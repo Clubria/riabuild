@@ -79,7 +79,28 @@ jobs:
       # the failure surfaces to whoever is using it rather than here.
       - name: Deploy Convex functions
         if: env.CONVEX_DEPLOY_KEY != ''
-        run: npx convex deploy -y
+        run: |
+          set -euo pipefail
+          # Convex deploy keys carry the deployment they target. A `dev:` or
+          # `preview:` key deploys successfully — to a deployment this
+          # dashboard never talks to, since the bundle is built against
+          # production. The job would stay green while production functions
+          # silently never changed, and the warning that says Convex was
+          # skipped would be gone too. Fail instead.
+          #
+          # Only the prefix is ever printed; the secret itself is not.
+          case "$CONVEX_DEPLOY_KEY" in
+            prod:*) ;;
+            *)
+              echo "::error::CONVEX_DEPLOY_KEY targets '${CONVEX_DEPLOY_KEY%%:*}', not production."
+              echo "::error::The dashboard is built against $VITE_CONVEX_URL, so a key for any"
+              echo "::error::other deployment would report success while production never updates."
+              echo "::error::Generate a production deploy key: Convex dashboard -> the production"
+              echo "::error::deployment -> Settings -> Deploy keys. It starts with 'prod:'."
+              exit 1
+              ;;
+          esac
+          npx convex deploy -y
 
       - name: Note that Convex was skipped
         if: env.CONVEX_DEPLOY_KEY == ''
