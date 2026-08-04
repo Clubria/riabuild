@@ -1,0 +1,56 @@
+# riabuild
+
+Provisioning tool that gets a Clubria developer from "accepted a GitHub org invite" to
+"running Claude Code against our codebase with working secrets" without them making a
+single environment decision.
+
+Design: `docs/superpowers/specs/2026-08-04-riabuild-design.md`. Read it before changing
+anything structural.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
+| `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
+| `docs/superpowers/specs/` | design specs |
+| `.claude/skills/` | repo skills — read the relevant one before the work it covers |
+
+Each subproject has its own `CLAUDE.md` with conventions specific to it.
+
+## Workflow — not optional
+
+**All work goes through a pull request. Work is not finished until PR CI has completed.**
+
+```sh
+git checkout -b <type>/<short-description>
+# ... work ...
+gh pr create --fill
+gh pr checks --watch          # wait for completion — this is part of the task
+```
+
+Do not push to `main`. Do not report work as done while checks are queued, running, or
+failing. If CI fails, fixing it is part of the same task, not a follow-up.
+
+## Architecture rules
+
+**The server ships data, never logic.** Setup tasks are compiled into the Rust binary —
+versioned, auditable, distributed through signed Homebrew releases. riabuild-web provides
+the org Claude settings JSON, the repo slug, version floors, and brokered tokens. A
+server-driven task manifest would be a remote code execution channel onto every
+developer's laptop. Do not cross this boundary for convenience.
+
+**Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
+and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
+written to a developer's machine. Infisical service tokens are deprecated — use machine
+identities with universal auth.
+
+**Identity is GitHub, authorization is Convex.** Membership in the Clubria GitHub org
+gates access at all; `members.role` decides how much. Every secret-brokering request
+re-verifies org membership, so the Convex role is never the sole gate.
+
+## Scope
+
+riabuild is a provisioner, not a platform. No agent session sharing, cost tracking, or
+review flows. If a proposed feature does not shorten or de-risk the onboarding path, it
+does not belong here.
