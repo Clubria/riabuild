@@ -130,6 +130,22 @@ riabuild has to change.
 > custom domain requires the zone and the Worker in the same account, whereas
 > Pages can serve a custom domain whose zone lives elsewhere.
 
+**Automated.** `.github/workflows/deploy.yml` publishes `riabuild.clubria.com` on every
+commit to main that touches `riabuild-web/`, after re-running lint and tests. It needs
+`CLOUDFLARE_API_TOKEN` as a repository secret; the account id and `VITE_CONVEX_URL` are
+public and defaulted in the workflow, overridable as repository *variables*.
+
+The path filter is load-bearing: `release.yml` commits `Formula/riabuild.rb` to main on
+every CLI release, and without it each release would redeploy an unchanged dashboard.
+
+> **Convex is deployed by the same workflow, but only if `CONVEX_DEPLOY_KEY` is set**
+> (Convex dashboard → Settings → Deploy keys → `gh secret set CONVEX_DEPLOY_KEY`).
+> Without it the job still publishes the dashboard and emits a warning, so the static
+> site can be newer than the functions it calls. Backend runs first when the key is
+> present, so a deploy never leaves the dashboard calling functions that do not exist.
+
+To deploy by hand — the same command the workflow runs:
+
 ```sh
 cd riabuild-web
 export CLOUDFLARE_API_TOKEN=…
