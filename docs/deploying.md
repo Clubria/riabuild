@@ -180,16 +180,32 @@ custom-domain feature.
 
 ## 6. Homebrew tap
 
-The CLI ships as `clubria/tap/riabuild`. Build release binaries for `darwin-arm64` and
-`darwin-x64`, publish them as a GitHub release, and point a formula in the
-`clubria/homebrew-tap` repository at the tarballs.
+Fully automated, and unlike everything else on this page it needs no credential you
+do not already have. `.github/workflows/release.yml` builds both macOS architectures
+on a `v<version>` tag, publishes them as a GitHub release, and commits the rendered
+formula to `Formula/riabuild.rb` on main. **`docs/releasing.md` is the runbook.**
 
-After publishing, set the version fields from the dashboard's lead panel:
+This repository serves as its own tap, so there is no second repository and no extra
+token — the workflow's own `GITHUB_TOKEN` can write here. Developers install with:
+
+```sh
+brew tap clubria/tap https://github.com/Clubria/riabuild
+brew install clubria/tap/riabuild
+```
+
+The repository and its release assets must stay **public**: `brew` fetches both with
+plain `curl` and no credentials. The binary holds no secrets, and every gate is
+re-verified server-side, so this costs nothing.
+
+After each release, set the version fields from the dashboard's lead panel. Both are
+release dates (`2026.08.04`), not semver:
 
 - `latestCliVersion` — what the startup check offers to upgrade to
 - `minCliVersion` — the floor below which the CLI refuses to run
 
-`minCliVersion` hard-blocks people mid-workday. Raise it deliberately.
+Neither is derived from GitHub, so a published release reaches nobody until
+`latestCliVersion` names it. `minCliVersion` hard-blocks people mid-workday. Raise it
+deliberately.
 
 ## Verifying a deployment
 

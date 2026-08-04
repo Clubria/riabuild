@@ -44,6 +44,15 @@ around a check that does not detect a real state, fix the check.
 `keychain.rs` are the only files that may know that. Linux support should be an addition,
 not a rewrite.
 
+**The version comes from the git tag, never from `Cargo.toml`.** riabuild is versioned by
+release date (`2026.08.04`), which semver cannot express, so `Cargo.toml` holds a
+permanent `0.0.0` placeholder and `cli.rs` reads `RIABUILD_VERSION` injected by the
+release workflow. Do not bump the crate version and do not reintroduce
+`CARGO_PKG_VERSION` — a binary reporting a version other than the release it shipped in
+makes every launch attempt a `brew upgrade` that cannot change anything. Local builds
+report `9999.0.0-dev`, above every real date, so working on riabuild never makes riabuild
+replace the binary being worked on. See `../docs/releasing.md`.
+
 ## Adding or changing a setup task
 
 Read `.claude/skills/writing-setup-tasks/SKILL.md` first. It covers the `Task` trait,

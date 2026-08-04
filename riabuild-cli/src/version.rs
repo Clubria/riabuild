@@ -114,6 +114,34 @@ mod tests {
     }
 
     #[test]
+    fn release_dates_compare_correctly() {
+        // riabuild's own version is a release date. Zero padding is
+        // presentation only and must not change the value, or a server floor
+        // of "2026.08.04" would reject a CLI reporting "2026.8.4".
+        assert_eq!(parse("2026.08.04"), Some(vec![2026, 8, 4]));
+        assert!(same("2026.08.04", "2026.8.4"));
+
+        assert!(at_least("2026.08.12", "2026.08.04"));
+        assert!(!at_least("2026.08.04", "2026.08.12"));
+        assert!(at_least("2026.11.03", "2026.08.04"));
+        assert!(at_least("2027.01.02", "2026.11.03"));
+
+        // A second release on the same day carries a fourth component, which
+        // semver could not express and which must sort above the first.
+        assert!(at_least("2026.08.04.1", "2026.08.04"));
+        assert!(!at_least("2026.08.04", "2026.08.04.1"));
+    }
+
+    #[test]
+    fn the_development_sentinel_outranks_every_real_date() {
+        // cli::VERSION falls back to this when no tag injected a version. It
+        // has to clear any floor the server might set, or `cargo run` would be
+        // refused by /api/v1 with `cli_too_old`.
+        assert!(at_least("9999.0.0-dev", "2026.08.04"));
+        assert!(!at_least("2026.08.04", "9999.0.0-dev"));
+    }
+
+    #[test]
     fn pinned_toolchains_compare_exactly() {
         assert!(same("v22.23.1", "22.23.1"));
         assert!(!same("v22.23.2", "22.23.1"));
