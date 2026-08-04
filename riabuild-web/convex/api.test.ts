@@ -524,6 +524,56 @@ describe("member administration", () => {
     ).rejects.toThrow(/valid JSON/i);
   });
 
+  test("org config rejects a CLI version that is not dotted-numeric", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "lead", role: "lead" });
+    const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
+
+    // parseVersion maps anything unparseable to 0, so an accepted "v2026.08.04"
+    // would become a silent floor of zero rather than an error.
+    await expect(
+      asLead.mutation(api.org.update, { latestCliVersion: "v2026.08.04" }),
+    ).rejects.toThrow(/dotted-numeric/i);
+    await expect(
+      asLead.mutation(api.org.update, { minCliVersion: "latest" }),
+    ).rejects.toThrow(/dotted-numeric/i);
+  });
+
+  test("org config refuses a floor nobody could satisfy", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "lead", role: "lead" });
+    const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
+
+    await asLead.mutation(api.org.update, {
+      latestCliVersion: "2026.08.04",
+      minCliVersion: "2026.08.04",
+    });
+
+    // Raising the floor past the newest published build would lock out every
+    // developer at once, including those already on the latest release.
+    await expect(
+      asLead.mutation(api.org.update, { minCliVersion: "2026.09.01" }),
+    ).rejects.toThrow(/nobody could satisfy/i);
+
+    // The same floor is fine once that release exists.
+    await asLead.mutation(api.org.update, {
+      latestCliVersion: "2026.09.01",
+      minCliVersion: "2026.09.01",
+    });
+    const config = await asLead.query(api.org.get);
+    expect(config.minCliVersion).toBe("2026.09.01");
+  });
+
+  test("org config accepts a zero-padded release date", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "lead", role: "lead" });
+    const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
+
+    await asLead.mutation(api.org.update, { latestCliVersion: "2026.08.04" });
+    const config = await asLead.query(api.org.get);
+    expect(config.latestCliVersion).toBe("2026.08.04");
+  });
+
   test("internal member lookup returns the stored profile", async () => {
     const t = setup();
     const { memberId } = await seedMember(t);

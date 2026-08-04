@@ -6,6 +6,7 @@ import {
   QueryCtx,
 } from "./_generated/server";
 import { viewerMember, writeAudit } from "./members";
+import { compareVersions } from "./lib/version";
 
 /**
  * Defaults exist so a fresh deployment serves a coherent config before any lead
@@ -108,6 +109,21 @@ export const update = mutation({
       }
     }
 
+    // parseVersion is forgiving by design — it maps anything unparseable to 0
+    // so a malformed value can never wedge a developer out of their
+    // environment. That forgiveness is wrong on the way in: "v2026.08.04" or
+    // "latest" would silently become a floor of zero.
+    for (const [field, value] of [
+      ["minCliVersion", args.minCliVersion],
+      ["latestCliVersion", args.latestCliVersion],
+    ] as const) {
+      if (value !== undefined && !/^\d+(\.\d+)*$/.test(value.trim())) {
+        throw new Error(
+          `${field} must be a dotted-numeric version like 2026.08.04 — no "v" prefix.`,
+        );
+      }
+    }
+
     const now = Date.now();
     const current = await loadConfig(ctx);
     const next = {
@@ -125,6 +141,19 @@ export const update = mutation({
         ? now
         : current.secretsUpdatedAt,
     };
+
+    // A floor above the newest published build locks out every developer at
+    // once, including anyone already on the latest release, and names no
+    // version they could upgrade to. The CLI would obey it — that is what a
+    // floor is for — so nothing downstream can soften this, and recovering
+    // means editing the database by hand.
+    if (compareVersions(next.minCliVersion, next.latestCliVersion) > 0) {
+      throw new Error(
+        `minCliVersion ${next.minCliVersion} is newer than latestCliVersion ` +
+          `${next.latestCliVersion}, so nobody could satisfy it. Publish that ` +
+          `release first, or lower the floor.`,
+      );
+    }
 
     const row = await ctx.db.query("orgConfig").first();
     if (row === null) {
