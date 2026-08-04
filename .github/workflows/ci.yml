@@ -66,3 +66,42 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  # The release workflow renders this template only after the GitHub release is
+  # already published, so a template that does not parse would leave a released
+  # version with a stale tap. Checking it on every pull request is what keeps
+  # that from being discovered at release time.
+  packaging:
+    name: Homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render and validate the formula
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s|@VERSION@|0.0.0|g" \
+            -e "s|@SHA256_AARCH64@|$(printf 'a%.0s' {1..64})|g" \
+            -e "s|@SHA256_X86_64@|$(printf 'b%.0s' {1..64})|g" \
+            packaging/homebrew/riabuild.rb > rendered.rb
+
+          if grep -q '@[A-Z0-9_]*@' rendered.rb; then
+            echo "::error::Template has a placeholder the release workflow does not substitute:"
+            grep -n '@[A-Z0-9_]*@' rendered.rb
+            exit 1
+          fi
+
+          ruby -c rendered.rb
+
+          # The formula's download URLs must match the names the release
+          # workflow actually produces, or `brew install` 404s on a release
+          # that otherwise looks healthy.
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            expected="riabuild-0.0.0-$target.tar.gz"
+            if ! grep -q "/$expected\"" rendered.rb; then
+              echo "::error::Formula does not point at $expected"
+              exit 1
+            fi
+          done
+          echo "Formula renders, parses, and points at the artifacts the release builds."

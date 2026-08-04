@@ -180,16 +180,24 @@ custom-domain feature.
 
 ## 6. Homebrew tap
 
-The CLI ships as `clubria/tap/riabuild`. Build release binaries for `darwin-arm64` and
-`darwin-x64`, publish them as a GitHub release, and point a formula in the
-`clubria/homebrew-tap` repository at the tarballs.
+Automated — `.github/workflows/release.yml` builds both macOS architectures on a
+`v<version>` tag, publishes them as a GitHub release, and pushes the rendered formula
+to `Clubria/homebrew-tap`. **`docs/releasing.md` is the runbook**, including the two
+one-time steps that need credentials this repository does not hold:
 
-After publishing, set the version fields from the dashboard's lead panel:
+| One-time step | Why it cannot be done here |
+|---|---|
+| Create the public `Clubria/homebrew-tap` repository | needs org repo-creation rights |
+| Set the `TAP_GITHUB_TOKEN` secret | `GITHUB_TOKEN` cannot write to a second repository |
+
+After each release, set the version fields from the dashboard's lead panel:
 
 - `latestCliVersion` — what the startup check offers to upgrade to
 - `minCliVersion` — the floor below which the CLI refuses to run
 
-`minCliVersion` hard-blocks people mid-workday. Raise it deliberately.
+Neither is derived from GitHub, so a published release reaches nobody until
+`latestCliVersion` names it. `minCliVersion` hard-blocks people mid-workday. Raise it
+deliberately.
 
 ## Verifying a deployment
 

@@ -11,14 +11,27 @@ Developer → riabuild.clubria.com → "Sign in with GitHub" → confirm profile
           → riabuild
 ```
 
+## Install
+
+```sh
+brew install clubria/tap/riabuild
+riabuild
+```
+
+macOS, Apple silicon or Intel. riabuild keeps itself current: it learns the
+published version from the dashboard and runs `brew upgrade` on its own when a
+newer one exists.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
+| `packaging/homebrew/` | the formula template the release workflow renders |
 | `docs/superpowers/specs/` | design specs |
 | `docs/deploying.md` | putting it on the domain |
+| `docs/releasing.md` | cutting a CLI release |
 
 ## What `riabuild` does to a machine
 
@@ -54,10 +67,13 @@ identity and mints short-lived tokens on demand; the CLI pipes them straight int
 
 ```sh
 cd riabuild-web  && pnpm dev            # convex + vite
-cd riabuild-cli  && cargo test          # 110 unit tests, no machine state needed
+cd riabuild-cli  && cargo test          # 112 unit tests, no machine state needed
 ```
 
 Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.
+
+To ship a new CLI version, bump `riabuild-cli/Cargo.toml` and push a `v<version>`
+tag; `docs/releasing.md` covers the rest.
 
 All work goes through a pull request, and is not finished until CI has passed. See
 `CLAUDE.md`.

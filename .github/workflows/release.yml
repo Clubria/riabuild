@@ -1,0 +1,243 @@
+name: Release
+
+# Cutting a release is `git tag v<x.y.z> && git push --tags`. Everything below
+# is what that tag sets off: build both macOS architectures, publish them as a
+# GitHub release, and point the Homebrew tap at the result.
+#
+# The dispatch trigger runs the same build and packaging without publishing, so
+# a change to this file can be exercised before a tag depends on it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release and update the tap (otherwise build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel: a half-published release is worse than a queued one.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      sha256_aarch64: ${{ steps.package.outputs.sha256_aarch64 }}
+      sha256_x86_64: ${{ steps.package.outputs.sha256_x86_64 }}
+    defaults:
+      run:
+        working-directory: riabuild-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: riabuild-cli
+
+      # A tag that disagrees with Cargo.toml produces a release whose binary
+      # reports a different version than the formula installs, which then makes
+      # the startup update check offer an upgrade that changes nothing.
+      - name: Resolve and check version
+        id: version
+        run: |
+          set -euo pipefail
+          crate=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$crate" ]; then
+              echo "::error::Tag v$tag does not match riabuild-cli/Cargo.toml version $crate."
+              echo "::error::Bump the crate version and re-tag, or delete the tag."
+              exit 1
+            fi
+            publish=true
+          else
+            publish=${{ inputs.publish }}
+          fi
+
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Releasing riabuild $crate (publish=$publish)"
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # `strip = "symbols"` can invalidate the ad-hoc signature rustc applies at
+      # link time. An arm64 binary with a broken signature is killed by the
+      # kernel on launch with no diagnostic beyond "killed: 9", so re-sign both
+      # slices after stripping rather than hoping the toolchain preserved it.
+      - name: Sign
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            codesign --force --sign - "target/$target/release/riabuild"
+            codesign --verify --verbose "target/$target/release/riabuild"
+          done
+
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+
+          file target/aarch64-apple-darwin/release/riabuild | grep -q 'arm64'
+          file target/x86_64-apple-darwin/release/riabuild | grep -q 'x86_64'
+
+          # The runner is arm64, so only that slice can actually be executed
+          # here. The x86_64 slice is checked structurally above and by the
+          # formula's `test do` block when Homebrew installs it on Intel.
+          actual=$(target/aarch64-apple-darwin/release/riabuild --version)
+          if [ "$actual" != "riabuild $version" ]; then
+            echo "::error::Binary reports '$actual', expected 'riabuild $version'."
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            arch="${target%%-*}"
+            tarball="riabuild-$version-$target.tar.gz"
+            # -C so the binary sits at the root of the tarball, which is what
+            # the formula's `bin.install "riabuild"` expects.
+            tar -czf "dist/$tarball" -C "target/$target/release" riabuild
+            sha=$(shasum -a 256 "dist/$tarball" | cut -d' ' -f1)
+            echo "sha256_$arch=$sha" >> "$GITHUB_OUTPUT"
+            echo "$sha  $tarball" >> "dist/riabuild-$version-checksums.txt"
+          done
+
+          cat "dist/riabuild-$version-checksums.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riabuild-${{ steps.version.outputs.version }}-macos
+          path: riabuild-cli/dist/*
+
+      - name: Publish release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          tag="v$version"
+
+          # A dispatch-triggered publish has no tag yet; a tag push already has one.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "riabuild $version" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
+          fi
+
+          gh release upload "$tag" dist/* --clobber
+
+  tap:
+    name: Update Homebrew tap
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GITHUB_TOKEN is scoped to this repository only, so pushing the formula
+      # to Clubria/homebrew-tap needs a token that can write there. Without it
+      # the release itself is still published and this job is the only failure.
+      - name: Check for a tap token
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::secrets.TAP_GITHUB_TOKEN is not set."
+            echo "::error::See docs/releasing.md — the release is published, only the tap is stale."
+            exit 1
+          fi
+
+      - name: Render formula
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256_AARCH64: ${{ needs.build.outputs.sha256_aarch64 }}
+          SHA256_X86_64: ${{ needs.build.outputs.sha256_x86_64 }}
+        run: |
+          set -euo pipefail
+          for placeholder in VERSION SHA256_AARCH64 SHA256_X86_64; do
+            if [ -z "${!placeholder}" ]; then
+              echo "::error::$placeholder came back empty from the build job."
+              exit 1
+            fi
+          done
+
+          sed \
+            -e "s|@VERSION@|$VERSION|g" \
+            -e "s|@SHA256_AARCH64@|$SHA256_AARCH64|g" \
+            -e "s|@SHA256_X86_64@|$SHA256_X86_64|g" \
+            packaging/homebrew/riabuild.rb > riabuild.rb
+
+          if grep -q '@[A-Z0-9_]*@' riabuild.rb; then
+            echo "::error::Formula still contains unsubstituted placeholders:"
+            grep -n '@[A-Z0-9_]*@' riabuild.rb
+            exit 1
+          fi
+
+          # A formula that does not parse breaks `brew install` for everyone,
+          # and nothing before this point would notice. Ruby is preinstalled on
+          # the runner, so the check is free.
+          ruby -c riabuild.rb
+
+          cat riabuild.rb
+
+      - name: Push to Clubria/homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! gh repo view Clubria/homebrew-tap >/dev/null 2>&1; then
+            echo "::error::Clubria/homebrew-tap does not exist or the token cannot see it."
+            echo "::error::See docs/releasing.md for how to create it."
+            exit 1
+          fi
+
+          git clone "https://x-access-token:$GH_TOKEN@github.com/Clubria/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp riabuild.rb tap/Formula/riabuild.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage first, then compare against the index: on the very first
+          # release Formula/riabuild.rb is untracked, and `git diff` alone
+          # reports no change for a file it does not yet know about — which
+          # would silently skip the push that creates the formula.
+          git add Formula/riabuild.rb
+          if git diff --cached --quiet; then
+            echo "Formula already at $VERSION; nothing to push."
+            exit 0
+          fi
+
+          git commit -m "riabuild $VERSION"
+          git push
