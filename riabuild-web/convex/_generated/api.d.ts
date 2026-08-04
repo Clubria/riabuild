@@ -8,9 +8,19 @@
  * @module
  */
 
+import type * as audit from "../audit.js";
 import type * as auth from "../auth.js";
+import type * as cliAuth from "../cliAuth.js";
+import type * as devSeed from "../devSeed.js";
+import type * as github from "../github.js";
 import type * as http from "../http.js";
-import type * as myFunctions from "../myFunctions.js";
+import type * as infisical from "../infisical.js";
+import type * as lib_crypto from "../lib/crypto.js";
+import type * as lib_responses from "../lib/responses.js";
+import type * as lib_version from "../lib/version.js";
+import type * as members from "../members.js";
+import type * as org from "../org.js";
+import type * as sessions from "../sessions.js";
 
 import type {
   ApiFromModules,
@@ -19,9 +29,19 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  audit: typeof audit;
   auth: typeof auth;
+  cliAuth: typeof cliAuth;
+  devSeed: typeof devSeed;
+  github: typeof github;
   http: typeof http;
-  myFunctions: typeof myFunctions;
+  infisical: typeof infisical;
+  "lib/crypto": typeof lib_crypto;
+  "lib/responses": typeof lib_responses;
+  "lib/version": typeof lib_version;
+  members: typeof members;
+  org: typeof org;
+  sessions: typeof sessions;
 }>;
 
 /**

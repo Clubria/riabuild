@@ -1,0 +1,3 @@
+# SPA fallback. The CLI opens /cli/authorize directly, and the dashboard routes
+# on window.location.pathname — without this that URL 404s on a cold load.
+/*    /index.html   200
