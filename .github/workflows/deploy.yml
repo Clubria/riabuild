@@ -1,0 +1,111 @@
+name: Deploy
+
+# Publishes riabuild.clubria.com on every commit to main that touches the
+# dashboard. The CLI has its own pipeline in release.yml and is not involved.
+#
+# The path filter matters more than it looks: release.yml commits
+# Formula/riabuild.rb to main on every release, and without it each release
+# would redeploy a dashboard that did not change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "riabuild-web/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web
+  # Never cancel: interrupting `convex deploy` or a Pages upload leaves the
+  # site and its backend disagreeing about which functions exist.
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: riabuild.clubria.com
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://riabuild.clubria.com
+    defaults:
+      run:
+        working-directory: riabuild-web
+    env:
+      CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Documented in docs/deploying.md §4, and not a secret — the account that
+      # owns Workers and Pages, which is *not* the one that owns the
+      # clubria.com zone. Sending this to the wrong account returns
+      # "Authentication error [code: 10000]", which reads exactly like a
+      # missing permission and is not.
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || '2570e0b4e3586a4da93eabe5d530f27d' }}
+      # The client API hostname, baked into the bundle at build time. Public.
+      VITE_CONVEX_URL: ${{ vars.VITE_CONVEX_URL || 'https://handsome-vulture-127.eu-west-1.convex.cloud' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for a Cloudflare token
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::secrets.CLOUDFLARE_API_TOKEN is not set."
+            echo "::error::See docs/deploying.md §4."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # main is only meant to move through merged pull requests, which have
+      # already passed these. Running them again is cheap, and it is the
+      # difference between a bad direct push being caught and being published.
+      - name: Lint and typecheck
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+      # Backend before frontend, always. The reverse order publishes a
+      # dashboard that calls functions the deployment does not have yet, and
+      # the failure surfaces to whoever is using it rather than here.
+      - name: Deploy Convex functions
+        if: env.CONVEX_DEPLOY_KEY != ''
+        run: npx convex deploy -y
+
+      - name: Note that Convex was skipped
+        if: env.CONVEX_DEPLOY_KEY == ''
+        run: |
+          echo "::warning::CONVEX_DEPLOY_KEY is not set, so backend functions were NOT deployed."
+          echo "::warning::Only the static dashboard was published; schema, validators and"
+          echo "::warning::mutations on the deployment are whatever was last pushed by hand."
+          echo "::warning::Add the key from the Convex dashboard: Settings -> Deploy keys."
+
+      # `pnpm deploy:web` is the same command docs/deploying.md gives for a
+      # manual deploy, so there is one definition of what deploying means.
+      - name: Build and deploy to Cloudflare Pages
+        run: pnpm deploy:web
+
+      - name: Verify the site is serving
+        run: |
+          set -euo pipefail
+          # Pages needs a moment to propagate a new deployment to the edge.
+          for attempt in $(seq 1 10); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' https://riabuild.clubria.com/ || true)
+            if [ "$status" = "200" ]; then
+              echo "riabuild.clubria.com is serving 200."
+              exit 0
+            fi
+            echo "attempt $attempt: HTTP $status, retrying…"
+            sleep 6
+          done
+          echo "::error::riabuild.clubria.com did not return 200 after the deploy."
+          exit 1
