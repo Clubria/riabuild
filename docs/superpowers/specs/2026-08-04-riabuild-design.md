@@ -389,11 +389,14 @@ macOS for v1, Linux-shaped code. Path resolution and keychain access sit behind 
 from the first commit so Linux support is an addition rather than a rewrite. The Node
 tarball target is selected at runtime and already supports both.
 
-## Open questions
+## Decisions and open questions
 
-None blocking implementation. Two to revisit after v1 ships:
+**Decided: stay on `@convex-dev/auth`** with the GitHub provider. Convex documents the
+package as beta and points new projects at third-party providers, but migrating to
+`@convex-dev/better-auth` is churn we should not pay before there is evidence of actual
+instability. Revisit only if beta breakage costs us time.
 
-- Whether `@convex-dev/auth`'s beta status costs enough friction to justify migrating to
-  `@convex-dev/better-auth`.
+One open question, not blocking implementation:
+
 - Whether `candidate` scoping in Infisical is fine-grained enough in practice, or whether
   path subsets need to become per-person rather than per-role.
