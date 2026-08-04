@@ -91,6 +91,8 @@ export function OrgSettings() {
   const update = useMutation(api.org.update);
   const [draft, setDraft] = useState<string | null>(null);
   const [repoSlug, setRepoSlug] = useState<string | null>(null);
+  const [latestCli, setLatestCli] = useState<string | null>(null);
+  const [minCli, setMinCli] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -100,6 +102,9 @@ export function OrgSettings() {
 
   const settings = draft ?? config.claudeSettings;
   const slug = repoSlug ?? config.repoSlug;
+  const latest = latestCli ?? config.latestCliVersion;
+  const floor = minCli ?? config.minCliVersion;
+  const floorIsChanging = floor.trim() !== config.minCliVersion;
 
   return (
     <div className="max-w-2xl">
@@ -124,12 +129,58 @@ export function OrgSettings() {
         />
       </label>
 
+      <div className="mt-4 grid gap-4 sm:grid-cols-2">
+        <label className="block">
+          <span className="eyebrow mb-1 block">
+            Latest CLI version — offered as an upgrade
+          </span>
+          <input
+            className="field mono"
+            value={latest}
+            spellCheck={false}
+            placeholder="2026.08.04"
+            onChange={(event) => setLatestCli(event.target.value)}
+          />
+        </label>
+
+        <label className="block">
+          <span className="eyebrow mb-1 block">
+            Minimum CLI version — refuses to run below this
+          </span>
+          <input
+            className="field mono"
+            value={floor}
+            spellCheck={false}
+            placeholder="2026.08.04"
+            onChange={(event) => setMinCli(event.target.value)}
+          />
+        </label>
+      </div>
+
+      {floorIsChanging && (
+        <div className="mt-4">
+          <Notice tone="signal" title="This blocks people mid-workday">
+            <p>
+              The floor moves from v{config.minCliVersion} to v{floor.trim()}.
+              Anyone on an older riabuild is refused by the API until they
+              upgrade — the next command they run stops working, whatever they
+              were in the middle of.
+            </p>
+          </Notice>
+        </div>
+      )}
+
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <button
           className="btn"
           onClick={() => {
             setError(null);
-            void update({ claudeSettings: settings, repoSlug: slug })
+            void update({
+              claudeSettings: settings,
+              repoSlug: slug,
+              latestCliVersion: latest.trim(),
+              minCliVersion: floor.trim(),
+            })
               .then(() => {
                 setSaved(true);
                 setTimeout(() => setSaved(false), 2000);
@@ -153,8 +204,8 @@ export function OrgSettings() {
         {saved && <span className="eyebrow text-verified">Saved</span>}
       </div>
       <p className="mono mt-3 text-muted">
-        secrets last rotated {formatTime(config.secretsUpdatedAt)} · CLI floor v
-        {config.minCliVersion} · latest v{config.latestCliVersion}
+        secrets last rotated {formatTime(config.secretsUpdatedAt)} · saved CLI
+        floor v{config.minCliVersion} · saved latest v{config.latestCliVersion}
       </p>
       {error !== null && (
         <div className="mt-4">
