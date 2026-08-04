@@ -14,9 +14,18 @@ use std::time::Duration;
 
 /// The dashboard a browser is sent to.
 pub const DEFAULT_WEB_URL: &str = "https://riabuild.clubria.com";
-/// The `/api/v1` origin. Convex serves HTTP actions from its own hostname, so
-/// this is a separate name pointed at the deployment.
-pub const DEFAULT_API_URL: &str = "https://api.riabuild.clubria.com";
+
+/// The `/api/v1` origin — the Convex deployment's own hostname.
+///
+/// Not `api.riabuild.clubria.com`, which cannot be made to work for free:
+/// unproxied, TLS terminates at Convex, which only holds a certificate for
+/// `*.convex.site`; proxied, Cloudflare's Universal SSL covers only one label
+/// below the apex, and `api.riabuild` is two. Pointing a custom name here needs
+/// Convex's custom-domain feature.
+///
+/// No developer ever types this, so a pretty name buys nothing. Overridable with
+/// `RIABUILD_API_URL` for local development.
+pub const DEFAULT_API_URL: &str = "https://handsome-vulture-127.eu-west-1.convex.site";
 
 pub fn web_url() -> String {
     trim(std::env::var("RIABUILD_WEB_URL").unwrap_or_else(|_| DEFAULT_WEB_URL.to_string()))

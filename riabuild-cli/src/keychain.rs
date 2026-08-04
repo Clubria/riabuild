@@ -8,6 +8,7 @@
 //! behaviour unit-testable.
 
 use crate::runner::{CommandRunner, RunOptions};
+use crate::ui::Failure;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
@@ -98,10 +99,28 @@ impl SecretToolKeychain {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self { runner }
     }
+
+    /// A machine with no keyring is an ordinary situation on Linux — a headless
+    /// box, a container, a minimal install — not a bug in riabuild. Without this
+    /// guard the missing binary surfaces as a raw `os error 2` under a message
+    /// telling the developer to report it, which sends them nowhere useful.
+    fn ensure_available(&self) -> Result<()> {
+        if self.runner.which("secret-tool").is_some() {
+            return Ok(());
+        }
+        Err(Failure::new(
+            "reading the riabuild token from your keyring",
+            "Install libsecret (`sudo apt install libsecret-tools`), or set RIABUILD_TOKEN \
+             to a token from the riabuild dashboard if this machine has no keyring.",
+        )
+        .detail("`secret-tool` is not installed, so riabuild has nowhere to keep your token")
+        .into())
+    }
 }
 
 impl Keychain for SecretToolKeychain {
     fn get(&self) -> Result<Option<String>> {
+        self.ensure_available()?;
         let output = self.runner.run(
             "secret-tool",
             &["lookup", "service", SERVICE, "account", ACCOUNT],
@@ -115,6 +134,7 @@ impl Keychain for SecretToolKeychain {
     }
 
     fn set(&self, token: &str) -> Result<()> {
+        self.ensure_available()?;
         let output = self.runner.run(
             "secret-tool",
             &[
@@ -141,6 +161,10 @@ impl Keychain for SecretToolKeychain {
     }
 
     fn delete(&self) -> Result<()> {
+        // Nothing to remove if there is no keyring; signing out succeeds.
+        if self.runner.which("secret-tool").is_none() {
+            return Ok(());
+        }
         self.runner.run(
             "secret-tool",
             &["clear", "service", SERVICE, "account", ACCOUNT],
@@ -266,6 +290,22 @@ mod tests {
         keychain.set("first").unwrap();
         keychain.set("second").unwrap();
         assert!(runner.calls().iter().all(|call| call.contains("-U")));
+    }
+
+    #[test]
+    fn a_machine_with_no_keyring_gets_a_next_action_not_a_bug_report() {
+        // A headless Linux box has no libsecret. That is an ordinary state, and
+        // the message has to name both fixes.
+        let keychain = SecretToolKeychain::new(Arc::new(FakeRunner::new()));
+        let error = keychain.get().unwrap_err().to_string();
+        assert!(error.contains("RIABUILD_TOKEN"), "{error}");
+        assert!(error.contains("libsecret"), "{error}");
+    }
+
+    #[test]
+    fn signing_out_works_even_without_a_keyring() {
+        let keychain = SecretToolKeychain::new(Arc::new(FakeRunner::new()));
+        assert!(keychain.delete().is_ok());
     }
 
     #[test]

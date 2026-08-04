@@ -1,2 +1,6 @@
 allowBuilds:
   esbuild: true
+  # Only needed by `wrangler dev`, which this project does not use — deploying
+  # static assets never runs the local workerd runtime. Flip to true if you
+  # start developing the Worker itself locally.
+  workerd: false

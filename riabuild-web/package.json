@@ -38,12 +38,7 @@
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.58.2",
     "vite": "^8.0.9",
-    "vitest": "^4.1.10"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "@tailwindcss/oxide"
-    ]
+    "vitest": "^4.1.10",
+    "wrangler": "^4.118.0"
   }
 }

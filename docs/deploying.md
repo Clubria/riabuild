@@ -1,15 +1,40 @@
 # Deploying riabuild
 
-Everything in this document needs a credential the repository does not contain. The
-code is complete and verified against a local Convex backend; these are the steps that
-put it on `riabuild.clubria.com`.
+## Current state
+
+| Piece | Status |
+|---|---|
+| Convex production | **live** — `handsome-vulture-127.eu-west-1.convex.cloud`, HTTP actions on `…convex.site` |
+| Convex dev | **live** — `wary-bandicoot-285.eu-west-1.convex.cloud` |
+| Convex project | `lowerkinded / riabuild` |
+| `/api/v1` | **live**, returning 401 to anonymous callers |
+| GitHub sign-in | **not working** — `AUTH_GITHUB_ID` / `AUTH_GITHUB_SECRET` unset |
+| Org membership checks | **not working** — `GITHUB_ORG_TOKEN` unset, so brokering returns 503 |
+| Secret brokering | **not working** — Infisical identities unset |
+| Dashboard hosting | **not deployed** — needs a Cloudflare token with Workers permission |
+| DNS | no `riabuild` records; see the TLS note in §5 |
+
+To reproduce the local `.env.local` for this project:
+
+```
+CONVEX_DEPLOYMENT=dev:wary-bandicoot-285
+VITE_CONVEX_URL=https://wary-bandicoot-285.eu-west-1.convex.cloud
+```
+
+The rest of this document is the remaining work. Everything left needs a credential the
+repository does not contain.
 
 ## 1. Convex deployment
 
+Already done for this project. To repeat elsewhere — and note `--login-flow paste`,
+which is what makes this work over SSH, since the default loopback flow needs a browser
+on the same machine:
+
 ```sh
 cd riabuild-web
-npx convex login          # interactive; opens a browser
-npx convex deploy         # creates the production deployment
+npx convex login --login-flow paste --no-open   # prints a URL; paste the token back
+npx convex dev --once --configure new --team <team> --project riabuild --dev-deployment cloud
+npx convex deploy -y                            # creates the production deployment
 ```
 
 `convex deploy` prints two hostnames:
@@ -68,37 +93,54 @@ to authenticate as, and never sees a secret value.
 
 ## 4. Hosting the dashboard
 
-`pnpm build` produces a static `dist/`. Any static host works; Cloudflare Pages keeps it
-on the same account as the DNS:
+`wrangler.jsonc` configures a static-asset Worker. `not_found_handling:
+single-page-application` is load-bearing — the dashboard routes on `pathname`, so
+`/cli/authorize` must serve `index.html` when opened directly, which is exactly how the
+CLI opens it.
 
 ```sh
 cd riabuild-web
-pnpm build
-cf deploy            # needs `cf auth login` or CLOUDFLARE_API_TOKEN
+VITE_CONVEX_URL=https://handsome-vulture-127.eu-west-1.convex.cloud pnpm build
+CLOUDFLARE_API_TOKEN=… npx wrangler deploy
 ```
 
-Set `VITE_CONVEX_URL` to the `.convex.cloud` hostname at build time.
+**The API token needs `Account → Workers Scripts → Edit`.** A token made from the "Edit
+zone DNS" template can create DNS records but returns `Authentication error [code:
+10000]` here. Verify with:
+
+```sh
+curl -s "https://api.cloudflare.com/client/v4/accounts/185f8d1747f1e766b83b40ddebdbfafa/workers/scripts" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+```
 
 ## 5. DNS
 
-Two names, both on the `clubria.com` zone:
+Only **one** record is needed:
 
 | Name | Target | Why |
 |---|---|---|
-| `riabuild.clubria.com` | the static dashboard host | what developers visit |
-| `api.riabuild.clubria.com` | `<deployment>.convex.site` | what the CLI calls |
+| `riabuild.clubria.com` | the Worker | what developers visit |
 
-```sh
-cf dns records create --zone clubria.com \
-  --type CNAME --name api.riabuild --content <deployment>.convex.site --proxied false
-```
+### There is no `api.riabuild.clubria.com`, and it cannot be added for free
 
-Leave the API record unproxied: it is a JSON API for a Rust client, and Cloudflare's
-proxy adds nothing but a failure mode.
+Both routings were tried against the live zone and both fail TLS:
 
-The CLI's defaults are compiled in (`api/mod.rs`), so nothing needs configuring on a
-developer's machine. Both are overridable with `RIABUILD_WEB_URL` and `RIABUILD_API_URL`
-for local development.
+- **Unproxied** — TLS terminates at Convex, which holds a certificate for `*.convex.site`
+  only. `curl` reports `ssl_verify_result=1`.
+- **Proxied** — Cloudflare's Universal SSL covers `clubria.com` and `*.clubria.com`, one
+  label below the apex. `api.riabuild` is two labels, so no edge certificate exists.
+
+Fixing it properly needs Convex's custom-domain feature (a paid plan), or Advanced
+Certificate Manager plus an origin rule to rewrite the SNI. Neither is worth it: no
+developer ever types this hostname. The CLI's `DEFAULT_API_URL` therefore points straight
+at `handsome-vulture-127.eu-west-1.convex.site`, which has a valid certificate today.
+
+If you later add a Convex custom domain, change that constant and cut a release — it is
+one line in `riabuild-cli/src/api/mod.rs`, and `RIABUILD_API_URL` overrides it meanwhile.
+
+A single-label name like `riabuild-api.clubria.com` would get an edge certificate, but
+Convex routes HTTP actions by hostname and would not recognise it, so it still needs the
+custom-domain feature.
 
 ## 6. Homebrew tap
 
@@ -116,7 +158,7 @@ After publishing, set the version fields from the dashboard's lead panel:
 ## Verifying a deployment
 
 ```sh
-curl -s https://api.riabuild.clubria.com/api/v1/me
+curl -s https://handsome-vulture-127.eu-west-1.convex.site/api/v1/me
 # expect 401 unauthenticated — the endpoint is live and refusing anonymous callers
 ```
 
