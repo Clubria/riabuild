@@ -154,26 +154,18 @@ jobs:
 
           gh release upload "$tag" dist/* --clobber
 
-  tap:
-    name: Update Homebrew tap
+  formula:
+    name: Update the Homebrew formula
     needs: build
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
+      # The release is triggered by a tag, but the formula has to land on the
+      # default branch: `brew tap` clones that and reads nothing else. Checking
+      # out main rather than the tag is what makes the push below meaningful.
       - uses: actions/checkout@v4
-
-      # GITHUB_TOKEN is scoped to this repository only, so pushing the formula
-      # to Clubria/homebrew-tap needs a token that can write there. Without it
-      # the release itself is still published and this job is the only failure.
-      - name: Check for a tap token
-        env:
-          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-        run: |
-          if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "::error::secrets.TAP_GITHUB_TOKEN is not set."
-            echo "::error::See docs/releasing.md — the release is published, only the tap is stale."
-            exit 1
-          fi
+        with:
+          ref: main
 
       - name: Render formula
         env:
@@ -189,55 +181,49 @@ jobs:
             fi
           done
 
+          mkdir -p Formula
           sed \
             -e "s|@VERSION@|$VERSION|g" \
             -e "s|@SHA256_AARCH64@|$SHA256_AARCH64|g" \
             -e "s|@SHA256_X86_64@|$SHA256_X86_64|g" \
-            packaging/homebrew/riabuild.rb > riabuild.rb
+            packaging/homebrew/riabuild.rb > Formula/riabuild.rb
 
-          if grep -q '@[A-Z0-9_]*@' riabuild.rb; then
+          if grep -q '@[A-Z0-9_]*@' Formula/riabuild.rb; then
             echo "::error::Formula still contains unsubstituted placeholders:"
-            grep -n '@[A-Z0-9_]*@' riabuild.rb
+            grep -n '@[A-Z0-9_]*@' Formula/riabuild.rb
             exit 1
           fi
 
           # A formula that does not parse breaks `brew install` for everyone,
           # and nothing before this point would notice. Ruby is preinstalled on
           # the runner, so the check is free.
-          ruby -c riabuild.rb
+          ruby -c Formula/riabuild.rb
 
-          cat riabuild.rb
+          cat Formula/riabuild.rb
 
-      - name: Push to Clubria/homebrew-tap
+      - name: Commit the formula to main
         env:
-          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
-
-          if ! gh repo view Clubria/homebrew-tap >/dev/null 2>&1; then
-            echo "::error::Clubria/homebrew-tap does not exist or the token cannot see it."
-            echo "::error::See docs/releasing.md for how to create it."
-            exit 1
-          fi
-
-          git clone "https://x-access-token:$GH_TOKEN@github.com/Clubria/homebrew-tap.git" tap
-          mkdir -p tap/Formula
-          cp riabuild.rb tap/Formula/riabuild.rb
-
-          cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # Stage first, then compare against the index: on the very first
           # release Formula/riabuild.rb is untracked, and `git diff` alone
           # reports no change for a file it does not yet know about — which
-          # would silently skip the push that creates the formula.
+          # would silently skip the commit that creates the formula.
           git add Formula/riabuild.rb
           if git diff --cached --quiet; then
-            echo "Formula already at $VERSION; nothing to push."
+            echo "Formula already at $VERSION; nothing to commit."
             exit 0
           fi
 
-          git commit -m "riabuild $VERSION"
-          git push
+          git commit \
+            -m "riabuild $VERSION" \
+            -m "Written by .github/workflows/release.yml. Edit packaging/homebrew/riabuild.rb, never this file."
+
+          # Anything merged to main while the macOS build was running would
+          # otherwise reject this push.
+          git pull --rebase origin main
+          git push origin HEAD:main

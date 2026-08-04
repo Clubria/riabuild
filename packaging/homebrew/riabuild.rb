@@ -1,8 +1,9 @@
-# Template for the formula published to Clubria/homebrew-tap.
+# Template for the formula this repository serves as a Homebrew tap.
 #
 # `.github/workflows/release.yml` substitutes the at-sign-delimited placeholders
-# below and pushes the result to that repository as `Formula/riabuild.rb`. Edit
-# this file, never the copy in the tap — the next release overwrites it.
+# below and commits the result to `Formula/riabuild.rb` on main, which is where
+# `brew tap` looks. Edit this file, never `Formula/riabuild.rb` — the next
+# release overwrites that one.
 #
 # The workflow rejects a rendered formula that still contains a placeholder, so
 # this comment deliberately describes their shape rather than spelling one out.

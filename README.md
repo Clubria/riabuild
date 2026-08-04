@@ -14,6 +14,7 @@ Developer → riabuild.clubria.com → "Sign in with GitHub" → confirm profile
 ## Install
 
 ```sh
+brew tap clubria/tap https://github.com/Clubria/riabuild
 brew install clubria/tap/riabuild
 riabuild
 ```
@@ -22,13 +23,19 @@ macOS, Apple silicon or Intel. riabuild keeps itself current: it learns the
 published version from the dashboard and runs `brew upgrade` on its own when a
 newer one exists.
 
+This repository *is* the tap — the formula is `Formula/riabuild.rb`, written by
+the release workflow. The explicit `brew tap` line is what the second command
+needs: Homebrew only auto-taps `clubria/tap` when it can guess the repository
+name, and it guesses `Clubria/homebrew-tap`.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
-| `packaging/homebrew/` | the formula template the release workflow renders |
+| `packaging/homebrew/` | the formula template — edit this one |
+| `Formula/riabuild.rb` | the rendered formula `brew tap` reads — generated, do not edit |
 | `docs/superpowers/specs/` | design specs |
 | `docs/deploying.md` | putting it on the domain |
 | `docs/releasing.md` | cutting a CLI release |

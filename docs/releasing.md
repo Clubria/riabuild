@@ -1,7 +1,8 @@
 # Releasing riabuild
 
-Cutting a release is two commands. Everything else on this page is either
-one-time setup or an explanation of why a step exists.
+Cutting a release is two commands, and there is no one-time setup — this
+repository is its own Homebrew tap, and the release workflow has write access
+to it already.
 
 ```sh
 # from a clean main, with riabuild-cli/Cargo.toml already bumped
@@ -10,62 +11,42 @@ git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` then builds both macOS architectures, publishes
-them as a GitHub release, and pushes an updated formula to
-`Clubria/homebrew-tap`. A developer picks it up with:
+them as a GitHub release, and commits the rendered formula to
+`Formula/riabuild.rb` on main. A developer picks it up with:
 
 ```sh
-brew install clubria/tap/riabuild     # first time
-brew upgrade clubria/tap/riabuild     # afterwards, or riabuild does it itself
+brew tap clubria/tap https://github.com/Clubria/riabuild   # first time only
+brew install clubria/tap/riabuild
+brew upgrade clubria/tap/riabuild                          # or riabuild does it itself
 ```
 
-## One-time setup
+## This repository is the tap
 
-Neither step can be done from this repository, because both need a credential
-the repository does not contain.
+Homebrew will tap any git repository under a name you choose, provided the
+formulae live in `Formula/`. `brew tap clubria/tap <url>` registers this
+repository under the name `clubria/tap`, so `clubria/tap/riabuild` resolves
+and, importantly, so does the `brew upgrade clubria/tap/riabuild` that
+`update.rs` runs on its own.
 
-### 1. Create the tap repository
+The cost is the explicit `brew tap` line. `brew install clubria/tap/riabuild`
+auto-taps only when Homebrew can derive the repository name from the tap name,
+and the name it derives is `Clubria/homebrew-tap`. Collapsing install back to a
+single command means a separate repository with that exact name; nothing else
+about the pipeline would change.
 
-Homebrew resolves `clubria/tap` to `github.com/Clubria/homebrew-tap`. The name
-is not a convention you may vary — `brew` constructs it.
-
-```sh
-gh repo create Clubria/homebrew-tap --public \
-  --description "Homebrew formulae for Clubria tools"
-```
-
-**It must be public.** `brew install` fetches the formula and the release
-tarball with plain `curl`, carrying no GitHub credentials, so a private tap
-returns 404 to every developer. This costs nothing: the binary contains no
-secrets, and every gate that matters — org membership, secret brokering, org
-config — is re-verified server-side on each request. Someone outside the
-Clubria org who downloads riabuild gets a program that can only tell them they
-are not in the Clubria org.
-
-The first release creates `Formula/riabuild.rb`; the repository can start empty.
-
-### 2. Add the `TAP_GITHUB_TOKEN` secret
-
-The workflow's `GITHUB_TOKEN` is scoped to `Clubria/riabuild` alone, so pushing
-to a second repository needs its own credential.
-
-Create a fine-grained personal access token limited to `Clubria/homebrew-tap`
-with **Contents: read and write**, then:
-
-```sh
-gh secret set TAP_GITHUB_TOKEN --repo Clubria/riabuild
-```
-
-If this is missing, the release itself still publishes correctly and only the
-`tap` job fails — the tap is stale, not broken, and re-running the job after
-adding the secret fixes it.
+Both the repository and the release assets are public, which is what makes
+`brew install` work at all: it fetches with plain `curl`, carrying no GitHub
+credentials. Nothing is lost by that — the binary contains no secrets, and org
+membership, secret brokering, and org config are re-verified server-side on
+every request. Someone outside the Clubria org who installs riabuild gets a
+program that can only tell them they are not in the Clubria org.
 
 ## Cutting a release
 
 1. **Bump `version` in `riabuild-cli/Cargo.toml`** and merge it through a PR
    like any other change.
 2. **Tag the merge commit** as `v<version>` and push the tag.
-3. **Watch the run** — `gh run watch` — until the release and the tap job are
-   both green.
+3. **Watch the run** — `gh run watch` — until both jobs are green.
 4. **Set `latestCliVersion`** in the dashboard's lead panel to the new version.
    Until this happens the release exists but no CLI offers it, because the
    startup check reads the version from `/api/v1/org/config`, not from GitHub.
@@ -87,8 +68,8 @@ gh workflow run release.yml
 ```
 
 That exercises the build, the signing, the smoke test, and the packaging, and
-leaves the tarballs as run artifacts. Nothing is published and the tap is not
-touched. Use it after editing the workflow.
+leaves the tarballs as run artifacts. Nothing is published and the formula is
+not touched. Use it after editing the workflow.
 
 ## What the workflow does, and why
 
@@ -112,20 +93,28 @@ Gatekeeper never inspects the binary and an ad-hoc signature is sufficient.
 Notarization would become necessary if riabuild were ever distributed as a
 `.dmg`, a cask, or a direct download.
 
-**The formula lives in `packaging/homebrew/riabuild.rb`.** The workflow
-substitutes the version and both checksums and pushes the result. Edit that
-template; a change made directly in the tap is overwritten by the next release.
+**The formula job checks out main, not the tag.** `brew tap` clones the default
+branch and reads nothing else, so a formula committed onto the tag would never
+be seen. It rebases before pushing, because anything merged while the macOS
+build was running would otherwise reject the push.
+
+**`Formula/riabuild.rb` is generated.** Edit `packaging/homebrew/riabuild.rb`;
+the next release overwrites the generated copy. CI renders the template and
+parses it with `ruby -c` on every pull request, so a template that would break
+`brew install` fails before it is merged rather than after a release has
+already been published.
 
 ## When something goes wrong
 
 | Symptom | Cause |
 |---|---|
-| Release job fails on "Resolve and check version" | The tag and `Cargo.toml` disagree. Delete the tag, fix the version, tag again. |
-| `tap` job fails, release published | `TAP_GITHUB_TOKEN` is missing or expired, or the tap repository does not exist. Fix it and re-run the job. |
-| `brew install` reports 404 | The tap repository is private, or the release assets did not upload. |
+| Release fails on "Resolve and check version" | The tag and `Cargo.toml` disagree. Delete the tag, fix the version, tag again. |
+| `formula` job fails, release published | Usually a push race on main. Re-run the job; it rebases. |
+| `brew install` reports 404 | The release assets did not upload, or the repository stopped being public. |
+| `brew install` cannot find the formula | The developer skipped `brew tap`, or the formula has not landed on main yet. |
 | `riabuild` installs but is killed on launch | A signing problem — check the `Sign` step ran. |
 | Nobody is offered the new version | `latestCliVersion` was never updated in the lead panel. |
 
-To withdraw a release, delete it and its tag, then revert the formula in the
-tap. Anyone who already upgraded keeps the withdrawn build until the next
+To withdraw a release, delete it and its tag, then revert `Formula/riabuild.rb`
+on main. Anyone who already upgraded keeps the withdrawn build until the next
 release, so publishing a higher version is usually the better move.

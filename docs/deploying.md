@@ -180,15 +180,22 @@ custom-domain feature.
 
 ## 6. Homebrew tap
 
-Automated — `.github/workflows/release.yml` builds both macOS architectures on a
-`v<version>` tag, publishes them as a GitHub release, and pushes the rendered formula
-to `Clubria/homebrew-tap`. **`docs/releasing.md` is the runbook**, including the two
-one-time steps that need credentials this repository does not hold:
+Fully automated, and unlike everything else on this page it needs no credential you
+do not already have. `.github/workflows/release.yml` builds both macOS architectures
+on a `v<version>` tag, publishes them as a GitHub release, and commits the rendered
+formula to `Formula/riabuild.rb` on main. **`docs/releasing.md` is the runbook.**
 
-| One-time step | Why it cannot be done here |
-|---|---|
-| Create the public `Clubria/homebrew-tap` repository | needs org repo-creation rights |
-| Set the `TAP_GITHUB_TOKEN` secret | `GITHUB_TOKEN` cannot write to a second repository |
+This repository serves as its own tap, so there is no second repository and no extra
+token — the workflow's own `GITHUB_TOKEN` can write here. Developers install with:
+
+```sh
+brew tap clubria/tap https://github.com/Clubria/riabuild
+brew install clubria/tap/riabuild
+```
+
+The repository and its release assets must stay **public**: `brew` fetches both with
+plain `curl` and no credentials. The binary holds no secrets, and every gate is
+re-verified server-side, so this costs nothing.
 
 After each release, set the version fields from the dashboard's lead panel:
 
