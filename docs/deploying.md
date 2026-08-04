@@ -8,11 +8,11 @@
 | Convex dev | **live** — `wary-bandicoot-285.eu-west-1.convex.cloud` |
 | Convex project | `lowerkinded / riabuild` |
 | `/api/v1` | **live**, returning 401 to anonymous callers |
-| GitHub sign-in | **not working** — `AUTH_GITHUB_ID` / `AUTH_GITHUB_SECRET` unset |
-| Org membership checks | **not working** — `GITHUB_ORG_TOKEN` unset, so brokering returns 503 |
-| Secret brokering | **not working** — Infisical identities unset |
-| Dashboard hosting | **not deployed** — needs a Cloudflare token with Workers permission |
-| DNS | no `riabuild` records; see the TLS note in §5 |
+| Secret brokering | **not working** — Infisical identities unset, so `/secrets/token` returns 503 |
+| Dashboard | **live** — <https://riabuild.clubria.com> (Cloudflare Pages, `riabuild-web`) |
+| GitHub sign-in | configured — verify the OAuth callback URL matches §2 |
+| Org membership checks | working — `GITHUB_ORG_TOKEN` verified against the live org |
+| DNS | `riabuild.clubria.com` CNAME → `riabuild-web.pages.dev`, DNS-only |
 
 To reproduce the local `.env.local` for this project:
 
@@ -93,33 +93,43 @@ to authenticate as, and never sees a secret value.
 
 ## 4. Hosting the dashboard
 
-`wrangler.jsonc` configures a static-asset Worker. `not_found_handling:
-single-page-application` is load-bearing — the dashboard routes on `pathname`, so
-`/cli/authorize` must serve `index.html` when opened directly, which is exactly how the
-CLI opens it.
+> **The two-account trap.** This Cloudflare login has two accounts:
+> `Aibuildersclub@proton.me` (`185f8d17…`) owns the **clubria.com zone**, and
+> `Lowerkinded@gmail.com` (`2570e0b4…`) is where **Workers and Pages** permissions
+> live. Calling the wrong one returns `Authentication error [code: 10000]`, which
+> reads exactly like a missing permission and is not. Always set
+> `CLOUDFLARE_ACCOUNT_ID=2570e0b4e3586a4da93eabe5d530f27d` when deploying.
+>
+> This split is also why the dashboard is on **Pages, not Workers**: a Workers
+> custom domain requires the zone and the Worker in the same account, whereas
+> Pages can serve a custom domain whose zone lives elsewhere.
 
 ```sh
 cd riabuild-web
-VITE_CONVEX_URL=https://handsome-vulture-127.eu-west-1.convex.cloud pnpm build
-CLOUDFLARE_API_TOKEN=… npx wrangler deploy
+export CLOUDFLARE_API_TOKEN=…
+export CLOUDFLARE_ACCOUNT_ID=2570e0b4e3586a4da93eabe5d530f27d
+VITE_CONVEX_URL=https://handsome-vulture-127.eu-west-1.convex.cloud pnpm deploy:web
 ```
 
-**The API token needs `Account → Workers Scripts → Edit`.** A token made from the "Edit
-zone DNS" template can create DNS records but returns `Authentication error [code:
-10000]` here. Verify with:
+`public/_redirects` is load-bearing: it serves `index.html` for unmatched paths, so
+`/cli/authorize` works on a cold load — which is exactly how the CLI opens it.
 
-```sh
-curl -s "https://api.cloudflare.com/client/v4/accounts/185f8d1747f1e766b83b40ddebdbfafa/workers/scripts" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-```
+### The old Workers route, for reference
+
+Not used. A static-asset Worker would work, but only in the account that owns the
+zone — see the trap above.
 
 ## 5. DNS
 
-Only **one** record is needed:
+Only **one** record is needed, and it already exists:
 
-| Name | Target | Why |
-|---|---|---|
-| `riabuild.clubria.com` | the Worker | what developers visit |
+| Name | Type | Target | Proxy |
+|---|---|---|---|
+| `riabuild.clubria.com` | CNAME | `riabuild-web.pages.dev` | **DNS only** |
+
+It must stay unproxied. The zone is in a different account from the Pages project, so
+Cloudflare validates the custom domain and issues its certificate over the direct
+connection; orange-clouding it breaks that validation.
 
 ### There is no `api.riabuild.clubria.com`, and it cannot be added for free
 

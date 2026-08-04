@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "lint": "tsc && eslint .  --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "deploy:web": "vite build && wrangler pages deploy dist --project-name riabuild-web --branch main"
   },
   "dependencies": {
     "@auth/core": "^0.37.4",
