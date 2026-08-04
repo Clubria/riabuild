@@ -78,13 +78,16 @@ program that can only tell them they are not in the Clubria org.
    git tag "v$(date -u +%Y.%m.%d)" && git push origin "v$(date -u +%Y.%m.%d)"
    ```
    Releasing twice in one day? Add a fourth component: `v2026.08.04.1`.
-2. **Watch the run** — `gh run watch` — until both jobs are green.
-3. **Set `latestCliVersion`** in the dashboard's lead panel to the new version.
-   Until this happens the release exists but no CLI offers it, because the
-   startup check reads the version from `/api/v1/org/config`, not from GitHub.
-4. **Leave `minCliVersion` alone** unless you mean it. It is the floor below
-   which the CLI refuses to run, and raising it interrupts whatever everyone is
-   doing at the moment they next launch riabuild.
+2. **Watch the run** — `gh run watch` — until all three jobs are green.
+
+That is the whole procedure. The run builds and publishes the release, updates
+`Formula/riabuild.rb`, and announces the version to riabuild-web so developers
+are actually offered it.
+
+**`minCliVersion` is never touched by any of this.** It is the floor below
+which the CLI refuses to run, and raising it interrupts whatever everyone is
+doing the moment they next launch riabuild. It is a deliberate decision made in
+the dashboard's lead panel, not a consequence of shipping.
 
 Use the UTC date, not your local one — that is what `date -u` above gives you,
 and what the workflow suggests back if you mistype a tag. A tag dated a day
@@ -131,6 +134,20 @@ branch and reads nothing else, so a formula committed onto the tag would never
 be seen. It rebases before pushing, because anything merged while the macOS
 build was running would otherwise reject the push.
 
+**The version is announced, not just published.** The CLI reads what to upgrade
+to from `/api/v1/org/config`, never from GitHub, so a GitHub release nobody has
+been told about reaches nobody — silently, with nothing anywhere reporting a
+problem. The `announce` job calls `release:publishCliVersion`, which re-checks
+with GitHub that the release really exists before writing, and
+`org.setLatestCliVersion` refuses to move the version backwards. Between them
+the only value that can land there is the newest genuinely published build,
+which is why the entry point needs no shared secret — a Convex deploy key
+cannot write environment variables, so a secret could only have been installed
+by hand.
+
+Without `CONVEX_DEPLOY_KEY` the release still publishes and the job warns that
+nobody was offered it.
+
 **`Formula/riabuild.rb` is generated.** Edit `packaging/homebrew/riabuild.rb`;
 the next release overwrites the generated copy. CI renders the template and
 parses it with `ruby -c` on every pull request, so a template that would break
@@ -147,7 +164,7 @@ already been published.
 | `brew install` reports 404 | The release assets did not upload, or the repository stopped being public. |
 | `brew install` cannot find the formula | The developer skipped `brew tap`, or the formula has not landed on main yet. |
 | `riabuild` installs but is killed on launch | A signing problem — check the `Sign` step ran. |
-| Nobody is offered the new version | `latestCliVersion` was never updated in the lead panel. |
+| Nobody is offered the new version | The `announce` job was skipped — `CONVEX_DEPLOY_KEY` is unset. |
 
 To withdraw a release, delete it and its tag, then revert `Formula/riabuild.rb`
 on main. Anyone who already upgraded keeps the withdrawn build until the next

@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import {
+  internalMutation,
   internalQuery,
   mutation,
   query,
@@ -172,5 +173,65 @@ export const update = mutation({
       },
     });
     return null;
+  },
+});
+
+/**
+ * Publishes a newly released CLI version, called by the release workflow.
+ *
+ * Until this existed, cutting a release and telling developers about it were
+ * separate acts, and only the first was automated. A release nobody is offered
+ * is invisible: the CLI learns what to upgrade to from `/api/v1/org/config`,
+ * never from GitHub, so a forgotten field left every machine on the old build
+ * with nothing anywhere reporting a problem.
+ *
+ * Internal on purpose. It is reachable with a deploy key from CI and from the
+ * Convex dashboard, and by no browser client — a version bump is not a thing a
+ * signed-in user should be able to trigger by calling an endpoint.
+ *
+ * Deliberately does **not** touch `minCliVersion`. Raising the floor blocks
+ * people mid-workday, and the moment it happens automatically is the moment it
+ * happens by accident.
+ */
+export const setLatestCliVersion = internalMutation({
+  args: { version: v.string() },
+  returns: v.object({
+    updated: v.boolean(),
+    latestCliVersion: v.string(),
+  }),
+  handler: async (ctx, args) => {
+    const version = args.version.trim();
+    if (!/^\d+(\.\d+)*$/.test(version)) {
+      throw new Error(
+        `version must be dotted-numeric like 2026.08.04 — got "${version}".`,
+      );
+    }
+
+    const current = await loadConfig(ctx);
+
+    // Never move backwards. Re-running an old release's workflow — to retry a
+    // failed tap push, say — must not offer every developer a downgrade, and
+    // re-running the current one must be a no-op rather than a second audit
+    // entry claiming something changed.
+    if (compareVersions(version, current.latestCliVersion) <= 0) {
+      return { updated: false, latestCliVersion: current.latestCliVersion };
+    }
+
+    const next = { ...current, latestCliVersion: version };
+    const row = await ctx.db.query("orgConfig").first();
+    if (row === null) {
+      await ctx.db.insert("orgConfig", next);
+    } else {
+      await ctx.db.replace("orgConfig", row._id, next);
+    }
+
+    // No actorId: this is the release pipeline, not a person. The audit view
+    // already renders an entry without one.
+    await writeAudit(ctx, {
+      action: "org.cli_version_published",
+      meta: { from: current.latestCliVersion, to: version },
+    });
+
+    return { updated: true, latestCliVersion: version };
   },
 });

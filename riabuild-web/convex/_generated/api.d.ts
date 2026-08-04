@@ -20,6 +20,7 @@ import type * as lib_responses from "../lib/responses.js";
 import type * as lib_version from "../lib/version.js";
 import type * as members from "../members.js";
 import type * as org from "../org.js";
+import type * as release from "../release.js";
 import type * as sessions from "../sessions.js";
 
 import type {
@@ -41,6 +42,7 @@ declare const fullApi: ApiFromModules<{
   "lib/version": typeof lib_version;
   members: typeof members;
   org: typeof org;
+  release: typeof release;
   sessions: typeof sessions;
 }>;
 
