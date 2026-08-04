@@ -22,6 +22,10 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
 
+    /* `convex/_generated/api` pulls the Convex modules into this project, and
+       those read Convex env vars through `process.env`. */
+    "types": ["node"],
+
     /* Import paths */
     "paths": {
       "@/*": ["./src/*"]

@@ -1,0 +1,139 @@
+//! The setup tasks and the context they run against.
+
+pub mod claude_profiles;
+pub mod engine;
+pub mod env_local;
+pub mod github_cli;
+pub mod infisical_cli;
+pub mod login;
+pub mod org_settings;
+pub mod project;
+pub mod repo_status;
+pub mod toolchain;
+
+use crate::api::org::OrgConfig;
+use crate::api::{ApiClient, Member};
+use crate::config::{State, UserConfig};
+use crate::keychain::Keychain;
+use crate::paths::Paths;
+use crate::runner::CommandRunner;
+use crate::ui::Ui;
+use anyhow::Result;
+use std::sync::Arc;
+
+pub type TaskId = &'static str;
+
+/// Why a task is about to run. Surfaced to the developer, so it reads as an
+/// explanation rather than a status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reason {
+    NeverRun,
+    VersionChanged { from: u32, to: u32 },
+    UpstreamChanged(TaskId),
+    CheckFailed(String),
+}
+
+impl Reason {
+    pub fn describe(&self) -> String {
+        match self {
+            Reason::NeverRun => "first run".to_string(),
+            Reason::VersionChanged { from, to } => {
+                format!("riabuild changed what this should look like (v{from} → v{to})")
+            }
+            Reason::UpstreamChanged(id) => format!("{id} changed"),
+            Reason::CheckFailed(detail) => detail.clone(),
+        }
+    }
+
+    /// Stored in `state.json` for the next run to report against.
+    pub fn tag(&self) -> String {
+        match self {
+            Reason::NeverRun => "never_run".into(),
+            Reason::VersionChanged { .. } => "version_changed".into(),
+            Reason::UpstreamChanged(id) => format!("upstream:{id}"),
+            Reason::CheckFailed(_) => "check_failed".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    Satisfied,
+    Needs(Reason),
+}
+
+impl Status {
+    /// Convenience for the common `check()` shape.
+    pub fn needs(detail: impl Into<String>) -> Status {
+        Status::Needs(Reason::CheckFailed(detail.into()))
+    }
+}
+
+pub trait Task: Send + Sync {
+    fn id(&self) -> TaskId;
+    fn title(&self) -> &str;
+    /// Forced-rerun escape hatch for drift `check()` genuinely cannot observe.
+    /// `check()` is authoritative; bumping this to paper over a weak check is a
+    /// bug in the check.
+    fn version(&self) -> u32;
+    fn depends_on(&self) -> &[TaskId];
+    fn check(&self, ctx: &Ctx) -> Result<Status>;
+    fn apply(&self, ctx: &mut Ctx) -> Result<()>;
+}
+
+/// Everything a task is allowed to touch.
+pub struct Ctx {
+    pub paths: Arc<dyn Paths>,
+    pub runner: Arc<dyn CommandRunner>,
+    pub keychain: Arc<dyn Keychain>,
+    pub api: ApiClient,
+    pub ui: Ui,
+    pub config: UserConfig,
+    pub state: State,
+    pub org: Option<OrgConfig>,
+    pub member: Option<Member>,
+    pub cli_version: String,
+    pub web_url: String,
+    /// Environment the shell will be spawned with.
+    pub env: Vec<(String, String)>,
+    /// Report-only findings, printed after the run. `repo_status` fills this.
+    pub notes: Vec<String>,
+    /// Set when the developer asked for checks only.
+    pub dry_run: bool,
+}
+
+impl Ctx {
+    pub fn org(&self) -> Result<&OrgConfig> {
+        self.org
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("riabuild has not loaded the team configuration yet"))
+    }
+
+    pub fn note(&mut self, note: impl Into<String>) {
+        self.notes.push(note.into());
+    }
+
+    /// The project directory the developer chose, if one has been chosen.
+    pub fn project_dir(&self) -> Option<std::path::PathBuf> {
+        self.config
+            .project_path
+            .as_deref()
+            .map(|path| crate::paths::expand_tilde(path, &self.paths.home()))
+    }
+}
+
+/// Every task riabuild knows how to perform, in declaration order. The engine
+/// sorts by `depends_on`, so this order is for reading, not execution.
+pub fn registry() -> Vec<Box<dyn Task>> {
+    vec![
+        Box::new(login::Login),
+        Box::new(github_cli::GithubCli),
+        Box::new(infisical_cli::InfisicalCli),
+        Box::new(toolchain::Toolchain),
+        Box::new(project::Project),
+        Box::new(repo_status::RepoStatus),
+        Box::new(claude_profiles::ClaudeProfiles),
+        Box::new(org_settings::OrgSettings),
+        Box::new(env_local::EnvLocal),
+    ]
+}

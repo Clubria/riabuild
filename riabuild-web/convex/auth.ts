@@ -1,6 +1,187 @@
+import GitHub from "@auth/core/providers/github";
 import { convexAuth } from "@convex-dev/auth/server";
-import { Password } from "@convex-dev/auth/providers/Password";
+import { MutationCtx } from "./_generated/server";
+import { Id } from "./_generated/dataModel";
+
+/**
+ * GitHub only. There is no password provider and there never should be — the
+ * whole authorization model assumes the identity is a GitHub account whose org
+ * membership can be re-checked later.
+ *
+ * `read:org` is required: without it the token cannot answer membership
+ * questions and every secret-brokering request fails closed.
+ */
+const GitHubProvider = GitHub({
+  authorization: {
+    params: { scope: "read:user user:email read:org" },
+  },
+  async profile(githubProfile, tokens) {
+    const login = String(githubProfile.login);
+    const email = await resolveEmail(githubProfile.email, tokens.access_token);
+    return {
+      id: String(githubProfile.id),
+      name: githubProfile.name ?? login,
+      email,
+      image: githubProfile.avatar_url,
+      // Consumed by `createOrUpdateUser` below; never written to `users`.
+      githubLogin: login,
+      githubId: String(githubProfile.id),
+      // The OAuth access token is deliberately not persisted. Membership is
+      // re-checked with a server-held org token instead.
+    } as unknown as { id: string };
+  },
+});
+
+/**
+ * GitHub omits `email` from the profile when the developer keeps it private.
+ * The profile screen is prefilled from the verified email list instead, which is
+ * what `user:email` scope is for.
+ */
+async function resolveEmail(
+  profileEmail: string | null | undefined,
+  accessToken: string | undefined,
+): Promise<string | undefined> {
+  if (profileEmail) return profileEmail;
+  if (!accessToken) return undefined;
+  try {
+    const response = await fetch("https://api.github.com/user/emails", {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "riabuild-web",
+      },
+    });
+    if (!response.ok) return undefined;
+    const emails = (await response.json()) as unknown;
+    if (!Array.isArray(emails)) return undefined;
+    const verified = emails.filter(
+      (entry): entry is { email: string; primary: boolean; verified: boolean } =>
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof (entry as { email?: unknown }).email === "string" &&
+        (entry as { verified?: unknown }).verified === true,
+    );
+    return (verified.find((entry) => entry.primary) ?? verified[0])?.email;
+  } catch {
+    return undefined;
+  }
+}
+
+function bootstrapLeads(): string[] {
+  return (process.env.RIABUILD_BOOTSTRAP_LEADS ?? "")
+    .split(/[\s,]+/)
+    .map((login) => login.trim().toLowerCase())
+    .filter((login) => login.length > 0);
+}
+
+function splitName(name: string): { firstName: string; lastName: string } {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { firstName: "", lastName: "" };
+  return {
+    firstName: parts[0],
+    lastName: parts.slice(1).join(" "),
+  };
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
 
 export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
-  providers: [Password],
+  providers: [GitHubProvider],
+  callbacks: {
+    /**
+     * We own user creation rather than using `afterUserCreatedOrUpdated`
+     * because the GitHub login has to reach the `members` row without being
+     * spread into `users`, whose schema comes from `authTables`.
+     */
+    async createOrUpdateUser(ctx: MutationCtx, args) {
+      const profile = args.profile;
+      const githubLogin = readString(profile.githubLogin) ?? "";
+      const githubId = readString(profile.githubId) ?? "";
+      const name = readString(profile.name) ?? githubLogin;
+      const image = readString(profile.image);
+      const email = readString(profile.email) ?? "";
+
+      const userFields = { name, email: email || undefined, image };
+
+      let userId: Id<"users">;
+      if (args.existingUserId !== null) {
+        userId = args.existingUserId;
+        await ctx.db.patch("users", userId, userFields);
+      } else {
+        userId = await ctx.db.insert("users", userFields);
+      }
+
+      await upsertMember(ctx, { userId, githubLogin, githubId, name, email });
+      return userId;
+    },
+  },
 });
+
+async function upsertMember(
+  ctx: MutationCtx,
+  args: {
+    userId: Id<"users">;
+    githubLogin: string;
+    githubId: string;
+    name: string;
+    email: string;
+  },
+): Promise<void> {
+  const isBootstrapLead = bootstrapLeads().includes(
+    args.githubLogin.toLowerCase(),
+  );
+
+  const existing = await ctx.db
+    .query("members")
+    .withIndex("by_userId", (q) => q.eq("userId", args.userId))
+    .unique();
+
+  if (existing === null) {
+    const { firstName, lastName } = splitName(args.name);
+    const memberId = await ctx.db.insert("members", {
+      userId: args.userId,
+      githubLogin: args.githubLogin,
+      githubId: args.githubId,
+      firstName,
+      lastName,
+      email: args.email,
+      role: isBootstrapLead ? "lead" : "candidate",
+      status: "active",
+    });
+    await ctx.db.insert("auditLog", {
+      subjectId: memberId,
+      action: "member.created",
+      meta: {
+        githubLogin: args.githubLogin,
+        role: isBootstrapLead ? "lead" : "candidate",
+        source: isBootstrapLead ? "bootstrap" : "signup",
+      },
+      at: Date.now(),
+    });
+    return;
+  }
+
+  // A developer can rename their GitHub account; the numeric id cannot change.
+  // Profile fields they may have corrected in the dashboard are left alone.
+  await ctx.db.patch("members", existing._id, {
+    githubLogin: args.githubLogin,
+    githubId: args.githubId || existing.githubId,
+  });
+
+  if (isBootstrapLead && existing.role !== "lead") {
+    await ctx.db.patch("members", existing._id, { role: "lead" });
+    await ctx.db.insert("auditLog", {
+      subjectId: existing._id,
+      action: "member.role_changed",
+      meta: {
+        githubLogin: args.githubLogin,
+        from: existing.role,
+        to: "lead",
+        source: "bootstrap",
+      },
+      at: Date.now(),
+    });
+  }
+}
