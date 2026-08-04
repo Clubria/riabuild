@@ -1,8 +1,9 @@
 name: Release
 
-# Cutting a release is `git tag v<x.y.z> && git push --tags`. Everything below
-# is what that tag sets off: build both macOS architectures, publish them as a
-# GitHub release, and point the Homebrew tap at the result.
+# Cutting a release is `git tag v$(date -u +%Y.%m.%d) && git push --tags`.
+# Everything below is what that tag sets off: build both macOS architectures,
+# publish them as a GitHub release, point the Homebrew tap at the result, and
+# tell riabuild-web the version exists so developers are actually offered it.
 #
 # The dispatch trigger runs the same build and packaging without publishing, so
 # a change to this file can be exercised before a tag depends on it.
@@ -237,3 +238,68 @@ jobs:
           # otherwise reject this push.
           git pull --rebase origin main
           git push origin HEAD:main
+
+  announce:
+    name: Offer the release to developers
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: riabuild-web
+    env:
+      CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # A published release nobody is offered is invisible: the CLI reads the
+      # version to upgrade to from /api/v1/org/config, never from GitHub. This
+      # is the step that turns a GitHub release into something developers see.
+      #
+      # publishCliVersion re-checks with GitHub that the release really exists
+      # before writing, so this cannot announce a version that was not shipped.
+      - name: Publish the version to riabuild-web
+        if: env.CONVEX_DEPLOY_KEY != ''
+        run: |
+          set -euo pipefail
+          case "$CONVEX_DEPLOY_KEY" in
+            prod:*) ;;
+            *)
+              echo "::error::CONVEX_DEPLOY_KEY targets '${CONVEX_DEPLOY_KEY%%:*}', not production."
+              exit 1
+              ;;
+          esac
+
+          # The release was created moments ago in the build job; give
+          # api.github.com a little room before deciding it does not exist.
+          for attempt in 1 2 3; do
+            if npx convex run release:publishCliVersion "{\"version\":\"$VERSION\"}"; then
+              exit 0
+            fi
+            echo "attempt $attempt failed, retrying…"
+            sleep 10
+          done
+          echo "::error::Could not publish $VERSION to riabuild-web."
+          echo "::error::The release is out; set Latest CLI version in the lead panel."
+          exit 1
+
+      - name: Note that the version was not published
+        if: env.CONVEX_DEPLOY_KEY == ''
+        run: |
+          echo "::warning::CONVEX_DEPLOY_KEY is not set, so $VERSION was NOT offered to anyone."
+          echo "::warning::The release exists on GitHub, but every CLI still reads the old"
+          echo "::warning::latestCliVersion. Set it in the dashboard's lead panel."

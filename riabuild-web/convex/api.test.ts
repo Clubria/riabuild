@@ -574,6 +574,66 @@ describe("member administration", () => {
     expect(config.latestCliVersion).toBe("2026.08.04");
   });
 
+  test("publishing a CLI version moves latest forward and audits it", async () => {
+    const t = setup();
+    const before = await t.query(api.org.get);
+
+    const result = await t.mutation(internal.org.setLatestCliVersion, {
+      version: "2026.08.04",
+    });
+    expect(result).toEqual({ updated: true, latestCliVersion: "2026.08.04" });
+
+    const after = await t.query(api.org.get);
+    expect(after.latestCliVersion).toBe("2026.08.04");
+    // Publishing a release says nothing about what the team requires.
+    expect(after.minCliVersion).toBe(before.minCliVersion);
+
+    const entries = await t.run(
+      async (ctx) => await ctx.db.query("auditLog").collect(),
+    );
+    const published = entries.find(
+      (entry) => entry.action === "org.cli_version_published",
+    );
+    expect(published?.meta).toEqual({ from: "0.1.0", to: "2026.08.04" });
+    // No actor: this is the release pipeline, not a person.
+    expect(published?.actorId).toBeUndefined();
+  });
+
+  test("publishing never moves the CLI version backwards", async () => {
+    const t = setup();
+    await t.mutation(internal.org.setLatestCliVersion, {
+      version: "2026.08.12",
+    });
+
+    // Re-running an older release's workflow — to retry a failed step, say —
+    // must not offer every developer a downgrade.
+    const older = await t.mutation(internal.org.setLatestCliVersion, {
+      version: "2026.08.04",
+    });
+    expect(older).toEqual({ updated: false, latestCliVersion: "2026.08.12" });
+
+    // Re-running the current one is a no-op, not a second audit entry
+    // claiming something changed.
+    const same = await t.mutation(internal.org.setLatestCliVersion, {
+      version: "2026.08.12",
+    });
+    expect(same.updated).toBe(false);
+
+    const entries = await t.run(
+      async (ctx) => await ctx.db.query("auditLog").collect(),
+    );
+    expect(
+      entries.filter((entry) => entry.action === "org.cli_version_published"),
+    ).toHaveLength(1);
+  });
+
+  test("publishing rejects a version that is not dotted-numeric", async () => {
+    const t = setup();
+    await expect(
+      t.mutation(internal.org.setLatestCliVersion, { version: "v2026.08.04" }),
+    ).rejects.toThrow(/dotted-numeric/i);
+  });
+
   test("internal member lookup returns the stored profile", async () => {
     const t = setup();
     const { memberId } = await seedMember(t);
