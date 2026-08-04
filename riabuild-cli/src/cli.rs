@@ -6,7 +6,25 @@
 
 use clap::{Parser, Subcommand};
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// riabuild is versioned by release date, not by semver.
+///
+/// The version comes from the git tag, injected by the release workflow, and
+/// deliberately **not** from `CARGO_PKG_VERSION`: Cargo requires valid semver,
+/// which forbids both the leading zeros in `2026.08.04` and the fourth
+/// component a same-day rebuild needs. Taking it from the tag also makes the
+/// tag the only place a version is written down, so a binary that reports a
+/// different version than the release it shipped in is not a mistake anyone
+/// can make.
+///
+/// A local `cargo build` has no tag, and gets a sentinel that sits above every
+/// real date. That is the useful direction to fail in: it reads as obviously
+/// not-a-release, it clears any `minCliVersion` the server enforces, and
+/// `update::decide` already leaves a build ahead of the published latest alone
+/// — so working on riabuild never triggers riabuild upgrading itself.
+pub const VERSION: &str = match option_env!("RIABUILD_VERSION") {
+    Some(version) => version,
+    None => "9999.0.0-dev",
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,6 +76,17 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_version_is_always_comparable() {
+        // Injected from a tag or fallen back to the dev sentinel, VERSION is
+        // sent to /api/v1 and compared against minCliVersion. A value the
+        // comparator cannot parse fails closed and locks the machine out.
+        assert!(
+            crate::version::parse(VERSION).is_some(),
+            "VERSION {VERSION:?} does not parse as a version"
+        );
     }
 
     #[test]

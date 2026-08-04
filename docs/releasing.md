@@ -1,13 +1,11 @@
 # Releasing riabuild
 
-Cutting a release is two commands, and there is no one-time setup — this
-repository is its own Homebrew tap, and the release workflow has write access
-to it already.
+Cutting a release is one command against a clean main. There is nothing to
+bump first and no one-time setup — this repository is its own Homebrew tap, and
+the release workflow can already write to it.
 
 ```sh
-# from a clean main, with riabuild-cli/Cargo.toml already bumped
-git tag v0.2.0
-git push origin v0.2.0
+git push origin "v$(date -u +%Y.%m.%d)"    # after: git tag "v$(date -u +%Y.%m.%d)"
 ```
 
 `.github/workflows/release.yml` then builds both macOS architectures, publishes
@@ -19,6 +17,38 @@ brew tap clubria/tap https://github.com/Clubria/riabuild   # first time only
 brew install clubria/tap/riabuild
 brew upgrade clubria/tap/riabuild                          # or riabuild does it itself
 ```
+
+## Versioning is by release date
+
+A version is the UTC date it was released, zero-padded: **`2026.08.04`**. A
+second release on the same day adds a fourth component — `2026.08.04.1`, then
+`.2`. There is no major, minor, or patch, and no meaning attached to a version
+beyond when it shipped.
+
+**The git tag is the only place a version is written down.** Nothing is bumped
+before tagging, and `riabuild-cli/Cargo.toml` holds a permanent `0.0.0`
+placeholder that is never the product version.
+
+That is not an accident of tooling, it is the reason the scheme works. Cargo
+requires the `version` field to be valid semver, and semver forbids both the
+leading zeros in `08` and a fourth component. So the release workflow injects
+the tag as `RIABUILD_VERSION`, and `cli.rs` compiles that in instead of
+`CARGO_PKG_VERSION`. A binary that reports a different version than the release
+it shipped in stops being a mistake anyone can make.
+
+Both version comparators — `riabuild-cli/src/version.rs` and
+`riabuild-web/convex/lib/version.ts` — are plain dotted-numeric, so they handle
+dates, zero padding, and the fourth component without any special cases.
+`2026.08.04` and `2026.8.4` compare equal.
+
+The workflow checks the tag's *shape* rather than its value. `v20260804` or
+`v2026.8.4` would each publish a release that sorts wrongly against every other
+one for the rest of the project's life, so both are rejected.
+
+A local `cargo build` has no tag and reports **`9999.0.0-dev`** — deliberately
+above every real date, so a development build clears whatever `minCliVersion`
+the server enforces and never talks itself into running `brew upgrade` over the
+binary being worked on.
 
 ## This repository is the tap
 
@@ -43,21 +73,24 @@ program that can only tell them they are not in the Clubria org.
 
 ## Cutting a release
 
-1. **Bump `version` in `riabuild-cli/Cargo.toml`** and merge it through a PR
-   like any other change.
-2. **Tag the merge commit** as `v<version>` and push the tag.
-3. **Watch the run** — `gh run watch` — until both jobs are green.
-4. **Set `latestCliVersion`** in the dashboard's lead panel to the new version.
+1. **Tag a commit on main** with today's UTC date, and push the tag:
+   ```sh
+   git tag "v$(date -u +%Y.%m.%d)" && git push origin "v$(date -u +%Y.%m.%d)"
+   ```
+   Releasing twice in one day? Add a fourth component: `v2026.08.04.1`.
+2. **Watch the run** — `gh run watch` — until both jobs are green.
+3. **Set `latestCliVersion`** in the dashboard's lead panel to the new version.
    Until this happens the release exists but no CLI offers it, because the
    startup check reads the version from `/api/v1/org/config`, not from GitHub.
-5. **Leave `minCliVersion` alone** unless you mean it. It is the floor below
+4. **Leave `minCliVersion` alone** unless you mean it. It is the floor below
    which the CLI refuses to run, and raising it interrupts whatever everyone is
    doing at the moment they next launch riabuild.
 
-The tag and `Cargo.toml` must agree. The workflow checks this and fails the
-release rather than shipping a binary that reports a different version than the
-formula installed — that mismatch makes every launch run a `brew upgrade` that
-cannot change anything.
+Use the UTC date, not your local one — that is what `date -u` above gives you,
+and what the workflow suggests back if you mistype a tag. A tag dated a day
+ahead of the previous release's is the only ordering that matters, but keeping
+to UTC is what stops two people in different timezones disagreeing about which
+day it is.
 
 ### Trying the pipeline without releasing
 
@@ -108,7 +141,8 @@ already been published.
 
 | Symptom | Cause |
 |---|---|
-| Release fails on "Resolve and check version" | The tag and `Cargo.toml` disagree. Delete the tag, fix the version, tag again. |
+| Release fails on "Resolve and check version" | The tag is not a zero-padded date. Delete it and tag `vYYYY.MM.DD`. |
+| `riabuild --version` says `9999.0.0-dev` | A binary built without `RIABUILD_VERSION` — a local `cargo build`, not a release. |
 | `formula` job fails, release published | Usually a push race on main. Re-run the job; it rebases. |
 | `brew install` reports 404 | The release assets did not upload, or the repository stopped being public. |
 | `brew install` cannot find the formula | The developer skipped `brew tap`, or the formula has not landed on main yet. |

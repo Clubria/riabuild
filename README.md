@@ -79,8 +79,15 @@ cd riabuild-cli  && cargo test          # 112 unit tests, no machine state neede
 
 Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.
 
-To ship a new CLI version, bump `riabuild-cli/Cargo.toml` and push a `v<version>`
-tag; `docs/releasing.md` covers the rest.
+Versions are release dates — `2026.08.04`, plus a fourth component for a second
+release on one day. Shipping is one command, with nothing to bump first:
+
+```sh
+git tag "v$(date -u +%Y.%m.%d)" && git push origin "v$(date -u +%Y.%m.%d)"
+```
+
+The tag is the only place a version is written down; `riabuild-cli/Cargo.toml`
+holds a placeholder. `docs/releasing.md` covers why, and the rest.
 
 All work goes through a pull request, and is not finished until CI has passed. See
 `CLAUDE.md`.

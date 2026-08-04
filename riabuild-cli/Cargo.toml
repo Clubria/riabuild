@@ -1,6 +1,10 @@
 [package]
 name = "riabuild-cli"
-version = "0.1.0"
+# Not the product version, and never bumped. riabuild is versioned by release
+# date (`2026.08.04`), which Cargo cannot express — semver forbids the leading
+# zeros. The real version is injected from the git tag as RIABUILD_VERSION and
+# read in cli.rs; this field only exists because Cargo requires one.
+version = "0.0.0"
 edition = "2024"
 description = "Sets up a Clubria developer's machine and opens the Clubria environment"
 homepage = "https://riabuild.clubria.com"

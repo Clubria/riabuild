@@ -131,6 +131,51 @@ mod tests {
     }
 
     #[test]
+    fn a_later_release_date_is_an_optional_upgrade() {
+        assert_eq!(
+            decide("2026.08.04", "2026.08.01", "2026.08.12", false),
+            Action::Upgrade {
+                to: "2026.08.12".into(),
+                mandatory: false
+            }
+        );
+    }
+
+    #[test]
+    fn below_the_date_floor_the_upgrade_is_mandatory() {
+        assert_eq!(
+            decide("2026.07.30", "2026.08.04", "2026.08.12", false),
+            Action::Upgrade {
+                to: "2026.08.12".into(),
+                mandatory: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_same_day_rebuild_is_offered() {
+        // The fourth component is how a second release on one date is named.
+        assert_eq!(
+            decide("2026.08.04", "2026.08.01", "2026.08.04.1", false),
+            Action::Upgrade {
+                to: "2026.08.04.1".into(),
+                mandatory: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_development_build_never_upgrades_itself() {
+        // Working on riabuild must not make riabuild replace the binary being
+        // worked on. The dev sentinel sits above every real date, so this goes
+        // through the same path as a local build ahead of the published latest.
+        assert_eq!(
+            decide("9999.0.0-dev", "2026.08.04", "2026.08.12", false),
+            Action::Continue
+        );
+    }
+
+    #[test]
     fn the_second_pass_never_upgrades_again() {
         // RIABUILD_UPDATED is what stops an upgrade that does not take from
         // re-execing forever.

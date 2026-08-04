@@ -197,7 +197,8 @@ The repository and its release assets must stay **public**: `brew` fetches both 
 plain `curl` and no credentials. The binary holds no secrets, and every gate is
 re-verified server-side, so this costs nothing.
 
-After each release, set the version fields from the dashboard's lead panel:
+After each release, set the version fields from the dashboard's lead panel. Both are
+release dates (`2026.08.04`), not semver:
 
 - `latestCliVersion` — what the startup check offers to upgrade to
 - `minCliVersion` — the floor below which the CLI refuses to run

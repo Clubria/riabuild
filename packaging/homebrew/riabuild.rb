@@ -45,6 +45,9 @@ class Riabuild < Formula
   end
 
   test do
-    assert_match "riabuild #{version}", shell_output("#{bin}/riabuild --version")
+    # Compared against the literal rather than #{version}: riabuild's versions
+    # are zero-padded release dates, and this asserts what the binary prints
+    # without depending on how Homebrew's own Version renders "2026.08.04".
+    assert_match "riabuild @VERSION@", shell_output("#{bin}/riabuild --version")
   end
 end
