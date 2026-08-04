@@ -8,7 +8,8 @@
 | Convex dev | **live** — `wary-bandicoot-285.eu-west-1.convex.cloud` |
 | Convex project | `lowerkinded / riabuild` |
 | `/api/v1` | **live**, returning 401 to anonymous callers |
-| Secret brokering | **not working** — Infisical identities unset, so `/secrets/token` returns 503 |
+| Secret brokering | **working** — verified end to end through Convex's network |
+| Infisical | self-hosted at `https://infisical.aib.club`, project `AI Builders`, path `/dev-env` |
 | Dashboard | **live** — <https://riabuild.clubria.com> (Cloudflare Pages, `riabuild-web`) |
 | GitHub sign-in | configured — verify the OAuth callback URL matches §2 |
 | Org membership checks | working — `GITHUB_ORG_TOKEN` verified against the live org |
@@ -80,8 +81,8 @@ sign-in gate and the profile prefill both depend on it.
 
 ## 3. Infisical machine identities
 
-Service tokens and API keys were deprecated in April 2024. Create two **machine
-identities** with universal auth:
+Service tokens and API keys were deprecated in April 2024. Two **machine identities**
+with universal auth, already created:
 
 | Identity | Access |
 |---|---|
@@ -90,6 +91,31 @@ identities** with universal auth:
 
 Path scoping is enforced by Infisical's own RBAC. riabuild only chooses which identity
 to authenticate as, and never sees a secret value.
+
+This deployment points at the **self-hosted** instance, so `INFISICAL_SITE_URL` must be
+set — the code otherwise defaults to Infisical Cloud, where these identities do not
+exist and the login returns 401. Convex's servers can reach it; that was verified rather
+than assumed, since an instance reachable from a developer laptop is not necessarily
+reachable from eu-west-1.
+
+### `INFISICAL_SECRET_PATH` is not `/`
+
+The `dev` environment has **no secrets at its root** — they live in folders (`convex`,
+`convex-runtime`, `dev-env`, `services`, `vercel`), and `infisical export` in this CLI
+version has no recursive flag, only `--path`. Left at the default `/`, brokering
+succeeds and exports **zero** secrets, which surfaces as riabuild's "Infisical returned
+no secrets" failure rather than anything mentioning paths.
+
+It is set to `/dev-env`, which holds the 15 entries that make up a developer's
+`.env.local`.
+
+### Shorten the access token TTL
+
+The brokered token currently lives **30 days** (`expiresIn: 2592000`), which is the
+identity default. The design calls for a short-lived credential, and riabuild pipes it
+straight into `infisical export` and discards it — nothing needs it for more than a few
+seconds. Set **Access Token TTL to 300** on both identities in Infisical; nothing in
+riabuild has to change.
 
 ## 4. Hosting the dashboard
 
