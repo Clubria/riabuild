@@ -35,7 +35,8 @@ use std::sync::Arc;
 use tasks::{Ctx, engine};
 use ui::{Failure, Ui};
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
     let quiet = cli.quiet;
 
