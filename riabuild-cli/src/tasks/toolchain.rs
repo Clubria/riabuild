@@ -8,6 +8,7 @@
 use super::{Ctx, Status, Task, TaskId};
 use crate::download;
 use crate::runner::RunOptions;
+use crate::shims;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
@@ -15,7 +16,7 @@ use std::path::Path;
 
 /// Used when the repo pins nothing. Kept current with the repo's own `.nvmrc`.
 const FALLBACK_NODE: &str = "22.23.1";
-const FALLBACK_PNPM: &str = "10.20.0";
+const FALLBACK_PNPM: &str = "11.11.0";
 
 pub struct Toolchain;
 
@@ -151,19 +152,48 @@ fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
 }
 
 fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
-    let asset = download::pnpm_asset()?;
+    let asset = download::pnpm_asset(pnpm_version)?;
     ctx.ui.note(&format!("Downloading pnpm {pnpm_version}…"));
+    // Unlike Node, pnpm publishes no checksums file, so there is no digest to
+    // verify this against — HTTPS to github.com is the whole trust anchor.
+    // Do not invent one; an unpublished digest checks nothing.
     let bytes = download::fetch_bytes(&download::pnpm_url(pnpm_version, &asset))?;
 
     let bin_dir = ctx.paths.bin_dir();
     std::fs::create_dir_all(&bin_dir)?;
     let target = bin_dir.join("pnpm");
-    // Write then rename so an interrupted download cannot leave a half-written
-    // binary that looks installed.
-    let staging = bin_dir.join("pnpm.partial");
-    std::fs::write(&staging, &bytes)?;
+
+    if download::pnpm_ships_a_tarball(pnpm_version) {
+        // pnpm 11 is a launcher plus the `dist/` tree it loads from beside
+        // itself, so it is installed as a tree and reached through a shim.
+        let home = ctx.paths.pnpm_dir(pnpm_version);
+        download::extract_pnpm_tarball(&bytes, &home)?;
+        let launcher = home.join("pnpm");
+        if !launcher.exists() {
+            return Err(Failure::new(
+                format!("installing pnpm {pnpm_version}"),
+                "Ask your team lead to check the pnpm version pinned in the repo's package.json.",
+            )
+            .detail(format!(
+                "{asset} unpacked without a `pnpm` launcher at its root"
+            ))
+            .into());
+        }
+        download::make_executable(&launcher)?;
+        write_executable(&target, shims::pnpm_shim(&launcher).as_bytes())?;
+    } else {
+        write_executable(&target, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Writes an executable via a staging file, so an interrupted run cannot leave
+/// a half-written one behind that looks installed.
+fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
+    let staging = target.with_extension("partial");
+    std::fs::write(&staging, bytes)?;
     download::make_executable(&staging)?;
-    std::fs::rename(&staging, &target)?;
+    std::fs::rename(&staging, target)?;
     Ok(())
 }
 
@@ -195,6 +225,39 @@ mod tests {
             r#"{"packageManager":"pnpm@10.20.0+sha512.abc"}"#,
         );
         assert_eq!(desired_pnpm(Some(dir.path())), "10.20.0");
+    }
+
+    /// Downloads the pinned pnpm and starts it through the shim riabuild
+    /// writes.
+    ///
+    /// Ignored by default because it pulls ~50 MB from github.com; run it with
+    /// `cargo test -- --ignored` whenever the pinned pnpm major moves. Nothing
+    /// else catches a release-layout change: pnpm 11 renamed its macOS asset
+    /// and stopped shipping a bare executable at all, and the first symptom was
+    /// a 404 on a developer's first run.
+    #[test]
+    #[ignore = "downloads ~50 MB from github.com; pins pnpm's release layout"]
+    fn the_pinned_pnpm_downloads_and_runs() {
+        use crate::runner::{CommandRunner, RealRunner};
+
+        let asset = download::pnpm_asset(FALLBACK_PNPM).unwrap();
+        let bytes = download::fetch_bytes(&download::pnpm_url(FALLBACK_PNPM, &asset)).unwrap();
+
+        let home = tempfile::TempDir::new().unwrap();
+        let tree = home.path().join(FALLBACK_PNPM);
+        download::extract_pnpm_tarball(&bytes, &tree).unwrap();
+        let launcher = tree.join("pnpm");
+        assert!(launcher.exists(), "{asset} has no launcher at its root");
+        download::make_executable(&launcher).unwrap();
+
+        let shim = home.path().join("pnpm");
+        write_executable(&shim, shims::pnpm_shim(&launcher).as_bytes()).unwrap();
+
+        let output = RealRunner
+            .run(&shim.to_string_lossy(), &["-v"], &RunOptions::default())
+            .expect("pnpm -v");
+        assert!(output.ok(), "the shim could not start pnpm: {output:?}");
+        assert_eq!(output.trimmed(), FALLBACK_PNPM);
     }
 
     #[test]
@@ -235,13 +298,15 @@ mod tests {
             .with(
                 &format!("{} -v", node_bin.to_string_lossy()),
                 0,
-                "v22.23.1",
+                &format!("v{FALLBACK_NODE}"),
                 "",
             )
+            // Reported through the constants, so bumping a fallback cannot
+            // leave this test asserting a version nothing installs.
             .with(
                 &format!("{} -v", pnpm_bin.to_string_lossy()),
                 0,
-                "10.20.0",
+                FALLBACK_PNPM,
                 "",
             );
         let (mut ctx, _home2) = ctx_with(runner);

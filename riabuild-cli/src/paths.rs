@@ -26,6 +26,11 @@ pub trait Paths: Send + Sync {
     fn node_dir(&self, version: &str) -> PathBuf {
         self.root().join("node").join(version)
     }
+    /// pnpm 11 and newer are a launcher plus the `dist/` tree it loads, so they
+    /// get a directory of their own rather than a file in `bin/`.
+    fn pnpm_dir(&self, version: &str) -> PathBuf {
+        self.root().join("pnpm").join(version)
+    }
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
     }

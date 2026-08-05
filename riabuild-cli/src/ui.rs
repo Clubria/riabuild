@@ -6,10 +6,19 @@
 //! fails vaguely is worse than one that does not run.
 
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Ui {
     colour: bool,
     quiet: bool,
+    /// Columns of a status line left on screen without a newline, so whatever
+    /// replaces it can cover the whole thing. Zero means nothing is pending.
+    pending: AtomicUsize,
+}
+
+/// Spaces needed for `line` to cover a status line `previous` columns wide.
+fn cover(previous: usize, line: &str) -> usize {
+    previous.saturating_sub(line.chars().count())
 }
 
 impl Default for Ui {
@@ -21,7 +30,16 @@ impl Default for Ui {
 impl Ui {
     pub fn new(quiet: bool) -> Self {
         let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        Self { colour, quiet }
+        Self {
+            colour,
+            quiet,
+            pending: AtomicUsize::new(0),
+        }
+    }
+
+    /// Claims the pending status line, so it is only covered once.
+    fn take_pending(&self) -> usize {
+        self.pending.swap(0, Ordering::Relaxed)
     }
 
     fn paint(&self, code: &str, text: &str) -> String {
@@ -64,6 +82,11 @@ impl Ui {
         if self.quiet {
             return;
         }
+        // Measured without the colour escapes, which occupy no columns.
+        self.pending.store(
+            format!("  ◐ {title} — {reason}").chars().count(),
+            Ordering::Relaxed,
+        );
         print!(
             "  {} {} {}",
             self.paint("33", "◐"),
@@ -77,13 +100,22 @@ impl Ui {
         if self.quiet {
             return;
         }
-        println!("\r  {} {}          ", self.paint("32", "●"), title);
+        // This line is written over the status line, which is longer: it also
+        // carried the reason the task ran. Padding has to cover whatever was
+        // there, not a fixed guess — a fixed ten spaces left the tail of
+        // "— first run" behind, so finished tasks read "● GitHub CLI    un".
+        let line = format!("  ● {title}");
+        let padding = " ".repeat(cover(self.take_pending(), &line));
+        println!("\r  {} {}{}", self.paint("32", "●"), title, padding);
     }
 
     pub fn note(&self, text: &str) {
         if self.quiet {
             return;
         }
+        // A note is written on the end of the status line and ends it, so
+        // there is nothing left for `applied` to cover.
+        self.take_pending();
         println!("    {}", self.paint("2", text));
     }
 
@@ -180,6 +212,38 @@ impl std::error::Error for Failure {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_task_covers_the_status_line_it_replaces() {
+        // "  ◐ GitHub CLI — first run" is 26 columns and "  ● GitHub CLI" is
+        // 14. The ten fixed spaces this used to print reached column 24 and
+        // left the last two behind, so a satisfied task rendered as
+        // "● GitHub CLI          un".
+        assert_eq!("  ◐ GitHub CLI — first run".chars().count(), 26);
+        assert!(cover(26, "  ● GitHub CLI") > 10);
+        assert_eq!(cover(26, "  ● GitHub CLI"), 12);
+    }
+
+    #[test]
+    fn a_longer_finished_line_is_not_padded_backwards() {
+        assert_eq!(cover(8, "  ● Node and pnpm"), 0);
+    }
+
+    #[test]
+    fn a_note_ends_the_status_line_so_nothing_is_left_to_cover() {
+        let ui = Ui::new(false);
+        ui.working("Infisical CLI", "first run");
+        ui.note("Installing infisical with Homebrew…");
+        assert_eq!(ui.take_pending(), 0);
+    }
+
+    #[test]
+    fn a_status_line_is_only_covered_once() {
+        let ui = Ui::new(false);
+        ui.working("GitHub CLI", "first run");
+        ui.applied("GitHub CLI");
+        assert_eq!(ui.take_pending(), 0);
+    }
 
     #[test]
     fn a_failure_carries_all_four_parts() {
