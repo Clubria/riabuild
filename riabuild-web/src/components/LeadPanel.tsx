@@ -1,105 +1,174 @@
-import { useMutation, useQuery } from "convex/react";
 import { useState } from "react";
-import { api } from "../../convex/_generated/api";
-import { Chip, Notice } from "./primitives";
+import { useData } from "../data/context";
+import { AuditEntry, Member, Role } from "../data/types";
+import { readError } from "../lib/errors";
 import { formatTime } from "../lib/time";
+import {
+  Alert,
+  Badge,
+  Button,
+  Column,
+  DataTable,
+  Empty,
+  Field,
+  Loading,
+  Select,
+  TextArea,
+  Tone,
+} from "../ui";
 
-type Role = "candidate" | "developer" | "lead";
-
-const ROLE_TONE: Record<Role, "ink" | "verified" | "muted"> = {
+const ROLE_TONE: Record<Role, Tone> = {
   candidate: "muted",
-  developer: "ink",
-  lead: "verified",
+  developer: "accent",
+  lead: "ok",
 };
 
-export function Members({ viewerId }: { viewerId: string }) {
-  const members = useQuery(api.members.list);
-  const setRole = useMutation(api.members.setRole);
-  const setStatus = useMutation(api.members.setStatus);
-  const [error, setError] = useState<string | null>(null);
+const ROLE_OPTIONS = [
+  { value: "candidate", label: "candidate" },
+  { value: "developer", label: "developer" },
+  { value: "lead", label: "lead" },
+];
 
-  if (members === undefined) {
-    return <p className="mono text-muted">Loading members…</p>;
+export function Members({ viewerId }: { viewerId: string }) {
+  const data = useData();
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  if (data.members.state === "loading") return <Loading label="loading members" />;
+  if (data.members.state === "error") {
+    return (
+      <Alert tone="danger" title="Could not list members">
+        <p className="wrap-value">{data.members.message}</p>
+      </Alert>
+    );
   }
 
+  const columns: Column<Member>[] = [
+    {
+      key: "login",
+      header: "github",
+      grow: true,
+      render: (m) => <span className="text-fg">@{m.githubLogin}</span>,
+    },
+    {
+      key: "name",
+      header: "name",
+      priority: "wide",
+      render: (m) => (
+        <span className="text-fg-dim">
+          {`${m.firstName} ${m.lastName}`.trim() === ""
+            ? "—"
+            : `${m.firstName} ${m.lastName}`}
+        </span>
+      ),
+    },
+    {
+      key: "state",
+      header: "state",
+      render: (m) => (
+        <span className="inline-flex flex-wrap gap-1.5">
+          <Badge tone={ROLE_TONE[m.role]}>{m.role}</Badge>
+          {m.status === "suspended" && <Badge tone="danger">suspended</Badge>}
+        </span>
+      ),
+    },
+  ];
+
   return (
-    <div>
-      <ul className="divide-y divide-rule border-y border-rule">
-        {members.map((member) => {
-          const suspended = member.status === "suspended";
+    <>
+      <DataTable
+        caption="Org members and their roles"
+        columns={columns}
+        rows={data.members.value}
+        rowKey={(m) => m._id}
+        renderActions={(m) => {
+          const suspended = m.status === "suspended";
+          const isSelf = m._id === viewerId;
           return (
-            <li
-              key={member._id}
-              className="flex flex-wrap items-baseline gap-x-4 gap-y-2 py-3"
-            >
-              <span className="mono flex-1 basis-40 text-graphite">
-                @{member.githubLogin}
-              </span>
-              <span className="flex-1 basis-48 text-muted">
-                {member.firstName} {member.lastName}
-              </span>
-              {suspended && <Chip tone="signal">suspended</Chip>}
-              <Chip tone={ROLE_TONE[member.role]}>{member.role}</Chip>
-              <select
-                className="field w-auto"
-                value={member.role}
-                onChange={(event) => {
+            <>
+              <Select
+                compact
+                label={`Role for @${m.githubLogin}`}
+                value={m.role}
+                options={ROLE_OPTIONS}
+                disabled={busy === m._id}
+                onChange={(value) => {
                   setError(null);
-                  void setRole({
-                    memberId: member._id,
-                    role: event.target.value as Role,
-                  }).catch((cause: unknown) => setError(readError(cause)));
+                  setBusy(m._id);
+                  void data
+                    .setRole({ memberId: m._id, role: value as Role })
+                    .catch((cause: unknown) => setError(readError(cause)))
+                    .finally(() => setBusy(null));
                 }}
-              >
-                <option value="candidate">candidate</option>
-                <option value="developer">developer</option>
-                <option value="lead">lead</option>
-              </select>
-              <button
-                className={suspended ? "btn btn-quiet" : "btn btn-danger"}
-                disabled={member._id === viewerId}
+              />
+              <Button
+                variant={suspended ? "quiet" : "danger"}
+                disabled={isSelf}
+                pending={busy === m._id}
+                pendingLabel="…"
+                title={
+                  isSelf ? "You cannot suspend your own account." : undefined
+                }
+                aria-label={`${suspended ? "Reactivate" : "Suspend"} @${m.githubLogin}`}
                 onClick={() => {
                   setError(null);
-                  void setStatus({
-                    memberId: member._id,
-                    status: suspended ? "active" : "suspended",
-                  }).catch((cause: unknown) => setError(readError(cause)));
+                  setBusy(m._id);
+                  void data
+                    .setStatus({
+                      memberId: m._id,
+                      status: suspended ? "active" : "suspended",
+                    })
+                    .catch((cause: unknown) => setError(readError(cause)))
+                    .finally(() => setBusy(null));
                 }}
               >
-                {suspended ? "Reactivate" : "Suspend"}
-              </button>
-            </li>
+                {suspended ? "reactivate" : "suspend"}
+              </Button>
+            </>
           );
-        })}
-      </ul>
-      <p className="mono mt-3 text-muted">
+        }}
+        empty={
+          <Empty glyph="⌂" title="Nobody has signed in yet.">
+            Members appear here the first time they sign in with GitHub.
+          </Empty>
+        }
+      />
+      <p className="mt-3 text-xs text-fg-faint">
         Suspending revokes that person&rsquo;s CLI sessions immediately.
       </p>
       {error !== null && (
         <div className="mt-4">
-          <Notice tone="signal" title="Nothing changed">
-            <p>{error}</p>
-          </Notice>
+          <Alert tone="danger" title="Nothing changed">
+            <p className="wrap-value">{error}</p>
+          </Alert>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
 export function OrgSettings() {
-  const config = useQuery(api.org.get);
-  const update = useMutation(api.org.update);
+  const data = useData();
   const [draft, setDraft] = useState<string | null>(null);
   const [repoSlug, setRepoSlug] = useState<string | null>(null);
   const [latestCli, setLatestCli] = useState<string | null>(null);
   const [minCli, setMinCli] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  if (config === undefined) {
-    return <p className="mono text-muted">Loading org config…</p>;
+  if (data.orgConfig.state === "loading") {
+    return <Loading label="loading org config" />;
+  }
+  if (data.orgConfig.state === "error") {
+    return (
+      <Alert tone="danger" title="Could not load org config">
+        <p className="wrap-value">{data.orgConfig.message}</p>
+      </Alert>
+    );
   }
 
+  const config = data.orgConfig.value;
   const settings = draft ?? config.claudeSettings;
   const slug = repoSlug ?? config.repoSlug;
   const latest = latestCli ?? config.latestCliVersion;
@@ -108,110 +177,101 @@ export function OrgSettings() {
 
   return (
     <div className="max-w-2xl">
-      <label className="block">
-        <span className="eyebrow mb-1 block">Repository</span>
-        <input
-          className="field"
-          value={slug}
-          onChange={(event) => setRepoSlug(event.target.value)}
-        />
-      </label>
+      <Field label="repository" value={slug} onChange={setRepoSlug} />
 
-      <label className="mt-4 block">
-        <span className="eyebrow mb-1 block">
-          Claude Code settings — layered over every profile at launch
-        </span>
-        <textarea
-          className="field h-56 resize-y"
-          spellCheck={false}
+      <div className="mt-4">
+        <TextArea
+          label="claude code settings"
+          hint="Layered over every profile at launch. Must be valid JSON."
           value={settings}
-          onChange={(event) => setDraft(event.target.value)}
+          rows={12}
+          onChange={setDraft}
         />
-      </label>
+      </div>
 
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
-        <label className="block">
-          <span className="eyebrow mb-1 block">
-            Latest CLI version — offered as an upgrade
-          </span>
-          <input
-            className="field mono"
-            value={latest}
-            spellCheck={false}
-            placeholder="2026.08.04"
-            onChange={(event) => setLatestCli(event.target.value)}
-          />
-        </label>
-
-        <label className="block">
-          <span className="eyebrow mb-1 block">
-            Minimum CLI version — refuses to run below this
-          </span>
-          <input
-            className="field mono"
-            value={floor}
-            spellCheck={false}
-            placeholder="2026.08.04"
-            onChange={(event) => setMinCli(event.target.value)}
-          />
-        </label>
+        <Field
+          label="latest cli version"
+          hint="Offered as an upgrade."
+          value={latest}
+          placeholder="2026.08.04"
+          spellCheck={false}
+          onChange={setLatestCli}
+        />
+        <Field
+          label="minimum cli version"
+          hint="Refuses to run below this."
+          value={floor}
+          placeholder="2026.08.04"
+          spellCheck={false}
+          onChange={setMinCli}
+        />
       </div>
 
       {floorIsChanging && (
         <div className="mt-4">
-          <Notice tone="signal" title="This blocks people mid-workday">
-            <p>
+          <Alert tone="danger" title="This blocks people mid-workday">
+            <p className="wrap-value">
               The floor moves from v{config.minCliVersion} to v{floor.trim()}.
               Anyone on an older riabuild is refused by the API until they
               upgrade — the next command they run stops working, whatever they
               were in the middle of.
             </p>
-          </Notice>
+          </Alert>
         </div>
       )}
 
-      <div className="mt-4 flex flex-wrap items-center gap-3">
-        <button
-          className="btn"
+      <div className="mt-5 flex flex-wrap items-center gap-2">
+        <Button
+          variant="primary"
+          pending={saving}
+          pendingLabel="saving"
           onClick={() => {
             setError(null);
-            void update({
-              claudeSettings: settings,
-              repoSlug: slug,
-              latestCliVersion: latest.trim(),
-              minCliVersion: floor.trim(),
-            })
+            setSaving(true);
+            void data
+              .updateOrg({
+                claudeSettings: settings,
+                repoSlug: slug,
+                latestCliVersion: latest.trim(),
+                minCliVersion: floor.trim(),
+              })
               .then(() => {
                 setSaved(true);
                 setTimeout(() => setSaved(false), 2000);
               })
+              .catch((cause: unknown) => setError(readError(cause)))
+              .finally(() => setSaving(false));
+          }}
+        >
+          save org config
+        </Button>
+        <Button
+          variant="quiet"
+          onClick={() => {
+            setError(null);
+            void data
+              .updateOrg({ markSecretsRotated: true })
               .catch((cause: unknown) => setError(readError(cause)));
           }}
         >
-          Save org config
-        </button>
-        <button
-          className="btn btn-quiet"
-          onClick={() => {
-            setError(null);
-            void update({ markSecretsRotated: true }).catch((cause: unknown) =>
-              setError(readError(cause)),
-            );
-          }}
-        >
-          Mark secrets rotated
-        </button>
-        {saved && <span className="eyebrow text-verified">Saved</span>}
+          mark secrets rotated
+        </Button>
+        {saved && (
+          <span className="text-xs tracking-wider text-ok uppercase">saved</span>
+        )}
       </div>
-      <p className="mono mt-3 text-muted">
+
+      <p className="mt-3 text-xs text-fg-faint wrap-value">
         secrets last rotated {formatTime(config.secretsUpdatedAt)} · saved CLI
         floor v{config.minCliVersion} · saved latest v{config.latestCliVersion}
       </p>
+
       {error !== null && (
         <div className="mt-4">
-          <Notice tone="signal" title="Not saved">
-            <p>{error}</p>
-          </Notice>
+          <Alert tone="danger" title="Not saved">
+            <p className="wrap-value">{error}</p>
+          </Alert>
         </div>
       )}
     </div>
@@ -219,38 +279,70 @@ export function OrgSettings() {
 }
 
 export function AuditLog() {
-  const entries = useQuery(api.members.auditLog, { limit: 40 });
-  if (entries === undefined) {
-    return <p className="mono text-muted">Loading audit log…</p>;
-  }
-  if (entries.length === 0) {
-    return <p className="text-muted">Nothing has changed yet.</p>;
-  }
-  return (
-    <ul className="divide-y divide-rule border-y border-rule">
-      {entries.map((entry) => (
-        <li key={entry._id} className="mono flex flex-wrap gap-x-3 py-2">
-          <span className="text-muted">{formatTime(entry.at)}</span>
-          <span className="text-ink">{entry.action}</span>
-          {entry.actorLogin !== null && (
-            <span className="text-muted">by @{entry.actorLogin}</span>
-          )}
-          {entry.subjectLogin !== null &&
-            entry.subjectLogin !== entry.actorLogin && (
-              <span className="text-muted">on @{entry.subjectLogin}</span>
-            )}
-          <span className="text-graphite">
-            {Object.entries(entry.meta)
-              .map(([key, value]) => `${key}=${value}`)
-              .join(" ")}
-          </span>
-        </li>
-      ))}
-    </ul>
-  );
-}
+  const data = useData();
 
-function readError(cause: unknown): string {
-  if (!(cause instanceof Error)) return "Something went wrong.";
-  return cause.message.replace(/^.*Uncaught Error:\s*/, "").split("\n")[0];
+  if (data.auditLog.state === "loading") {
+    return <Loading label="loading audit log" />;
+  }
+  if (data.auditLog.state === "error") {
+    return (
+      <Alert tone="danger" title="Could not load the audit log">
+        <p className="wrap-value">{data.auditLog.message}</p>
+      </Alert>
+    );
+  }
+
+  const columns: Column<AuditEntry>[] = [
+    {
+      key: "at",
+      header: "when",
+      render: (e) => <span className="text-fg-faint">{formatTime(e.at)}</span>,
+    },
+    {
+      key: "action",
+      header: "action",
+      render: (e) => <span className="text-accent">{e.action}</span>,
+    },
+    {
+      key: "who",
+      header: "who",
+      priority: "wide",
+      render: (e) => (
+        <span className="text-fg-dim">
+          {e.actorLogin !== null && <>by @{e.actorLogin}</>}
+          {e.subjectLogin !== null && e.subjectLogin !== e.actorLogin && (
+            <> on @{e.subjectLogin}</>
+          )}
+          {e.actorLogin === null && e.subjectLogin === null && "—"}
+        </span>
+      ),
+    },
+    {
+      key: "meta",
+      header: "detail",
+      grow: true,
+      priority: "wide",
+      render: (e) => (
+        <span className="text-fg-dim">
+          {Object.entries(e.meta)
+            .map(([key, value]) => `${key}=${value}`)
+            .join(" ") || "—"}
+        </span>
+      ),
+    },
+  ];
+
+  return (
+    <DataTable
+      caption="Changes to access"
+      columns={columns}
+      rows={data.auditLog.value}
+      rowKey={(e) => e._id}
+      empty={
+        <Empty glyph="∅" title="Nothing has changed yet.">
+          Role promotions, suspensions and session revocations are recorded here.
+        </Empty>
+      }
+    />
+  );
 }

@@ -1,10 +1,10 @@
-import { useQuery } from "convex/react";
-import { api } from "../../convex/_generated/api";
-import { Chip, CommandLine, Notice, Step } from "../components/primitives";
+import { useData } from "../data/context";
+import { Member } from "../data/types";
+import { ErrorBoundary } from "../app/ErrorBoundary";
 import { Profile } from "../components/Profile";
 import { Sessions } from "../components/Sessions";
 import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
-import { OrgMembership } from "../useOrgMembership";
+import { Alert, Badge, Command, Panel, Tab } from "../ui";
 
 /** What riabuild will do to the machine, stated before it does it. */
 const MANIFEST: [string, string][] = [
@@ -19,137 +19,158 @@ const MANIFEST: [string, string][] = [
   ["env_local", "secrets, brokered fresh each time"],
 ];
 
-export function Dashboard({
-  member,
-  membership,
-}: {
-  member: {
-    _id: string;
-    githubLogin: string;
-    firstName: string;
-    lastName: string;
-    email: string;
-    role: "candidate" | "developer" | "lead";
-    status: "active" | "suspended";
-  };
-  membership: OrgMembership;
-}) {
-  const config = useQuery(api.org.get);
-  const isLead = member.role === "lead";
+export function DASHBOARD_TABS(isLead: boolean): Tab[] {
+  const tabs: Tab[] = [
+    { id: "profile", label: "profile", href: "#profile" },
+    { id: "install", label: "install", href: "#install" },
+    { id: "machines", label: "machines", href: "#machines" },
+  ];
+  if (isLead) tabs.push({ id: "lead", label: "lead", href: "#lead" });
+  return tabs;
+}
 
-  if (membership.status === "not_member") {
+export function Dashboard({ member }: { member: Member }) {
+  const data = useData();
+  const isLead = member.role === "lead";
+  const config = data.orgConfig.state === "ready" ? data.orgConfig.value : null;
+
+  if (data.membership.status === "not_member") {
     return (
-      <div className="max-w-xl py-10">
-        <Notice tone="signal" title={`Not in the ${membership.org} org`}>
-          <p className="mt-2">
-            Your GitHub account{" "}
-            <span className="mono">@{member.githubLogin}</span> is not a member
-            of {membership.org} yet. Ask your team lead for a GitHub invite —
-            accepting it is all riabuild needs.
+      <div className="mx-auto max-w-xl py-4">
+        <Alert
+          tone="danger"
+          title={`Not in the ${data.membership.org} org`}
+        >
+          <p className="wrap-value">
+            Your GitHub account <strong>@{member.githubLogin}</strong> is not a
+            member of {data.membership.org} yet. Ask your team lead for a GitHub
+            invite — accepting it is all riabuild needs.
           </p>
-        </Notice>
+        </Alert>
       </div>
     );
   }
 
   return (
-    <>
-      <section className="step-in py-10">
-        <p className="eyebrow mb-4">
-          Signed in as @{member.githubLogin} ·{" "}
-          <Chip tone={member.role === "candidate" ? "muted" : "ink"}>
+    <div className="flex flex-col gap-7">
+      <section>
+        <p className="flex flex-wrap items-center gap-2 text-fg-faint">
+          <span aria-hidden="true">$</span>
+          <span>riabuild status</span>
+        </p>
+        <p className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-fg-dim">signed in as</span>
+          <span className="min-w-0 text-fg wrap-value">
+            @{member.githubLogin}
+          </span>
+          <Badge tone={member.role === "candidate" ? "muted" : "accent"}>
             {member.role}
-          </Chip>
+          </Badge>
           {member.status === "suspended" && (
-            <>
-              {" "}
-              <Chip tone="signal">suspended</Chip>
-            </>
+            <Badge tone="danger">suspended</Badge>
           )}
         </p>
-        <h1 className="display text-4xl sm:text-6xl">
-          One command
-          <br />
-          builds the machine.
+
+        <h1 className="mt-4 text-xl leading-snug text-fg sm:text-2xl">
+          One command builds the machine.
         </h1>
-        <p className="mt-5 max-w-xl">
+        <p className="mt-2 max-w-prose text-fg-dim">
           riabuild sets up everything below, checks each item is genuinely true
           of your laptop, and drops you into a shell with the team&rsquo;s
           environment. You choose nothing.
         </p>
 
-        <ol className="mt-8 grid gap-x-8 gap-y-1 sm:grid-cols-2">
+        <ul className="mt-5 grid gap-x-6 gap-y-0.5 sm:grid-cols-2">
           {MANIFEST.map(([id, description]) => (
-            <li key={id} className="flex items-baseline gap-3">
-              <span className="mono text-ink" aria-hidden="true">
+            <li key={id} className="flex items-baseline gap-2">
+              <span aria-hidden="true" className="text-accent">
                 ●
               </span>
-              <span className="mono text-graphite">{id}</span>
-              <span className="text-muted">{description}</span>
+              {/* `ch` is exact in a monospace face: 16ch clears the longest id
+                  (`claude_profiles`) so every description starts on the same
+                  column. Only from `sm` — at 380px that width would leave the
+                  description nothing to wrap in. */}
+              <span className="shrink-0 text-fg sm:min-w-[16ch]">{id}</span>
+              <span className="min-w-0 text-fg-faint wrap-value">
+                {description}
+              </span>
             </li>
           ))}
-        </ol>
+        </ul>
       </section>
 
-      {membership.status === "unavailable" && (
-        <div className="mb-6">
-          <Notice tone="signal" title="GitHub check unavailable">
-            <p>
-              riabuild could not confirm your {membership.org} membership just
-              now. You can still edit your profile; secrets will not be handed
-              out until the check succeeds.
-            </p>
-          </Notice>
-        </div>
+      {member.status === "suspended" && (
+        <Alert tone="danger" title="Your account is suspended">
+          <p>
+            riabuild will refuse to hand this machine any secrets until a team
+            lead reactivates you.
+          </p>
+        </Alert>
       )}
 
-      <Step index="01" title="Confirm your profile" delayMs={60}>
-        <p className="mb-5 max-w-xl text-muted">
+      {data.membership.status === "unavailable" && (
+        <Alert tone="warn" title="GitHub check unavailable">
+          <p>
+            riabuild could not confirm your {data.membership.org} membership just
+            now. You can still edit your profile; secrets will not be handed out
+            until the check succeeds.
+          </p>
+        </Alert>
+      )}
+
+      <Panel id="profile" index="01" title="confirm your profile">
+        <p className="mb-4 max-w-prose text-fg-dim">
           Prefilled from GitHub. Correct anything that is wrong.
         </p>
         <Profile member={member} />
-      </Step>
+      </Panel>
 
-      <Step index="02" title="Install riabuild" delayMs={120}>
-        <p className="mb-4 max-w-xl text-muted">
+      <Panel id="install" index="02" title="install riabuild">
+        <p className="mb-3 max-w-prose text-fg-dim">
           One formula, from the Clubria tap. Homebrew handles updates from here.
         </p>
-        <CommandLine command="brew install clubria/tap/riabuild" />
-      </Step>
+        <Command command="brew install clubria/tap/riabuild" />
+      </Panel>
 
-      <Step index="03" title="Run it" delayMs={180}>
-        <CommandLine command="riabuild" />
-        <p className="mt-4 max-w-xl text-muted">
+      <Panel index="03" title="run it">
+        <Command command="riabuild" />
+        <p className="mt-3 max-w-prose text-fg-dim">
           The first run signs this machine in through your browser and comes
           straight back to the terminal. Every run after that checks the machine
-          and repairs what drifted. Type <span className="mono">exit</span> to
+          and repairs what drifted. Type <span className="text-fg">exit</span> to
           leave the environment.
         </p>
-        {config !== undefined && (
-          <p className="mono mt-4 text-muted">
+        {config !== null && (
+          <p className="mt-3 text-xs text-fg-faint wrap-value">
             repo {config.repoSlug} · needs riabuild v{config.minCliVersion} or
             newer
           </p>
         )}
-      </Step>
+      </Panel>
 
-      <Step index="04" title="Your machines" delayMs={240}>
+      <Panel id="machines" index="04" title="your machines">
         <Sessions />
-      </Step>
+      </Panel>
 
       {isLead && (
         <>
-          <Step index="LEAD" title="Members and roles" delayMs={300}>
-            <Members viewerId={member._id} />
-          </Step>
-          <Step index="LEAD" title="Org configuration" delayMs={320}>
-            <OrgSettings />
-          </Step>
-          <Step index="LEAD" title="Audit log" delayMs={340}>
-            <AuditLog />
-          </Step>
+          <Panel id="lead" index="lead" title="members and roles" tone="accent">
+            <ErrorBoundary label="the member list">
+              <Members viewerId={member._id} />
+            </ErrorBoundary>
+          </Panel>
+          <Panel index="lead" title="org configuration" tone="accent">
+            <ErrorBoundary label="org configuration">
+              <OrgSettings />
+            </ErrorBoundary>
+          </Panel>
+          <Panel index="lead" title="audit log" tone="accent">
+            <ErrorBoundary label="the audit log">
+              <AuditLog />
+            </ErrorBoundary>
+          </Panel>
         </>
       )}
-    </>
+    </div>
   );
 }

@@ -34,6 +34,7 @@ export default defineConfig([
           "./tsconfig.node.json",
           "./tsconfig.app.json",
           "./convex/tsconfig.json",
+          "./tsconfig.e2e.json",
         ],
       },
     },
@@ -74,6 +75,14 @@ export default defineConfig([
       // Allow async functions without await
       // for consistency (esp. Convex `handler`s)
       "@typescript-eslint/require-await": "off",
+    },
+  },
+  {
+    // Playwright's fixture API takes a callback named `use`, which the React
+    // Hooks rule reads as a misplaced `use()` hook. There is no React here.
+    files: ["e2e/**/*.ts"],
+    rules: {
+      "react-hooks/rules-of-hooks": "off",
     },
   },
   ...convexPlugin.configs.recommended,
