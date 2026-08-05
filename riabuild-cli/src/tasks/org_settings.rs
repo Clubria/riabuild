@@ -50,7 +50,7 @@ impl Task for OrgSettings {
         }
 
         // The authoritative comparison: what the server says it published.
-        let remote = org::fetch_claude_settings(&ctx.api)?;
+        let remote = org::fetch_claude_settings(&ctx.api).await?;
         match ctx.config.org_settings_updated_at {
             Some(cached) if cached == remote.updated_at => Ok(Status::Satisfied),
             _ => Ok(Status::needs("the team settings changed")),
@@ -58,7 +58,7 @@ impl Task for OrgSettings {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let remote = org::fetch_claude_settings(&ctx.api)?;
+        let remote = org::fetch_claude_settings(&ctx.api).await?;
         let file = ctx.paths.org_settings_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;

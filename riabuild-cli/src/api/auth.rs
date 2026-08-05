@@ -266,10 +266,12 @@ pub async fn login(
         .detail(error.to_string())
     })?;
 
-    let response: TokenResponse = api.post_json(
-        "/api/v1/cli/token",
-        serde_json::json!({ "code": code, "verifier": flow.verifier }),
-    )?;
+    let response: TokenResponse = api
+        .post_json(
+            "/api/v1/cli/token",
+            serde_json::json!({ "code": code, "verifier": flow.verifier }),
+        )
+        .await?;
 
     Ok((response.token, response.member))
 }

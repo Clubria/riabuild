@@ -72,7 +72,7 @@ impl Task for Login {
         ctx.api.set_token(Some(token));
 
         // The token is now live, so everything the server knows is reachable.
-        ctx.org = Some(org::fetch_config(&ctx.api)?);
+        ctx.org = Some(org::fetch_config(&ctx.api).await?);
         ctx.config.session_expires_at = Some(now_millis() + SESSION_TTL_MS);
         ctx.config.save(ctx.paths.as_ref())?;
         ctx.ui

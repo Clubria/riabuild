@@ -115,8 +115,8 @@ impl Task for Toolchain {
         let node_version = desired_node(project.as_deref());
         let pnpm_version = desired_pnpm(project.as_deref());
 
-        install_node(ctx, &node_version)?;
-        install_pnpm(ctx, &pnpm_version)?;
+        install_node(ctx, &node_version).await?;
+        install_pnpm(ctx, &pnpm_version).await?;
 
         ctx.config.node_version = Some(node_version);
         ctx.config.pnpm_version = Some(pnpm_version);
@@ -125,12 +125,12 @@ impl Task for Toolchain {
     }
 }
 
-fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
+async fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
     let platform = download::node_platform()?;
     let filename = download::node_tarball_name(node_version, &platform);
 
     ctx.ui.note(&format!("Downloading Node {node_version}…"));
-    let shasums = download::fetch_text(&download::node_shasums_url(node_version))?;
+    let shasums = download::fetch_text(&download::node_shasums_url(node_version)).await?;
     let expected = download::digest_for(&shasums, &filename).ok_or_else(|| {
         Failure::new(
             format!("downloading Node {node_version}"),
@@ -139,7 +139,7 @@ fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
         .detail(format!("nodejs.org does not publish {filename}"))
     })?;
 
-    let bytes = download::fetch_bytes(&download::node_tarball_url(node_version, &platform))?;
+    let bytes = download::fetch_bytes(&download::node_tarball_url(node_version, &platform)).await?;
     let actual = download::sha256_hex(&bytes);
     if actual != expected {
         // Never unpack an archive that is not the one nodejs.org published.
@@ -155,13 +155,13 @@ fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
+async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
     let asset = download::pnpm_asset(pnpm_version)?;
     ctx.ui.note(&format!("Downloading pnpm {pnpm_version}…"));
     // Unlike Node, pnpm publishes no checksums file, so there is no digest to
     // verify this against — HTTPS to github.com is the whole trust anchor.
     // Do not invent one; an unpublished digest checks nothing.
-    let bytes = download::fetch_bytes(&download::pnpm_url(pnpm_version, &asset))?;
+    let bytes = download::fetch_bytes(&download::pnpm_url(pnpm_version, &asset)).await?;
 
     let bin_dir = ctx.paths.bin_dir();
     std::fs::create_dir_all(&bin_dir)?;
@@ -245,7 +245,9 @@ mod tests {
         use crate::runner::{CommandRunner, RealRunner};
 
         let asset = download::pnpm_asset(FALLBACK_PNPM).unwrap();
-        let bytes = download::fetch_bytes(&download::pnpm_url(FALLBACK_PNPM, &asset)).unwrap();
+        let bytes = download::fetch_bytes(&download::pnpm_url(FALLBACK_PNPM, &asset))
+            .await
+            .unwrap();
 
         let home = tempfile::TempDir::new().unwrap();
         let tree = home.path().join(FALLBACK_PNPM);

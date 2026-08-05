@@ -126,10 +126,10 @@ async fn connect(ctx: &mut Ctx) -> Result<()> {
     };
     ctx.api.set_token(Some(token));
 
-    match ctx.api.me() {
+    match ctx.api.me().await {
         Ok(member) => {
             ctx.member = Some(member);
-            ctx.org = Some(org::fetch_config(&ctx.api)?);
+            ctx.org = Some(org::fetch_config(&ctx.api).await?);
             Ok(())
         }
         Err(error) => match error.downcast_ref::<ApiError>() {

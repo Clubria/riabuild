@@ -80,9 +80,6 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",
     "time",
 ] }
-# Removed in the commit that ports api/ and download.rs to reqwest. It stays
-# here only so this commit compiles on its own.
-ureq = { version = "2.12", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"

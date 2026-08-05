@@ -118,7 +118,7 @@ impl Task for EnvLocal {
         // checkout that would commit it.
         ensure_ignored(ctx, &project).await?;
 
-        let brokered = secrets::broker(&ctx.api)?;
+        let brokered = secrets::broker(&ctx.api).await?;
         ctx.ui.note("Fetching your secrets from Infisical…");
 
         let output = ctx
