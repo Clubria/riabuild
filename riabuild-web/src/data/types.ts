@@ -101,6 +101,12 @@ export type Data = {
   revokeSession(p: { sessionId: string }): Promise<void>;
   updateOrg(p: OrgUpdate): Promise<void>;
   signIn(p?: { redirectTo?: string }): Promise<void>;
+  /**
+   * Present only in dev builds, and only works against a deployment that sets
+   * `RIABUILD_DEV_AUTH=1`. Optional on the type so a production build has no
+   * expression referring to it at all.
+   */
+  devSignIn?(login: string): Promise<void>;
   signOut(): Promise<void>;
   authorizeCli(p: {
     challenge: string;

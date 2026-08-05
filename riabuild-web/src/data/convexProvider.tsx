@@ -78,6 +78,11 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     signIn: async (p) => {
       await signIn("github", p?.redirectTo !== undefined ? { redirectTo: p.redirectTo } : {});
     },
+    devSignIn: import.meta.env.DEV
+      ? async (login: string) => {
+          await signIn("dev", { login });
+        }
+      : undefined,
     signOut: async () => {
       await signOut();
     },

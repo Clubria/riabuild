@@ -62,6 +62,39 @@ export function SignIn({
           </div>
         )}
       </Panel>
+
+      {import.meta.env.DEV && data.devSignIn !== undefined && (
+        <div className="mt-6">
+          <Panel title="dev sign-in" tone="warn" index="dev">
+            <p className="max-w-prose text-fg-dim">
+              Only in dev builds, and only works if the deployment sets{" "}
+              <span className="text-fg">RIABUILD_DEV_AUTH=1</span>. Whether an
+              account is a lead still comes from{" "}
+              <span className="text-fg">RIABUILD_BOOTSTRAP_LEADS</span>.
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {["devlead", "devuser"].map((login) => (
+                <Button
+                  key={login}
+                  variant="quiet"
+                  onClick={() => {
+                    setError(null);
+                    void data.devSignIn?.(login).catch((cause: unknown) =>
+                      setError(
+                        cause instanceof Error
+                          ? cause.message
+                          : "Dev sign-in failed.",
+                      ),
+                    );
+                  }}
+                >
+                  sign in as {login}
+                </Button>
+              ))}
+            </div>
+          </Panel>
+        </div>
+      )}
     </div>
   );
 }
