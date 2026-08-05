@@ -41,6 +41,9 @@ pnpm exec playwright test -c e2e/playwright.config.ts visual.spec.ts --project=n
 
 - the document does not scroll horizontally, naming the widest offender
 - nothing is clipped by an `overflow: hidden` ancestor
+- every `#anchor` link points at an element that exists — the no-fake-affordances rule
+  from `riabuild-ui`, as an assertion. It caught the tab strip still offering
+  `#profile` on the "not in the org" screen, which has no such section.
 - every interactive element is tabbable and shows a focus ring
 - `axe-core` reports no WCAG 2.1 AA violations
 - no console errors or unhandled rejections

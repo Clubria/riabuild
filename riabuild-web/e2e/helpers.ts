@@ -59,6 +59,19 @@ export async function checkPage(
 
   await expectNoHorizontalOverflow(page);
   await expectNothingClipped(page);
+  await expectAnchorTargetsExist(page);
+
+  // Screenshot BEFORE the focus sweep. Focusing an element scrolls its
+  // container to reveal it, so a screenshot taken afterwards shows tables
+  // scrolled sideways with their first columns out of frame — a picture of the
+  // test poking the page, not of the page.
+  if (options.screenshot !== undefined) {
+    await page.screenshot({
+      path: `e2e/__screens__/${options.screenshot}-${info.project.name}.png`,
+      fullPage: true,
+    });
+  }
+
   await expectVisibleFocus(page, info);
 
   const axe = new AxeBuilder({ page }).withTags([
@@ -75,13 +88,6 @@ export async function checkPage(
     results.violations.map((v) => `${v.id}: ${v.nodes.length} node(s) — ${v.help}`),
     "axe-core accessibility violations",
   ).toEqual([]);
-
-  if (options.screenshot !== undefined) {
-    await page.screenshot({
-      path: `e2e/__screens__/${options.screenshot}-${info.project.name}.png`,
-      fullPage: true,
-    });
-  }
 
   if (options.expectConsoleErrors !== true) {
     const unexpected = consoleErrors.filter(
@@ -145,6 +151,25 @@ async function expectNothingClipped(page: Page): Promise<void> {
     return bad;
   });
   expect(clipped, "content clipped by an overflow:hidden ancestor").toEqual([]);
+}
+
+/**
+ * Every in-page link points at something that exists.
+ *
+ * This is the no-fake-affordances rule as an assertion. The tab strip is a row
+ * of `#section` anchors, and a tab shown on a screen that has no such section —
+ * the "not in the org" block, for one — is a control that silently does
+ * nothing. Same broken promise as advertising a keybinding we never handle,
+ * and just as invisible in a screenshot.
+ */
+async function expectAnchorTargetsExist(page: Page): Promise<void> {
+  const dangling = await page.evaluate(() =>
+    [...document.querySelectorAll<HTMLAnchorElement>('a[href^="#"]')]
+      .map((a) => a.getAttribute("href") ?? "")
+      .filter((href) => href.length > 1)
+      .filter((href) => document.querySelector(href) === null),
+  );
+  expect(dangling, "in-page links whose target does not exist").toEqual([]);
 }
 
 /**

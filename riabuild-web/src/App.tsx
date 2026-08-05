@@ -24,14 +24,29 @@ export default function App() {
   const data = useData();
   const current = route(window.location.pathname);
 
-  const viewer =
-    data.viewer.state === "ready" ? data.viewer.value : null;
+  const viewer = data.viewer.state === "ready" ? data.viewer.value : null;
+
+  /**
+   * Tabs are anchors to sections of the dashboard, so they appear only when the
+   * dashboard is what is actually on screen. Someone blocked at the "not in the
+   * org" screen has no `#profile` to jump to, and a tab that scrolls nowhere is
+   * the same broken promise as a keybinding hint we never handle.
+   */
+  const showsSections =
+    current.kind === "dashboard" &&
+    data.auth === "signed-in" &&
+    viewer !== null &&
+    data.membership.status !== "not_member";
 
   return (
     <Screen
       title="riabuild"
       subtitle={subtitleFor(current.kind)}
-      tabs={current.kind === "dashboard" && viewer !== null ? DASHBOARD_TABS(viewer.role === "lead") : undefined}
+      tabs={
+        showsSections && viewer !== null
+          ? DASHBOARD_TABS(viewer.role === "lead")
+          : undefined
+      }
       actions={
         data.auth === "signed-in" ? (
           <Button variant="quiet" onClick={() => void data.signOut()}>
@@ -126,7 +141,12 @@ function Body({
 function StatusLeft() {
   const data = useData();
 
-  if (data.auth !== "signed-in") {
+  // "Signed out" and "still asking" are different facts, and the status bar is
+  // the one place claiming to report what is true right now.
+  if (data.auth === "loading") {
+    return <Dot tone="muted" label="connecting" />;
+  }
+  if (data.auth === "signed-out") {
     return <Dot tone="muted" label="signed out" />;
   }
 

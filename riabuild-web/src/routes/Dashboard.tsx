@@ -86,7 +86,11 @@ export function Dashboard({ member }: { member: Member }) {
               <span aria-hidden="true" className="text-accent">
                 ●
               </span>
-              <span className="shrink-0 text-fg">{id}</span>
+              {/* `ch` is exact in a monospace face: 16ch clears the longest id
+                  (`claude_profiles`) so every description starts on the same
+                  column. Only from `sm` — at 380px that width would leave the
+                  description nothing to wrap in. */}
+              <span className="shrink-0 text-fg sm:min-w-[16ch]">{id}</span>
               <span className="min-w-0 text-fg-faint wrap-value">
                 {description}
               </span>

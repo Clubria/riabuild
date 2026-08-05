@@ -25,7 +25,7 @@ export function Select({
   const control = (
     <select
       id={id}
-      className={`${CONTROL_CLASS} ${compact ? "w-auto py-0.5" : ""}`}
+      className={`${CONTROL_CLASS} ${compact ? "w-auto min-w-[12ch] py-0.5" : ""}`}
       value={value}
       disabled={disabled}
       aria-describedby={hint !== undefined ? describedBy : undefined}

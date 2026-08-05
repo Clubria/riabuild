@@ -46,6 +46,14 @@ if (import.meta.env.DEV && scenarioName() !== null) {
  * page rather than any of the error screens built for exactly that situation.
  * Failing over to offline data keeps the 404, the error boundary and the shell
  * alive and says what is wrong.
+ *
+ * One consequence worth knowing: Vite inlines `import.meta.env.VITE_CONVEX_URL`
+ * at build time, so building without it makes the check below statically true
+ * and Rollup drops the entire Convex client as dead code (313kB → 227kB). That
+ * is correct — a build with no backend URL has no use for a client — but it
+ * means a deploy that forgets the variable produces a healthy-looking bundle
+ * that can never connect. CI guards it by building once with the variable set
+ * and asserting the client is still in `dist/`.
  */
 function live() {
   const url = import.meta.env.VITE_CONVEX_URL as string | undefined;

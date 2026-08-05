@@ -68,8 +68,10 @@ export function Gallery() {
           </Button>
         </Row>
         <Row label="long label">
+          {/* Wraps rather than pushing the page sideways at 380px. Real labels
+              are two words; this is the hostile case. */}
           <Button variant="primary">
-            {"a-very-long-button-label-that-should-not-wrap"}
+            {"a-very-long-button-label-that-must-wrap-not-overflow"}
           </Button>
         </Row>
       </Section>

@@ -47,7 +47,12 @@ export class ErrorBoundary extends Component<Props, State> {
         </p>
 
         {import.meta.env.DEV ? (
-          <pre className="mt-4 max-h-64 overflow-auto border border-rule bg-bg-sunk p-3 text-xs whitespace-pre-wrap text-danger wrap-value">
+          // Focusable because it scrolls: a long component stack is unreadable
+          // to anyone who cannot reach the region to scroll it.
+          <pre
+            tabIndex={0}
+            className="mt-4 max-h-64 overflow-auto border border-rule bg-bg-sunk p-3 text-xs whitespace-pre-wrap text-danger wrap-value"
+          >
             {error.message}
             {stack !== null && (
               <span className="text-fg-faint">{"\n" + stack}</span>

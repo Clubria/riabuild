@@ -79,6 +79,23 @@ jobs:
           fi
           echo "No fixture data in dist/."
 
+      # Vite inlines `import.meta.env.VITE_CONVEX_URL` at build time, so a build
+      # without it makes the guard in main.tsx statically true and Rollup drops
+      # the whole Convex client as dead code. That is the right behaviour — the
+      # app renders "no backend" instead of a blank page — but it means a deploy
+      # that forgets the variable ships a bundle that can never connect and
+      # looks perfectly healthy. This proves the configured path still bundles
+      # a real client.
+      - name: A configured build still contains the Convex client
+        run: |
+          set -euo pipefail
+          VITE_CONVEX_URL="https://ci-placeholder.convex.cloud" pnpm build
+          if ! grep -rq 'convex\.cloud' dist/assets/; then
+            echo "::error::Convex client missing from a build that had VITE_CONVEX_URL set"
+            exit 1
+          fi
+          echo "Configured build bundles the Convex client."
+
   ui:
     name: riabuild-web UI
     runs-on: ubuntu-latest
