@@ -2,6 +2,13 @@
 //! against the Clubria codebase with working secrets", without the developer
 //! making a single environment decision.
 
+// `unwrap_used` is denied for the shipped binary in `Cargo.toml`. In tests a
+// panic *is* the reporting mechanism for a failed precondition, so unwrapping a
+// fixture there is correct and this exemption keeps the deny from forcing
+// ceremony into every `#[cfg(test)]` module. The lint still applies to the
+// binary target, which is the build that reaches a developer's laptop.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 mod api;
 mod cli;
 mod config;

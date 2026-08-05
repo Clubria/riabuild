@@ -29,6 +29,19 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 
+# A panic in a provisioner is the worst failure it has: it prints a Rust
+# backtrace on a developer's laptop, says nothing about what riabuild was doing,
+# and leaves the machine half-set-up with no advice on whether re-running is
+# safe. Every reachable error must instead become a `Failure` (see `ui.rs`),
+# which carries what was attempted, the command, the detail, one next action,
+# and whether a re-run is safe.
+#
+# `unwrap_used` is a clippy `restriction` lint and off by default, so `-D
+# warnings` alone never caught this. Tests are exempt via a `cfg_attr` in
+# `main.rs` — there, a panic is how a failed assertion reports itself.
+[lints.clippy]
+unwrap_used = "deny"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
