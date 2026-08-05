@@ -127,8 +127,8 @@ export function Dashboard({
         </p>
         {config !== undefined && (
           <p className="mono mt-4 text-muted">
-            repo {config.repoSlug} · into {config.defaultProjectPath} · needs
-            riabuild v{config.minCliVersion} or newer
+            repo {config.repoSlug} · needs riabuild v{config.minCliVersion} or
+            newer
           </p>
         )}
       </Step>

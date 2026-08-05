@@ -240,8 +240,10 @@ fn open_shell(ctx: &mut Ctx) -> Result<i32> {
             .info("You are already in the Clubria environment. Type `exit` to leave it.");
         return Ok(0);
     }
+    // The banner itself comes from the generated rcfile, inside the new shell —
+    // printing it here too is what made every developer see it twice. This blank
+    // line is only separation from the task list above.
     ctx.ui.info("");
-    ctx.ui.info(shell::BANNER);
     shell::spawn(ctx)
 }
 

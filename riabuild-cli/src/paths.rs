@@ -72,6 +72,33 @@ impl Paths for RealPaths {
     }
 }
 
+/// The folder Clubria checkouts are grouped under on macOS.
+const MACOS_ORG_DIR: &str = "Clubria";
+
+/// Where a repository is checked out when the developer has not chosen a place.
+///
+/// This is the only decision riabuild makes from the operating system, which is
+/// why it lives in the file that is allowed to know about one. A Mac developer
+/// keeps work in `~/Documents`, and finding a checkout in `~/code` on macOS
+/// reads as riabuild dumping a folder somewhere arbitrary; `~/code` is the
+/// convention everywhere else.
+///
+/// It used to be a single string sent by the server, which cannot be right on
+/// both platforms at once. A developer who wants somewhere else passes
+/// `riabuild --project <path>`, and that choice is remembered.
+pub fn default_project_dir(home: &Path, repo_name: &str) -> PathBuf {
+    default_project_dir_on(std::env::consts::OS, home, repo_name)
+}
+
+/// Split out so both platforms' answers are testable from either platform —
+/// `cfg!` would compile one of these branches out of the test binary entirely.
+fn default_project_dir_on(os: &str, home: &Path, repo_name: &str) -> PathBuf {
+    match os {
+        "macos" => home.join("Documents").join(MACOS_ORG_DIR).join(repo_name),
+        _ => home.join("code").join(repo_name),
+    }
+}
+
 /// Expands a leading `~` the way a developer typing a path expects.
 pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
@@ -109,6 +136,35 @@ mod tests {
             "~/code/hub"
         );
         assert_eq!(contract_tilde(Path::new("/opt/hub"), home), "/opt/hub");
+    }
+
+    #[test]
+    fn a_mac_checkout_lands_under_documents() {
+        assert_eq!(
+            default_project_dir_on("macos", Path::new("/Users/ada"), "ai-builders-hub"),
+            PathBuf::from("/Users/ada/Documents/Clubria/ai-builders-hub")
+        );
+    }
+
+    #[test]
+    fn everywhere_else_uses_the_code_directory() {
+        for os in ["linux", "freebsd"] {
+            assert_eq!(
+                default_project_dir_on(os, Path::new("/home/ada"), "ai-builders-hub"),
+                PathBuf::from("/home/ada/code/ai-builders-hub"),
+                "{os}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_matches_the_platform_it_is_running_on() {
+        // Guards the wiring between the public function and the tested one.
+        let home = Path::new("/home/ada");
+        assert_eq!(
+            default_project_dir(home, "hub"),
+            default_project_dir_on(std::env::consts::OS, home, "hub")
+        );
     }
 
     #[test]

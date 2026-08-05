@@ -78,7 +78,7 @@ sessions.
 | `authTables` | from `@convex-dev/auth`, GitHub provider only |
 | `members` | `userId`, `githubLogin`, `githubId`, `firstName`, `lastName`, `email`, `role`, `status` |
 | `cliSessions` | `memberId`, `tokenHash`, `deviceLabel`, `cliVersion`, `lastUsedAt`, `expiresAt`, `revokedAt` |
-| `orgConfig` | `claudeSettings`, `repoSlug`, `defaultProjectPath`, `minCliVersion`, `latestCliVersion`, `secretsUpdatedAt` |
+| `orgConfig` | `claudeSettings`, `repoSlug`, `minCliVersion`, `latestCliVersion`, `secretsUpdatedAt` |
 | `auditLog` | `actorId`, `action`, `subjectId`, `meta`, `at` |
 
 `members.role` is one of `candidate` | `developer` | `lead`, defaulting to `candidate`.
@@ -154,9 +154,22 @@ looks it up in `cliSessions`, rejects revoked or expired sessions, and updates
 |---|---|
 | `POST /api/v1/cli/token` | exchange one-time code for a session token |
 | `GET /api/v1/me` | member profile, role, status |
-| `GET /api/v1/org/config` | `repoSlug`, `defaultProjectPath`, `minCliVersion`, `latestCliVersion` |
+| `GET /api/v1/org/config` | `repoSlug`, `minCliVersion`, `latestCliVersion` (plus a frozen `defaultProjectPath`, retired — see below) |
 | `GET /api/v1/org/claude-settings` | org Claude Code settings JSON + `updatedAt` |
 | `POST /api/v1/secrets/token` | short-lived Infisical access token |
+
+### Where the checkout goes
+
+The CLI decides, not the server. The default depends on the operating system —
+`~/Documents/Clubria/<repo>` on macOS, `~/code/<repo>` elsewhere — and a single stored
+string cannot be right on both at once. It lives in `paths.rs`, the one file allowed to
+know which platform it is on. A developer who wants somewhere else passes
+`riabuild --project <path>`, which is remembered in `~/.riabuild/config.json`.
+
+`orgConfig.defaultProjectPath` used to carry this and is retired. `/api/v1/org/config`
+still emits a frozen value for CLIs released before the change, because they cannot
+deserialize a response without it and `/api/v1` is add-only. It can be dropped once no
+installed CLI predates the change.
 
 ### Dashboard routes
 
