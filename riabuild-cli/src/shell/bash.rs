@@ -22,8 +22,11 @@ pub fn rcfile(home: &Path, banner: &str, prompt: &str) -> String {
     )
 }
 
+/// Guarded on stdout being a terminal — see the note in `zsh::banner_command`.
+/// `if` rather than `&&` so a non-terminal shell does not start with a
+/// non-zero `$?` for the developer's prompt to report as a failure.
 pub fn banner_command(text: &str) -> String {
-    format!("printf '%s\\n' {}", shell_quote(text))
+    format!("if [ -t 1 ]; then printf '%s\\n' {}; fi", shell_quote(text))
 }
 
 /// Prefixes `PS1` from a `PROMPT_COMMAND` hook rather than assigning it once.
@@ -110,6 +113,13 @@ mod tests {
     #[test]
     fn survives_a_developer_with_no_bashrc() {
         assert!(rcfile(Path::new("/Users/ada"), "", "").contains(r#"[ -f "/Users/ada/.bashrc" ]"#));
+    }
+
+    #[test]
+    fn the_banner_only_prints_to_a_terminal() {
+        let command = banner_command("hi");
+        assert!(command.starts_with("if [ -t 1 ]; then "), "{command}");
+        assert!(command.ends_with("; fi"), "{command}");
     }
 
     #[test]

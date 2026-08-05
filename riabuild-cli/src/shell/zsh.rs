@@ -31,8 +31,15 @@ export ZDOTDIR="{user}"
 ///
 /// `-r` rather than `-P`: the text carries raw ANSI escapes, and prompt
 /// expansion would try to read `%` sequences inside them.
+///
+/// Guarded on stdout being a terminal. `zsh -i -c '…'` is interactive, so it
+/// reads this file, but its output is usually being captured — and riabuild
+/// exists to run Claude Code, which shells out constantly. An unguarded banner
+/// prepends itself to whatever that command was supposed to return. `if`
+/// rather than `&&` so a shell that is not a terminal does not start life with
+/// a non-zero `$?` for a prompt to report.
 pub fn banner_command(text: &str) -> String {
-    format!("print -r -- {}", shell_quote(text))
+    format!("if [[ -t 1 ]]; then print -r -- {}; fi", shell_quote(text))
 }
 
 /// Prefixes the prompt through a `precmd` hook rather than assigning `PROMPT`
@@ -159,5 +166,14 @@ mod tests {
     fn banner_text_is_quoted() {
         let command = banner_command("it's active");
         assert!(command.contains(r"'\''"), "{command}");
+    }
+
+    #[test]
+    fn the_banner_only_prints_to_a_terminal() {
+        // `zsh -i -c 'git rev-parse HEAD'` is interactive but piped. Without
+        // this guard the banner lands on stdout ahead of the real output.
+        let command = banner_command("hi");
+        assert!(command.starts_with("if [[ -t 1 ]]; then "), "{command}");
+        assert!(command.ends_with("; fi"), "{command}");
     }
 }

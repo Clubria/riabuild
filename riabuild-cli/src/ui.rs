@@ -21,6 +21,19 @@ fn cover(previous: usize, line: &str) -> usize {
     previous.saturating_sub(line.chars().count())
 }
 
+/// `1 commit`, `2 commits`.
+///
+/// Regular English `-s` only, which covers every noun riabuild counts. Worth a
+/// function because `commit(s)` is exactly the sort of detail that makes a
+/// tool read as unfinished, and it had spread to four separate messages.
+pub fn plural(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("{count} {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
+}
+
 /// A count of minutes as something a person can judge at a glance.
 ///
 /// A brokered credential lasts around a month, and "43199 more minute(s)" is a
@@ -39,10 +52,7 @@ pub fn duration_words(minutes: u64) -> String {
     parts
         .iter()
         .filter(|(count, _)| *count > 0)
-        .map(|(count, unit)| {
-            let plural = if *count == 1 { "" } else { "s" };
-            format!("{count} {unit}{plural}")
-        })
+        .map(|(count, unit)| plural(*count, unit))
         .collect::<Vec<_>>()
         .join(" ")
 }

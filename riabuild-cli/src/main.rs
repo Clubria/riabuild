@@ -171,11 +171,17 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
 
     if ctx.dry_run {
         ctx.ui.info("");
-        ctx.ui.info(&format!(
-            "{} item(s) already correct, {} would be set up.",
-            outcome.satisfied.len(),
-            outcome.applied.len()
-        ));
+        // "9 item(s) already correct, 0 would be set up." made a fine machine
+        // read like a to-do list. The all-clear deserves to say so plainly.
+        ctx.ui.info(&if outcome.applied.is_empty() {
+            "Everything on this machine is already set up.".to_string()
+        } else {
+            format!(
+                "{} already correct, {} still to set up.",
+                ui::plural(outcome.satisfied.len() as u64, "item"),
+                outcome.applied.len(),
+            )
+        });
         return Ok(0);
     }
 

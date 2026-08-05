@@ -107,7 +107,10 @@ impl Task for Project {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            ctx.ui.note(&format!("Cloning {} …", org.repo_slug));
+            // No space before the ellipsis — every other progress line in
+            // riabuild is written "Downloading Node 22…", and this one sat
+            // among them looking misaligned.
+            ctx.ui.note(&format!("Cloning {}…", org.repo_slug));
             // Through `gh` so the developer's existing GitHub auth is reused and
             // nobody has to set up SSH keys to get started.
             let output = ctx.runner.run(

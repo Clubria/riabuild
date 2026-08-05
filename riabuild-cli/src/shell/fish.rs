@@ -25,8 +25,9 @@ end
     )
 }
 
+/// Guarded on stdout being a terminal — see the note in `zsh::banner_command`.
 pub fn banner_command(text: &str) -> String {
-    format!("echo {}", shell_quote(text))
+    format!("if isatty stdout\n    echo {}\nend", shell_quote(text))
 }
 
 /// Wraps the developer's `fish_prompt` instead of replacing it.
@@ -39,6 +40,14 @@ pub fn banner_command(text: &str) -> String {
 /// The `_riabuild_inner_prompt` guard is load-bearing. Sourcing this file twice
 /// without it would copy the wrapper onto itself, and the prompt would recurse
 /// until fish gave up.
+///
+/// Known limitation: when the whole prompt is wider than the terminal, fish
+/// truncates it from the left and replaces the overflow with `…`, so the
+/// riabuild prefix is the first thing to go. Verified as a width effect alone —
+/// the same prompt at 200 columns keeps it. Nothing to do about it short of
+/// moving the marker to `fish_right_prompt`, which would be inconsistent with
+/// the other two shells and truncates in its own way; at that width fish is
+/// already mangling the developer's own prompt.
 pub fn prompt_command(colour: bool) -> String {
     let prefix = if colour {
         format!(
@@ -123,6 +132,13 @@ mod tests {
         let generated = config(Path::new("/Users/ada/.config"), "", "");
         assert!(generated.contains("if test -f"));
         assert!(generated.contains("end"));
+    }
+
+    #[test]
+    fn the_banner_only_prints_to_a_terminal() {
+        let command = banner_command("hi");
+        assert!(command.starts_with("if isatty stdout\n"), "{command}");
+        assert!(command.ends_with("\nend"), "{command}");
     }
 
     #[test]
