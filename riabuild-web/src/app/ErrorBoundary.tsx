@@ -1,5 +1,5 @@
 import { Component, ErrorInfo, ReactNode } from "react";
-import { Button, Panel } from "../ui";
+import { Button, Panel, Screen } from "../ui";
 
 type Props = {
   children: ReactNode;
@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
     if (error === null) return this.props.children;
 
     const scope = this.props.label;
-    return (
+    const panel = (
       <Panel
         title={scope === undefined ? "core dumped" : `core dumped — ${scope}`}
         index="err"
@@ -70,6 +70,17 @@ export class ErrorBoundary extends Component<Props, State> {
           )}
         </div>
       </Panel>
+    );
+
+    // A panel wrapping one failed section is already inside the terminal. The
+    // top-level boundary is not — whatever threw took the frame with it — so it
+    // draws its own, or the failure screen arrives as bare text flush to the
+    // edge of a black page and looks like a second, worse bug.
+    if (scope !== undefined) return panel;
+    return (
+      <Screen title="riabuild" subtitle="error" statusLeft={<span>halted</span>}>
+        <div className="mx-auto max-w-xl py-4">{panel}</div>
+      </Screen>
     );
   }
 }

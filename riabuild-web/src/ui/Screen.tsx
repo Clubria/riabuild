@@ -36,7 +36,10 @@ export function Screen({
           active={activeTab}
           actions={actions}
         />
-        <main className="min-w-0 flex-1 overflow-x-hidden px-3 py-5 sm:px-5 sm:py-6">
+        {/* Deliberately not `overflow-x-hidden`: clipping here would hide
+            exactly the layout bugs the visual suite exists to catch. Content
+            that is too wide must scroll its own container instead. */}
+        <main className="min-w-0 flex-1 px-3 py-5 sm:px-5 sm:py-6">
           {children}
         </main>
         <StatusBar left={statusLeft} right={statusRight} />

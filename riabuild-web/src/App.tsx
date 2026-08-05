@@ -136,9 +136,16 @@ function StatusLeft() {
   return (
     <>
       {viewer !== null && (
-        <span className="text-fg-dim">@{viewer.githubLogin}</span>
+        // A GitHub login can be 39 characters and the status bar is the
+        // narrowest thing on the page; without wrapping it pushes the document
+        // sideways at 380px.
+        <span className="min-w-0 text-fg-dim wrap-value">
+          @{viewer.githubLogin}
+        </span>
       )}
-      {viewer !== null && <span className="text-accent">{viewer.role}</span>}
+      {viewer !== null && (
+        <span className="min-w-0 text-accent wrap-value">{viewer.role}</span>
+      )}
       {membership.status === "member" && <Dot tone="ok" label={membership.org} />}
       {membership.status === "checking" && (
         <Dot tone="muted" label="checking github" />

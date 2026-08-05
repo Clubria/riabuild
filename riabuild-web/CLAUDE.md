@@ -9,10 +9,46 @@ Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 ## Commands
 
 ```sh
-pnpm dev      # convex dev + vite
-pnpm lint     # tsc + eslint, zero warnings tolerated
+pnpm dev       # convex dev + vite
+pnpm lint      # tsc -b + eslint, zero warnings tolerated
+pnpm test      # vitest — Convex functions
+pnpm ui:check  # Playwright visual suite, all scenarios × 3 viewports
 pnpm build
 ```
+
+## The dashboard
+
+The UI is a fake TUI: one framed terminal, dark only, built entirely from the component
+library in `src/ui/`. Two skills are not optional here:
+
+- **`.claude/skills/riabuild-ui/SKILL.md`** — read before building or changing any UI.
+  The visual system, the component library, and the rule that the page handles no
+  keystrokes and never advertises a key it does not handle.
+- **`.claude/skills/visual-testing/SKILL.md`** — read before claiming any UI works. The
+  scenario fixtures and the look-at-every-screenshot loop.
+
+Design: `../docs/superpowers/specs/2026-08-05-tui-console-design.md`.
+
+**Components never call `useQuery`.** `src/data/convexProvider.tsx` is the only file in
+`src/` that may import from `convex/react`; everything else reads `useData()`. That
+boundary is what lets `?scenario=<name>` render any data state from fixtures. Check it:
+
+```sh
+grep -rn "convex/react" src/ --include=*.tsx | grep -v data/convexProvider   # must be empty
+```
+
+## Local development
+
+Two deployment environment variables unlock local testing. **Production sets neither**,
+and each is checked on the deployment rather than in the client:
+
+| Variable | Effect |
+|---|---|
+| `RIABUILD_DEV_AUTH=1` | registers an `Anonymous` sign-in provider and makes the GitHub org check return `member` |
+| `RIABUILD_DEV_SEED=1` | allows `devSeed:seedForE2e` and `devSeed:seedOrgForDev` |
+
+`RIABUILD_DEV_AUTH` adds a way to authenticate and no way to authorize — role still comes
+from `RIABUILD_BOOTSTRAP_LEADS`, and `members.role` gates everything that matters.
 
 ## Convex conventions
 

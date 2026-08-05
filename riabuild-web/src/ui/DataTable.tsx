@@ -38,7 +38,23 @@ export function DataTable<T>({
   if (rows.length === 0) return <>{empty}</>;
 
   return (
-    <div className="-mx-3 overflow-x-auto px-3 sm:mx-0 sm:px-0">
+    // `tabIndex` is not decoration: a region that scrolls with a mouse and not
+    // with a keyboard strands anyone who does not use one. The browser handles
+    // the arrow keys once the region is focusable — the page still listens for
+    // no keystrokes of its own.
+    <div
+      // `contain: paint` is not decoration. `overflow-x: auto` alone sizes and
+      // scrolls this box correctly, but the overflowing table still extends the
+      // *document's* scrollable region — the page picks up a horizontal
+      // scrollbar for a table that is already scrolling itself. Declaring that
+      // descendants must not paint outside this box is what stops it.
+      // Measured, not guessed: without it the document is 957px wide at a
+      // 768px viewport; with it, 768px.
+      className="-mx-3 overflow-x-auto px-3 [contain:paint] sm:mx-0 sm:px-0"
+      tabIndex={0}
+      role="region"
+      aria-label={caption}
+    >
       <table className="w-full border-collapse text-left">
         <caption className="sr-only">{caption}</caption>
         <thead>
@@ -83,7 +99,10 @@ export function DataTable<T>({
               ))}
               {renderActions !== undefined && (
                 <td className="py-2 text-right whitespace-nowrap">
-                  <span className="inline-flex flex-wrap justify-end gap-1.5">
+                  {/* Never wraps. A `grow` column takes all the slack, so a
+                      wrapping action cell stacks its controls into a ragged
+                      column even at 1440px. The row scrolls instead. */}
+                  <span className="inline-flex flex-nowrap items-center justify-end gap-1.5">
                     {renderActions(row)}
                   </span>
                 </td>

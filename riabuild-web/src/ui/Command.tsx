@@ -14,11 +14,9 @@ type CopyState = "idle" | "copied" | "failed";
 export function Command({
   command,
   prompt = "$",
-  multiline = false,
 }: {
   command: string;
   prompt?: string;
-  multiline?: boolean;
 }) {
   const [state, setState] = useState<CopyState>("idle");
 
@@ -39,23 +37,28 @@ export function Command({
 
   return (
     <div className="flex items-stretch border border-rule bg-bg-sunk">
-      <code
-        className={`min-w-0 flex-1 px-2.5 py-2 text-fg ${
-          multiline ? "whitespace-pre-wrap wrap-value" : "overflow-x-auto whitespace-pre"
-        }`}
-      >
+      {/* Wraps rather than scrolls. A real terminal wraps a long command too,
+          and a horizontally scrolling code block hides the end of the very
+          string the reader came to copy — from a keyboard user entirely, unless
+          the region is made a tab stop it has no reason to be. Newlines survive
+          because `pre-wrap` keeps them. */}
+      <code className="min-w-0 flex-1 px-2.5 py-2 whitespace-pre-wrap text-fg wrap-value">
         <span aria-hidden="true" className="mr-2 text-fg-faint select-none">
           {prompt}
         </span>
         {command}
       </code>
-      <span className="flex shrink-0 items-center border-l border-rule px-1.5">
+      <span className="flex shrink-0 items-start border-l border-rule px-1.5 py-1.5">
         <Button
           variant="quiet"
           onClick={copy}
           aria-label={`Copy command: ${command}`}
         >
-          {state === "copied" ? "copied" : state === "failed" ? "copy failed" : "copy"}
+          {state === "copied"
+            ? "copied"
+            : state === "failed"
+              ? "copy failed"
+              : "copy"}
         </Button>
       </span>
     </div>

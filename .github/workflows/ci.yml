@@ -67,6 +67,68 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Fixtures describe an org that does not exist and a dev sign-in that must
+      # never ship. They are supposed to fall out with the dead
+      # `import.meta.env.DEV` branch — this proves they did.
+      - name: No fixtures in the production bundle
+        run: |
+          set -euo pipefail
+          if grep -rlE 'Wolfeschlegelsteinhausenbergerdorff|Fixture scenario|clubria\.test' dist/assets/; then
+            echo "::error::Dev fixtures leaked into the production bundle"
+            exit 1
+          fi
+          echo "No fixture data in dist/."
+
+  ui:
+    name: riabuild-web UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: riabuild-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Structural assertions only — horizontal overflow, clipping, focus
+      # visibility, axe, console errors. Deliberately no committed pixel
+      # baselines: font rasterisation differs between a laptop and this
+      # container, so a pixel gate would fail forever for reasons unrelated to
+      # any change. Judging pixels is the human-in-the-loop step documented in
+      # .claude/skills/visual-testing/SKILL.md.
+      - name: Visual suite
+        run: pnpm ui:check
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots
+          path: riabuild-web/e2e/__screens__/
+          if-no-files-found: warn
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-traces
+          path: riabuild-web/e2e/__results__/
+          if-no-files-found: ignore
+
   # The release workflow renders this template only after the GitHub release is
   # already published, so a template that does not parse would leave a released
   # version with a stale tap. Checking it on every pull request is what keeps

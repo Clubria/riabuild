@@ -61,7 +61,7 @@ export function Button({
 }) {
   const spinner = useSpinner(pending);
   const className =
-    "inline-flex items-center gap-1.5 border px-2.5 py-1 text-xs tracking-wider uppercase whitespace-nowrap no-underline transition-colors disabled:cursor-not-allowed disabled:opacity-45 " +
+    "inline-flex max-w-full items-center gap-1.5 border px-2.5 py-1 text-xs tracking-wider uppercase no-underline transition-colors disabled:cursor-not-allowed disabled:opacity-45 " +
     VARIANT[variant];
 
   const label = (
@@ -74,7 +74,9 @@ export function Button({
           {spinner}
         </span>
       )}
-      <span>{pending && pendingLabel !== undefined ? pendingLabel : children}</span>
+      <span className="min-w-0 wrap-value">
+        {pending && pendingLabel !== undefined ? pendingLabel : children}
+      </span>
       <span aria-hidden="true" className="opacity-50">
         ]
       </span>

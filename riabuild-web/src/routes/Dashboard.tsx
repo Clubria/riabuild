@@ -60,7 +60,9 @@ export function Dashboard({ member }: { member: Member }) {
         </p>
         <p className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-fg-dim">signed in as</span>
-          <span className="text-fg">@{member.githubLogin}</span>
+          <span className="min-w-0 text-fg wrap-value">
+            @{member.githubLogin}
+          </span>
           <Badge tone={member.role === "candidate" ? "muted" : "accent"}>
             {member.role}
           </Badge>

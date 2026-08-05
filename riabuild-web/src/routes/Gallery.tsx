@@ -151,11 +151,7 @@ export function Gallery() {
         <Command command="riabuild" />
         <Command command="brew install clubria/tap/riabuild" />
         <Command command={`riabuild --flag ${"x".repeat(200)}`} />
-        <Command
-          multiline
-          command={"line one\nline two\nline three"}
-          prompt="&gt;"
-        />
+        <Command command={"line one\nline two\nline three"} prompt=">" />
       </Section>
 
       <Section name="KeyValue">

@@ -33,7 +33,11 @@ export function Panel({
   return (
     <section
       id={id}
-      className={`relative border ${BORDER_TONE[tone]} ${
+      // `min-w-0` is load-bearing: a flex item defaults to `min-width: auto`,
+      // so without it a DataTable's `overflow-x-auto` wrapper widens the panel
+      // instead of scrolling, and a 60-character login pushes the whole
+      // document sideways at 380px.
+      className={`relative min-w-0 border ${BORDER_TONE[tone]} ${
         dense ? "px-3 py-3" : "px-3 py-4 sm:px-5 sm:py-5"
       } ${labelled ? "mt-3" : ""}`}
     >
@@ -42,6 +46,11 @@ export function Panel({
           {index !== undefined && (
             <span className={TEXT_TONE[tone === "default" ? "accent" : tone]}>
               {index}
+              {/* Separated, or `lead` + `members and roles` reads as one
+                  phrase rather than a label and a title. */}
+              <span aria-hidden="true" className="ml-2 text-fg-faint">
+                ·
+              </span>
             </span>
           )}
           <span className={tone === "default" ? "text-fg-dim" : TEXT_TONE[tone]}>
