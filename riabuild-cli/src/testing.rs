@@ -28,22 +28,34 @@ pub fn org_config() -> OrgConfig {
 }
 
 pub fn test_ctx() -> (Ctx, TempDir) {
-    build(
+    let (ctx, home, _) = build(
         FakeRunner::new(),
         MemoryKeychain::with_token("rb_test_token"),
-    )
+    );
+    (ctx, home)
 }
 
 pub fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
+    let (ctx, home, _) = ctx_and_runner(runner);
+    (ctx, home)
+}
+
+/// Like `ctx_with`, but hands back the runner as well.
+///
+/// Some things a task must get right are only visible in *what it ran*: that a
+/// developer whose machine is already fine is not sent through a browser
+/// sign-in, for instance, cannot be seen in the returned `Status` at all.
+pub fn ctx_and_runner(runner: FakeRunner) -> (Ctx, TempDir, Arc<FakeRunner>) {
     build(runner, MemoryKeychain::with_token("rb_test_token"))
 }
 
-fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir) {
+fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, Arc<FakeRunner>) {
     let home = TempDir::new().expect("tempdir");
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
     std::fs::create_dir_all(paths.root()).expect("create ~/.riabuild");
 
-    let runner: Arc<dyn CommandRunner> = Arc::new(runner);
+    let fake = Arc::new(runner);
+    let runner: Arc<dyn CommandRunner> = fake.clone();
     let keychain: Arc<dyn Keychain> = Arc::new(keychain);
 
     let ctx = Ctx {
@@ -62,7 +74,7 @@ fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir) {
         notes: Vec::new(),
         dry_run: false,
     };
-    (ctx, home)
+    (ctx, home, fake)
 }
 
 /// Writes a file and every directory above it.

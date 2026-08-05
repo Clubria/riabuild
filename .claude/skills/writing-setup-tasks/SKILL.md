@@ -96,5 +96,13 @@ developer decide. `repo_status` is deliberately report-only for this reason.
 **Existence checks standing in for health checks.** The most common cause of "riabuild
 said everything was fine but nothing works."
 
+**Testing a proxy instead of the capability.** `gh auth status` listing `read:org` is not
+the same fact as "this token can read org membership": GitHub accepts five different
+scopes there and folds `read:org` into `admin:org`. So the check rejected machines that
+worked, and the repair it prescribed — `gh auth refresh -s read:org` — could never make
+the string appear, leaving `riabuild` telling the developer to try again, forever. When a
+single API call answers the question directly, that call **is** the check. A check that
+cannot be satisfied by the `apply()` that follows it is worse than no check.
+
 **Reaching for the shell.** If a task needs a login shell to work, the design is wrong —
 that is why riabuild owns the Node tarball instead of driving nvm.

@@ -49,7 +49,7 @@ a task never records a success it has not verified.
 | # | Task | Checks |
 |---|---|---|
 | 1 | `login` | a live riabuild session, refreshed before it expires |
-| 2 | `github_cli` | `gh` present, signed in, carrying `read:org`, and in the Clubria org |
+| 2 | `github_cli` | `gh` present, signed in, and able to read your Clubria membership |
 | 3 | `infisical_cli` | `infisical` present — **no token is stored** |
 | 4 | `toolchain` | riabuild-owned Node and pnpm at the versions the repo pins |
 | 5 | `project` | the checkout exists and `origin` really is our repo |

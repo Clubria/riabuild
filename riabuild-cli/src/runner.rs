@@ -163,7 +163,7 @@ impl FakeRunner {
         self.calls.lock().unwrap().clone()
     }
 
-    fn lookup(&self, invocation: &str) -> CommandOutput {
+    fn stubbed(&self, invocation: &str) -> Option<CommandOutput> {
         let mut best: Option<(&String, &CommandOutput)> = None;
         for (key, value) in &self.responses {
             if invocation == key || invocation.starts_with(&format!("{key} ")) {
@@ -174,11 +174,14 @@ impl FakeRunner {
             }
         }
         best.map(|(_, output)| output.clone())
-            .unwrap_or(CommandOutput {
-                code: Some(127),
-                stdout: String::new(),
-                stderr: format!("fake runner: no stub for `{invocation}`"),
-            })
+    }
+
+    fn lookup(&self, invocation: &str) -> CommandOutput {
+        self.stubbed(invocation).unwrap_or(CommandOutput {
+            code: Some(127),
+            stdout: String::new(),
+            stderr: format!("fake runner: no stub for `{invocation}`"),
+        })
     }
 }
 
@@ -193,11 +196,17 @@ impl CommandRunner for FakeRunner {
 
     fn run_interactive(&self, program: &str, args: &[&str], _options: &RunOptions) -> Result<i32> {
         let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
-        Ok(0)
+        let invocation = invocation.trim_end().to_string();
+        self.calls.lock().unwrap().push(invocation.clone());
+        // A stub's exit code applies here too: interactive commands fail as
+        // well — a developer who abandons a device-code prompt leaves `gh`
+        // exiting non-zero — and a task that ignores that reports a sign-in
+        // it never got. Unstubbed commands still succeed, so tests that only
+        // care about which commands ran need not script every prompt.
+        Ok(self
+            .stubbed(&invocation)
+            .and_then(|output| output.code)
+            .unwrap_or(0))
     }
 
     fn which(&self, program: &str) -> Option<PathBuf> {
