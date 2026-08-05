@@ -200,9 +200,10 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
     Err(anyhow!("no reply from the browser within three minutes"))
 }
 
-fn device_label(runner: &dyn CommandRunner) -> String {
+async fn device_label(runner: &dyn CommandRunner) -> String {
     let hostname = runner
         .run("hostname", &[], &RunOptions::default())
+        .await
         .ok()
         .filter(|output| output.ok())
         .map(|output| output.trimmed().to_string())
@@ -210,7 +211,7 @@ fn device_label(runner: &dyn CommandRunner) -> String {
     hostname.unwrap_or_else(|| "this machine".to_string())
 }
 
-fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
+async fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -218,6 +219,7 @@ fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
     };
     runner
         .run(opener, &[url], &RunOptions::default())
+        .await
         .map(|output| output.ok())
         .unwrap_or(false)
 }
@@ -230,7 +232,7 @@ struct TokenResponse {
 
 /// Runs the whole flow and returns the session token. The caller stores it in
 /// the keychain; it is never written to `~/.riabuild`.
-pub fn login(
+pub async fn login(
     api: &ApiClient,
     runner: &dyn CommandRunner,
     ui: &Ui,
@@ -247,11 +249,11 @@ pub fn login(
     let port = listener.local_addr()?.port();
 
     let flow = LoginFlow::new();
-    let label = device_label(runner);
+    let label = device_label(runner).await;
     let url = flow.authorize_url(web_url, port, &label, version);
 
     ui.heading("Signing this machine in to riabuild");
-    if !open_browser(runner, &url) {
+    if !open_browser(runner, &url).await {
         ui.note("Could not open your browser. Open this link yourself:");
     }
     ui.note(&url);

@@ -191,8 +191,8 @@ fn interpret<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_403_is_never_treated_as_a_login_problem() {
+    #[tokio::test]
+    async fn a_403_is_never_treated_as_a_login_problem() {
         // Re-authenticating after losing org membership would succeed and loop.
         let lost_org = ApiError {
             status: 403,

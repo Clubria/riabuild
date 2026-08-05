@@ -40,7 +40,7 @@ async fn main() {
     let cli = Cli::parse();
     let quiet = cli.quiet;
 
-    match run(cli) {
+    match run(cli).await {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             let ui = Ui::new(quiet);
@@ -67,7 +67,7 @@ async fn main() {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
@@ -99,20 +99,20 @@ fn run(cli: Cli) -> Result<i32> {
     }
 
     match cli.command {
-        Some(Command::Logout) => return logout(&mut ctx),
+        Some(Command::Logout) => return logout(&mut ctx).await,
         Some(Command::Env) => return print_env(&ctx),
-        Some(Command::Shell) => return open_shell(&mut ctx),
+        Some(Command::Shell) => return open_shell(&mut ctx).await,
         Some(Command::Login) => {
             use tasks::Task;
-            connect(&mut ctx)?;
-            tasks::login::Login.apply(&mut ctx)?;
+            connect(&mut ctx).await?;
+            tasks::login::Login.apply(&mut ctx).await?;
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
         Some(Command::Status) | None => {}
     }
 
-    provision(&mut ctx, &cli)
+    provision(&mut ctx, &cli).await
 }
 
 /// Asks riabuild-web who this machine belongs to, before any task runs.
@@ -120,8 +120,8 @@ fn run(cli: Cli) -> Result<i32> {
 /// A missing or expired session is not an error here — the `login` task exists
 /// to fix exactly that. Anything else (suspended, removed from the org) is
 /// surfaced immediately, because no amount of provisioning will help.
-fn connect(ctx: &mut Ctx) -> Result<()> {
-    let Some(token) = ctx.keychain.get()? else {
+async fn connect(ctx: &mut Ctx) -> Result<()> {
+    let Some(token) = ctx.keychain.get().await? else {
         return Ok(());
     };
     ctx.api.set_token(Some(token));
@@ -142,9 +142,9 @@ fn connect(ctx: &mut Ctx) -> Result<()> {
     }
 }
 
-fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
+async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.ui.banner("Clubria");
-    connect(ctx)?;
+    connect(ctx).await?;
     describe_session(ctx);
 
     if let Some(org) = &ctx.org {
@@ -156,14 +156,14 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         ) {
             update::Action::Continue => {}
             update::Action::Upgrade { to, mandatory } => {
-                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory)?;
+                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory).await?;
             }
         }
     }
 
     ctx.ui.heading("Checking this machine");
     let registry = tasks::registry();
-    let outcome = engine::run_all(&registry, ctx)?;
+    let outcome = engine::run_all(&registry, ctx).await?;
 
     shims::write_all(ctx)?;
 
@@ -190,7 +190,7 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     if cli.no_shell {
         return Ok(0);
     }
-    open_shell(ctx)
+    open_shell(ctx).await
 }
 
 /// Who riabuild thinks this machine belongs to, and where the token lives.
@@ -240,7 +240,7 @@ fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
     }
 }
 
-fn open_shell(ctx: &mut Ctx) -> Result<i32> {
+async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     if shell::already_inside() {
         // Nesting would stack PATH entries and leave the developer two `exit`s
         // away from their own terminal.
@@ -250,11 +250,11 @@ fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     }
     ctx.ui.info("");
     ctx.ui.info(shell::BANNER);
-    shell::spawn(ctx)
+    shell::spawn(ctx).await
 }
 
-fn logout(ctx: &mut Ctx) -> Result<i32> {
-    ctx.keychain.delete()?;
+async fn logout(ctx: &mut Ctx) -> Result<i32> {
+    ctx.keychain.delete().await?;
     ctx.config.session_expires_at = None;
     ctx.config.save(ctx.paths.as_ref())?;
     ctx.state.forget("login");

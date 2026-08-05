@@ -99,7 +99,7 @@ pub fn already_inside() -> bool {
     std::env::var("RIABUILD_SHELL").is_ok_and(|value| value == "1")
 }
 
-pub fn spawn(ctx: &mut Ctx) -> Result<i32> {
+pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let shell = Shell::detect();
     let env = environment(ctx);
 
@@ -120,6 +120,7 @@ pub fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     ctx.runner
         .run_interactive(&shell.program(), &arg_refs, &options)
+        .await
 }
 
 #[cfg(test)]

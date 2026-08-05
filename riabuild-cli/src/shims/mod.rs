@@ -136,9 +136,9 @@ mod tests {
     /// Ignored by default because it needs `claude` on PATH; run it with
     /// `cargo test -- --ignored` on a machine that has it, and before every
     /// Claude Code version bump.
-    #[test]
+    #[tokio::test]
     #[ignore = "requires Claude Code installed; pins undocumented behaviour"]
-    fn claude_config_dir_smoke() {
+    async fn claude_config_dir_smoke() {
         use crate::runner::{CommandRunner, RealRunner, RunOptions};
         let runner = RealRunner;
         let Some(_) = runner.which("claude") else {
@@ -161,6 +161,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .expect("claude --version");
 
         assert!(output.ok(), "claude rejected CLAUDE_CONFIG_DIR: {output:?}");

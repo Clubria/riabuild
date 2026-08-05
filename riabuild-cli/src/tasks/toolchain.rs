@@ -12,6 +12,7 @@ use crate::shims;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::path::Path;
 
 /// Used when the repo pins nothing. Kept current with the repo's own `.nvmrc`.
@@ -50,6 +51,7 @@ pub fn desired_pnpm(project: Option<&Path>) -> String {
         .unwrap_or_else(|| FALLBACK_PNPM.to_string())
 }
 
+#[async_trait]
 impl Task for Toolchain {
     fn id(&self) -> TaskId {
         "toolchain"
@@ -67,7 +69,7 @@ impl Task for Toolchain {
         &["project"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let project = ctx.project_dir();
         let node_version = desired_node(project.as_deref());
         let pnpm_version = desired_pnpm(project.as_deref());
@@ -79,9 +81,10 @@ impl Task for Toolchain {
             )));
         }
 
-        let reported =
-            ctx.runner
-                .run(&node_bin.to_string_lossy(), &["-v"], &RunOptions::default())?;
+        let reported = ctx
+            .runner
+            .run(&node_bin.to_string_lossy(), &["-v"], &RunOptions::default())
+            .await?;
         if !version::same(reported.trimmed(), &node_version) {
             return Ok(Status::needs(format!(
                 "the Node in ~/.riabuild reports {} but the repo asks for {node_version}",
@@ -93,9 +96,10 @@ impl Task for Toolchain {
         if !pnpm_bin.exists() {
             return Ok(Status::needs("pnpm is not installed yet"));
         }
-        let reported =
-            ctx.runner
-                .run(&pnpm_bin.to_string_lossy(), &["-v"], &RunOptions::default())?;
+        let reported = ctx
+            .runner
+            .run(&pnpm_bin.to_string_lossy(), &["-v"], &RunOptions::default())
+            .await?;
         if !version::same(reported.trimmed(), &pnpm_version) {
             return Ok(Status::needs(format!(
                 "pnpm reports {} but the repo asks for {pnpm_version}",
@@ -106,7 +110,7 @@ impl Task for Toolchain {
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let project = ctx.project_dir();
         let node_version = desired_node(project.as_deref());
         let pnpm_version = desired_pnpm(project.as_deref());
@@ -235,9 +239,9 @@ mod tests {
     /// else catches a release-layout change: pnpm 11 renamed its macOS asset
     /// and stopped shipping a bare executable at all, and the first symptom was
     /// a 404 on a developer's first run.
-    #[test]
+    #[tokio::test]
     #[ignore = "downloads ~50 MB from github.com; pins pnpm's release layout"]
-    fn the_pinned_pnpm_downloads_and_runs() {
+    async fn the_pinned_pnpm_downloads_and_runs() {
         use crate::runner::{CommandRunner, RealRunner};
 
         let asset = download::pnpm_asset(FALLBACK_PNPM).unwrap();
@@ -255,19 +259,23 @@ mod tests {
 
         let output = RealRunner
             .run(&shim.to_string_lossy(), &["-v"], &RunOptions::default())
+            .await
             .expect("pnpm -v");
         assert!(output.ok(), "the shim could not start pnpm: {output:?}");
         assert_eq!(output.trimmed(), FALLBACK_PNPM);
     }
 
-    #[test]
-    fn a_missing_node_is_detected() {
+    #[tokio::test]
+    async fn a_missing_node_is_detected() {
         let (ctx, _home) = ctx_with(FakeRunner::new());
-        assert!(matches!(Toolchain.check(&ctx).unwrap(), Status::Needs(_)));
+        assert!(matches!(
+            Toolchain.check(&ctx).await.unwrap(),
+            Status::Needs(_)
+        ));
     }
 
-    #[test]
-    fn a_node_of_the_wrong_version_is_detected() {
+    #[tokio::test]
+    async fn a_node_of_the_wrong_version_is_detected() {
         // The case an existence check misses: the directory is there, the binary
         // runs, and it is the wrong Node.
         let (ctx, home) = ctx_with(FakeRunner::new());
@@ -282,12 +290,12 @@ mod tests {
         let (mut ctx, _home2) = ctx_with(runner);
         // Point the second context at the same tree.
         ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
-        let status = Toolchain.check(&ctx).unwrap();
+        let status = Toolchain.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("22.23.1"), "{status:?}");
     }
 
-    #[test]
-    fn a_complete_toolchain_is_satisfied() {
+    #[tokio::test]
+    async fn a_complete_toolchain_is_satisfied() {
         let (ctx, home) = ctx_with(FakeRunner::new());
         let node_bin = ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node");
         let pnpm_bin = ctx.paths.bin_dir().join("pnpm");
@@ -311,6 +319,6 @@ mod tests {
             );
         let (mut ctx, _home2) = ctx_with(runner);
         ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
-        assert_eq!(Toolchain.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(Toolchain.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 }

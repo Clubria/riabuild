@@ -75,7 +75,7 @@ pub fn topological_order(tasks: &[Box<dyn Task>]) -> Result<Vec<usize>> {
 }
 
 /// Decides whether a task needs to run, without running anything.
-pub fn status_for(task: &dyn Task, ctx: &Ctx, applied: &HashSet<TaskId>) -> Result<Status> {
+pub async fn status_for(task: &dyn Task, ctx: &Ctx, applied: &HashSet<TaskId>) -> Result<Status> {
     let record = ctx.state.tasks.get(task.id());
 
     let Some(record) = record else {
@@ -95,17 +95,17 @@ pub fn status_for(task: &dyn Task, ctx: &Ctx, applied: &HashSet<TaskId>) -> Resu
         }
     }
 
-    task.check(ctx)
+    task.check(ctx).await
 }
 
-pub fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> {
+pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> {
     let order = topological_order(tasks)?;
     let mut applied: HashSet<TaskId> = HashSet::new();
     let mut outcome = Outcome::default();
 
     for position in order {
         let task = tasks[position].as_ref();
-        let status = status_for(task, ctx, &applied)?;
+        let status = status_for(task, ctx, &applied).await?;
 
         let reason = match status {
             Status::Satisfied => {
@@ -127,10 +127,10 @@ pub fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> {
         }
 
         ctx.ui.working(task.title(), &reason.describe());
-        task.apply(ctx)?;
+        task.apply(ctx).await?;
 
         // The whole point: never record a success we have not verified.
-        match task.check(ctx)? {
+        match task.check(ctx).await? {
             Status::Satisfied => {}
             Status::Needs(still) => {
                 return Err(Failure::new(
@@ -162,6 +162,7 @@ mod tests {
     use super::*;
     use crate::tasks::registry;
     use crate::testing::test_ctx;
+    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
     struct Fake {
@@ -185,6 +186,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Task for Fake {
         fn id(&self) -> TaskId {
             self.id
@@ -198,14 +200,14 @@ mod tests {
         fn depends_on(&self) -> &[TaskId] {
             &self.deps
         }
-        fn check(&self, _ctx: &Ctx) -> Result<Status> {
+        async fn check(&self, _ctx: &Ctx) -> Result<Status> {
             let mut checks = self.checks.lock().unwrap();
             if checks.is_empty() {
                 return Ok(Status::Satisfied);
             }
             Ok(checks.remove(0))
         }
-        fn apply(&self, _ctx: &mut Ctx) -> Result<()> {
+        async fn apply(&self, _ctx: &mut Ctx) -> Result<()> {
             *self.applies.lock().unwrap() += 1;
             Ok(())
         }
@@ -249,8 +251,8 @@ mod tests {
         assert!(error.contains("not registered"), "{error}");
     }
 
-    #[test]
-    fn a_first_run_applies_everything_and_records_it() {
+    #[tokio::test]
+    async fn a_first_run_applies_everything_and_records_it() {
         let (mut ctx, _home) = test_ctx();
         // Only one status is queued: with no record in state.json the engine
         // reports NeverRun without asking `check()` at all, so the single call
@@ -258,41 +260,41 @@ mod tests {
         let tasks: Vec<Box<dyn Task>> =
             vec![Box::new(Fake::new("a", vec![], vec![Status::Satisfied]))];
 
-        let outcome = run_all(&tasks, &mut ctx).unwrap();
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(outcome.applied, vec!["a"]);
         assert_eq!(ctx.state.tasks["a"].version, 1);
         assert_eq!(ctx.state.tasks["a"].last_reason, "never_run");
     }
 
-    #[test]
-    fn a_satisfied_machine_is_left_alone() {
+    #[tokio::test]
+    async fn a_satisfied_machine_is_left_alone() {
         let (mut ctx, _home) = test_ctx();
         ctx.state.mark_satisfied("a", 1, "never_run");
         let task = Fake::new("a", vec![], vec![Status::Satisfied]);
         let applies = task.applies.clone();
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(task)];
 
-        let outcome = run_all(&tasks, &mut ctx).unwrap();
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(outcome.satisfied, vec!["a"]);
         assert_eq!(*applies.lock().unwrap(), 0);
     }
 
-    #[test]
-    fn a_version_bump_forces_a_rerun_even_when_the_check_passes() {
+    #[tokio::test]
+    async fn a_version_bump_forces_a_rerun_even_when_the_check_passes() {
         let (mut ctx, _home) = test_ctx();
         ctx.state.mark_satisfied("a", 1, "never_run");
         let mut task = Fake::new("a", vec![], vec![Status::Satisfied]);
         task.version = 2;
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(task)];
 
-        let outcome = run_all(&tasks, &mut ctx).unwrap();
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(outcome.applied, vec!["a"]);
         assert_eq!(ctx.state.tasks["a"].version, 2);
         assert_eq!(ctx.state.tasks["a"].last_reason, "version_changed");
     }
 
-    #[test]
-    fn a_dependency_that_ran_forces_its_dependents_to_rerun() {
+    #[tokio::test]
+    async fn a_dependency_that_ran_forces_its_dependents_to_rerun() {
         let (mut ctx, _home) = test_ctx();
         ctx.state.mark_satisfied("a", 1, "never_run");
         ctx.state.mark_satisfied("b", 1, "never_run");
@@ -305,13 +307,13 @@ mod tests {
             Box::new(Fake::new("b", vec!["a"], vec![Status::Satisfied])),
         ];
 
-        let outcome = run_all(&tasks, &mut ctx).unwrap();
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(outcome.applied, vec!["a", "b"]);
         assert_eq!(ctx.state.tasks["b"].last_reason, "upstream:a");
     }
 
-    #[test]
-    fn an_apply_that_did_not_take_is_a_hard_error() {
+    #[tokio::test]
+    async fn an_apply_that_did_not_take_is_a_hard_error() {
         let (mut ctx, _home) = test_ctx();
         // check fails, apply "succeeds", re-check still fails.
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(Fake::new(
@@ -320,21 +322,21 @@ mod tests {
             vec![Status::needs("missing"), Status::needs("still missing")],
         ))];
 
-        let error = run_all(&tasks, &mut ctx).unwrap_err().to_string();
+        let error = run_all(&tasks, &mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("did not take effect"), "{error}");
         // And nothing was recorded: a lie about the machine is worse than a gap.
         assert!(!ctx.state.tasks.contains_key("a"));
     }
 
-    #[test]
-    fn a_dry_run_changes_nothing() {
+    #[tokio::test]
+    async fn a_dry_run_changes_nothing() {
         let (mut ctx, _home) = test_ctx();
         ctx.dry_run = true;
         let task = Fake::new("a", vec![], vec![Status::needs("missing")]);
         let applies = task.applies.clone();
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(task)];
 
-        run_all(&tasks, &mut ctx).unwrap();
+        run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(*applies.lock().unwrap(), 0);
         assert!(!ctx.state.tasks.contains_key("a"));
     }

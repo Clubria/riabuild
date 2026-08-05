@@ -10,15 +10,17 @@
 use crate::runner::{CommandRunner, RunOptions};
 use crate::ui::Failure;
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use std::sync::Arc;
 
 const SERVICE: &str = "com.clubria.riabuild";
 const ACCOUNT: &str = "session-token";
 
+#[async_trait]
 pub trait Keychain: Send + Sync {
-    fn get(&self) -> Result<Option<String>>;
-    fn set(&self, token: &str) -> Result<()>;
-    fn delete(&self) -> Result<()>;
+    async fn get(&self) -> Result<Option<String>>;
+    async fn set(&self, token: &str) -> Result<()>;
+    async fn delete(&self) -> Result<()>;
     /// Shown in diagnostics so a developer knows where the token lives.
     fn describe(&self) -> &'static str;
 }
@@ -34,13 +36,17 @@ impl SecurityCliKeychain {
     }
 }
 
+#[async_trait]
 impl Keychain for SecurityCliKeychain {
-    fn get(&self) -> Result<Option<String>> {
-        let output = self.runner.run(
-            "security",
-            &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"],
-            &RunOptions::default(),
-        )?;
+    async fn get(&self) -> Result<Option<String>> {
+        let output = self
+            .runner
+            .run(
+                "security",
+                &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"],
+                &RunOptions::default(),
+            )
+            .await?;
         if !output.ok() {
             return Ok(None);
         }
@@ -48,23 +54,26 @@ impl Keychain for SecurityCliKeychain {
         Ok((!token.is_empty()).then_some(token))
     }
 
-    fn set(&self, token: &str) -> Result<()> {
+    async fn set(&self, token: &str) -> Result<()> {
         // `-U` updates in place; without it a second login errors on a duplicate
         // item, which would make `apply()` unsafe to run twice.
-        let output = self.runner.run(
-            "security",
-            &[
-                "add-generic-password",
-                "-U",
-                "-s",
-                SERVICE,
-                "-a",
-                ACCOUNT,
-                "-w",
-                token,
-            ],
-            &RunOptions::default(),
-        )?;
+        let output = self
+            .runner
+            .run(
+                "security",
+                &[
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    ACCOUNT,
+                    "-w",
+                    token,
+                ],
+                &RunOptions::default(),
+            )
+            .await?;
         if output.ok() {
             Ok(())
         } else {
@@ -75,12 +84,14 @@ impl Keychain for SecurityCliKeychain {
         }
     }
 
-    fn delete(&self) -> Result<()> {
-        self.runner.run(
-            "security",
-            &["delete-generic-password", "-s", SERVICE, "-a", ACCOUNT],
-            &RunOptions::default(),
-        )?;
+    async fn delete(&self) -> Result<()> {
+        self.runner
+            .run(
+                "security",
+                &["delete-generic-password", "-s", SERVICE, "-a", ACCOUNT],
+                &RunOptions::default(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -118,14 +129,18 @@ impl SecretToolKeychain {
     }
 }
 
+#[async_trait]
 impl Keychain for SecretToolKeychain {
-    fn get(&self) -> Result<Option<String>> {
+    async fn get(&self) -> Result<Option<String>> {
         self.ensure_available()?;
-        let output = self.runner.run(
-            "secret-tool",
-            &["lookup", "service", SERVICE, "account", ACCOUNT],
-            &RunOptions::default(),
-        )?;
+        let output = self
+            .runner
+            .run(
+                "secret-tool",
+                &["lookup", "service", SERVICE, "account", ACCOUNT],
+                &RunOptions::default(),
+            )
+            .await?;
         if !output.ok() {
             return Ok(None);
         }
@@ -133,23 +148,26 @@ impl Keychain for SecretToolKeychain {
         Ok((!token.is_empty()).then_some(token))
     }
 
-    fn set(&self, token: &str) -> Result<()> {
+    async fn set(&self, token: &str) -> Result<()> {
         self.ensure_available()?;
-        let output = self.runner.run(
-            "secret-tool",
-            &[
-                "store",
-                "--label=riabuild session token",
-                "service",
-                SERVICE,
-                "account",
-                ACCOUNT,
-            ],
-            &RunOptions {
-                stdin: Some(token.to_string()),
-                ..Default::default()
-            },
-        )?;
+        let output = self
+            .runner
+            .run(
+                "secret-tool",
+                &[
+                    "store",
+                    "--label=riabuild session token",
+                    "service",
+                    SERVICE,
+                    "account",
+                    ACCOUNT,
+                ],
+                &RunOptions {
+                    stdin: Some(token.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
         if output.ok() {
             Ok(())
         } else {
@@ -160,16 +178,18 @@ impl Keychain for SecretToolKeychain {
         }
     }
 
-    fn delete(&self) -> Result<()> {
+    async fn delete(&self) -> Result<()> {
         // Nothing to remove if there is no keyring; signing out succeeds.
         if self.runner.which("secret-tool").is_none() {
             return Ok(());
         }
-        self.runner.run(
-            "secret-tool",
-            &["clear", "service", SERVICE, "account", ACCOUNT],
-            &RunOptions::default(),
-        )?;
+        self.runner
+            .run(
+                "secret-tool",
+                &["clear", "service", SERVICE, "account", ACCOUNT],
+                &RunOptions::default(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -182,21 +202,22 @@ impl Keychain for SecretToolKeychain {
 /// backend, where there is no keyring daemon to talk to.
 pub struct EnvKeychain;
 
+#[async_trait]
 impl Keychain for EnvKeychain {
-    fn get(&self) -> Result<Option<String>> {
+    async fn get(&self) -> Result<Option<String>> {
         Ok(std::env::var("RIABUILD_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()))
     }
 
-    fn set(&self, _token: &str) -> Result<()> {
+    async fn set(&self, _token: &str) -> Result<()> {
         Err(anyhow!(
             "RIABUILD_TOKEN is set, so riabuild will not store a token itself.\n\
              Unset it to sign in normally."
         ))
     }
 
-    fn delete(&self) -> Result<()> {
+    async fn delete(&self) -> Result<()> {
         Ok(())
     }
 
@@ -221,17 +242,18 @@ impl MemoryKeychain {
 }
 
 #[cfg(test)]
+#[async_trait]
 impl Keychain for MemoryKeychain {
-    fn get(&self) -> Result<Option<String>> {
+    async fn get(&self) -> Result<Option<String>> {
         Ok(self.token.lock().unwrap().clone())
     }
 
-    fn set(&self, token: &str) -> Result<()> {
+    async fn set(&self, token: &str) -> Result<()> {
         *self.token.lock().unwrap() = Some(token.to_string());
         Ok(())
     }
 
-    fn delete(&self) -> Result<()> {
+    async fn delete(&self) -> Result<()> {
         *self.token.lock().unwrap() = None;
         Ok(())
     }
@@ -258,8 +280,8 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
 
-    #[test]
-    fn reads_a_token_from_the_macos_keychain() {
+    #[tokio::test]
+    async fn reads_a_token_from_the_macos_keychain() {
         let runner = Arc::new(FakeRunner::new().with(
             "security find-generic-password",
             0,
@@ -267,11 +289,14 @@ mod tests {
             "",
         ));
         let keychain = SecurityCliKeychain::new(runner);
-        assert_eq!(keychain.get().unwrap().as_deref(), Some("rb_token_value"));
+        assert_eq!(
+            keychain.get().await.unwrap().as_deref(),
+            Some("rb_token_value")
+        );
     }
 
-    #[test]
-    fn a_missing_item_is_none_rather_than_an_error() {
+    #[tokio::test]
+    async fn a_missing_item_is_none_rather_than_an_error() {
         let runner = Arc::new(FakeRunner::new().with(
             "security find-generic-password",
             44,
@@ -279,41 +304,41 @@ mod tests {
             "The specified item could not be found in the keychain.",
         ));
         let keychain = SecurityCliKeychain::new(runner);
-        assert_eq!(keychain.get().unwrap(), None);
+        assert_eq!(keychain.get().await.unwrap(), None);
     }
 
-    #[test]
-    fn storing_twice_updates_rather_than_failing() {
+    #[tokio::test]
+    async fn storing_twice_updates_rather_than_failing() {
         // `apply()` must be safe to run twice, which is what `-U` buys.
         let runner = Arc::new(FakeRunner::new().with("security add-generic-password", 0, "", ""));
         let keychain = SecurityCliKeychain::new(runner.clone());
-        keychain.set("first").unwrap();
-        keychain.set("second").unwrap();
+        keychain.set("first").await.unwrap();
+        keychain.set("second").await.unwrap();
         assert!(runner.calls().iter().all(|call| call.contains("-U")));
     }
 
-    #[test]
-    fn a_machine_with_no_keyring_gets_a_next_action_not_a_bug_report() {
+    #[tokio::test]
+    async fn a_machine_with_no_keyring_gets_a_next_action_not_a_bug_report() {
         // A headless Linux box has no libsecret. That is an ordinary state, and
         // the message has to name both fixes.
         let keychain = SecretToolKeychain::new(Arc::new(FakeRunner::new()));
-        let error = keychain.get().unwrap_err().to_string();
+        let error = keychain.get().await.unwrap_err().to_string();
         assert!(error.contains("RIABUILD_TOKEN"), "{error}");
         assert!(error.contains("libsecret"), "{error}");
     }
 
-    #[test]
-    fn signing_out_works_even_without_a_keyring() {
+    #[tokio::test]
+    async fn signing_out_works_even_without_a_keyring() {
         let keychain = SecretToolKeychain::new(Arc::new(FakeRunner::new()));
-        assert!(keychain.delete().is_ok());
+        assert!(keychain.delete().await.is_ok());
     }
 
-    #[test]
-    fn a_secret_never_appears_in_a_secret_tool_argument_list() {
+    #[tokio::test]
+    async fn a_secret_never_appears_in_a_secret_tool_argument_list() {
         // Arguments are world-readable through `ps`; stdin is not.
         let runner = Arc::new(FakeRunner::new().with("secret-tool store", 0, "", ""));
         let keychain = SecretToolKeychain::new(runner.clone());
-        keychain.set("super-secret").unwrap();
+        keychain.set("super-secret").await.unwrap();
         assert!(
             !runner
                 .calls()

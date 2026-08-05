@@ -12,6 +12,7 @@ use crate::runner::RunOptions;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 
 const MIN_VERSION: &str = "2.40.0";
 const ORG: &str = "Clubria";
@@ -26,6 +27,7 @@ const ORG_SCOPE: &str = "read:org";
 
 pub struct GithubCli;
 
+#[async_trait]
 impl Task for GithubCli {
     fn id(&self) -> TaskId {
         "github_cli"
@@ -43,56 +45,59 @@ impl Task for GithubCli {
         &[]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         if ctx.runner.which("gh").is_none() {
             return Ok(Status::needs("gh is not installed"));
         }
 
         let version_output = ctx
             .runner
-            .run("gh", &["--version"], &RunOptions::default())?;
+            .run("gh", &["--version"], &RunOptions::default())
+            .await?;
         if !version::at_least(version_output.trimmed(), MIN_VERSION) {
             return Ok(Status::needs(format!("gh is older than {MIN_VERSION}")));
         }
 
         if !ctx
             .runner
-            .run("gh", &["auth", "status"], &RunOptions::default())?
+            .run("gh", &["auth", "status"], &RunOptions::default())
+            .await?
             .ok()
         {
             return Ok(Status::needs("gh is not signed in to GitHub"));
         }
 
-        Ok(match membership(ctx)? {
+        Ok(match membership(ctx).await? {
             Membership::Active => Status::Satisfied,
             other => Status::needs(other.describe()),
         })
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         if ctx.runner.which("gh").is_none() {
-            install(ctx)?;
+            install(ctx).await?;
         }
 
         if !ctx
             .runner
-            .run("gh", &["auth", "status"], &RunOptions::default())?
+            .run("gh", &["auth", "status"], &RunOptions::default())
+            .await?
             .ok()
         {
-            sign_in(ctx)?;
+            sign_in(ctx).await?;
         }
 
         // Ask GitHub the question before asking the developer for anything.
         // Most tokens can already answer it — `gh auth login` grants `repo` by
         // default, which GitHub accepts here — so a browser round trip is the
         // exception, not the routine.
-        let mut state = membership(ctx)?;
+        let mut state = membership(ctx).await?;
         match state {
             // The token itself is no longer valid; refreshing scopes on a dead
             // token cannot work, so sign in from scratch.
             Membership::SignedOut => {
-                sign_in(ctx)?;
-                state = membership(ctx)?;
+                sign_in(ctx).await?;
+                state = membership(ctx).await?;
             }
             Membership::Forbidden => {
                 ctx.ui.note(&format!(
@@ -109,8 +114,9 @@ impl Task for GithubCli {
                         ORG_SCOPE,
                     ],
                     format!("adding the {ORG_SCOPE} permission to your GitHub token"),
-                )?;
-                state = membership(ctx)?;
+                )
+                .await?;
+                state = membership(ctx).await?;
             }
             _ => {}
         }
@@ -197,12 +203,15 @@ impl Membership {
 /// holding `admin:org` was told they lacked permission, sent through a browser
 /// sign-in that could not add a scope they already had, and told to try again.
 /// Forever: no run of `gh auth refresh` can make that string appear.
-fn membership(ctx: &Ctx) -> Result<Membership> {
-    let output = ctx.runner.run(
-        "gh",
-        &["api", &format!("/user/memberships/orgs/{ORG}")],
-        &RunOptions::default(),
-    )?;
+async fn membership(ctx: &Ctx) -> Result<Membership> {
+    let output = ctx
+        .runner
+        .run(
+            "gh",
+            &["api", &format!("/user/memberships/orgs/{ORG}")],
+            &RunOptions::default(),
+        )
+        .await?;
 
     if output.ok() {
         // Tolerant of pretty-printed bodies: `gh api` emits compact JSON today,
@@ -254,7 +263,7 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-fn sign_in(ctx: &mut Ctx) -> Result<()> {
+async fn sign_in(ctx: &mut Ctx) -> Result<()> {
     // Interactive on purpose: this is a browser sign-in, and there is no
     // non-interactive path that does not involve pasting a token.
     ctx.ui.note("Opening GitHub to sign you in…");
@@ -273,6 +282,7 @@ fn sign_in(ctx: &mut Ctx) -> Result<()> {
         ],
         "signing you in to GitHub",
     )
+    .await
 }
 
 /// Runs an interactive `gh auth` command and insists that it worked.
@@ -280,10 +290,11 @@ fn sign_in(ctx: &mut Ctx) -> Result<()> {
 /// The exit code used to be discarded. Cancelling the device-code prompt left
 /// riabuild convinced it had signed the developer in, and the only symptom was
 /// a later check failing for a reason that did not mention the sign-in.
-fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> Result<()> {
+async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> Result<()> {
     let code = ctx
         .runner
-        .run_interactive("gh", args, &RunOptions::default())?;
+        .run_interactive("gh", args, &RunOptions::default())
+        .await?;
     if code != 0 {
         return Err(Failure::new(
             attempting,
@@ -296,7 +307,7 @@ fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> R
     Ok(())
 }
 
-fn install(ctx: &mut Ctx) -> Result<()> {
+async fn install(ctx: &mut Ctx) -> Result<()> {
     if ctx.runner.which("brew").is_none() {
         return Err(Failure::new(
             "installing the GitHub CLI",
@@ -308,7 +319,8 @@ fn install(ctx: &mut Ctx) -> Result<()> {
     ctx.ui.note("Installing gh with Homebrew…");
     let output = ctx
         .runner
-        .run("brew", &["install", "gh"], &RunOptions::default())?;
+        .run("brew", &["install", "gh"], &RunOptions::default())
+        .await?;
     if !output.ok() {
         return Err(Failure::new(
             "installing the GitHub CLI",
@@ -341,37 +353,40 @@ mod tests {
             .with(MEMBERSHIP, 0, r#"{"state":"active","role":"member"}"#, "")
     }
 
-    fn reason(runner: FakeRunner) -> String {
+    async fn reason(runner: FakeRunner) -> String {
         let (ctx, _home) = ctx_with(runner);
-        format!("{:?}", GithubCli.check(&ctx).unwrap())
+        format!("{:?}", GithubCli.check(&ctx).await.unwrap())
     }
 
-    #[test]
-    fn a_healthy_machine_is_satisfied() {
+    #[tokio::test]
+    async fn a_healthy_machine_is_satisfied() {
         let (ctx, _home) = ctx_with(healthy());
-        assert_eq!(GithubCli.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn a_missing_gh_is_detected() {
+    #[tokio::test]
+    async fn a_missing_gh_is_detected() {
         let (ctx, _home) = ctx_with(FakeRunner::new());
-        assert!(matches!(GithubCli.check(&ctx).unwrap(), Status::Needs(_)));
+        assert!(matches!(
+            GithubCli.check(&ctx).await.unwrap(),
+            Status::Needs(_)
+        ));
     }
 
-    #[test]
-    fn an_old_gh_is_detected() {
+    #[tokio::test]
+    async fn an_old_gh_is_detected() {
         let runner = healthy().with("gh --version", 0, "gh version 2.10.0 (2023-01-01)", "");
-        assert!(reason(runner).contains("older"));
+        assert!(reason(runner).await.contains("older"));
     }
 
-    #[test]
-    fn a_logged_out_gh_is_detected() {
+    #[tokio::test]
+    async fn a_logged_out_gh_is_detected() {
         let runner = healthy().with("gh auth status", 1, "", "You are not logged into any hosts");
-        assert!(reason(runner).contains("not signed in"));
+        assert!(reason(runner).await.contains("not signed in"));
     }
 
-    #[test]
-    fn an_admin_org_token_can_read_membership() {
+    #[tokio::test]
+    async fn an_admin_org_token_can_read_membership() {
         // The bug this file exists to not have again. `admin:org` grants
         // everything `read:org` does, and GitHub does not list both, so a
         // check that looked for the literal string rejected a token that
@@ -383,39 +398,39 @@ mod tests {
             "github.com\n  ✓ Logged in to github.com account ada\n  - Token scopes: 'admin:org', 'gist', 'repo'",
         );
         let (ctx, _home) = ctx_with(runner);
-        assert_eq!(GithubCli.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn a_token_that_cannot_read_membership_is_detected() {
+    #[tokio::test]
+    async fn a_token_that_cannot_read_membership_is_detected() {
         let runner = healthy().with(MEMBERSHIP, 1, "", "gh: Forbidden (HTTP 403)");
-        assert!(reason(runner).contains("may not read"));
+        assert!(reason(runner).await.contains("may not read"));
     }
 
-    #[test]
-    fn an_expired_token_is_told_apart_from_a_missing_permission() {
+    #[tokio::test]
+    async fn an_expired_token_is_told_apart_from_a_missing_permission() {
         // Different remedy: refreshing scopes on a dead token cannot work.
         let runner = healthy().with(MEMBERSHIP, 1, "", "gh: Bad credentials (HTTP 401)");
-        assert!(reason(runner).contains("no longer valid"));
+        assert!(reason(runner).await.contains("no longer valid"));
     }
 
-    #[test]
-    fn a_pending_invite_is_not_membership() {
+    #[tokio::test]
+    async fn a_pending_invite_is_not_membership() {
         let runner = healthy().with(MEMBERSHIP, 0, r#"{"state":"pending"}"#, "");
-        assert!(reason(runner).contains("not been accepted"));
+        assert!(reason(runner).await.contains("not been accepted"));
     }
 
-    #[test]
-    fn being_removed_from_the_org_is_detected() {
+    #[tokio::test]
+    async fn being_removed_from_the_org_is_detected() {
         let runner = healthy().with(MEMBERSHIP, 1, "", "gh: Not Found (HTTP 404)");
-        assert!(reason(runner).contains("not report you as a member"));
+        assert!(reason(runner).await.contains("not report you as a member"));
     }
 
-    #[test]
-    fn an_unreachable_github_is_not_mistaken_for_a_rejection() {
+    #[tokio::test]
+    async fn an_unreachable_github_is_not_mistaken_for_a_rejection() {
         // A captive portal must not read as "you were removed from the org".
         let runner = healthy().with(MEMBERSHIP, 1, "", "dial tcp: lookup api.github.com");
-        let described = reason(runner);
+        let described = reason(runner).await;
         assert!(described.contains("could not check"), "{described}");
         assert!(
             !described.contains("not report you as a member"),
@@ -423,12 +438,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_working_token_is_never_sent_through_a_browser() {
+    #[tokio::test]
+    async fn a_working_token_is_never_sent_through_a_browser() {
         // The regression that matters most: apply() must not demand a sign-in
         // from a developer whose token already answers the question.
         let (mut ctx, _home, runner) = ctx_and_runner(healthy());
-        GithubCli.apply(&mut ctx).unwrap();
+        GithubCli.apply(&mut ctx).await.unwrap();
         let calls = runner.calls();
         assert!(
             !calls
@@ -438,8 +453,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_missing_permission_is_repaired_before_giving_up() {
+    #[tokio::test]
+    async fn a_missing_permission_is_repaired_before_giving_up() {
         let runner = healthy()
             .with(MEMBERSHIP, 1, "", "gh: Forbidden (HTTP 403)")
             .with("gh auth refresh", 0, "", "");
@@ -447,7 +462,7 @@ mod tests {
 
         // The refresh runs, and because the stub still reports 403 afterwards,
         // apply() reports that rather than claiming success.
-        let error = GithubCli.apply(&mut ctx).unwrap_err().to_string();
+        let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("membership"), "{error}");
         assert!(
             calls
@@ -459,22 +474,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_cancelled_sign_in_is_not_treated_as_success() {
+    #[tokio::test]
+    async fn a_cancelled_sign_in_is_not_treated_as_success() {
         // gh exits non-zero when the developer abandons the device-code prompt.
         let runner = healthy()
             .with("gh auth status", 1, "", "You are not logged into any hosts")
             .with("gh auth login", 1, "", "");
         let (mut ctx, _home) = ctx_with(runner);
-        let error = GithubCli.apply(&mut ctx).unwrap_err().to_string();
+        let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("signing you in"), "{error}");
     }
 
-    #[test]
-    fn a_pending_invite_names_the_invite_rather_than_the_token() {
+    #[tokio::test]
+    async fn a_pending_invite_names_the_invite_rather_than_the_token() {
         let runner = healthy().with(MEMBERSHIP, 0, r#"{"state":"pending"}"#, "");
         let (mut ctx, _home) = ctx_with(runner);
-        let error = GithubCli.apply(&mut ctx).unwrap_err().to_string();
+        let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("Accept the Clubria invite"), "{error}");
     }
 

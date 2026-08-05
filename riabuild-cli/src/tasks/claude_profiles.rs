@@ -9,6 +9,7 @@ use crate::runner::RunOptions;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 use rand::RngCore;
 use std::path::Path;
 
@@ -52,6 +53,7 @@ fn existing_profile(claude_dir: &Path) -> Option<String> {
         .find(|name| looks_like_profile_id(name))
 }
 
+#[async_trait]
 impl Task for ClaudeProfiles {
     fn id(&self) -> TaskId {
         "claude_profiles"
@@ -71,13 +73,14 @@ impl Task for ClaudeProfiles {
         &["toolchain"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         if ctx.runner.which("claude").is_none() {
             return Ok(Status::needs("Claude Code is not installed"));
         }
         let reported = ctx
             .runner
-            .run("claude", &["--version"], &RunOptions::default())?;
+            .run("claude", &["--version"], &RunOptions::default())
+            .await?;
         if !version::at_least(reported.trimmed(), MIN_VERSION) {
             return Ok(Status::needs(format!(
                 "Claude Code is older than {MIN_VERSION}"
@@ -97,9 +100,9 @@ impl Task for ClaudeProfiles {
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         if ctx.runner.which("claude").is_none() {
-            install_claude(ctx)?;
+            install_claude(ctx).await?;
         }
 
         let claude_dir = ctx.paths.claude_dir();
@@ -114,7 +117,7 @@ impl Task for ClaudeProfiles {
     }
 }
 
-fn install_claude(ctx: &mut Ctx) -> Result<()> {
+async fn install_claude(ctx: &mut Ctx) -> Result<()> {
     let node_version = ctx
         .config
         .node_version
@@ -132,11 +135,14 @@ fn install_claude(ctx: &mut Ctx) -> Result<()> {
     }
 
     ctx.ui.note("Installing Claude Code…");
-    let output = ctx.runner.run(
-        &npm.to_string_lossy(),
-        &["install", "-g", "@anthropic-ai/claude-code"],
-        &RunOptions::default(),
-    )?;
+    let output = ctx
+        .runner
+        .run(
+            &npm.to_string_lossy(),
+            &["install", "-g", "@anthropic-ai/claude-code"],
+            &RunOptions::default(),
+        )
+        .await?;
     if !output.ok() {
         return Err(Failure::new(
             "installing Claude Code",
@@ -173,25 +179,25 @@ mod tests {
         assert!(!looks_like_profile_id(""));
     }
 
-    #[test]
-    fn a_missing_claude_is_detected() {
+    #[tokio::test]
+    async fn a_missing_claude_is_detected() {
         let (ctx, _home) = ctx_with(FakeRunner::new());
         assert!(matches!(
-            ClaudeProfiles.check(&ctx).unwrap(),
+            ClaudeProfiles.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn an_installed_claude_without_a_profile_is_detected() {
+    #[tokio::test]
+    async fn an_installed_claude_without_a_profile_is_detected() {
         let (ctx, _home) =
             ctx_with(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
-        let status = ClaudeProfiles.check(&ctx).unwrap();
+        let status = ClaudeProfiles.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("profile"), "{status:?}");
     }
 
-    #[test]
-    fn a_deleted_profile_directory_is_noticed() {
+    #[tokio::test]
+    async fn a_deleted_profile_directory_is_noticed() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new());
         std::fs::create_dir_all(ctx.paths.claude_dir()).unwrap();
         ctx.config.claude_profile = Some(new_profile_id());
@@ -199,19 +205,19 @@ mod tests {
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
         // The directory recorded in config.json is gone from disk.
         assert!(matches!(
-            ClaudeProfiles.check(&ctx).unwrap(),
+            ClaudeProfiles.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn a_profile_on_disk_is_satisfied() {
+    #[tokio::test]
+    async fn a_profile_on_disk_is_satisfied() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new());
         let profile = new_profile_id();
         std::fs::create_dir_all(ctx.paths.claude_dir().join(&profile)).unwrap();
         ctx.config.claude_profile = Some(profile);
         ctx.runner =
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
-        assert_eq!(ClaudeProfiles.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(ClaudeProfiles.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 }

@@ -12,9 +12,11 @@
 use super::{Ctx, Status, Task, TaskId};
 use crate::api::org;
 use anyhow::Result;
+use async_trait::async_trait;
 
 pub struct OrgSettings;
 
+#[async_trait]
 impl Task for OrgSettings {
     fn id(&self) -> TaskId {
         "org_settings"
@@ -32,7 +34,7 @@ impl Task for OrgSettings {
         &["login"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let file = ctx.paths.org_settings_file();
         if !file.exists() {
             return Ok(Status::needs("the team settings have not been fetched yet"));
@@ -55,7 +57,7 @@ impl Task for OrgSettings {
         }
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let remote = org::fetch_claude_settings(&ctx.api)?;
         let file = ctx.paths.org_settings_file();
         if let Some(parent) = file.parent() {
@@ -75,23 +77,23 @@ mod tests {
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
 
-    #[test]
-    fn a_missing_cache_needs_fetching() {
+    #[tokio::test]
+    async fn a_missing_cache_needs_fetching() {
         let (ctx, _home) = ctx_with(FakeRunner::new());
-        let status = OrgSettings.check(&ctx).unwrap();
+        let status = OrgSettings.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("not been fetched"),
             "{status:?}"
         );
     }
 
-    #[test]
-    fn a_corrupt_cache_is_detected_without_asking_the_server() {
+    #[tokio::test]
+    async fn a_corrupt_cache_is_detected_without_asking_the_server() {
         // No network here on purpose: invalid JSON on disk is enough to know the
         // machine is wrong.
         let (ctx, _home) = ctx_with(FakeRunner::new());
         write_file(&ctx.paths.org_settings_file(), "{ not json");
-        let status = OrgSettings.check(&ctx).unwrap();
+        let status = OrgSettings.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("not valid JSON"),
             "{status:?}"

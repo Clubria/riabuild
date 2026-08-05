@@ -19,6 +19,7 @@ use crate::paths::Paths;
 use crate::runner::CommandRunner;
 use crate::ui::Ui;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::Arc;
 
 pub type TaskId = &'static str;
@@ -69,6 +70,7 @@ impl Status {
     }
 }
 
+#[async_trait]
 pub trait Task: Send + Sync {
     fn id(&self) -> TaskId;
     fn title(&self) -> &str;
@@ -77,8 +79,8 @@ pub trait Task: Send + Sync {
     /// bug in the check.
     fn version(&self) -> u32;
     fn depends_on(&self) -> &[TaskId];
-    fn check(&self, ctx: &Ctx) -> Result<Status>;
-    fn apply(&self, ctx: &mut Ctx) -> Result<()>;
+    async fn check(&self, ctx: &Ctx) -> Result<Status>;
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()>;
 }
 
 /// Everything a task is allowed to touch.
