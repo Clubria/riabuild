@@ -1,7 +1,9 @@
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../../convex/_generated/api";
-import { Chip } from "./primitives";
-import { formatTime, useNow } from "../lib/time";
+import { useState } from "react";
+import { useData } from "../data/context";
+import { Session } from "../data/types";
+import { readError } from "../lib/errors";
+import { formatTime } from "../lib/time";
+import { Alert, Badge, Button, Column, DataTable, Empty, Loading } from "../ui";
 
 /**
  * Every machine that holds a live riabuild token, and the button that takes it
@@ -9,59 +11,107 @@ import { formatTime, useNow } from "../lib/time";
  * cached credential to wait out.
  */
 export function Sessions() {
-  const sessions = useQuery(api.sessions.listMine);
-  const now = useNow();
-  const revoke = useMutation(api.sessions.revoke);
+  const data = useData();
+  const [error, setError] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
 
-  if (sessions === undefined) {
-    return <p className="mono text-muted">Loading sessions…</p>;
-  }
-  if (sessions.length === 0) {
+  if (data.sessions.state === "loading") return <Loading label="loading machines" />;
+  if (data.sessions.state === "error") {
     return (
-      <p className="text-muted">
-        No machines signed in yet. Running <code className="mono">riabuild</code>{" "}
-        for the first time will add one.
-      </p>
+      <Alert tone="danger" title="Could not list your machines">
+        <p className="wrap-value">{data.sessions.message}</p>
+      </Alert>
     );
   }
 
-  return (
-    <ul className="divide-y divide-rule border-y border-rule">
-      {sessions.map((session) => {
-        const expired = session.expiresAt <= now;
-        const revoked = session.revokedAt !== null;
-        const dead = expired || revoked;
+  const now = data.now;
+  const sessions = data.sessions.value;
+
+  const columns: Column<Session>[] = [
+    {
+      key: "device",
+      header: "device",
+      grow: true,
+      render: (s) => <span className="text-fg">{s.deviceLabel}</span>,
+    },
+    {
+      key: "version",
+      header: "cli",
+      priority: "wide",
+      render: (s) => <span className="text-fg-dim">v{s.cliVersion}</span>,
+    },
+    {
+      key: "lastUsed",
+      header: "last used",
+      priority: "wide",
+      render: (s) => (
+        <span className="text-fg-dim">{formatTime(s.lastUsedAt)}</span>
+      ),
+    },
+    {
+      key: "state",
+      header: "state",
+      render: (s) => {
+        const state = sessionState(s, now);
         return (
-          <li
-            key={session._id}
-            className="flex flex-wrap items-baseline gap-x-4 gap-y-1 py-3"
-          >
-            <span className="mono flex-1 basis-48 text-graphite">
-              {session.deviceLabel}
-            </span>
-            <span className="mono text-muted">v{session.cliVersion}</span>
-            <span className="mono text-muted">
-              last used {formatTime(session.lastUsedAt)}
-            </span>
-            {revoked ? (
-              <Chip tone="muted">revoked</Chip>
-            ) : expired ? (
-              <Chip tone="muted">expired</Chip>
-            ) : (
-              <Chip tone="verified">active</Chip>
-            )}
-            <button
-              className="btn btn-danger"
+          <Badge tone={state === "active" ? "ok" : "muted"}>{state}</Badge>
+        );
+      },
+    },
+  ];
+
+  return (
+    <>
+      <DataTable
+        caption="Machines signed in to riabuild"
+        columns={columns}
+        rows={sessions}
+        rowKey={(s) => s._id}
+        renderActions={(s) => {
+          const dead = sessionState(s, now) !== "active";
+          return (
+            <Button
+              variant="danger"
               disabled={dead}
+              pending={revoking === s._id}
+              pendingLabel="revoking"
+              aria-label={`Revoke ${s.deviceLabel}`}
               onClick={() => {
-                void revoke({ sessionId: session._id });
+                setError(null);
+                setRevoking(s._id);
+                void data
+                  .revokeSession({ sessionId: s._id })
+                  .catch((cause: unknown) => setError(readError(cause)))
+                  .finally(() => setRevoking(null));
               }}
             >
-              Revoke
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+              revoke
+            </Button>
+          );
+        }}
+        empty={
+          <Empty glyph="⌁" title="No machines signed in yet.">
+            Running <span className="text-fg">riabuild</span> for the first time
+            will add one.
+          </Empty>
+        }
+      />
+      {error !== null && (
+        <div className="mt-4">
+          <Alert tone="danger" title="Not revoked">
+            <p className="wrap-value">{error}</p>
+          </Alert>
+        </div>
+      )}
+    </>
   );
+}
+
+function sessionState(
+  session: Session,
+  now: number,
+): "active" | "expired" | "revoked" {
+  if (session.revokedAt !== null) return "revoked";
+  if (session.expiresAt <= now) return "expired";
+  return "active";
 }
