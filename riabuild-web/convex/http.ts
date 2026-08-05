@@ -8,7 +8,7 @@ import { meetsMinimum } from "./lib/version";
 import { ApiFailure, apiError, fail, jsonResponse } from "./lib/responses";
 import { checkOrgMembership, orgLogin } from "./github";
 import { brokerToken } from "./infisical";
-import type { OrgConfig } from "./org";
+import { RETIRED_DEFAULT_PROJECT_PATH, type OrgConfig } from "./org";
 
 const http = httpRouter();
 auth.addHttpRoutes(http);
@@ -245,7 +245,10 @@ http.route({
       const config = await loadConfig(ctx);
       return jsonResponse({
         repoSlug: config.repoSlug,
-        defaultProjectPath: config.defaultProjectPath,
+        // Frozen, not read from config: this field is retired and only still
+        // here because a CLI released before the change cannot parse a response
+        // without it. Current CLIs ignore it and choose the path themselves.
+        defaultProjectPath: RETIRED_DEFAULT_PROJECT_PATH,
         minCliVersion: config.minCliVersion,
         latestCliVersion: config.latestCliVersion,
         secretsUpdatedAt: config.secretsUpdatedAt,

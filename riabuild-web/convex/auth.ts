@@ -1,5 +1,6 @@
 import GitHub from "@auth/core/providers/github";
 import { convexAuth } from "@convex-dev/auth/server";
+import { Anonymous } from "@convex-dev/auth/providers/Anonymous";
 import { MutationCtx } from "./_generated/server";
 import { Id } from "./_generated/dataModel";
 
@@ -67,6 +68,48 @@ async function resolveEmail(
   }
 }
 
+/**
+ * A door that only exists on a deployment that has opted in.
+ *
+ * Playwright cannot complete a GitHub OAuth round trip, so without this there is
+ * no way to walk the signed-in pages against a real backend at all. It is safe
+ * because it is not conditionally *enabled* — it is conditionally *registered*.
+ * On a deployment without `RIABUILD_DEV_AUTH=1` the provider is not in the
+ * providers array, so `signIn("dev")` has nothing to dispatch to and fails the
+ * same way a misspelt provider name would.
+ *
+ * The role still comes from `RIABUILD_BOOTSTRAP_LEADS`, exactly as it does for a
+ * real GitHub sign-in. This adds a way to authenticate; it adds no way to
+ * authorize, and it is `members.role` that gates everything that matters.
+ */
+const DevProvider = Anonymous({
+  id: "dev",
+  profile(params) {
+    const raw = params.login;
+    const login = (typeof raw === "string" && raw !== "" ? raw : "devuser").slice(
+      0,
+      39,
+    );
+    return {
+      name: login,
+      email: `${login}@example.invalid`,
+      githubLogin: login,
+      githubId: `dev-${login}`,
+      isAnonymous: true,
+    } as unknown as { name: string; isAnonymous: true };
+  },
+});
+
+function providers() {
+  if (process.env.RIABUILD_DEV_AUTH === "1") {
+    console.warn(
+      "riabuild: RIABUILD_DEV_AUTH=1 — the dev sign-in provider is registered. Never set this in production.",
+    );
+    return [GitHubProvider, DevProvider];
+  }
+  return [GitHubProvider];
+}
+
 function bootstrapLeads(): string[] {
   return (process.env.RIABUILD_BOOTSTRAP_LEADS ?? "")
     .split(/[\s,]+/)
@@ -88,7 +131,7 @@ function readString(value: unknown): string | undefined {
 }
 
 export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
-  providers: [GitHubProvider],
+  providers: providers(),
   callbacks: {
     /**
      * We own user creation rather than using `afterUserCreatedOrUpdated`

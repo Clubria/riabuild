@@ -37,13 +37,22 @@ impl Report {
             parts.push("not on a branch".to_string());
         }
         if self.behind > 0 {
-            parts.push(format!("{} commit(s) behind origin", self.behind));
+            parts.push(format!(
+                "{} behind origin",
+                crate::ui::plural(self.behind.into(), "commit")
+            ));
         }
         if self.ahead > 0 {
-            parts.push(format!("{} commit(s) not pushed", self.ahead));
+            parts.push(format!(
+                "{} not pushed",
+                crate::ui::plural(self.ahead.into(), "commit")
+            ));
         }
         if self.dirty > 0 {
-            parts.push(format!("{} file(s) with local changes", self.dirty));
+            parts.push(format!(
+                "{} with local changes",
+                crate::ui::plural(self.dirty.into(), "file")
+            ));
         }
         if parts.is_empty() {
             return format!("{} is clean and up to date", self.branch);
@@ -166,11 +175,27 @@ mod tests {
         assert_eq!(report.behind, 5);
         assert_eq!(report.dirty, 2);
         let described = report.describe();
-        assert!(described.contains("5 commit(s) behind"), "{described}");
+        assert!(described.contains("5 commits behind"), "{described}");
+        assert!(described.contains("2 commits not pushed"), "{described}");
         assert!(
-            described.contains("2 file(s) with local changes"),
+            described.contains("2 files with local changes"),
             "{described}"
         );
+    }
+
+    #[test]
+    fn a_single_commit_or_file_is_not_pluralised() {
+        let report = parse_status(
+            "# branch.head main\n# branch.ab +1 -1\n1 .M N... 100644 100644 100644 aaa bbb src/a.rs\n",
+        );
+        let described = report.describe();
+        assert!(described.contains("1 commit behind origin"), "{described}");
+        assert!(described.contains("1 commit not pushed"), "{described}");
+        assert!(
+            described.contains("1 file with local changes"),
+            "{described}"
+        );
+        assert!(!described.contains("(s)"), "{described}");
     }
 
     #[test]

@@ -8,12 +8,15 @@ use crate::api::ApiClient;
 use anyhow::Result;
 use serde::Deserialize;
 
+/// Note the absence of a checkout path. The server used to send one, but a
+/// single string cannot be right on macOS and Linux at once, so where a
+/// repository lands is now the CLI's decision — see `paths::default_project_dir`.
+/// The endpoint still emits the old field for CLIs released before this change;
+/// unknown fields are ignored here, so it costs nothing to keep receiving it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgConfig {
     #[serde(rename = "repoSlug")]
     pub repo_slug: String,
-    #[serde(rename = "defaultProjectPath")]
-    pub default_project_path: String,
     #[serde(rename = "minCliVersion")]
     pub min_cli_version: String,
     #[serde(rename = "latestCliVersion")]
@@ -23,6 +26,16 @@ pub struct OrgConfig {
 }
 
 impl OrgConfig {
+    /// The repository half of `owner/repo`, which is what the checkout
+    /// directory is named after.
+    pub fn repo_name(&self) -> &str {
+        self.repo_slug
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.repo_slug)
+    }
+
     /// Accepts every spelling of a GitHub remote for the same repository, so a
     /// developer who cloned over SSH is not told their checkout is wrong.
     pub fn matches_remote(&self, remote: &str) -> bool {
@@ -62,11 +75,36 @@ mod tests {
     fn config() -> OrgConfig {
         OrgConfig {
             repo_slug: "Clubria/ai-builders-hub".into(),
-            default_project_path: "~/code/ai-builders-hub".into(),
             min_cli_version: "0.1.0".into(),
             latest_cli_version: "0.1.0".into(),
             secrets_updated_at: 0,
         }
+    }
+
+    #[test]
+    fn the_checkout_is_named_after_the_repository_not_the_owner() {
+        assert_eq!(config().repo_name(), "ai-builders-hub");
+    }
+
+    #[test]
+    fn a_slug_without_an_owner_is_still_usable() {
+        let mut config = config();
+        config.repo_slug = "ai-builders-hub".into();
+        assert_eq!(config.repo_name(), "ai-builders-hub");
+        config.repo_slug = "Clubria/".into();
+        assert_eq!(config.repo_name(), "Clubria/");
+    }
+
+    #[test]
+    fn a_retired_checkout_path_from_an_older_server_is_ignored() {
+        // The endpoint still sends defaultProjectPath for CLIs released before
+        // the client started choosing the location. Receiving it must not fail.
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"repoSlug":"Clubria/ai-builders-hub","defaultProjectPath":"~/code/ai-builders-hub",
+                "minCliVersion":"0.1.0","latestCliVersion":"0.1.0","secretsUpdatedAt":0}"#,
+        )
+        .expect("an unknown field must not break the config");
+        assert_eq!(config.repo_name(), "ai-builders-hub");
     }
 
     #[test]

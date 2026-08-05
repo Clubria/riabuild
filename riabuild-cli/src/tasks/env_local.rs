@@ -8,7 +8,7 @@ use super::{Ctx, Status, Task, TaskId};
 use crate::api::secrets;
 use crate::config::modified_millis;
 use crate::runner::RunOptions;
-use crate::ui::Failure;
+use crate::ui::{Failure, duration_words};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -176,13 +176,18 @@ impl Task for EnvLocal {
             .saturating_sub(crate::config::now_millis())
             / 60_000;
         ctx.note(format!(
-            "secrets written to .env.local from the {} environment (credential valid {minutes} more minute(s))",
+            "secrets written to .env.local from the {} environment (credential valid another {})",
             brokered.environment,
+            duration_words(minutes),
         ));
         if brokered.secrets_updated_at > 0 {
+            // Relative, for the same reason as above: an epoch-ms timestamp is
+            // not something a developer can read.
+            let ago =
+                crate::config::now_millis().saturating_sub(brokered.secrets_updated_at) / 60_000;
             ctx.note(format!(
-                "the team last rotated these secrets at {} epoch-ms",
-                brokered.secrets_updated_at
+                "the team last rotated these secrets {} ago",
+                duration_words(ago),
             ));
         }
         Ok(())

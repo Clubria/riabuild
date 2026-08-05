@@ -81,15 +81,19 @@ impl Task for Project {
         let org = ctx.org()?.clone();
         let home = ctx.paths.home();
 
-        let chosen = match ctx.config.project_path.clone() {
-            Some(path) => path,
+        let dir = match ctx.config.project_path.clone() {
+            Some(path) => expand_tilde(&path, &home),
             None => {
-                let default = org.default_project_path.clone();
-                ctx.ui.note(&format!("Using {default} for the checkout"));
+                // Where this lands is riabuild's decision, and it differs per
+                // platform — see `paths::default_project_dir`.
+                let default = crate::paths::default_project_dir(&home, org.repo_name());
+                ctx.ui.note(&format!(
+                    "Using {} for the checkout",
+                    contract_tilde(&default, &home)
+                ));
                 default
             }
         };
-        let dir = expand_tilde(&chosen, &home);
 
         if tokio::fs::try_exists(&dir.join(".git"))
             .await
@@ -112,7 +116,10 @@ impl Task for Project {
             if let Some(parent) = dir.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            ctx.ui.note(&format!("Cloning {} …", org.repo_slug));
+            // No space before the ellipsis — every other progress line in
+            // riabuild is written "Downloading Node 22…", and this one sat
+            // among them looking misaligned.
+            ctx.ui.note(&format!("Cloning {}…", org.repo_slug));
             // Through `gh` so the developer's existing GitHub auth is reused and
             // nobody has to set up SSH keys to get started.
             let output = ctx
@@ -155,6 +162,35 @@ mod tests {
             Project.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unchosen_checkout_goes_to_the_platform_default() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        Project.apply(&mut ctx).await.unwrap();
+
+        let expected = crate::paths::default_project_dir(home.path(), "ai-builders-hub");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(expected.to_string_lossy().as_ref()),
+            "the checkout must land where this platform puts it"
+        );
+        // Named after the repository, not the whole owner/repo slug.
+        assert!(expected.ends_with("ai-builders-hub"), "{expected:?}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_project_path_still_wins() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        let chosen = home.path().join("elsewhere/hub");
+        ctx.config.project_path = Some(chosen.to_string_lossy().into());
+        Project.apply(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(chosen.to_string_lossy().as_ref()),
+            "`riabuild --project` must not be overridden by the default"
+        );
     }
 
     #[tokio::test]
