@@ -11,12 +11,18 @@ pub struct Outcome {
     pub applied: Vec<TaskId>,
 }
 
-/// Orders tasks so every dependency comes before its dependents.
+/// Orders tasks into dependency *waves*: every task in a wave has all of its
+/// dependencies satisfied by earlier waves.
+///
+/// The loop below already computed these waves and then flattened them away.
+/// Keeping them costs nothing and means the graph still knows its own shape, so
+/// running a wave concurrently later becomes a change to the runner rather than
+/// a rewrite of the ordering. Execution today is still strictly sequential.
 ///
 /// Returns an error for a cycle or for an edge naming a task that is not
 /// registered — both are programming mistakes that must fail loudly in tests
 /// rather than quietly reorder someone's setup.
-pub fn topological_order(tasks: &[Box<dyn Task>]) -> Result<Vec<usize>> {
+pub fn topological_order(tasks: &[Box<dyn Task>]) -> Result<Vec<Vec<usize>>> {
     let index: HashMap<TaskId, usize> = tasks
         .iter()
         .enumerate()
@@ -29,7 +35,7 @@ pub fn topological_order(tasks: &[Box<dyn Task>]) -> Result<Vec<usize>> {
 
     let mut remaining: BTreeSet<usize> = (0..tasks.len()).collect();
     let mut done: HashSet<TaskId> = HashSet::new();
-    let mut order = Vec::with_capacity(tasks.len());
+    let mut waves: Vec<Vec<usize>> = Vec::new();
 
     for task in tasks {
         for dependency in task.depends_on() {
@@ -64,14 +70,14 @@ pub fn topological_order(tasks: &[Box<dyn Task>]) -> Result<Vec<usize>> {
             ));
         }
 
-        for position in ready {
-            remaining.remove(&position);
-            done.insert(tasks[position].id());
-            order.push(position);
+        for position in &ready {
+            remaining.remove(position);
+            done.insert(tasks[*position].id());
         }
+        waves.push(ready);
     }
 
-    Ok(order)
+    Ok(waves)
 }
 
 /// Decides whether a task needs to run, without running anything.
@@ -103,7 +109,7 @@ pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> 
     let mut applied: HashSet<TaskId> = HashSet::new();
     let mut outcome = Outcome::default();
 
-    for position in order {
+    for position in order.into_iter().flatten() {
         let task = tasks[position].as_ref();
         let status = status_for(task, ctx, &applied).await?;
 
@@ -214,23 +220,56 @@ mod tests {
     }
 
     #[test]
+    fn independent_tasks_land_in_the_same_wave() {
+        // `a` and `b` depend on nothing, `c` depends on both: two waves.
+        //
+        // Execution is still strictly sequential — this only stops the graph
+        // from discarding structure it already computes, so that running a wave
+        // concurrently later is a change to the runner rather than a rewrite of
+        // the ordering.
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::new("a", vec![], vec![])),
+            Box::new(Fake::new("b", vec![], vec![])),
+            Box::new(Fake::new("c", vec!["a", "b"], vec![])),
+        ];
+
+        let waves = topological_order(&tasks).unwrap();
+
+        assert_eq!(
+            waves.len(),
+            2,
+            "a and b are independent and belong together"
+        );
+        assert_eq!(waves[0], vec![0, 1]);
+        assert_eq!(waves[1], vec![2]);
+    }
+
+    #[test]
     fn the_real_graph_is_acyclic_and_fully_declared() {
         // The test the design asks for: every declared edge names a registered
         // task, and the graph can actually be ordered.
         let tasks = registry();
-        let order = topological_order(&tasks).expect("registry must be a DAG");
-        assert_eq!(order.len(), tasks.len());
+        let waves = topological_order(&tasks).expect("registry must be a DAG");
+        assert_eq!(waves.iter().flatten().count(), tasks.len());
 
+        // Checked wave by wave rather than over the flattened order: a
+        // dependency must be satisfied by an *earlier* wave, not merely earlier
+        // in the list. Flattening first would let two tasks in the same wave
+        // look correctly ordered when they are meant to be independent.
         let mut seen: HashSet<TaskId> = HashSet::new();
-        for position in order {
-            for dependency in tasks[position].depends_on() {
-                assert!(
-                    seen.contains(dependency),
-                    "{} ran before its dependency {dependency}",
-                    tasks[position].id()
-                );
+        for wave in waves {
+            for position in &wave {
+                for dependency in tasks[*position].depends_on() {
+                    assert!(
+                        seen.contains(dependency),
+                        "{} ran before its dependency {dependency}",
+                        tasks[*position].id()
+                    );
+                }
             }
-            seen.insert(tasks[position].id());
+            for position in &wave {
+                seen.insert(tasks[*position].id());
+            }
         }
     }
 
