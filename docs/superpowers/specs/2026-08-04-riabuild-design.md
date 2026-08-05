@@ -264,7 +264,7 @@ names a registered task.
 | # | Task | Depends on | Check |
 |---|---|---|---|
 | 1 | `login` | — | Keychain token present; `/api/v1/me` returns 200 with `status == active`. Refreshes proactively when expiring within 7 days. |
-| 2 | `github_cli` | — | `gh --version` ≥ floor; `gh auth status` exits 0; token carries `read:org`; user is in the Clubria org. |
+| 2 | `github_cli` | — | `gh --version` ≥ floor; `gh auth status` exits 0; `/user/memberships/orgs/Clubria` reports an active membership. The capability is tested, never the scope string: GitHub accepts five scopes there and folds `read:org` into `admin:org`. |
 | 3 | `infisical_cli` | — | `infisical --version` ≥ floor. **No token is installed** — credentials are brokered per use. |
 | 4 | `toolchain` | — | `~/.riabuild/node/<pinned>/bin/node -v` matches the repo's `.nvmrc`; `~/.riabuild/bin/pnpm -v` matches the repo's `packageManager` field. |
 | 5 | `project` | 2 | configured directory exists, is a git repo, `origin` is `Clubria/ai-builders-hub`. |
