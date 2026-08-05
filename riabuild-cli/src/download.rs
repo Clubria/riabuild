@@ -190,11 +190,11 @@ fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Resu
 }
 
 #[cfg(unix)]
-pub fn make_executable(path: &Path) -> Result<()> {
+pub async fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path)?.permissions();
+    let mut permissions = tokio::fs::metadata(path).await?.permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions)?;
+    tokio::fs::set_permissions(path, permissions).await?;
     Ok(())
 }
 

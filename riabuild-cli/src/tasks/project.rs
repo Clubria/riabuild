@@ -46,13 +46,16 @@ impl Task for Project {
         let Some(dir) = ctx.project_dir() else {
             return Ok(Status::needs("no project directory chosen yet"));
         };
-        if !dir.exists() {
+        if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
             return Ok(Status::needs(format!(
                 "{} does not exist",
                 contract_tilde(&dir, &ctx.paths.home())
             )));
         }
-        if !dir.join(".git").exists() {
+        if !tokio::fs::try_exists(&dir.join(".git"))
+            .await
+            .unwrap_or(false)
+        {
             return Ok(Status::needs(format!(
                 "{} is not a git checkout",
                 contract_tilde(&dir, &ctx.paths.home())
@@ -88,7 +91,10 @@ impl Task for Project {
         };
         let dir = expand_tilde(&chosen, &home);
 
-        if dir.join(".git").exists() {
+        if tokio::fs::try_exists(&dir.join(".git"))
+            .await
+            .unwrap_or(false)
+        {
             // Already a checkout: verify rather than clone over it. Cloning into
             // an existing directory would fail, and deleting it could destroy
             // uncommitted work.
@@ -104,7 +110,7 @@ impl Task for Project {
             }
         } else {
             if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent)?;
+                tokio::fs::create_dir_all(parent).await?;
             }
             ctx.ui.note(&format!("Cloning {} …", org.repo_slug));
             // Through `gh` so the developer's existing GitHub auth is reused and
@@ -130,7 +136,7 @@ impl Task for Project {
         }
 
         ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
-        ctx.config.save(ctx.paths.as_ref())?;
+        ctx.config.save(ctx.paths.as_ref()).await?;
         Ok(())
     }
 }
@@ -144,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unchosen_project_needs_setting_up() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
             Project.check(&ctx).await.unwrap(),
             Status::Needs(_)
@@ -153,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_directory_is_detected() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         ctx.config.project_path = Some(home.path().join("code/hub").to_string_lossy().into());
         let status = Project.check(&ctx).await.unwrap();
         assert!(
@@ -164,9 +170,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_directory_that_is_not_a_checkout_is_detected() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         let dir = home.path().join("code/hub");
-        std::fs::create_dir_all(&dir).unwrap();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
         ctx.config.project_path = Some(dir.to_string_lossy().into());
         let status = Project.check(&ctx).await.unwrap();
         assert!(
@@ -177,9 +183,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_checkout_of_the_wrong_repo_is_detected() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         let dir = home.path().join("code/hub");
-        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
         ctx.config.project_path = Some(dir.to_string_lossy().into());
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",
@@ -196,9 +202,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_right_checkout_is_satisfied() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         let dir = home.path().join("code/hub");
-        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
         ctx.config.project_path = Some(dir.to_string_lossy().into());
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",

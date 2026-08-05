@@ -61,23 +61,24 @@ exec "{launcher}" "$@"
     )
 }
 
-pub fn write_all(ctx: &Ctx) -> Result<()> {
+pub async fn write_all(ctx: &Ctx) -> Result<()> {
     let Some(profile) = &ctx.config.claude_profile else {
         return Ok(());
     };
 
     let bin = ctx.paths.bin_dir();
-    std::fs::create_dir_all(&bin)?;
+    tokio::fs::create_dir_all(&bin).await?;
 
     let launcher = bin.join("c");
-    std::fs::write(
+    tokio::fs::write(
         &launcher,
         launcher_script(
             &ctx.paths.claude_dir().join(profile),
             &ctx.paths.org_settings_file(),
         ),
-    )?;
-    make_executable(&launcher)?;
+    )
+    .await?;
+    make_executable(&launcher).await?;
     Ok(())
 }
 
@@ -119,14 +120,16 @@ mod tests {
         assert!(script.contains("exec claude \"$@\""));
     }
 
-    #[test]
-    fn writing_the_shim_twice_is_safe() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn writing_the_shim_twice_is_safe() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
-        write_all(&ctx).unwrap();
-        write_all(&ctx).unwrap();
+        write_all(&ctx).await.unwrap();
+        write_all(&ctx).await.unwrap();
 
-        let script = std::fs::read_to_string(ctx.paths.bin_dir().join("c")).unwrap();
+        let script = tokio::fs::read_to_string(ctx.paths.bin_dir().join("c"))
+            .await
+            .unwrap();
         assert_eq!(script.matches("CLAUDE_CONFIG_DIR").count(), 2);
     }
 
@@ -147,7 +150,7 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let profile = home.path().join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
+        tokio::fs::create_dir_all(&profile).await.unwrap();
 
         let output = runner
             .run(

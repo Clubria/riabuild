@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> Result<i32> {
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     let keychain: Arc<dyn keychain::Keychain> = Arc::from(keychain::for_platform(runner.clone()));
 
-    std::fs::create_dir_all(paths.root())?;
+    tokio::fs::create_dir_all(paths.root()).await?;
 
     let mut ctx = Ctx {
         paths: paths.clone(),
@@ -81,8 +81,8 @@ async fn run(cli: Cli) -> Result<i32> {
         keychain: keychain.clone(),
         api: api::ApiClient::new(cli::VERSION),
         ui,
-        config: UserConfig::load(paths.as_ref()),
-        state: State::load(paths.as_ref()),
+        config: UserConfig::load(paths.as_ref()).await,
+        state: State::load(paths.as_ref()).await,
         org: None,
         member: None,
         cli_version: cli::VERSION.to_string(),
@@ -95,7 +95,7 @@ async fn run(cli: Cli) -> Result<i32> {
     if let Some(project) = &cli.project {
         let expanded = expand_tilde(project, &paths.home());
         ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
-        ctx.config.save(paths.as_ref())?;
+        ctx.config.save(paths.as_ref()).await?;
     }
 
     match cli.command {
@@ -165,7 +165,7 @@ async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     let registry = tasks::registry();
     let outcome = engine::run_all(&registry, ctx).await?;
 
-    shims::write_all(ctx)?;
+    shims::write_all(ctx).await?;
 
     let notes = std::mem::take(&mut ctx.notes);
     if !notes.is_empty() {
@@ -175,7 +175,7 @@ async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         }
     }
 
-    log_run(ctx, &outcome);
+    log_run(ctx, &outcome).await;
 
     if ctx.dry_run {
         ctx.ui.info("");
@@ -217,11 +217,11 @@ fn describe_session(ctx: &Ctx) {
 /// Deliberately never fatal: failing to write a log must not fail a setup that
 /// otherwise worked. It exists so "send me your riabuild log" is a useful thing
 /// for a team lead to ask.
-fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
-    use std::io::Write;
+async fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
+    use tokio::io::AsyncWriteExt;
     let path = ctx.paths.log_file();
     let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
+    if tokio::fs::create_dir_all(parent).await.is_err() {
         return;
     }
     let line = format!(
@@ -231,12 +231,13 @@ fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
         outcome.satisfied.len(),
         outcome.applied.join(","),
     );
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
+        .await
     {
-        let _ = file.write_all(line.as_bytes());
+        let _ = file.write_all(line.as_bytes()).await;
     }
 }
 
@@ -256,9 +257,9 @@ async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
 async fn logout(ctx: &mut Ctx) -> Result<i32> {
     ctx.keychain.delete().await?;
     ctx.config.session_expires_at = None;
-    ctx.config.save(ctx.paths.as_ref())?;
+    ctx.config.save(ctx.paths.as_ref()).await?;
     ctx.state.forget("login");
-    ctx.state.save(ctx.paths.as_ref())?;
+    ctx.state.save(ctx.paths.as_ref()).await?;
     ctx.ui
         .info("This machine is signed out. Run `riabuild` to sign in again.");
     Ok(0)

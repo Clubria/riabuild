@@ -120,7 +120,10 @@ impl Task for RepoStatus {
         let Some(dir) = ctx.project_dir() else {
             return Ok(Status::Satisfied);
         };
-        if !dir.join(".git").exists() {
+        if !tokio::fs::try_exists(&dir.join(".git"))
+            .await
+            .unwrap_or(false)
+        {
             return Ok(Status::Satisfied);
         }
 
@@ -179,9 +182,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_dirty_checkout_is_still_satisfied_because_this_task_only_reports() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         let dir = home.path().join("code/hub");
-        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
         ctx.config.project_path = Some(dir.to_string_lossy().into());
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",
@@ -197,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_touches_nothing() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         RepoStatus.apply(&mut ctx).await.unwrap();
         let calls = ctx
             .runner

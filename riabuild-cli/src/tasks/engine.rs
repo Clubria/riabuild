@@ -148,12 +148,12 @@ pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> 
         ctx.ui.applied(task.title());
         ctx.state
             .mark_satisfied(task.id(), task.version(), &reason.tag());
-        ctx.state.save(ctx.paths.as_ref())?;
+        ctx.state.save(ctx.paths.as_ref()).await?;
         applied.insert(task.id());
         outcome.applied.push(task.id());
     }
 
-    ctx.state.save(ctx.paths.as_ref())?;
+    ctx.state.save(ctx.paths.as_ref()).await?;
     Ok(outcome)
 }
 
@@ -253,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_first_run_applies_everything_and_records_it() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         // Only one status is queued: with no record in state.json the engine
         // reports NeverRun without asking `check()` at all, so the single call
         // that happens is the verifying re-check after `apply()`.
@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_satisfied_machine_is_left_alone() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.state.mark_satisfied("a", 1, "never_run");
         let task = Fake::new("a", vec![], vec![Status::Satisfied]);
         let applies = task.applies.clone();
@@ -281,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_version_bump_forces_a_rerun_even_when_the_check_passes() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.state.mark_satisfied("a", 1, "never_run");
         let mut task = Fake::new("a", vec![], vec![Status::Satisfied]);
         task.version = 2;
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dependency_that_ran_forces_its_dependents_to_rerun() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.state.mark_satisfied("a", 1, "never_run");
         ctx.state.mark_satisfied("b", 1, "never_run");
         let tasks: Vec<Box<dyn Task>> = vec![
@@ -314,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_apply_that_did_not_take_is_a_hard_error() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         // check fails, apply "succeeds", re-check still fails.
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(Fake::new(
             "a",
@@ -330,7 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dry_run_changes_nothing() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.dry_run = true;
         let task = Fake::new("a", vec![], vec![Status::needs("missing")]);
         let applies = task.applies.clone();

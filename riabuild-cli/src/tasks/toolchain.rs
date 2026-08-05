@@ -22,21 +22,27 @@ const FALLBACK_PNPM: &str = "11.11.0";
 pub struct Toolchain;
 
 /// Reads the Node version the repo asks for.
-pub fn desired_node(project: Option<&Path>) -> String {
-    project
-        .map(|dir| dir.join(".nvmrc"))
-        .and_then(|file| std::fs::read_to_string(file).ok())
-        .map(|text| text.trim().trim_start_matches('v').to_string())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| FALLBACK_NODE.to_string())
+pub async fn desired_node(project: Option<&Path>) -> String {
+    // A closure cannot be async, so the read has to leave the combinator chain.
+    let Some(file) = project.map(|dir| dir.join(".nvmrc")) else {
+        return FALLBACK_NODE.to_string();
+    };
+    let Ok(text) = tokio::fs::read_to_string(file).await else {
+        return FALLBACK_NODE.to_string();
+    };
+    let text = text.trim().trim_start_matches('v').to_string();
+    if text.is_empty() {
+        return FALLBACK_NODE.to_string();
+    }
+    text
 }
 
 /// Reads the pnpm version out of `"packageManager": "pnpm@10.20.0"`.
-pub fn desired_pnpm(project: Option<&Path>) -> String {
-    let Some(text) = project
-        .map(|dir| dir.join("package.json"))
-        .and_then(|file| std::fs::read_to_string(file).ok())
-    else {
+pub async fn desired_pnpm(project: Option<&Path>) -> String {
+    let Some(file) = project.map(|dir| dir.join("package.json")) else {
+        return FALLBACK_PNPM.to_string();
+    };
+    let Ok(text) = tokio::fs::read_to_string(file).await else {
         return FALLBACK_PNPM.to_string();
     };
 
@@ -71,11 +77,11 @@ impl Task for Toolchain {
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let project = ctx.project_dir();
-        let node_version = desired_node(project.as_deref());
-        let pnpm_version = desired_pnpm(project.as_deref());
+        let node_version = desired_node(project.as_deref()).await;
+        let pnpm_version = desired_pnpm(project.as_deref()).await;
 
         let node_bin = ctx.paths.node_dir(&node_version).join("bin").join("node");
-        if !node_bin.exists() {
+        if !tokio::fs::try_exists(&node_bin).await.unwrap_or(false) {
             return Ok(Status::needs(format!(
                 "Node {node_version} is not installed yet"
             )));
@@ -93,7 +99,7 @@ impl Task for Toolchain {
         }
 
         let pnpm_bin = ctx.paths.bin_dir().join("pnpm");
-        if !pnpm_bin.exists() {
+        if !tokio::fs::try_exists(&pnpm_bin).await.unwrap_or(false) {
             return Ok(Status::needs("pnpm is not installed yet"));
         }
         let reported = ctx
@@ -112,15 +118,15 @@ impl Task for Toolchain {
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let project = ctx.project_dir();
-        let node_version = desired_node(project.as_deref());
-        let pnpm_version = desired_pnpm(project.as_deref());
+        let node_version = desired_node(project.as_deref()).await;
+        let pnpm_version = desired_pnpm(project.as_deref()).await;
 
         install_node(ctx, &node_version).await?;
         install_pnpm(ctx, &pnpm_version).await?;
 
         ctx.config.node_version = Some(node_version);
         ctx.config.pnpm_version = Some(pnpm_version);
-        ctx.config.save(ctx.paths.as_ref())?;
+        ctx.config.save(ctx.paths.as_ref()).await?;
         Ok(())
     }
 }
@@ -164,7 +170,7 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
     let bytes = download::fetch_bytes(&download::pnpm_url(pnpm_version, &asset)).await?;
 
     let bin_dir = ctx.paths.bin_dir();
-    std::fs::create_dir_all(&bin_dir)?;
+    tokio::fs::create_dir_all(&bin_dir).await?;
     let target = bin_dir.join("pnpm");
 
     if download::pnpm_ships_a_tarball(pnpm_version) {
@@ -173,7 +179,7 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
         let home = ctx.paths.pnpm_dir(pnpm_version);
         download::extract_pnpm_tarball(&bytes, &home)?;
         let launcher = home.join("pnpm");
-        if !launcher.exists() {
+        if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
             return Err(Failure::new(
                 format!("installing pnpm {pnpm_version}"),
                 "Ask your team lead to check the pnpm version pinned in the repo's package.json.",
@@ -183,21 +189,21 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
             ))
             .into());
         }
-        download::make_executable(&launcher)?;
-        write_executable(&target, shims::pnpm_shim(&launcher).as_bytes())?;
+        download::make_executable(&launcher).await?;
+        write_executable(&target, shims::pnpm_shim(&launcher).as_bytes()).await?;
     } else {
-        write_executable(&target, &bytes)?;
+        write_executable(&target, &bytes).await?;
     }
     Ok(())
 }
 
 /// Writes an executable via a staging file, so an interrupted run cannot leave
 /// a half-written one behind that looks installed.
-fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
+async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
     let staging = target.with_extension("partial");
-    std::fs::write(&staging, bytes)?;
-    download::make_executable(&staging)?;
-    std::fs::rename(&staging, target)?;
+    tokio::fs::write(&staging, bytes).await?;
+    download::make_executable(&staging).await?;
+    tokio::fs::rename(&staging, target).await?;
     Ok(())
 }
 
@@ -207,28 +213,29 @@ mod tests {
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
 
-    #[test]
-    fn reads_the_node_version_the_repo_pins() {
+    #[tokio::test]
+    async fn reads_the_node_version_the_repo_pins() {
         let dir = tempfile::TempDir::new().unwrap();
-        write_file(&dir.path().join(".nvmrc"), "v22.23.1\n");
-        assert_eq!(desired_node(Some(dir.path())), "22.23.1");
+        write_file(&dir.path().join(".nvmrc"), "v22.23.1\n").await;
+        assert_eq!(desired_node(Some(dir.path())).await, "22.23.1");
     }
 
-    #[test]
-    fn falls_back_when_the_repo_pins_nothing() {
+    #[tokio::test]
+    async fn falls_back_when_the_repo_pins_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert_eq!(desired_node(Some(dir.path())), FALLBACK_NODE);
-        assert_eq!(desired_pnpm(None), FALLBACK_PNPM);
+        assert_eq!(desired_node(Some(dir.path())).await, FALLBACK_NODE);
+        assert_eq!(desired_pnpm(None).await, FALLBACK_PNPM);
     }
 
-    #[test]
-    fn reads_pnpm_out_of_package_manager() {
+    #[tokio::test]
+    async fn reads_pnpm_out_of_package_manager() {
         let dir = tempfile::TempDir::new().unwrap();
         write_file(
             &dir.path().join("package.json"),
             r#"{"packageManager":"pnpm@10.20.0+sha512.abc"}"#,
-        );
-        assert_eq!(desired_pnpm(Some(dir.path())), "10.20.0");
+        )
+        .await;
+        assert_eq!(desired_pnpm(Some(dir.path())).await, "10.20.0");
     }
 
     /// Downloads the pinned pnpm and starts it through the shim riabuild
@@ -253,11 +260,16 @@ mod tests {
         let tree = home.path().join(FALLBACK_PNPM);
         download::extract_pnpm_tarball(&bytes, &tree).unwrap();
         let launcher = tree.join("pnpm");
-        assert!(launcher.exists(), "{asset} has no launcher at its root");
-        download::make_executable(&launcher).unwrap();
+        assert!(
+            tokio::fs::try_exists(&launcher).await.unwrap_or(false),
+            "{asset} has no launcher at its root"
+        );
+        download::make_executable(&launcher).await.unwrap();
 
         let shim = home.path().join("pnpm");
-        write_executable(&shim, shims::pnpm_shim(&launcher).as_bytes()).unwrap();
+        write_executable(&shim, shims::pnpm_shim(&launcher).as_bytes())
+            .await
+            .unwrap();
 
         let output = RealRunner
             .run(&shim.to_string_lossy(), &["-v"], &RunOptions::default())
@@ -269,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_node_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
             Toolchain.check(&ctx).await.unwrap(),
             Status::Needs(_)
@@ -280,16 +292,16 @@ mod tests {
     async fn a_node_of_the_wrong_version_is_detected() {
         // The case an existence check misses: the directory is there, the binary
         // runs, and it is the wrong Node.
-        let (ctx, home) = ctx_with(FakeRunner::new());
+        let (ctx, home) = ctx_with(FakeRunner::new()).await;
         let node_bin = ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node");
-        write_file(&node_bin, "#!/bin/sh\n");
+        write_file(&node_bin, "#!/bin/sh\n").await;
         let runner = FakeRunner::new().with(
             &format!("{} -v", node_bin.to_string_lossy()),
             0,
             "v20.11.0",
             "",
         );
-        let (mut ctx, _home2) = ctx_with(runner);
+        let (mut ctx, _home2) = ctx_with(runner).await;
         // Point the second context at the same tree.
         ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
         let status = Toolchain.check(&ctx).await.unwrap();
@@ -298,11 +310,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_complete_toolchain_is_satisfied() {
-        let (ctx, home) = ctx_with(FakeRunner::new());
+        let (ctx, home) = ctx_with(FakeRunner::new()).await;
         let node_bin = ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node");
         let pnpm_bin = ctx.paths.bin_dir().join("pnpm");
-        write_file(&node_bin, "#!/bin/sh\n");
-        write_file(&pnpm_bin, "#!/bin/sh\n");
+        write_file(&node_bin, "#!/bin/sh\n").await;
+        write_file(&pnpm_bin, "#!/bin/sh\n").await;
 
         let runner = FakeRunner::new()
             .with(
@@ -319,7 +331,7 @@ mod tests {
                 FALLBACK_PNPM,
                 "",
             );
-        let (mut ctx, _home2) = ctx_with(runner);
+        let (mut ctx, _home2) = ctx_with(runner).await;
         ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
         assert_eq!(Toolchain.check(&ctx).await.unwrap(), Status::Satisfied);
     }

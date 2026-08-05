@@ -74,7 +74,7 @@ impl Task for Login {
         // The token is now live, so everything the server knows is reachable.
         ctx.org = Some(org::fetch_config(&ctx.api).await?);
         ctx.config.session_expires_at = Some(now_millis() + SESSION_TTL_MS);
-        ctx.config.save(ctx.paths.as_ref())?;
+        ctx.config.save(ctx.paths.as_ref()).await?;
         ctx.ui
             .note(&format!("signed in as {}", member.display_name()));
         ctx.member = Some(member);
@@ -105,13 +105,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsigned_machine_needs_signing_in() {
-        let (ctx, _home) = test_ctx();
+        let (ctx, _home) = test_ctx().await;
         assert!(matches!(Login.check(&ctx).await.unwrap(), Status::Needs(_)));
     }
 
     #[tokio::test]
     async fn a_live_session_is_satisfied() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.member = Some(member("active"));
         ctx.config.session_expires_at = Some(now_millis() + 60 * 24 * 3600 * 1000);
         assert_eq!(Login.check(&ctx).await.unwrap(), Status::Satisfied);
@@ -119,7 +119,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_expiring_within_a_week_is_refreshed_early() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.member = Some(member("active"));
         ctx.config.session_expires_at = Some(now_millis() + 3 * 24 * 3600 * 1000);
         assert!(matches!(Login.check(&ctx).await.unwrap(), Status::Needs(_)));
@@ -127,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_suspended_account_stops_rather_than_looping_through_the_browser() {
-        let (mut ctx, _home) = test_ctx();
+        let (mut ctx, _home) = test_ctx().await;
         ctx.member = Some(member("suspended"));
         let error = Login.check(&ctx).await.unwrap_err().to_string();
         assert!(error.contains("reactivate"), "{error}");

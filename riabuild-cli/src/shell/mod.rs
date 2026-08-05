@@ -104,9 +104,9 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let env = environment(ctx);
 
     let (args, extra_env) = match &shell {
-        Shell::Zsh => zsh::prepare(ctx)?,
-        Shell::Bash => bash::prepare(ctx)?,
-        Shell::Fish => fish::prepare(ctx)?,
+        Shell::Zsh => zsh::prepare(ctx).await?,
+        Shell::Bash => bash::prepare(ctx).await?,
+        Shell::Fish => fish::prepare(ctx).await?,
         Shell::Other(_) => (Vec::new(), Vec::new()),
     };
 
@@ -140,9 +140,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn riabuild_paths_come_first() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn riabuild_paths_come_first() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.node_version = Some("22.23.1".into());
         let path = path_with_riabuild(&ctx, "/usr/bin:/bin");
 
@@ -157,9 +157,9 @@ mod tests {
         assert!(path.ends_with("/usr/bin:/bin"));
     }
 
-    #[test]
-    fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
         let env = environment(&ctx);
 

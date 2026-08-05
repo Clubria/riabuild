@@ -103,14 +103,14 @@ mod tests {
     #[tokio::test]
     async fn a_current_infisical_is_satisfied() {
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
     async fn an_old_infisical_is_detected() {
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.12.0", "");
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         assert!(matches!(
             InfisicalCli.check(&ctx).await.unwrap(),
             Status::Needs(_)
@@ -119,7 +119,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_infisical_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
             InfisicalCli.check(&ctx).await.unwrap(),
             Status::Needs(_)
@@ -131,7 +131,7 @@ mod tests {
         // Guards the design rule: presence of a token is not part of "healthy",
         // because riabuild never installs one.
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         InfisicalCli.check(&ctx).await.unwrap();
         let calls = format!("{:?}", ctx.runner.which("infisical"));
         assert!(!calls.contains("login"));

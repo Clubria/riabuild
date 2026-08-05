@@ -354,19 +354,19 @@ mod tests {
     }
 
     async fn reason(runner: FakeRunner) -> String {
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         format!("{:?}", GithubCli.check(&ctx).await.unwrap())
     }
 
     #[tokio::test]
     async fn a_healthy_machine_is_satisfied() {
-        let (ctx, _home) = ctx_with(healthy());
+        let (ctx, _home) = ctx_with(healthy()).await;
         assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
     async fn a_missing_gh_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
             GithubCli.check(&ctx).await.unwrap(),
             Status::Needs(_)
@@ -397,7 +397,7 @@ mod tests {
             "",
             "github.com\n  ✓ Logged in to github.com account ada\n  - Token scopes: 'admin:org', 'gist', 'repo'",
         );
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
@@ -442,7 +442,7 @@ mod tests {
     async fn a_working_token_is_never_sent_through_a_browser() {
         // The regression that matters most: apply() must not demand a sign-in
         // from a developer whose token already answers the question.
-        let (mut ctx, _home, runner) = ctx_and_runner(healthy());
+        let (mut ctx, _home, runner) = ctx_and_runner(healthy()).await;
         GithubCli.apply(&mut ctx).await.unwrap();
         let calls = runner.calls();
         assert!(
@@ -458,7 +458,7 @@ mod tests {
         let runner = healthy()
             .with(MEMBERSHIP, 1, "", "gh: Forbidden (HTTP 403)")
             .with("gh auth refresh", 0, "", "");
-        let (mut ctx, _home, calls) = ctx_and_runner(runner);
+        let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
 
         // The refresh runs, and because the stub still reports 403 afterwards,
         // apply() reports that rather than claiming success.
@@ -480,7 +480,7 @@ mod tests {
         let runner = healthy()
             .with("gh auth status", 1, "", "You are not logged into any hosts")
             .with("gh auth login", 1, "", "");
-        let (mut ctx, _home) = ctx_with(runner);
+        let (mut ctx, _home) = ctx_with(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("signing you in"), "{error}");
     }
@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_invite_names_the_invite_rather_than_the_token() {
         let runner = healthy().with(MEMBERSHIP, 0, r#"{"state":"pending"}"#, "");
-        let (mut ctx, _home) = ctx_with(runner);
+        let (mut ctx, _home) = ctx_with(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("Accept the Clubria invite"), "{error}");
     }
