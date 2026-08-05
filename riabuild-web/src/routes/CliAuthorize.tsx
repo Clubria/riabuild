@@ -1,7 +1,7 @@
-import { useAction } from "convex/react";
 import { useState } from "react";
-import { api } from "../../convex/_generated/api";
-import { Notice } from "../components/primitives";
+import { useData } from "../data/context";
+import { readError } from "../lib/errors";
+import { Alert, Button, KeyValue, Panel } from "../ui";
 
 type Params = {
   state: string;
@@ -17,8 +17,8 @@ type Params = {
  * code. `state` is passed through untouched so the CLI can reject a callback it
  * did not start.
  */
-export function CliAuthorize({ signedIn }: { signedIn: boolean }) {
-  const authorize = useAction(api.cliAuth.authorize);
+export function CliAuthorize() {
+  const data = useData();
   const [error, setError] = useState<string | null>(null);
   const [handedOff, setHandedOff] = useState(false);
   const [pending, setPending] = useState(false);
@@ -27,100 +27,100 @@ export function CliAuthorize({ signedIn }: { signedIn: boolean }) {
 
   if (params === null) {
     return (
-      <div className="max-w-xl py-10">
-        <Notice tone="signal" title="Nothing to approve">
-          <p>
+      <div className="mx-auto max-w-xl py-4">
+        <Panel title="nothing to approve" tone="warn" index="!">
+          <p className="max-w-prose text-fg-dim">
             This page is opened by the riabuild CLI. Run{" "}
-            <span className="mono">riabuild</span> in your terminal instead.
+            <span className="text-fg">riabuild</span> in your terminal instead.
           </p>
-        </Notice>
+          <div className="mt-5">
+            <Button variant="quiet" href="/">
+              cd /
+            </Button>
+          </div>
+        </Panel>
       </div>
     );
   }
 
   if (handedOff) {
     return (
-      <div className="max-w-xl py-10">
-        <h1 className="display mb-4 text-3xl">Back to your terminal.</h1>
-        <p className="text-muted">
-          riabuild has what it needs. You can close this tab.
-        </p>
+      <div className="mx-auto max-w-xl py-4">
+        <Panel title="approved" tone="ok" index="ok">
+          <p className="text-fg">Back to your terminal.</p>
+          <p className="mt-2 max-w-prose text-fg-dim">
+            riabuild has what it needs. You can close this tab.
+          </p>
+        </Panel>
       </div>
     );
   }
 
   return (
-    <div className="max-w-xl py-10">
-      <p className="eyebrow mb-4">Device authorisation</p>
-      <h1 className="display text-3xl sm:text-4xl">
-        Sign this machine
-        <br />
-        in to riabuild?
+    <div className="mx-auto max-w-xl py-4">
+      <p className="mb-1 text-fg-faint">
+        <span aria-hidden="true">$ </span>riabuild login
+      </p>
+      <h1 className="mb-5 text-xl text-fg sm:text-2xl">
+        Sign this machine in to riabuild?
       </h1>
 
-      <dl className="mono mt-8 grid grid-cols-[7rem_1fr] gap-y-2 border-y border-rule py-4">
-        <dt className="text-muted">device</dt>
-        <dd className="text-graphite">{params.label}</dd>
-        <dt className="text-muted">riabuild</dt>
-        <dd className="text-graphite">v{params.version}</dd>
-        <dt className="text-muted">callback</dt>
-        <dd className="text-graphite">127.0.0.1:{params.port}</dd>
-      </dl>
+      <Panel title="device">
+        <KeyValue
+          rows={[
+            { label: "device", value: params.label },
+            { label: "riabuild", value: `v${params.version}` },
+            { label: "callback", value: `127.0.0.1:${params.port}` },
+          ]}
+        />
+        <p className="mt-5 max-w-prose text-fg-dim">
+          Approving grants this machine a token that expires in 90 days. You can
+          revoke it from the dashboard at any time.
+        </p>
 
-      <p className="mt-5 text-muted">
-        Approving grants this machine a token that expires in 90 days. You can
-        revoke it from the dashboard at any time.
-      </p>
-
-      {!signedIn ? (
-        <p className="mt-6">Sign in above to continue.</p>
-      ) : (
-        <div className="mt-6 flex flex-wrap gap-3">
-          <button
-            className="btn"
-            disabled={pending}
+        <div className="mt-5 flex flex-wrap gap-2">
+          <Button
+            variant="primary"
+            pending={pending}
+            pendingLabel="approving"
             onClick={() => {
               setPending(true);
               setError(null);
-              void authorize({
-                challenge: params.challenge,
-                deviceLabel: params.label,
-                cliVersion: params.version,
-              })
+              void data
+                .authorizeCli({
+                  challenge: params.challenge,
+                  deviceLabel: params.label,
+                  cliVersion: params.version,
+                })
                 .then((result) => {
                   setHandedOff(true);
-                  window.location.href =
+                  data.handOffToCli(
                     `http://127.0.0.1:${params.port}/callback` +
-                    `?code=${encodeURIComponent(result.code)}` +
-                    `&state=${encodeURIComponent(params.state)}`;
+                      `?code=${encodeURIComponent(result.code)}` +
+                      `&state=${encodeURIComponent(params.state)}`,
+                  );
                 })
                 .catch((cause: unknown) => {
                   setPending(false);
-                  setError(
-                    cause instanceof Error
-                      ? cause.message
-                          .replace(/^.*Uncaught Error:\s*/, "")
-                          .split("\n")[0]
-                      : "Authorisation failed.",
-                  );
+                  setError(readError(cause, "Authorisation failed."));
                 });
             }}
           >
-            {pending ? "Approving…" : "Approve this machine"}
-          </button>
-          <a className="btn btn-quiet" href="/">
-            Cancel
-          </a>
+            approve this machine
+          </Button>
+          <Button variant="quiet" href="/" disabled={pending}>
+            cancel
+          </Button>
         </div>
-      )}
 
-      {error !== null && (
-        <div className="mt-6">
-          <Notice tone="signal" title="Not approved">
-            <p>{error}</p>
-          </Notice>
-        </div>
-      )}
+        {error !== null && (
+          <div className="mt-5">
+            <Alert tone="danger" title="Not approved">
+              <p className="wrap-value">{error}</p>
+            </Alert>
+          </div>
+        )}
+      </Panel>
     </div>
   );
 }

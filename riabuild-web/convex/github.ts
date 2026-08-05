@@ -112,6 +112,14 @@ export const viewerOrgMembership = action({
     );
     if (login === null) return { org: orgLogin(), status: "signed_out" as const };
 
+    // A dev deployment has no real GitHub org to ask about, and without this
+    // every local page renders the "check unavailable" banner — the happy path
+    // would be the one state nobody could ever look at. Same deployment-level
+    // gate as the dev sign-in provider; production never sets it.
+    if (process.env.RIABUILD_DEV_AUTH === "1") {
+      return { org: orgLogin(), status: "member" as const };
+    }
+
     const result = await checkOrgMembership(login);
     return {
       org: orgLogin(),

@@ -74,10 +74,16 @@ identity and mints short-lived tokens on demand; the CLI pipes them straight int
 
 ```sh
 cd riabuild-web  && pnpm dev            # convex + vite
+cd riabuild-web  && pnpm ui:check       # Playwright: every UI state × 3 viewports
 cd riabuild-cli  && cargo test          # 112 unit tests, no machine state needed
 ```
 
 Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.
+
+The dashboard is a fake TUI — one framed terminal, dark only, built from the
+component library in `riabuild-web/src/ui/`. Any data state renders without a
+backend via `?scenario=<name>`, and `/__ui` is the component gallery. See
+`.claude/skills/riabuild-ui/` and `.claude/skills/visual-testing/`.
 
 Versions are release dates — `2026.08.04`, plus a fourth component for a second
 release on one day. Shipping is one command, with nothing to bump first:

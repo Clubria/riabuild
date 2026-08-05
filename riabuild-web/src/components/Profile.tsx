@@ -1,20 +1,15 @@
-import { useMutation } from "convex/react";
 import { FormEvent, useState } from "react";
-import { api } from "../../convex/_generated/api";
-import { Field, Notice } from "./primitives";
-
-type Member = {
-  firstName: string;
-  lastName: string;
-  email: string;
-};
+import { useData } from "../data/context";
+import { Member } from "../data/types";
+import { readError } from "../lib/errors";
+import { Alert, Button, Field } from "../ui";
 
 /**
  * Prefilled from the GitHub profile and its verified email list. The developer
  * confirms or corrects it — this is the only thing riabuild asks them to decide.
  */
 export function Profile({ member }: { member: Member }) {
-  const updateProfile = useMutation(api.members.updateProfile);
+  const data = useData();
   const [firstName, setFirstName] = useState(member.firstName);
   const [lastName, setLastName] = useState(member.lastName);
   const [email, setEmail] = useState(member.email);
@@ -30,18 +25,15 @@ export function Profile({ member }: { member: Member }) {
     event.preventDefault();
     setState("saving");
     setError(null);
-    void updateProfile({ firstName, lastName, email })
+    void data
+      .updateProfile({ firstName, lastName, email })
       .then(() => {
         setState("saved");
         setTimeout(() => setState("idle"), 2000);
       })
       .catch((cause: unknown) => {
         setState("idle");
-        setError(
-          cause instanceof Error
-            ? cause.message.replace(/^.*Uncaught Error:\s*/, "")
-            : "Could not save your profile.",
-        );
+        setError(readError(cause, "Could not save your profile."));
       });
   }
 
@@ -49,13 +41,13 @@ export function Profile({ member }: { member: Member }) {
     <form onSubmit={onSubmit} className="max-w-xl">
       <div className="grid gap-4 sm:grid-cols-2">
         <Field
-          label="First name"
+          label="first name"
           value={firstName}
           onChange={setFirstName}
           autoComplete="given-name"
         />
         <Field
-          label="Last name"
+          label="last name"
           value={lastName}
           onChange={setLastName}
           autoComplete="family-name"
@@ -63,24 +55,35 @@ export function Profile({ member }: { member: Member }) {
       </div>
       <div className="mt-4">
         <Field
-          label="Email"
+          label="email"
           value={email}
           onChange={setEmail}
           type="email"
           autoComplete="email"
         />
       </div>
-      <div className="mt-5 flex items-center gap-4">
-        <button className="btn" disabled={!dirty || state === "saving"}>
-          {state === "saving" ? "Saving…" : "Save profile"}
-        </button>
-        {state === "saved" && <span className="eyebrow text-verified">Saved</span>}
+      <div className="mt-5 flex flex-wrap items-center gap-3">
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={!dirty}
+          pending={state === "saving"}
+          pendingLabel="saving"
+        >
+          save profile
+        </Button>
+        {state === "saved" && (
+          <span className="text-xs tracking-wider text-ok uppercase">saved</span>
+        )}
+        {!dirty && state === "idle" && (
+          <span className="text-xs text-fg-faint">no changes</span>
+        )}
       </div>
       {error !== null && (
         <div className="mt-5">
-          <Notice tone="signal" title="Not saved">
-            <p>{error}</p>
-          </Notice>
+          <Alert tone="danger" title="Not saved">
+            <p className="wrap-value">{error}</p>
+          </Alert>
         </div>
       )}
     </form>

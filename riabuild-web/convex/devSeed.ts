@@ -3,6 +3,14 @@ import { internalMutation } from "./_generated/server";
 import { roleValidator } from "./schema";
 import { SESSION_TTL_MS } from "./sessions";
 
+function requireDevSeed() {
+  if (process.env.RIABUILD_DEV_SEED !== "1") {
+    throw new Error(
+      "devSeed is disabled. Set RIABUILD_DEV_SEED=1 on this deployment to use it.",
+    );
+  }
+}
+
 /**
  * Seeds a member and a live CLI session for end-to-end tests against a local
  * backend, where there is no browser to complete the OAuth flow.
@@ -24,11 +32,7 @@ export const seedForE2e = internalMutation({
   },
   returns: v.object({ memberId: v.id("members"), sessionId: v.id("cliSessions") }),
   handler: async (ctx, args) => {
-    if (process.env.RIABUILD_DEV_SEED !== "1") {
-      throw new Error(
-        "devSeed is disabled. Set RIABUILD_DEV_SEED=1 on this deployment to use it.",
-      );
-    }
+    requireDevSeed();
 
     const existing = await ctx.db
       .query("members")
@@ -69,5 +73,118 @@ export const seedForE2e = internalMutation({
     });
 
     return { memberId, sessionId };
+  },
+});
+
+/**
+ * Populates a local deployment with an org worth looking at: a developer, a
+ * candidate, a suspended member, and sessions that are active, expired and
+ * revoked.
+ *
+ * The smoke suite needs this because a freshly signed-in dev account sees empty
+ * tables everywhere, and an empty table proves only that the empty state works.
+ * The fixture scenarios cover shapes in isolation; this covers the same shapes
+ * surviving a real round trip through Convex.
+ *
+ * Same three gates as `seedForE2e`: it is internal, reaching it needs the
+ * deployment admin key, and it refuses without `RIABUILD_DEV_SEED=1`.
+ */
+export const seedOrgForDev = internalMutation({
+  args: {},
+  returns: v.object({ members: v.number(), sessions: v.number() }),
+  handler: async (ctx) => {
+    requireDevSeed();
+
+    const people = [
+      {
+        login: "dana",
+        firstName: "Dana",
+        lastName: "Ruiz",
+        role: "developer" as const,
+        status: "active" as const,
+      },
+      {
+        login: "sam",
+        firstName: "Sam",
+        lastName: "Tran",
+        role: "candidate" as const,
+        status: "active" as const,
+      },
+      {
+        login: "rowan",
+        firstName: "Rowan",
+        lastName: "Fitzgerald-Whitmore",
+        role: "developer" as const,
+        status: "suspended" as const,
+      },
+    ];
+
+    const now = Date.now();
+    let members = 0;
+    let sessions = 0;
+
+    for (const person of people) {
+      const existing = await ctx.db
+        .query("members")
+        .withIndex("by_githubLogin", (q) => q.eq("githubLogin", person.login))
+        .unique();
+      if (existing !== null) continue;
+
+      const userId = await ctx.db.insert("users", {
+        name: `${person.firstName} ${person.lastName}`,
+        email: `${person.login}@example.invalid`,
+      });
+      const memberId = await ctx.db.insert("members", {
+        userId,
+        githubLogin: person.login,
+        githubId: `dev-${person.login}`,
+        firstName: person.firstName,
+        lastName: person.lastName,
+        email: `${person.login}@example.invalid`,
+        role: person.role,
+        status: person.status,
+      });
+      members += 1;
+
+      await ctx.db.insert("auditLog", {
+        subjectId: memberId,
+        action: "member.created",
+        meta: { githubLogin: person.login, source: "devSeed" },
+        at: now - members * 60_000,
+      });
+    }
+
+    // Sessions hang off whoever exists rather than a hard-coded login, so this
+    // works whatever name the local dev account signed in under.
+    const owner = await ctx.db.query("members").first();
+    if (owner !== null) {
+      const shapes = [
+        { label: "dev-active", expiresAt: now + SESSION_TTL_MS },
+        { label: "dev-expired", expiresAt: now - 1000 },
+        {
+          label: "dev-revoked",
+          expiresAt: now + SESSION_TTL_MS,
+          revokedAt: now,
+        },
+      ];
+      for (const shape of shapes) {
+        await ctx.db.insert("cliSessions", {
+          memberId: owner._id,
+          // Deliberately not a hash of anything: these rows exist to be listed
+          // and revoked in the UI, never to authenticate a request.
+          tokenHash: `devseed-${shape.label}-not-a-real-token-hash`,
+          deviceLabel: shape.label,
+          cliVersion: "2026.08.04",
+          lastUsedAt: now - 5 * 60_000,
+          expiresAt: shape.expiresAt,
+          ...(shape.revokedAt !== undefined
+            ? { revokedAt: shape.revokedAt }
+            : {}),
+        });
+        sessions += 1;
+      }
+    }
+
+    return { members, sessions };
   },
 });
