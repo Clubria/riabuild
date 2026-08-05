@@ -70,7 +70,12 @@ export default defineSchema({
     claudeSettings: v.string(),
     claudeSettingsUpdatedAt: v.number(),
     repoSlug: v.string(),
-    defaultProjectPath: v.string(),
+    /**
+     * Retired — the CLI now picks the checkout location per platform. Optional
+     * rather than deleted so the row written before this change still validates;
+     * the next `replace` drops it. See RETIRED_DEFAULT_PROJECT_PATH in org.ts.
+     */
+    defaultProjectPath: v.optional(v.string()),
     minCliVersion: v.string(),
     latestCliVersion: v.string(),
     /** Bumped when secrets rotate; the CLI treats an older .env.local as stale. */

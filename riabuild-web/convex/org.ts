@@ -26,11 +26,23 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
   2,
 );
 
+/**
+ * Retired. Where a checkout goes is now the CLI's decision, because one stored
+ * string cannot be right on macOS (`~/Documents/Clubria/<repo>`) and Linux
+ * (`~/code/<repo>`) at the same time — see `paths::default_project_dir` in
+ * riabuild-cli. A developer who wants somewhere else passes
+ * `riabuild --project <path>`.
+ *
+ * Still emitted by `/api/v1/org/config`: CLIs released before this change
+ * require the field to deserialize the response at all, and the `/api/v1`
+ * contract is add-only. Delete it once no installed CLI predates the change.
+ */
+export const RETIRED_DEFAULT_PROJECT_PATH = "~/code/ai-builders-hub";
+
 const configView = v.object({
   claudeSettings: v.string(),
   claudeSettingsUpdatedAt: v.number(),
   repoSlug: v.string(),
-  defaultProjectPath: v.string(),
   minCliVersion: v.string(),
   latestCliVersion: v.string(),
   secretsUpdatedAt: v.number(),
@@ -40,7 +52,6 @@ export type OrgConfig = {
   claudeSettings: string;
   claudeSettingsUpdatedAt: number;
   repoSlug: string;
-  defaultProjectPath: string;
   minCliVersion: string;
   latestCliVersion: string;
   secretsUpdatedAt: number;
@@ -53,7 +64,6 @@ export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
       claudeSettings: row.claudeSettings,
       claudeSettingsUpdatedAt: row.claudeSettingsUpdatedAt,
       repoSlug: row.repoSlug,
-      defaultProjectPath: row.defaultProjectPath,
       minCliVersion: row.minCliVersion,
       latestCliVersion: row.latestCliVersion,
       secretsUpdatedAt: row.secretsUpdatedAt,
@@ -63,7 +73,6 @@ export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
     claudeSettings: DEFAULT_CLAUDE_SETTINGS,
     claudeSettingsUpdatedAt: 0,
     repoSlug: "Clubria/ai-builders-hub",
-    defaultProjectPath: "~/code/ai-builders-hub",
     minCliVersion: "0.1.0",
     latestCliVersion: "0.1.0",
     secretsUpdatedAt: 0,
@@ -86,7 +95,6 @@ export const update = mutation({
   args: {
     claudeSettings: v.optional(v.string()),
     repoSlug: v.optional(v.string()),
-    defaultProjectPath: v.optional(v.string()),
     minCliVersion: v.optional(v.string()),
     latestCliVersion: v.optional(v.string()),
     /** Set when secrets rotate; forces every developer's .env.local to refresh. */
@@ -135,7 +143,6 @@ export const update = mutation({
           ? now
           : current.claudeSettingsUpdatedAt,
       repoSlug: args.repoSlug ?? current.repoSlug,
-      defaultProjectPath: args.defaultProjectPath ?? current.defaultProjectPath,
       minCliVersion: args.minCliVersion ?? current.minCliVersion,
       latestCliVersion: args.latestCliVersion ?? current.latestCliVersion,
       secretsUpdatedAt: args.markSecretsRotated

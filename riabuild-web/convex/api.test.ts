@@ -288,6 +288,49 @@ describe("org config and claude settings", () => {
     expect((await response.json()).repoSlug).toBe("Clubria/ai-builders-hub");
   });
 
+  test("the retired checkout path is still sent, so older CLIs can parse this", async () => {
+    const t = setup();
+    const { memberId } = await seedMember(t);
+    const token = await issueSession(t, memberId);
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(token),
+    });
+    // Current CLIs choose the checkout location themselves — it differs per
+    // platform, which one stored string cannot express. But a build released
+    // before that change cannot deserialize a response missing this field, and
+    // /api/v1 is add-only, so the endpoint keeps emitting a frozen value.
+    expect((await response.json()).defaultProjectPath).toBe(
+      "~/code/ai-builders-hub",
+    );
+  });
+
+  test("a lead editing config drops the retired path from the stored row", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t, { role: "lead" });
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{}",
+        claudeSettingsUpdatedAt: 0,
+        repoSlug: "Clubria/ai-builders-hub",
+        defaultProjectPath: "~/code/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    await t
+      .withIdentity({ subject: `${userId}|session` })
+      .mutation(api.org.update, { repoSlug: "Clubria/ai-builders-hub" });
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    // The field is optional in the schema precisely so this write can drop it;
+    // no backfill needed.
+    expect(row?.defaultProjectPath).toBeUndefined();
+  });
+
   test("claude settings come back parsed, with their timestamp", async () => {
     const t = setup();
     const { memberId } = await seedMember(t);

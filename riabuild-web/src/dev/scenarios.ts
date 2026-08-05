@@ -185,7 +185,6 @@ const AUDIT: AuditEntry[] = [
 
 const ORG: OrgConfig = {
   repoSlug: "Clubria/ai-builders-hub",
-  defaultProjectPath: "~/code/ai-builders-hub",
   claudeSettings: JSON.stringify(
     { permissions: { allow: ["Bash(pnpm *)"] }, model: "claude-opus-5" },
     null,
@@ -345,7 +344,6 @@ export const SCENARIOS: Record<string, () => Data> = {
       value: {
         ...ORG,
         repoSlug: `Clubria/${"very-long-repository-name".repeat(6)}`,
-        defaultProjectPath: `~/${"deeply-nested-directory/".repeat(12)}project`,
         claudeSettings: `{"note":"${"z".repeat(400)}"}`,
       },
     },

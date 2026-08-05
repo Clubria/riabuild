@@ -20,7 +20,6 @@ use tempfile::TempDir;
 pub fn org_config() -> OrgConfig {
     OrgConfig {
         repo_slug: "Clubria/ai-builders-hub".into(),
-        default_project_path: "~/code/ai-builders-hub".into(),
         min_cli_version: "0.1.0".into(),
         latest_cli_version: "0.1.0".into(),
         secrets_updated_at: 0,

@@ -49,7 +49,6 @@ export type AuditEntry = {
 
 export type OrgConfig = {
   repoSlug: string;
-  defaultProjectPath: string;
   claudeSettings: string;
   claudeSettingsUpdatedAt: number;
   minCliVersion: string;
@@ -73,7 +72,6 @@ export type Membership = {
 export type OrgUpdate = {
   claudeSettings?: string;
   repoSlug?: string;
-  defaultProjectPath?: string;
   minCliVersion?: string;
   latestCliVersion?: string;
   markSecretsRotated?: boolean;

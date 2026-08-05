@@ -20,8 +20,37 @@ pub type ShellLaunch = (Vec<String>, Vec<(String, String)>);
 /// Printed once when the environment shell starts. Tells the developer they are
 /// somewhere different and how to leave — and that launching an editor from
 /// inside this shell is what makes the editor inherit the environment.
+///
+/// "Once" is the load-bearing word. This used to be printed by the parent
+/// process *and* by the generated rcfile, so every developer saw it twice. The
+/// rcfile is the one that keeps it: it runs after the developer's own config,
+/// so the banner is the last thing on screen before the first prompt rather
+/// than something their `.zshrc` output scrolls away.
 pub const BANNER: &str =
     "● Clubria environment active — type `exit` to leave, `code .` to open your editor here";
+
+const BULLET: &str = "●";
+const HEADLINE: &str = "Clubria environment active";
+const HINT: &str = "— type `exit` to leave, `code .` to open your editor here";
+
+/// The banner with colour, matching what `Ui` does elsewhere: a green bullet
+/// for a good state, and the trailing advice dimmed so the headline reads first.
+///
+/// The escapes are baked into the generated rcfile because that file, not
+/// `Ui`, is what prints them — so `colour` has to be threaded across that
+/// boundary rather than re-derived inside the shell.
+pub fn banner(colour: bool) -> String {
+    if !colour {
+        return BANNER.to_string();
+    }
+    format!("\x1b[32m{BULLET}\x1b[0m {HEADLINE} \x1b[2m{HINT}\x1b[0m")
+}
+
+/// Marks the prompt so a developer can tell at a glance which shell they are in.
+///
+/// Without it the only evidence of the environment is a banner that scrolls
+/// away after the first few commands.
+pub const PROMPT_LABEL: &str = "(riabuild)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shell {
@@ -107,7 +136,13 @@ pub fn spawn(ctx: &mut Ctx) -> Result<i32> {
         Shell::Zsh => zsh::prepare(ctx)?,
         Shell::Bash => bash::prepare(ctx)?,
         Shell::Fish => fish::prepare(ctx)?,
-        Shell::Other(_) => (Vec::new(), Vec::new()),
+        // riabuild generates no startup file for a shell it does not know, so
+        // there is nothing inside it to print the banner or touch the prompt.
+        // The parent says it instead — and only here, so it is still said once.
+        Shell::Other(_) => {
+            ctx.ui.info(&banner(ctx.ui.colour()));
+            (Vec::new(), Vec::new())
+        }
     };
 
     let mut options = RunOptions {
@@ -137,6 +172,24 @@ mod tests {
             Shell::from_path("/usr/bin/nu"),
             Shell::Other("/usr/bin/nu".into())
         );
+    }
+
+    #[test]
+    fn the_coloured_banner_says_the_same_thing_as_the_plain_one() {
+        // Two spellings of one sentence drift apart. This is what stops the
+        // NO_COLOR path and the coloured path from disagreeing.
+        assert_eq!(BANNER, format!("{BULLET} {HEADLINE} {HINT}"));
+        assert_eq!(banner(false), BANNER);
+    }
+
+    #[test]
+    fn colour_wraps_the_bullet_and_dims_the_advice() {
+        let coloured = banner(true);
+        assert!(coloured.starts_with("\x1b[32m●\x1b[0m "), "{coloured:?}");
+        assert!(coloured.contains("\x1b[2m— type `exit`"), "{coloured:?}");
+        assert!(coloured.ends_with("\x1b[0m"), "{coloured:?}");
+        // The words survive the escapes.
+        assert!(coloured.contains(HEADLINE));
     }
 
     #[test]
