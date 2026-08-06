@@ -285,6 +285,7 @@ names a registered task.
 | 7 | `claude_profiles` | — | at least one UUID-named profile directory exists; `claude --version` ≥ floor. |
 | 8 | `org_settings` | 1 | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
 | 9 | `env_local` | 1, 3, 5 | `.env.local` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. |
+| 10 | `claude_trust` | 5, 7 | the profile's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
 
 Notes on specific tasks:
 
@@ -325,6 +326,24 @@ keys from developer keys after the first run, and silently clobbers developer ed
 > For policy a developer genuinely cannot bypass, Claude Code's managed settings at
 > `/Library/Application Support/ClaudeCode/managed-settings.json` take highest precedence.
 > That is a deliberate escalation requiring sudo, not v1 scope.
+
+The org settings ship the first-run experience the team wants: `theme: "auto"`,
+`permissions.defaultMode: "bypassPermissions"`, and `skipDangerousModePermissionPrompt:
+true`. The last one is not decoration — Claude Code silently downgrades bypass mode to
+default unless the disclaimer has been accepted, so the mode alone produces a developer
+who believes permissions are off and gets prompted anyway. All three are read from a
+`--settings` file: Claude Code treats it as a trusted source (`flagSettings`), alongside
+user and policy settings and unlike repo-controllable project settings.
+
+**10 — `claude_trust`.** The one piece of Claude Code state riabuild cannot express as
+settings data. Trust is `projects[<absolute path>].hasTrustDialogAccepted` in
+`.claude.json`, and until it is set, the first `c` in a fresh checkout opens a modal and
+holds the org's settings back as untrusted. The task read-modify-writes only the
+riabuild-owned profile's `.claude.json` — never `~/.claude.json` — preserving every key
+it does not own, and swaps the file in atomically because Claude Code may be running
+against it. It writes the key under both the literal and the resolved checkout path,
+since a symlinked checkout makes those different strings and trust under one is invisible
+under the other.
 
 ### Startup update check
 

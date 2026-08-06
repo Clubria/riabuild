@@ -1,6 +1,7 @@
 //! The setup tasks and the context they run against.
 
 pub mod claude_profiles;
+pub mod claude_trust;
 pub mod engine;
 pub mod env_local;
 pub mod github_cli;
@@ -136,6 +137,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(repo_status::RepoStatus),
         Box::new(claude_profiles::ClaudeProfiles),
         Box::new(org_settings::OrgSettings),
+        Box::new(claude_trust::ClaudeTrust),
         Box::new(env_local::EnvLocal),
     ]
 }

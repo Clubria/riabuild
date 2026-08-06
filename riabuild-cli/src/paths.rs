@@ -34,6 +34,15 @@ pub trait Paths: Send + Sync {
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
     }
+    /// One developer's Claude Code profile — what `CLAUDE_CONFIG_DIR` points at.
+    fn claude_profile_dir(&self, profile: &str) -> PathBuf {
+        self.claude_dir().join(profile)
+    }
+    /// Claude Code's own state for that profile. Named by Claude Code, not by
+    /// riabuild: it puts `.claude.json` inside whatever `CLAUDE_CONFIG_DIR` is.
+    fn claude_config_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join(".claude.json")
+    }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)
     }
