@@ -430,6 +430,44 @@ mod tests {
     }
 
     #[test]
+    fn enter_accepts_a_confirmation() {
+        // The prompt says [Y/n], so Enter has to mean yes. Getting this
+        // backwards makes riabuild refuse its own upgrade for anyone who
+        // answers the way the prompt tells them to.
+        assert_eq!(Ui::scripted([""]).confirm("Upgrade?"), Some(true));
+        assert_eq!(Ui::scripted(["y"]).confirm("Upgrade?"), Some(true));
+        assert_eq!(Ui::scripted(["YES\n"]).confirm("Upgrade?"), Some(true));
+    }
+
+    #[test]
+    fn anything_else_declines() {
+        for answer in ["n", "no", "nope", "later"] {
+            assert_eq!(
+                Ui::scripted([answer]).confirm("Upgrade?"),
+                Some(false),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_put_is_not_a_no() {
+        // `None` is what tells update.rs to print the command instead of
+        // running sudo. Collapsing it into `Some(false)` would silently skip a
+        // mandatory upgrade; collapsing it into `Some(true)` would run sudo in
+        // a CI job with nobody there to type a password.
+        assert_eq!(Ui::new(false).confirm("Upgrade?"), None);
+        // --quiet, even with someone there and an answer waiting.
+        let quiet = Ui {
+            quiet: true,
+            ..Ui::scripted(["y"])
+        };
+        assert_eq!(quiet.confirm("Upgrade?"), None);
+        // ^D is the absence of an answer, not a refusal.
+        assert_eq!(Ui::scripted([] as [&str; 0]).confirm("Upgrade?"), None);
+    }
+
+    #[test]
     fn a_failure_carries_all_four_parts() {
         let failure = Failure::new("checking your GitHub sign-in", "run `gh auth login`")
             .command("gh auth status")
