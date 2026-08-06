@@ -354,6 +354,24 @@ describe("org config and claude settings", () => {
     expect(body.settings).toEqual({ env: { CLUBRIA: "1" } });
     expect(body.updatedAt).toBe(1234);
   });
+
+  test("the default settings ask for bypass mode and pre-accept its disclaimer", async () => {
+    const t = setup();
+    const { memberId } = await seedMember(t);
+    const token = await issueSession(t, memberId);
+    const response = await t.fetch("/api/v1/org/claude-settings", {
+      headers: bearer(token),
+    });
+    const { settings } = await response.json();
+
+    expect(settings.theme).toBe("auto");
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+    // These two are one setting wearing two names. Claude Code downgrades
+    // bypassPermissions to default unless the disclaimer has been accepted, so
+    // shipping the mode alone produces a developer who thinks permissions are
+    // off and gets prompted anyway.
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+  });
 });
 
 describe("secret brokering", () => {

@@ -73,7 +73,7 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     tokio::fs::write(
         &launcher,
         launcher_script(
-            &ctx.paths.claude_dir().join(profile),
+            &ctx.paths.claude_profile_dir(profile),
             &ctx.paths.org_settings_file(),
         ),
     )

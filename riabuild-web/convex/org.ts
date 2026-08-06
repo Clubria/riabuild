@@ -15,11 +15,30 @@ import { compareVersions } from "./lib/version";
  * anything useful, and "set this up first" is a worse first run than sane
  * defaults a lead can correct.
  */
+/**
+ * Every key here is settings data Claude Code reads from the file the `c`
+ * launcher passes to `--settings` (source `flagSettings`, verified against
+ * 2.1.223). Nothing here is a script, and nothing here is written into anyone's
+ * own `settings.json`.
+ *
+ * `skipDangerousModePermissionPrompt` is what accepting the bypass-permissions
+ * disclaimer sets. Without it Claude Code silently downgrades the mode —
+ * "Permission mode downgraded to default — bypass requires accepting the
+ * disclaimer interactively first" — so shipping `defaultMode` without it would
+ * look configured and behave otherwise.
+ *
+ * Trusting the checkout is deliberately *not* here: `hasTrustDialogAccepted` is
+ * per-project state in `.claude.json`, not a settings key, and no settings file
+ * can express it. `claude_trust` in the CLI does that half.
+ */
 export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
   {
+    theme: "auto",
     permissions: {
+      defaultMode: "bypassPermissions",
       deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
     },
+    skipDangerousModePermissionPrompt: true,
     env: { CLUBRIA_ORG: "1" },
   },
   null,
