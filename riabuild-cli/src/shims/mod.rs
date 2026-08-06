@@ -194,15 +194,25 @@ mod tests {
     /// inherits a login from outside the config directory, this fails instead
     /// of silently merging two developers' sign-ins.
     ///
-    /// Ignored by default: it needs a real Claude Code install. To confirm
-    /// credentials (not just configuration) are isolated, additionally sign in
-    /// under two different `CLAUDE_CONFIG_DIR`s by hand and check
-    /// `claude auth status` disagrees between them — that step cannot be
-    /// scripted, so it isn't asserted here. Run with `cargo test -- --ignored`
-    /// before every Claude Code version bump, the way `claude_config_dir_smoke`
-    /// already is.
+    /// Ignored by default: it needs a real Claude Code install, **and** an
+    /// ambient sign-in already sitting in the default config directory (run
+    /// `claude auth login` first if `claude auth status` there says
+    /// `loggedIn: false`). Without that ambient sign-in the test is vacuous —
+    /// if isolation broke completely and every config dir now shared one
+    /// global (signed-out) login, a fresh temp dir would still report
+    /// `loggedIn: false` and the test would pass for the wrong reason. The
+    /// two probes together are the evidence: the ambient directory must be
+    /// signed in, and the fresh one must not be.
+    ///
+    /// To confirm credentials (not just configuration) are isolated,
+    /// additionally sign in under two different `CLAUDE_CONFIG_DIR`s by hand
+    /// and check `claude auth status` disagrees between them — that step
+    /// cannot be scripted, so it isn't asserted here. Run with
+    /// `cargo test -- --ignored` before every Claude Code version bump, the
+    /// way `claude_config_dir_smoke` already is.
     #[tokio::test]
-    #[ignore = "requires Claude Code installed; pins undocumented behaviour"]
+    #[ignore = "requires Claude Code installed and already signed in to the \
+                default config directory; pins undocumented behaviour"]
     async fn claude_credentials_follow_the_config_dir() {
         use crate::runner::{CommandRunner, RealRunner, RunOptions};
         let runner = RealRunner;
@@ -210,8 +220,32 @@ mod tests {
             panic!("claude is not installed; this test needs it");
         };
 
+        // Probe 1: the ambient config directory must already be signed in, or
+        // this test cannot distinguish "isolated" from "broken" — a machine
+        // with no sign-in anywhere would pass either way. Never surface any
+        // field but `loggedIn`: the signed-in probe's JSON also carries
+        // `email`, `orgId`, `orgName`, and `subscriptionType`.
+        let ambient = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude auth status --json (ambient)");
+        let ambient_status: serde_json::Value = serde_json::from_str(ambient.trimmed())
+            .expect("claude auth status --json must print JSON");
+        let Some(&serde_json::Value::Bool(true)) = ambient_status.get("loggedIn") else {
+            panic!(
+                "the default Claude config directory is not signed in \
+                 (loggedIn: false); this test needs an ambient sign-in to \
+                 prove anything — run `claude auth login` first"
+            );
+        };
+
+        // Probe 2: a brand-new config directory must report signed out.
         let home = tempfile::TempDir::new().unwrap();
-        let profile = home.path().join("fresh-profile");
+        let profile = home.path().join("profile");
         tokio::fs::create_dir_all(&profile).await.unwrap();
 
         let output = runner
@@ -227,7 +261,7 @@ mod tests {
                 },
             )
             .await
-            .expect("claude auth status --json");
+            .expect("claude auth status --json (fresh)");
 
         let status: serde_json::Value = serde_json::from_str(output.trimmed())
             .expect("claude auth status --json must print JSON");
