@@ -23,6 +23,14 @@ pub trait Paths: Send + Sync {
     fn bin_dir(&self) -> PathBuf {
         self.root().join("bin")
     }
+    /// The Claude Code status line script. It sits beside `org-settings.json`
+    /// rather than in `bin/` because it is a Node script Claude Code runs by
+    /// name, not something that belongs on `PATH`. The org settings name this
+    /// path as `node ~/.riabuild/claude-statusline.js`, so it cannot move
+    /// without them.
+    fn claude_statusline_file(&self) -> PathBuf {
+        self.root().join("claude-statusline.js")
+    }
     fn node_dir(&self, version: &str) -> PathBuf {
         self.root().join("node").join(version)
     }
