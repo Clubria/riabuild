@@ -96,6 +96,7 @@ src/
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
   move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
+  reset.rs     removes ~/.riabuild
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
 ```

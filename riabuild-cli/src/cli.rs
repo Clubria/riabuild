@@ -72,6 +72,16 @@ pub enum Command {
     },
     /// Print the environment riabuild would apply, as `export` lines.
     Env,
+    /// Remove `~/.riabuild` so the next run sets this machine up from scratch.
+    ///
+    /// Runs no setup tasks: the point of a reset is the machine no check can
+    /// repair, and checking first would mean fixing the tree about to be
+    /// deleted.
+    Reset {
+        /// Remove it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]
@@ -125,6 +135,18 @@ mod tests {
             panic!("expected move-project");
         };
         assert_eq!(path.as_deref(), Some("~/work/hub"));
+    }
+
+    #[test]
+    fn reset_asks_before_removing_anything() {
+        let cli = Cli::parse_from(["riabuild", "reset"]);
+        assert!(matches!(cli.command, Some(Command::Reset { yes: false })));
+    }
+
+    #[test]
+    fn reset_can_be_told_not_to_ask() {
+        let cli = Cli::parse_from(["riabuild", "reset", "--yes"]);
+        assert!(matches!(cli.command, Some(Command::Reset { yes: true })));
     }
 
     #[test]

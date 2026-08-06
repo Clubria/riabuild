@@ -111,6 +111,17 @@ impl Ui {
         self.colour
     }
 
+    /// Whether there is a developer on the other end to answer a question.
+    ///
+    /// Exposed so a caller can tell "nobody to ask" apart from "asked, and they
+    /// chose the default" — `ask` returns `None` for both. A destructive
+    /// subcommand needs that distinction: an empty answer at a real prompt is a
+    /// deliberate no, while no terminal at all means the choice was never
+    /// offered and should be refused rather than silently taken either way.
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+
     fn paint(&self, code: &str, text: &str) -> String {
         if self.colour {
             format!("\x1b[{code}m{text}\x1b[0m")
