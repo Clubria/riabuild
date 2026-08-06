@@ -86,26 +86,31 @@ Lands on its own. Ships the dashboard change and the schema the namespace depend
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `members.memberId?: string` in the schema; `internal.members.backfillPublicIds` as an `internalMutation` taking no args and returning `v.number()` (how many rows it filled).
+- Produces: `members.memberId?: string` in the schema; `internal.members.backfillMemberIds` as an `internalMutation` taking no args and returning `v.number()` (how many rows it filled).
 
 - [ ] **Step 1: Write the failing test**
 
 Add to `riabuild-web/convex/api.test.ts`:
 
 ```ts
-describe("member member ids", () => {
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+describe("member ids", () => {
   test("a member created through sign-in gets a member id", async () => {
+    // Exercises the insert in auth.ts. Reaching this through the backfill
+    // instead would pass with auth.ts unchanged, which is the whole bug this
+    // test is here to catch.
     const t = setup();
-    const { memberId } = await seedMemberWithPublicId(t);
-    const member = await t.run(async (ctx) => await ctx.db.get(memberId));
-    expect(member?.memberId).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-    );
+    const { memberId: rowId } = await seedMember(t);
+    const member = await t.run(async (ctx) => await ctx.db.get(rowId));
+    expect(member?.memberId).toMatch(UUID);
   });
 
+  // These two go away in Task 2, when the field becomes required — see the
+  // note there. They cover the one production deploy the mutation exists for.
   test("the backfill fills only the rows that are missing one", async () => {
     const t = setup();
-    const withId = await seedMemberWithPublicId(t);
+    const withId = await seedMember(t);
     const withoutId = await t.run(async (ctx) => {
       const userId = await ctx.db.insert("users", { name: "Bob", email: "bob@clubria.dev" });
       return await ctx.db.insert("members", {
@@ -121,7 +126,7 @@ describe("member member ids", () => {
     });
 
     const before = await t.run(async (ctx) => (await ctx.db.get(withId.memberId))?.memberId);
-    const filled = await t.mutation(internal.members.backfillPublicIds, {});
+    const filled = await t.mutation(internal.members.backfillMemberIds, {});
 
     expect(filled).toBe(1);
     const after = await t.run(async (ctx) => ({
@@ -135,29 +140,34 @@ describe("member member ids", () => {
   test("running the backfill twice changes nothing the second time", async () => {
     const t = setup();
     await seedMember(t);
-    await t.mutation(internal.members.backfillPublicIds, {});
-    expect(await t.mutation(internal.members.backfillPublicIds, {})).toBe(0);
+    await t.mutation(internal.members.backfillMemberIds, {});
+    expect(await t.mutation(internal.members.backfillMemberIds, {})).toBe(0);
   });
 });
 ```
 
-Add the helper beside `seedMember`:
+And give `seedMember` (`convex/api.test.ts:17`) the field, since every other test in the
+file goes through it and Task 2 makes the field required:
 
 ```ts
-async function seedMemberWithPublicId(
-  t: ReturnType<typeof setup>,
-  overrides: Parameters<typeof seedMember>[1] = {},
-) {
-  const seeded = await seedMember(t, overrides);
-  await t.mutation(internal.members.backfillPublicIds, {});
-  return seeded;
-}
+    const memberId = await ctx.db.insert("members", {
+      userId,
+      githubLogin: overrides.login ?? "ada",
+      githubId: "1234",
+      memberId: crypto.randomUUID(),
+      // … the rest unchanged
 ```
+
+Note the shadowing: `seedMember` already returns a local named `memberId` holding the
+Convex `v.id("members")`. That name now means two things in one file, so rename the returned
+one to `rowId` in the same change. The same collision exists in the schema —
+`cliSessions.memberId` is a document reference, `members.memberId` is this UUID — and both
+need a comment saying so.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "member id"`
-Expected: FAIL — `internal.members.backfillPublicIds` does not exist.
+Expected: FAIL — `internal.members.backfillMemberIds` does not exist.
 
 - [ ] **Step 3: Add the field, the minting and the backfill**
 
@@ -188,7 +198,7 @@ Expected: FAIL — `internal.members.backfillPublicIds` does not exist.
  * required. Idempotent, and returns how many rows it changed so the deploy
  * step can be checked rather than assumed.
  */
-export const backfillPublicIds = internalMutation({
+export const backfillMemberIds = internalMutation({
   args: {},
   returns: v.number(),
   handler: async (ctx) => {
@@ -235,8 +245,8 @@ git commit -m "Mint a member id for every member"
 ```ts
 test("every member payload carries the member id", async () => {
   const t = setup();
-  const { memberId } = await seedMemberWithPublicId(t);
-  const token = await seedSession(t, memberId);
+  const { memberId: rowId } = await seedMember(t);
+  const token = await issueSession(t, rowId);
 
   const response = await t.fetch("/api/v1/me", {
     headers: { authorization: `Bearer ${token}` },
@@ -244,11 +254,11 @@ test("every member payload carries the member id", async () => {
   const body = await response.json();
 
   expect(response.status).toBe(200);
-  expect(body.member.memberId).toBeTruthy();
+  expect(body.member.memberId).toMatch(UUID);
 });
 ```
 
-Use whichever session helper `api.test.ts` already defines for authenticated requests; if it is named differently from `seedSession`, use that name rather than adding another.
+`issueSession` is the existing helper at `convex/api.test.ts:44` — use it rather than adding another.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -294,10 +304,19 @@ Expected: PASS.
     memberId: member.memberId,
 ```
 
-- [ ] **Step 6: Run the whole backend suite**
+- [ ] **Step 6: Delete the two backfill tests**
+
+They insert a `members` row with no `memberId`, which `convex-test` now rejects against the
+required schema — the fixture cannot be repaired, because a row without the field is its
+entire subject. Delete both, and leave a comment on `backfillMemberIds` saying it exists for
+the one production deploy in the note below and is covered by that deploy's output rather
+than by the suite.
+
+- [ ] **Step 7: Run the whole backend suite**
 
 Run: `cd riabuild-web && pnpm vitest run convex`
-Expected: PASS. A failure here means a fixture inserts a member without a `memberId` — fix the fixture, not the schema.
+Expected: PASS. Any other failure means a fixture inserts a member without a `memberId` —
+fix the fixture, not the schema.
 
 - [ ] **Step 7: Commit**
 
@@ -306,7 +325,7 @@ git add riabuild-web/convex
 git commit -m "Serve memberId, and require it"
 ```
 
-> **Deploy note for the reviewer, not a code step.** Production takes this in three moves: deploy with the field optional, run `npx convex run members:backfillPublicIds --prod`, then deploy the required schema. The third deploy fails loudly if the backfill missed a row, which is the point of doing it in that order.
+> **Deploy note for the reviewer, not a code step.** Production takes this in three moves: deploy with the field optional, run `npx convex run members:backfillMemberIds --prod`, then deploy the required schema. The third deploy fails loudly if the backfill missed a row, which is the point of doing it in that order.
 
 ### Task 3: The CLI reads `member_id`
 
@@ -371,26 +390,272 @@ Every construction of `Member` in tests across the crate now needs the field. Ad
 Run: `cd riabuild-cli && cargo test`
 Expected: PASS.
 
-- [ ] **Step 5: Turn the decode failure into a sentence a developer can act on**
+- [ ] **Step 5: Validate the shape, not just the presence**
 
-In `riabuild-cli/src/api/mod.rs`, wherever a response body is deserialised into `Member` (the `me()` and token-exchange paths), map the serde error:
+An empty or malformed `member_id` is worse than a missing one: it reaches a remote command
+line, and an empty one collapses `~/.riabuild-remote/<member-id>` to `~/.riabuild-remote`,
+which puts every developer in one namespace and makes `forget`'s cleanup delete all of them.
+Validate where it is decoded, so no downstream caller can forget:
 
 ```rust
-.map_err(|error| {
-    Failure::new(
-        "reading your riabuild profile",
-        "Ask your team lead to deploy the dashboard — this riabuild is newer than it.",
-    )
-    .detail(error.to_string())
-})?
+fn uuid_only<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = String::deserialize(deserializer)?;
+    let shaped = value.len() == 36
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit() && !character.is_ascii_uppercase(),
+            });
+    if shaped {
+        Ok(value)
+    } else {
+        Err(D::Error::custom(format!("{value:?} is not a member id")))
+    }
+}
 ```
 
-- [ ] **Step 6: Run the suite and commit**
+Apply it with `#[serde(rename = "memberId", deserialize_with = "uuid_only")]`, and add:
+
+```rust
+#[test]
+fn a_member_id_that_is_not_a_uuid_is_refused() {
+    for bad in ["", "../../etc", "not-a-uuid", "550E8400-E29B-41D4-A716-446655440000"] {
+        let json = format!(
+            r#"{{"githubLogin":"ada","githubId":"1","memberId":"{bad}","firstName":"A",
+                "lastName":"B","email":"a@b.c","role":"developer","status":"active"}}"#
+        );
+        assert!(
+            serde_json::from_str::<Member>(&json).is_err(),
+            "{bad:?} must not be accepted as a member id"
+        );
+    }
+}
+```
+
+- [ ] **Step 6: Say what a decode failure means, without swallowing every other error**
+
+A dashboard older than this binary sends no `memberId`, and the raw serde error surfaces
+through `main.rs` as "it is a bug in riabuild", which sends the developer nowhere.
+
+**Do not map the error at `me()`.** `Member` is decoded inside the generic `interpret<T>()`
+(`api/mod.rs:181`), so `me()` only ever sees an already-wrapped `anyhow::Error` — and
+converting everything it returns into a `Failure` would swallow `ApiError`, whose
+`needs_login()` branch in `main::connect` (`main.rs:135`) is what makes an expired session
+re-run the `login` task. That would turn every laptop with a stale session into a hard stop
+telling it to deploy the dashboard.
+
+Give `Member` decoding its own path instead:
+
+```rust
+pub async fn me(&self) -> Result<Member> {
+    let envelope: serde_json::Value = self.get_json("/api/v1/me").await?;
+    let member = envelope.get("member").cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::from_value::<Member>(member).map_err(|error| {
+        Failure::new(
+            "reading your riabuild profile",
+            "Ask your team lead to deploy the dashboard — this riabuild is newer than it.",
+        )
+        .detail(error.to_string())
+        .into()
+    })
+}
+```
+
+- [ ] **Step 7: Prove the ordinary path still works**
+
+```rust
+#[tokio::test]
+async fn an_expired_session_still_asks_for_a_login_rather_than_a_deploy() {
+    // The regression this step exists to prevent: an ApiError must survive as
+    // an ApiError, or `main::connect` stops instead of re-running `login`.
+    let error = ApiError {
+        code: "session_expired".into(),
+        message: "This machine's session has expired.".into(),
+        action: "Run `riabuild login`.".into(),
+    };
+    let wrapped: anyhow::Error = error.into();
+    assert!(wrapped.downcast_ref::<ApiError>().is_some_and(ApiError::needs_login));
+}
+```
+
+Match the real `ApiError` field names and construction; if it is not constructible from a
+test, assert against a canned 401 response body through the same decode path instead.
+
+- [ ] **Step 8: Run the suite and commit**
 
 ```bash
 cd riabuild-cli && cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
 git add riabuild-cli/src
-git commit -m "Read the member member id, and refuse a payload without one"
+git commit -m "Read the member id, and refuse a payload without a real one"
+```
+
+### Task 3b: Revoking a session
+
+**Files:**
+- Modify: `riabuild-web/convex/http.ts`
+- Modify: `riabuild-web/convex/sessions.ts`
+- Test: `riabuild-web/convex/api.test.ts`
+
+**Interfaces:**
+- Consumes: the session authentication helpers `http.ts` already uses.
+- Produces: `DELETE /api/v1/cli/sessions/<id>` returning `{ revoked: true }`.
+
+Without this, `riabuild remote forget` revokes nothing — it deletes the laptop's copy of a
+credential that stays live on the server, readable by every co-tenant and usable from any
+machine. That revocability is the entire case for writing a token to a server's disk, and
+Task 10 writes it into `CLAUDE.md` as fact. **This task is what makes that sentence true.**
+
+- [ ] **Step 1: Read the API skill**
+
+Read `.claude/skills/riabuild-api/SKILL.md`. Every endpoint authenticates the session, loads
+the member, re-verifies GitHub org membership, narrows the body, does the work, and writes
+an `auditLog` entry when access changed. All six apply here.
+
+- [ ] **Step 2: Write the failing tests**
+
+```ts
+describe("revoking a session", () => {
+  test("a member can revoke their own session", async () => {
+    const t = setup();
+    const { memberId: rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const victim = await issueSession(t, rowId, { deviceLabel: "build-01.fly.dev" });
+    const victimId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      const found = rows.find((row) => row.deviceLabel === "build-01.fly.dev");
+      return found?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${victimId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    expect(response.status).toBe(200);
+
+    const revoked = await t.run(async (ctx) => await ctx.db.get(victimId!));
+    expect(revoked?.revokedAt).toBeTruthy();
+
+    // The revoked token is dead everywhere, not just on the laptop that held it.
+    const after = await t.fetch("/api/v1/me", {
+      headers: { authorization: `Bearer ${victim}` },
+    });
+    expect(after.status).toBe(401);
+  });
+
+  test("a developer cannot revoke somebody else's session", async () => {
+    const t = setup();
+    const { memberId: mine } = await seedMember(t);
+    const { memberId: theirs } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, mine);
+    const other = await issueSession(t, theirs);
+    const otherId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === theirs)?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${otherId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    expect(response.status).toBe(403);
+    expect(await t.run(async (ctx) => (await ctx.db.get(otherId!))?.revokedAt)).toBeFalsy();
+    expect(other).toBeTruthy();
+  });
+
+  test("revoking twice is not an error", async () => {
+    // `apply()` runs twice; so does `forget` after a half-finished one.
+    const t = setup();
+    const { memberId: rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const target = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows[0]?._id;
+    });
+    const once = await t.fetch(`/api/v1/cli/sessions/${target}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    // The caller just revoked the session it is calling with, so a second
+    // attempt authenticates as nobody — 401, not a 500.
+    expect(once.status).toBe(200);
+  });
+
+  test("an unknown session id is a 404, not a 500", async () => {
+    const t = setup();
+    const { memberId: rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/cli/sessions/not-an-id", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    expect([400, 404]).toContain(response.status);
+  });
+});
+```
+
+Check `issueSession`'s real signature at `convex/api.test.ts:44` and match it; if it takes no
+label, add an optional one rather than inlining a second insert.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "revoking a session"`
+Expected: FAIL — the route does not exist, so every call 404s.
+
+- [ ] **Step 4: Add the route**
+
+In `convex/http.ts`, beside the other `/api/v1` routes, with `pathPrefix` so the id is part
+of the path:
+
+```ts
+http.route({
+  pathPrefix: "/api/v1/cli/sessions/",
+  method: "DELETE",
+  handler: httpAction(async (ctx, req) => {
+    const session = await authenticate(ctx, req);          // 401 on missing/expired/revoked
+    const member = await requireActiveMember(ctx, session); // 403 on suspended
+    await requireOrgMembership(member.githubLogin);         // never role alone
+
+    const id = new URL(req.url).pathname.split("/").pop() ?? "";
+    const revoked = await ctx.runMutation(internal.sessions.revoke, {
+      sessionId: id,
+      actorId: member._id,
+      isLead: member.role === "lead",
+    });
+    if (revoked === "not_found") {
+      return fail(404, "session_unknown", "That session no longer exists.", "Run `riabuild remote list` to see what is left.");
+    }
+    if (revoked === "forbidden") {
+      return fail(403, "not_yours", "That session belongs to somebody else.", "Ask a team lead to revoke it.");
+    }
+    return jsonResponse({ revoked: true });
+  }),
+});
+```
+
+Use whatever the existing helpers in `http.ts` are actually called — the file already has an
+authenticate-then-load-member-then-check-org sequence; reuse it rather than writing a fourth
+copy.
+
+In `convex/sessions.ts`, an `internalMutation` that sets `revokedAt`, refuses a session
+belonging to another member unless the caller is a lead, is a no-op when `revokedAt` is
+already set, and writes an `auditLog` entry with `action: "session.revoked"`.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "revoking a session"`
+Expected: PASS, four tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add riabuild-web/convex
+git commit -m "Let a session be revoked, so forget can mean something"
 ```
 
 ### Task 4: A `Copyable` component
@@ -411,50 +676,70 @@ Read `.claude/skills/riabuild-ui/SKILL.md` and `.claude/skills/visual-testing/SK
 
 - [ ] **Step 2: Write the component**
 
+Read `riabuild-web/src/ui/Command.tsx` first and copy its clipboard handling exactly. It
+treats failure as a **rendered state**, because `navigator.clipboard` is `undefined` in an
+insecure context and can be denied outright — and `e2e/helpers.ts` asserts no unhandled
+rejections on every page, so an unguarded `.then()` fails the suite as well as the user.
+
 `riabuild-web/src/ui/Copyable.tsx`:
 
 ```tsx
 import { useState } from "react";
+import { Button } from "./Button";
+
+type CopyState = "idle" | "copied" | "failed";
 
 /**
- * An opaque value a developer needs to copy but never to read aloud — a member
- * id, which names their directory on a shared server.
+ * An opaque value a developer copies but never reads aloud — a member id, which
+ * names their directory on a shared server.
  *
  * Not a `Command` prop: `Command`'s `$` prompt means *this is a shell command*,
  * and an identifier is not one.
  */
 export function Copyable({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false);
+  const [state, setState] = useState<CopyState>("idle");
   const short = value.split("-")[0] || value;
 
   function copy() {
-    void navigator.clipboard.writeText(value).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    const clipboard = navigator.clipboard;
+    if (clipboard === undefined) {
+      setState("failed");
+      return;
+    }
+    void clipboard.writeText(value).then(
+      () => {
+        setState("copied");
+        setTimeout(() => setState("idle"), 1600);
+      },
+      () => setState("failed"),
+    );
   }
 
   return (
     <span className="inline-flex items-center gap-2">
-      <span className="font-mono text-fg-dim" title={value} aria-label={`${label} ${value}`}>
-        {short}…
-      </span>
-      <button
-        type="button"
-        onClick={copy}
-        className="text-fg-faint hover:text-accent focus-visible:text-accent"
-        aria-label={`Copy ${label}`}
-      >
-        {copied ? "copied" : "copy"}
-      </button>
+      {/* `title` and the visually hidden span carry the full value. An
+          `aria-label` on a plain span is `aria-prohibited-attr` under axe,
+          which e2e/helpers.ts runs on every page. */}
+      <code className="font-mono text-fg-dim" title={value}>
+        <span aria-hidden="true">{short}…</span>
+        <span className="sr-only">{value}</span>
+      </code>
+      <Button variant="quiet" onClick={copy} aria-label={`Copy ${label}`}>
+        {state === "copied" ? "copied" : state === "failed" ? "copy failed" : "copy"}
+      </Button>
     </span>
   );
 }
 ```
 
+Use whatever the repo's visually-hidden utility is actually called; if there is none, add one
+to `tokens.css` rather than inventing a second convention.
+
 - [ ] **Step 3: Export it and add the gallery entry**
 
-Add `export { Copyable } from "./Copyable";` to `riabuild-web/src/ui/index.ts`, and add a `Copyable` section to the `/__ui` gallery showing: a normal UUID, a value with no dashes, and an empty string.
+Add `export { Copyable } from "./Copyable";` to `riabuild-web/src/ui/index.ts`, and add a
+`Copyable` section to `riabuild-web/src/routes/Gallery.tsx` showing: a normal UUID, a value
+with no dashes, and an empty string.
 
 - [ ] **Step 4: Check it renders in both suites**
 
