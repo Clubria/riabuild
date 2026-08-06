@@ -1,7 +1,8 @@
 # riabuild-cli
 
 Rust binary that provisions a developer's machine and drops them into the Clubria
-environment. Distributed via Homebrew tap `clubria/tap`.
+environment. Distributed via the Homebrew tap `clubria/tap` on macOS, and via apt and
+dnf repositories on Linux — all three served from this repository.
 
 Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 `../docs/superpowers/specs/2026-08-04-riabuild-design.md`.
@@ -68,18 +69,43 @@ around a check that does not detect a real state, fix the check.
 `keychain.rs`. Infisical tokens are short-lived, brokered per use, and piped straight into
 `infisical export` — never written down.
 
-**Paths and keychain stay behind traits.** v1 targets macOS, but `paths.rs` and
-`keychain.rs` are the only files that may know that. Linux support should be an addition,
-not a rewrite.
+**Paths and keychain stay behind traits.** macOS and Linux are both supported, and
+`paths.rs`, `keychain.rs`, `tools.rs`, `download.rs` and `update.rs` are the only files
+that may know which one they are running on. A `cfg!(target_os)` or a
+`std::env::consts::OS` anywhere else is a bug — it puts a platform decision somewhere no
+test on the other platform can reach it.
+
+Where a platform answer is a value rather than a code path, take the OS as a *parameter*
+and keep a thin wrapper that supplies the real one. `paths::default_project_dir_on` is the
+pattern: `cfg!` would compile every branch but one out of the test binary, so only the
+runner's own answer could ever be asserted.
+
+**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, `gh`, and
+`infisical` are downloaded, verified against a published digest, and kept under
+`~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a
+package manager to install a dependency. Run them through `ctx.gh()` and `ctx.infisical()`
+rather than by name: during provisioning `~/.riabuild/bin` is not on `PATH`, so the bare
+name finds a binary no `check()` verified, or nothing at all.
+
+Pinned versions live in `tools.rs` as constants, never a `releases/latest` lookup —
+what riabuild puts on a laptop should be versioned, auditable, and shipped in a signed
+release. Bumping one means bumping the task's `version()` beside it.
 
 **The version comes from the git tag, never from `Cargo.toml`.** riabuild is versioned by
 release date (`2026.08.04`), which semver cannot express, so `Cargo.toml` holds a
 permanent `0.0.0` placeholder and `cli.rs` reads `RIABUILD_VERSION` injected by the
 release workflow. Do not bump the crate version and do not reintroduce
 `CARGO_PKG_VERSION` — a binary reporting a version other than the release it shipped in
-makes every launch attempt a `brew upgrade` that cannot change anything. Local builds
-report `9999.0.0-dev`, above every real date, so working on riabuild never makes riabuild
-replace the binary being worked on. See `../docs/releasing.md`.
+makes every launch attempt an upgrade that cannot change anything. Local builds report
+`9999.0.0-dev`, above every real date, so working on riabuild never makes riabuild replace
+the binary being worked on. See `../docs/releasing.md`.
+
+**Self-update asks what owns the binary, never what is installed.** `update.rs` runs
+`dpkg -S` and then `rpm -qf` against the running executable. A Fedora machine can have
+`apt` on it, and a riabuild built with `cargo` is owned by nothing — `sudo apt-get install
+riabuild` there installs a *second* riabuild elsewhere and leaves this one in place, so
+every upgrade reports success and nothing changes. That case prints the command and never
+sudoes.
 
 ## Adding or changing a setup task
 
@@ -96,9 +122,16 @@ src/
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
   move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
+  download.rs  fetching and digests    archive.rs   tar and zip extraction
+  tools.rs     the gh and infisical releases riabuild owns
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
 ```
+
+`download.rs` decides where bytes come from and whether they are the right bytes;
+`archive.rs` only ever sees a buffer that already matched a digest. Keep that split — it
+is what makes "verified before anything is written" a property of the code rather than a
+convention.
 
 One task per file. When a file passes roughly 300 lines, it is doing too much.
 
