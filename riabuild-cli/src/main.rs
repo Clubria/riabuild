@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod api;
+mod archive;
 mod cli;
 mod config;
 mod download;
@@ -20,6 +21,7 @@ mod shell;
 mod shims;
 mod tasks;
 mod testing;
+mod tools;
 mod ui;
 mod update;
 mod version;

@@ -40,6 +40,24 @@ pub async fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
     (ctx, home)
 }
 
+/// A `Ctx` on a machine where riabuild has already installed the tools it owns.
+///
+/// The file contents are irrelevant — every invocation goes through
+/// `FakeRunner` — but the files must exist, because their existence is exactly
+/// what `check()` uses to tell a provisioned machine from a bare one. Tests
+/// that want the bare case use `ctx_with` and assert the task asks to install.
+pub async fn ctx_with_tools(runner: FakeRunner) -> (Ctx, TempDir) {
+    let (ctx, home) = ctx_with(runner).await;
+    install_owned_tools(&ctx).await;
+    (ctx, home)
+}
+
+pub async fn install_owned_tools(ctx: &Ctx) {
+    for binary in [ctx.gh(), ctx.infisical()] {
+        write_file(std::path::Path::new(&binary), "#!/bin/sh\n").await;
+    }
+}
+
 /// Like `ctx_with`, but hands back the runner as well.
 ///
 /// Some things a task must get right are only visible in *what it ran*: that a
