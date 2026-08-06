@@ -91,12 +91,8 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 
     let shown = contract_tilde(&plan.root, &home);
     ui.info(&format!("riabuild reset will remove {shown}"));
-    if plan.entries.is_empty() {
-        ui.note("it is empty");
-    } else {
-        ui.note(&plan.entries.join(", "));
-        ui.note("this includes the Claude Code history kept in your Clubria profile");
-        ui.note("your checkout and your riabuild sign-in are not touched");
+    for line in warnings(&plan, &paths.claude_dir()) {
+        ui.note(&line);
     }
 
     if request.dry_run {
@@ -137,6 +133,30 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
         "Removed {shown}. Run `riabuild` to set this machine up again."
     ));
     Ok(0)
+}
+
+/// What the developer is told before being asked.
+///
+/// Pure, so the claims can be tested. The Claude Code history is the one item
+/// in the tree that is not reconstructible, so it is named — but only when the
+/// profile is actually there. Warning about history a developer does not have
+/// teaches them to skim the warning that matters. `claude_dir` is passed in
+/// rather than spelled out here, because the layout belongs to `paths.rs`.
+fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
+    if plan.entries.is_empty() {
+        return vec!["it is empty".to_string()];
+    }
+    let mut lines = vec![plan.entries.join(", ")];
+    if plan
+        .entries
+        .iter()
+        .any(|entry| plan.root.join(entry) == claude_dir)
+    {
+        lines
+            .push("this includes the Claude Code history kept in your Clubria profile".to_string());
+    }
+    lines.push("your checkout and your riabuild sign-in are not touched".to_string());
+    lines
 }
 
 /// A last guard on a recursive delete driven by a trait a test can override.
@@ -359,6 +379,43 @@ mod tests {
             .expect("refusal is an actionable failure");
         assert!(failure.action.contains("--yes"));
         assert!(paths.root().exists(), "nothing is removed when refused");
+    }
+
+    #[test]
+    fn the_claude_history_is_only_named_when_there_is_a_profile_to_lose() {
+        let paths = RealPaths::rooted_at("/Users/ada");
+        let claude = paths.claude_dir();
+
+        let with_profile = Plan {
+            root: paths.root(),
+            entries: vec!["claude".into(), "state.json".into()],
+        };
+        let without = Plan {
+            root: paths.root(),
+            entries: vec!["state.json".into()],
+        };
+
+        let names_history = |plan: &Plan| {
+            warnings(plan, &claude)
+                .iter()
+                .any(|line| line.contains("Claude Code history"))
+        };
+        assert!(names_history(&with_profile));
+        assert!(
+            !names_history(&without),
+            "a tree with no profile in it has no history to warn about"
+        );
+    }
+
+    #[test]
+    fn an_empty_tree_says_so_and_claims_nothing_else() {
+        let paths = RealPaths::rooted_at("/Users/ada");
+        let plan = Plan {
+            root: paths.root(),
+            entries: Vec::new(),
+        };
+
+        assert_eq!(warnings(&plan, &paths.claude_dir()), vec!["it is empty"]);
     }
 
     #[test]
