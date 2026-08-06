@@ -176,4 +176,66 @@ mod tests {
             "CLAUDE_CONFIG_DIR was ignored"
         );
     }
+
+    /// Does `CLAUDE_CONFIG_DIR` isolate *credentials*, or only configuration?
+    ///
+    /// The profile model assumes the former. Tested directly on macOS:
+    /// `CLAUDE_CONFIG_DIR=/tmp/asd claude` prompts for a fresh login, so the
+    /// credential is keyed to the config directory, not to the Unix account.
+    /// Two riabuild profiles on one Mac — or two developers sharing a Unix
+    /// account on a Mac server — get separate Claude sign-ins. See
+    /// `docs/superpowers/specs/2026-08-06-remote-mode-design.md`, "Claude Code
+    /// needs no special handling here".
+    ///
+    /// `claude auth status --json` is the non-interactive probe: it reports
+    /// `loggedIn` without opening a prompt and, for a signed-out directory,
+    /// without printing anything credential-shaped. A fresh `CLAUDE_CONFIG_DIR`
+    /// must report `loggedIn: false` — if a future Claude Code release instead
+    /// inherits a login from outside the config directory, this fails instead
+    /// of silently merging two developers' sign-ins.
+    ///
+    /// Ignored by default: it needs a real Claude Code install. To confirm
+    /// credentials (not just configuration) are isolated, additionally sign in
+    /// under two different `CLAUDE_CONFIG_DIR`s by hand and check
+    /// `claude auth status` disagrees between them — that step cannot be
+    /// scripted, so it isn't asserted here. Run with `cargo test -- --ignored`
+    /// before every Claude Code version bump, the way `claude_config_dir_smoke`
+    /// already is.
+    #[tokio::test]
+    #[ignore = "requires Claude Code installed; pins undocumented behaviour"]
+    async fn claude_credentials_follow_the_config_dir() {
+        use crate::runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let profile = home.path().join("fresh-profile");
+        tokio::fs::create_dir_all(&profile).await.unwrap();
+
+        let output = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions {
+                    env: vec![(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        profile.to_string_lossy().into_owned(),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("claude auth status --json");
+
+        let status: serde_json::Value = serde_json::from_str(output.trimmed())
+            .expect("claude auth status --json must print JSON");
+        assert_eq!(
+            status.get("loggedIn"),
+            Some(&serde_json::Value::Bool(false)),
+            "a fresh CLAUDE_CONFIG_DIR was already authenticated: credentials \
+             are not isolated per config directory"
+        );
+    }
 }
