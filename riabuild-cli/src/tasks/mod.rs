@@ -1,6 +1,8 @@
 //! The setup tasks and the context they run against.
 
 pub mod claude_profiles;
+pub mod claude_statusline;
+pub mod claude_trust;
 pub mod engine;
 pub mod env_local;
 pub mod github_cli;
@@ -19,6 +21,7 @@ use crate::paths::Paths;
 use crate::runner::CommandRunner;
 use crate::ui::Ui;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::Arc;
 
 pub type TaskId = &'static str;
@@ -69,6 +72,7 @@ impl Status {
     }
 }
 
+#[async_trait]
 pub trait Task: Send + Sync {
     fn id(&self) -> TaskId;
     fn title(&self) -> &str;
@@ -77,8 +81,8 @@ pub trait Task: Send + Sync {
     /// bug in the check.
     fn version(&self) -> u32;
     fn depends_on(&self) -> &[TaskId];
-    fn check(&self, ctx: &Ctx) -> Result<Status>;
-    fn apply(&self, ctx: &mut Ctx) -> Result<()>;
+    async fn check(&self, ctx: &Ctx) -> Result<Status>;
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()>;
 }
 
 /// Everything a task is allowed to touch.
@@ -120,6 +124,34 @@ impl Ctx {
             .as_deref()
             .map(|path| crate::paths::expand_tilde(path, &self.paths.home()))
     }
+
+    /// The `gh` riabuild owns.
+    ///
+    /// Every call site runs *this* rather than the string `"gh"`. Resolving
+    /// through `PATH` would find whatever the developer happens to have, which
+    /// is not the binary any `check()` verified — and during provisioning
+    /// `~/.riabuild/bin` is not on `PATH` at all, so it would usually not find
+    /// the owned copy even when one is installed.
+    pub fn gh(&self) -> String {
+        self.owned_tool("gh", crate::tools::GH_VERSION, crate::tools::GH_MEMBER)
+    }
+
+    /// The `infisical` riabuild owns. Same reasoning as `gh`.
+    pub fn infisical(&self) -> String {
+        self.owned_tool(
+            "infisical",
+            crate::tools::INFISICAL_VERSION,
+            crate::tools::INFISICAL_MEMBER,
+        )
+    }
+
+    fn owned_tool(&self, tool: &str, version: &str, member: &str) -> String {
+        self.paths
+            .tool_dir(tool, version)
+            .join(member)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// Every task riabuild knows how to perform, in declaration order. The engine
@@ -134,6 +166,8 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(repo_status::RepoStatus),
         Box::new(claude_profiles::ClaudeProfiles),
         Box::new(org_settings::OrgSettings),
+        Box::new(claude_trust::ClaudeTrust),
         Box::new(env_local::EnvLocal),
+        Box::new(claude_statusline::ClaudeStatusline),
     ]
 }

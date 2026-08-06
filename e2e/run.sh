@@ -119,16 +119,9 @@ for tool in cargo node npx pnpm gh git curl python3; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed."
 done
 
-# riabuild installs the Infisical CLI with Homebrew, which only exists on macOS
-# here. On Linux the task can still be *checked* — which is the interesting half
-# — as long as the binary is already on PATH.
-if [ "$PLATFORM" = linux ] && ! command -v infisical >/dev/null 2>&1; then
-  die "infisical is not installed.
-
-On macOS riabuild installs it itself with Homebrew. On Linux that path does not
-exist, so install it first:
-  curl -sL https://github.com/Infisical/cli/releases/latest/download/cli_\$(…)_linux_amd64.tar.gz | tar xz"
-fi
+# `gh` and `infisical` are riabuild's to install on both platforms now, so
+# nothing has to be staged for it — the tasks that fetch them are part of what
+# this run is testing.
 
 if [ -z "${E2E_GITHUB_TOKEN:-}" ]; then
   die "E2E_GITHUB_TOKEN is not set.
@@ -455,17 +448,8 @@ LOG="$RIA_HOME/logs/riabuild.log"
 # the session it produces — every request after this authenticates with the real
 # token against the real endpoint.
 mkdir -p "$RIA_HOME"
-SEEDED_TASKS='"login":{"version":1,"last_ok_at":'"$(date +%s)"',"last_reason":"e2e_seeded_session"}'
-
-# On Linux `infisical_cli` gets the same treatment, for a different reason:
-# riabuild installs it with Homebrew, which is the macOS path, so `apply()`
-# cannot succeed here at all. Its `check()` still runs against the real binary.
-# The macOS runner installs it for real, which is the run that counts.
-if [ "$PLATFORM" = linux ]; then
-  SEEDED_TASKS="$SEEDED_TASKS,\"infisical_cli\":{\"version\":1,\"last_ok_at\":$(date +%s),\"last_reason\":\"e2e_no_linux_installer\"}"
-fi
-
-printf '{"tasks":{%s}}\n' "$SEEDED_TASKS" > "$RIA_HOME/state.json"
+printf '{"tasks":{"login":{"version":1,"last_ok_at":%s,"last_reason":"e2e_seeded_session"}}}\n' \
+  "$(date +%s)" > "$RIA_HOME/state.json"
 
 # The task ids present before anything runs, so the dry run can be held to
 # adding none of its own.
@@ -529,7 +513,8 @@ pass "provisioned"
 step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
-for task in login github_cli infisical_cli toolchain project repo_status claude_profiles org_settings env_local; do
+for task in login github_cli infisical_cli toolchain project repo_status \
+            claude_profiles org_settings claude_trust env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
 
@@ -559,6 +544,12 @@ check_contains "org-settings.json is what this deployment served" \
   "$(cat "$RIA_HOME/org-settings.json" 2>/dev/null)" "CLUBRIA_E2E"
 
 check "a Claude Code profile exists" test -d "$RIA_HOME/claude/$CLAUDE_PROFILE"
+
+# The org settings *name* this script; the binary carries it. That split is what
+# keeps a dashboard field from being a way to run code on a laptop, so the file
+# has to actually arrive from the binary for the settings to mean anything.
+check "the status line script was installed from the binary" \
+  test -s "$RIA_HOME/claude-statusline.js"
 
 # The whole reason riabuild exists: a developer ends up with working secrets.
 ENV_LOCAL="$PROJECT_DIR/.env.local"

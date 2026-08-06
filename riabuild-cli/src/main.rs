@@ -10,16 +10,20 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod api;
+mod archive;
 mod cli;
 mod config;
 mod download;
+mod fs_move;
 mod keychain;
+mod move_project;
 mod paths;
 mod runner;
 mod shell;
 mod shims;
 mod tasks;
 mod testing;
+mod tools;
 mod ui;
 mod update;
 mod version;
@@ -35,11 +39,12 @@ use std::sync::Arc;
 use tasks::{Ctx, engine};
 use ui::{Failure, Ui};
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
     let quiet = cli.quiet;
 
-    match run(cli) {
+    match run(cli).await {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             let ui = Ui::new(quiet);
@@ -66,13 +71,13 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     let keychain: Arc<dyn keychain::Keychain> = Arc::from(keychain::for_platform(runner.clone()));
 
-    std::fs::create_dir_all(paths.root())?;
+    tokio::fs::create_dir_all(paths.root()).await?;
 
     let mut ctx = Ctx {
         paths: paths.clone(),
@@ -80,8 +85,8 @@ fn run(cli: Cli) -> Result<i32> {
         keychain: keychain.clone(),
         api: api::ApiClient::new(cli::VERSION),
         ui,
-        config: UserConfig::load(paths.as_ref()),
-        state: State::load(paths.as_ref()),
+        config: UserConfig::load(paths.as_ref()).await,
+        state: State::load(paths.as_ref()).await,
         org: None,
         member: None,
         cli_version: cli::VERSION.to_string(),
@@ -94,24 +99,27 @@ fn run(cli: Cli) -> Result<i32> {
     if let Some(project) = &cli.project {
         let expanded = expand_tilde(project, &paths.home());
         ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
-        ctx.config.save(paths.as_ref())?;
+        ctx.config.save(paths.as_ref()).await?;
     }
 
     match cli.command {
-        Some(Command::Logout) => return logout(&mut ctx),
+        Some(Command::Logout) => return logout(&mut ctx).await,
         Some(Command::Env) => return print_env(&ctx),
-        Some(Command::Shell) => return open_shell(&mut ctx),
+        Some(Command::Shell) => return open_shell(&mut ctx).await,
+        Some(Command::MoveProject { path }) => {
+            return move_project::run(&mut ctx, path.as_deref()).await;
+        }
         Some(Command::Login) => {
             use tasks::Task;
-            connect(&mut ctx)?;
-            tasks::login::Login.apply(&mut ctx)?;
+            connect(&mut ctx).await?;
+            tasks::login::Login.apply(&mut ctx).await?;
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
         Some(Command::Status) | None => {}
     }
 
-    provision(&mut ctx, &cli)
+    provision(&mut ctx, &cli).await
 }
 
 /// Asks riabuild-web who this machine belongs to, before any task runs.
@@ -119,16 +127,16 @@ fn run(cli: Cli) -> Result<i32> {
 /// A missing or expired session is not an error here — the `login` task exists
 /// to fix exactly that. Anything else (suspended, removed from the org) is
 /// surfaced immediately, because no amount of provisioning will help.
-fn connect(ctx: &mut Ctx) -> Result<()> {
-    let Some(token) = ctx.keychain.get()? else {
+async fn connect(ctx: &mut Ctx) -> Result<()> {
+    let Some(token) = ctx.keychain.get().await? else {
         return Ok(());
     };
     ctx.api.set_token(Some(token));
 
-    match ctx.api.me() {
+    match ctx.api.me().await {
         Ok(member) => {
             ctx.member = Some(member);
-            ctx.org = Some(org::fetch_config(&ctx.api)?);
+            ctx.org = Some(org::fetch_config(&ctx.api).await?);
             Ok(())
         }
         Err(error) => match error.downcast_ref::<ApiError>() {
@@ -141,9 +149,9 @@ fn connect(ctx: &mut Ctx) -> Result<()> {
     }
 }
 
-fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
+async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.ui.banner("Clubria");
-    connect(ctx)?;
+    connect(ctx).await?;
     describe_session(ctx);
 
     if let Some(org) = &ctx.org {
@@ -155,16 +163,16 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         ) {
             update::Action::Continue => {}
             update::Action::Upgrade { to, mandatory } => {
-                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory)?;
+                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory).await?;
             }
         }
     }
 
     ctx.ui.heading("Checking this machine");
     let registry = tasks::registry();
-    let outcome = engine::run_all(&registry, ctx)?;
+    let outcome = engine::run_all(&registry, ctx).await?;
 
-    shims::write_all(ctx)?;
+    shims::write_all(ctx).await?;
 
     let notes = std::mem::take(&mut ctx.notes);
     if !notes.is_empty() {
@@ -174,7 +182,7 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         }
     }
 
-    log_run(ctx, &outcome);
+    log_run(ctx, &outcome).await;
 
     if ctx.dry_run {
         ctx.ui.info("");
@@ -195,7 +203,7 @@ fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     if cli.no_shell {
         return Ok(0);
     }
-    open_shell(ctx)
+    open_shell(ctx).await
 }
 
 /// Who riabuild thinks this machine belongs to, and where the token lives.
@@ -222,11 +230,11 @@ fn describe_session(ctx: &Ctx) {
 /// Deliberately never fatal: failing to write a log must not fail a setup that
 /// otherwise worked. It exists so "send me your riabuild log" is a useful thing
 /// for a team lead to ask.
-fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
-    use std::io::Write;
+async fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
+    use tokio::io::AsyncWriteExt;
     let path = ctx.paths.log_file();
     let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
+    if tokio::fs::create_dir_all(parent).await.is_err() {
         return;
     }
     let line = format!(
@@ -236,16 +244,17 @@ fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
         outcome.satisfied.len(),
         outcome.applied.join(","),
     );
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
+        .await
     {
-        let _ = file.write_all(line.as_bytes());
+        let _ = file.write_all(line.as_bytes()).await;
     }
 }
 
-fn open_shell(ctx: &mut Ctx) -> Result<i32> {
+async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     if shell::already_inside() {
         // Nesting would stack PATH entries and leave the developer two `exit`s
         // away from their own terminal.
@@ -257,15 +266,15 @@ fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     // printing it here too is what made every developer see it twice. This blank
     // line is only separation from the task list above.
     ctx.ui.info("");
-    shell::spawn(ctx)
+    shell::spawn(ctx).await
 }
 
-fn logout(ctx: &mut Ctx) -> Result<i32> {
-    ctx.keychain.delete()?;
+async fn logout(ctx: &mut Ctx) -> Result<i32> {
+    ctx.keychain.delete().await?;
     ctx.config.session_expires_at = None;
-    ctx.config.save(ctx.paths.as_ref())?;
+    ctx.config.save(ctx.paths.as_ref()).await?;
     ctx.state.forget("login");
-    ctx.state.save(ctx.paths.as_ref())?;
+    ctx.state.save(ctx.paths.as_ref()).await?;
     ctx.ui
         .info("This machine is signed out. Run `riabuild` to sign in again.");
     Ok(0)

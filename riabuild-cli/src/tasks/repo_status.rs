@@ -11,6 +11,7 @@
 use super::{Ctx, Status, Task, TaskId};
 use crate::runner::RunOptions;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::path::Path;
 
 pub struct RepoStatus;
@@ -88,21 +89,25 @@ pub fn parse_status(output: &str) -> Report {
     report
 }
 
-fn gather(ctx: &Ctx, dir: &Path) -> Result<Report> {
-    let output = ctx.runner.run(
-        "git",
-        &[
-            "-C",
-            &dir.to_string_lossy(),
-            "status",
-            "--porcelain=v2",
-            "--branch",
-        ],
-        &RunOptions::default(),
-    )?;
+async fn gather(ctx: &Ctx, dir: &Path) -> Result<Report> {
+    let output = ctx
+        .runner
+        .run(
+            "git",
+            &[
+                "-C",
+                &dir.to_string_lossy(),
+                "status",
+                "--porcelain=v2",
+                "--branch",
+            ],
+            &RunOptions::default(),
+        )
+        .await?;
     Ok(parse_status(&output.stdout))
 }
 
+#[async_trait]
 impl Task for RepoStatus {
     fn id(&self) -> TaskId {
         "repo_status"
@@ -120,15 +125,18 @@ impl Task for RepoStatus {
         &["project"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let Some(dir) = ctx.project_dir() else {
             return Ok(Status::Satisfied);
         };
-        if !dir.join(".git").exists() {
+        if !tokio::fs::try_exists(&dir.join(".git"))
+            .await
+            .unwrap_or(false)
+        {
             return Ok(Status::Satisfied);
         }
 
-        let report = gather(ctx, &dir)?;
+        let report = gather(ctx, &dir).await?;
         if !report.is_clean_and_current() {
             ctx.ui.note(&report.describe());
         }
@@ -136,7 +144,7 @@ impl Task for RepoStatus {
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, _ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, _ctx: &mut Ctx) -> Result<()> {
         Ok(())
     }
 }
@@ -197,11 +205,11 @@ mod tests {
         assert!(report.describe().contains("not on a branch"));
     }
 
-    #[test]
-    fn a_dirty_checkout_is_still_satisfied_because_this_task_only_reports() {
-        let (mut ctx, home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn a_dirty_checkout_is_still_satisfied_because_this_task_only_reports() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
         let dir = home.path().join("code/hub");
-        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
         ctx.config.project_path = Some(dir.to_string_lossy().into());
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",
@@ -212,16 +220,17 @@ mod tests {
 
         // Never Needs: applying would mean pulling, and pulling at startup is
         // exactly what this task exists to avoid.
-        assert_eq!(RepoStatus.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(RepoStatus.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn apply_touches_nothing() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
-        RepoStatus.apply(&mut ctx).unwrap();
+    #[tokio::test]
+    async fn apply_touches_nothing() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        RepoStatus.apply(&mut ctx).await.unwrap();
         let calls = ctx
             .runner
             .run("noop", &[], &RunOptions::default())
+            .await
             .map(|_| ())
             .is_ok();
         assert!(calls);

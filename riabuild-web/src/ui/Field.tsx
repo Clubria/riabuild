@@ -1,7 +1,13 @@
 import { ReactNode, useId } from "react";
 
+/**
+ * `appearance-none` is first and is not optional. `color-scheme: dark` makes the
+ * browser draw its own dark widget — rounded, its own fill, its own arrow — and
+ * without this it renders *inside* our flat rule border rather than instead of
+ * it. One native control is enough to stop the page being a terminal.
+ */
 export const CONTROL_CLASS =
-  "w-full min-w-0 border border-rule bg-bg-sunk px-2 py-1.5 text-fg placeholder:text-fg-faint focus:border-accent disabled:opacity-50 aria-[invalid=true]:border-danger";
+  "appearance-none w-full min-w-0 border border-rule bg-bg-sunk px-2 py-1.5 text-fg placeholder:text-fg-faint focus:border-accent disabled:opacity-50 aria-[invalid=true]:border-danger";
 
 export function FieldShell({
   label,

@@ -4,6 +4,11 @@ Provisioning tool that gets a Clubria developer from "accepted a GitHub org invi
 "running Claude Code against our codebase with working secrets" without them making a
 single environment decision.
 
+The one exception is where their own source code lives, which riabuild offers rather than
+imposes: first setup shows the path it would use and takes Enter for yes, and
+`riabuild move-project` changes it later. Everything else stays riabuild's decision — a
+developer who presses Enter has still decided nothing.
+
 Design: `docs/superpowers/specs/2026-08-04-riabuild-design.md`. Read it before changing
 anything structural.
 
@@ -43,6 +48,13 @@ versioned, auditable, distributed through signed Homebrew releases. riabuild-web
 the org Claude settings JSON, the repo slug, version floors, and brokered tokens. A
 server-driven task manifest would be a remote code execution channel onto every
 developer's laptop. Do not cross this boundary for convenience.
+
+The org settings may **name** a program and never **carry** one. The default status line
+is `node ~/.riabuild/claude-statusline.js`; the script lives in `riabuild-cli/assets/`,
+is compiled in with `include_str!`, and is installed by the `claude_statusline` task.
+Editing that string in the dashboard cannot change what runs on a laptop — only a
+`brew upgrade` can. A settings key whose value the server chose the *contents* of would
+be the manifest again under another name.
 
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever

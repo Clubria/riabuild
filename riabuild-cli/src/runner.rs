@@ -6,10 +6,12 @@
 //! and the suite gets abandoned.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -38,15 +40,30 @@ pub struct RunOptions {
     pub stdin: Option<String>,
 }
 
+#[async_trait]
 pub trait CommandRunner: Send + Sync {
-    fn run(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<CommandOutput>;
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<CommandOutput>;
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
-    fn run_interactive(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32>;
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32>;
 
     /// Resolves a program on `PATH`, so `check()` can distinguish "not
     /// installed" from "installed but wrong version".
+    ///
+    /// Stays synchronous: it reads `PATH` and stats the candidates, which is
+    /// cheap enough that making it async would infect every `check()` for no
+    /// gain.
     fn which(&self, program: &str) -> Option<PathBuf>;
 }
 
@@ -66,8 +83,14 @@ impl RealRunner {
     }
 }
 
+#[async_trait]
 impl CommandRunner for RealRunner {
-    fn run(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<CommandOutput> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<CommandOutput> {
         let mut command = RealRunner::build(program, args, options);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.stdin(if options.stdin.is_some() {
@@ -81,13 +104,20 @@ impl CommandRunner for RealRunner {
             .with_context(|| format!("could not start `{program}`"))?;
 
         if let Some(input) = &options.stdin {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().expect("stdin was piped");
-            stdin.write_all(input.as_bytes())?;
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().context("stdin was piped")?;
+            stdin.write_all(input.as_bytes()).await?;
+            // Closing the pipe is what tells the child there is no more input.
+            // The blocking version got this free when the `if let` block ended;
+            // here the handle would otherwise live until the end of the
+            // function, and a child reading to EOF — `infisical export` does —
+            // would wait forever.
+            drop(stdin);
         }
 
         let output = child
             .wait_with_output()
+            .await
             .with_context(|| format!("`{program}` did not finish"))?;
 
         Ok(CommandOutput {
@@ -97,9 +127,15 @@ impl CommandRunner for RealRunner {
         })
     }
 
-    fn run_interactive(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
         let status = RealRunner::build(program, args, options)
             .status()
+            .await
             .with_context(|| format!("could not start `{program}`"))?;
         Ok(status.code().unwrap_or(1))
     }
@@ -163,6 +199,38 @@ impl FakeRunner {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The invocation a stub is matched against.
+    ///
+    /// The program is reduced to its file name, because riabuild runs the tools
+    /// it owns by absolute path — `~/.riabuild/gh/2.97.0/bin/gh`, under a
+    /// per-test tempdir. Without this every stub would have to be built from a
+    /// path the test does not care about, and `with("gh --version", …)` would
+    /// stop meaning "when gh is asked its version".
+    ///
+    /// `calls` still records the full path, so a test can assert riabuild ran
+    /// *its* gh rather than whatever is on `PATH`.
+    fn stub_key(program: &str, args: &[&str]) -> String {
+        let name = Path::new(program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.to_string());
+        format!("{name} {}", args.join(" ")).trim_end().to_string()
+    }
+
+    /// Finds a stub for an invocation, by full program path or by file name.
+    ///
+    /// Both, because tasks run some binaries by absolute path and others by
+    /// name, and a test should be able to say whichever it means. `toolchain`
+    /// stubs the exact `~/.riabuild/node/<version>/bin/node` it is asserting
+    /// about; `github_cli` says `gh --version` and does not care where gh is.
+    fn resolve(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
+        let full = format!("{program} {}", args.join(" "))
+            .trim_end()
+            .to_string();
+        self.stubbed(&full)
+            .or_else(|| self.stubbed(&FakeRunner::stub_key(program, args)))
+    }
+
     fn stubbed(&self, invocation: &str) -> Option<CommandOutput> {
         let mut best: Option<(&String, &CommandOutput)> = None;
         for (key, value) in &self.responses {
@@ -176,35 +244,54 @@ impl FakeRunner {
         best.map(|(_, output)| output.clone())
     }
 
-    fn lookup(&self, invocation: &str) -> CommandOutput {
-        self.stubbed(invocation).unwrap_or(CommandOutput {
-            code: Some(127),
-            stdout: String::new(),
-            stderr: format!("fake runner: no stub for `{invocation}`"),
-        })
+    fn lookup(&self, program: &str, args: &[&str]) -> CommandOutput {
+        self.resolve(program, args)
+            .unwrap_or_else(|| CommandOutput {
+                code: Some(127),
+                stdout: String::new(),
+                stderr: format!(
+                    "fake runner: no stub for `{}`",
+                    FakeRunner::stub_key(program, args)
+                ),
+            })
     }
 }
 
 #[cfg(test)]
+#[async_trait]
 impl CommandRunner for FakeRunner {
-    fn run(&self, program: &str, args: &[&str], _options: &RunOptions) -> Result<CommandOutput> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<CommandOutput> {
         let invocation = format!("{program} {}", args.join(" "));
-        let invocation = invocation.trim_end().to_string();
-        self.calls.lock().unwrap().push(invocation.clone());
-        Ok(self.lookup(&invocation))
+        self.calls
+            .lock()
+            .unwrap()
+            .push(invocation.trim_end().to_string());
+        Ok(self.lookup(program, args))
     }
 
-    fn run_interactive(&self, program: &str, args: &[&str], _options: &RunOptions) -> Result<i32> {
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<i32> {
         let invocation = format!("{program} {}", args.join(" "));
-        let invocation = invocation.trim_end().to_string();
-        self.calls.lock().unwrap().push(invocation.clone());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(invocation.trim_end().to_string());
         // A stub's exit code applies here too: interactive commands fail as
         // well — a developer who abandons a device-code prompt leaves `gh`
         // exiting non-zero — and a task that ignores that reports a sign-in
         // it never got. Unstubbed commands still succeed, so tests that only
         // care about which commands ran need not script every prompt.
         Ok(self
-            .stubbed(&invocation)
+            .resolve(program, args)
             .and_then(|output| output.code)
             .unwrap_or(0))
     }

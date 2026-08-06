@@ -70,19 +70,20 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-pub fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
     let dir = ctx.paths.shell_dir("bash");
-    std::fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
     let rc = dir.join("rc");
     let colour = ctx.ui.colour();
-    std::fs::write(
+    tokio::fs::write(
         &rc,
         rcfile(
             &ctx.paths.home(),
             &banner_command(&super::banner(colour)),
             &prompt_command(colour),
         ),
-    )?;
+    )
+    .await?;
 
     Ok((
         vec![

@@ -32,7 +32,7 @@ So this covers the seams no unit test reaches:
 ## What is faked
 
 One thing: `app.infisical.com`, by `infisical-stub.mjs`. Convex, GitHub, the
-Node tarball, Homebrew and npm are all the real service.
+Node tarball, the `gh` and `infisical` downloads and npm are all the real thing.
 
 Everything between the two calls the stub answers — brokering, the short-lived
 token, the environment-not-arguments handoff, writing and git-ignoring
@@ -102,10 +102,10 @@ dry run is ever tightened up, tighten this assertion with it.
 
 ## Running it locally
 
-Works on macOS and on Linux. Linux skips the Keychain assertions (riabuild's
-`RIABUILD_TOKEN` escape hatch stands in) and needs `infisical` already on PATH,
-since riabuild only knows how to install it with Homebrew. The macOS run is the
-authoritative one.
+Works on macOS and on Linux, with nothing to stage first — `gh` and `infisical`
+are riabuild's to install on both platforms, and fetching them is part of what
+this tests. Linux skips the Keychain assertions, standing in riabuild's own
+`RIABUILD_TOKEN` escape hatch, so the macOS run is the authoritative one.
 
 | Variable | Effect |
 |---|---|

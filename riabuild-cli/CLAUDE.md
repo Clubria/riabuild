@@ -25,6 +25,34 @@ outside `runner.rs`. This is what makes `check()` unit-testable against canned `
 `git`, `node`, and `claude` output. Bypassing it means the only way to test a task is to
 have a real machine in a real state, and the suite gets abandoned.
 
+**All IO is async.** riabuild runs on a current-thread tokio runtime. Filesystem work goes
+through `tokio::fs`, HTTP through `reqwest`, and subprocesses through `tokio::process` —
+never `std::fs` or `std::process`. A blocking call on the runtime thread stalls every
+other future on it, and the symptom is a provisioner that hangs on someone else's laptop
+with no output and no error to send anyone.
+
+The exception is **stdio**. `ui.rs` writes with `println!`/`eprintln!`, and
+`run_interactive` hands the terminal to a child process — that is a handoff, not IO
+riabuild performs. Async stdout buys nothing for line-at-a-time terminal output.
+
+Three things are synchronous because they are not IO, and are not exceptions to anything:
+`paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
+candidates, and tarball extraction is CPU work over an in-memory buffer — `extract_tarball`
+writes through the `tar` crate, which is synchronous, so making the directory calls around
+it async would be theatre.
+
+Note that `tokio::fs` is `std::fs` on a blocking threadpool: no portable async file API
+exists. "Current-thread" describes the reactor, not the process, and the binary does have
+threads. Closures cannot be async, so `and_then`/`unwrap_or_else` chains around IO have to
+be unrolled into `match` or `let else` rather than kept for tidiness.
+
+**Every prompt has a default.** `Ui::ask` returns `None` when there is no terminal — in
+CI, over a pipe, under `cargo test` — so a question is how riabuild offers a choice, never
+how it obtains a value it cannot otherwise get. A prompt that is the only route to an
+answer turns an unattended run into one that hangs with no output until something times
+out. Prompts also belong in `apply()` or a subcommand, never in `check()`, which runs
+under `--check`.
+
 **`apply()` must be safe to run twice.** Tasks re-run whenever a dependency changes, a
 version bumps, or a check fails. There is no "already done" branch to rely on.
 
@@ -67,6 +95,7 @@ src/
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
+  move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
 ```

@@ -354,6 +354,150 @@ describe("org config and claude settings", () => {
     expect(body.settings).toEqual({ env: { CLUBRIA: "1" } });
     expect(body.updatedAt).toBe(1234);
   });
+
+  test("the default settings ask for bypass mode and pre-accept its disclaimer", async () => {
+    const t = setup();
+    const { memberId } = await seedMember(t);
+    const token = await issueSession(t, memberId);
+    const response = await t.fetch("/api/v1/org/claude-settings", {
+      headers: bearer(token),
+    });
+    const { settings } = await response.json();
+
+    expect(settings.theme).toBe("auto");
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+    // These two are one setting wearing two names. Claude Code downgrades
+    // bypassPermissions to default unless the disclaimer has been accepted, so
+    // shipping the mode alone produces a developer who thinks permissions are
+    // off and gets prompted anyway.
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+  });
+
+  test("the default settings carry the context-window status line", async () => {
+    const t = setup();
+    const { memberId } = await seedMember(t);
+    const token = await issueSession(t, memberId);
+
+    const response = await t.fetch("/api/v1/org/claude-settings", {
+      headers: bearer(token),
+    });
+    // The path is load-bearing across two repositories: riabuild-cli's
+    // `claude_statusline` task writes exactly this file.
+    expect((await response.json()).settings.statusLine).toEqual({
+      type: "command",
+      command: "node ~/.riabuild/claude-statusline.js",
+    });
+  });
+
+  test("the backfill adds a status line to settings a lead saved earlier", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: JSON.stringify({ env: { CLUBRIA_ORG: "1" } }),
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(true);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    const settings = JSON.parse(row!.claudeSettings);
+    expect(settings.statusLine.command).toBe(
+      "node ~/.riabuild/claude-statusline.js",
+    );
+    // Settings a lead already chose survive the migration.
+    expect(settings.env).toEqual({ CLUBRIA_ORG: "1" });
+    // The CLI re-fetches by comparing this. A backfill that left it at 1234
+    // would change the database and nobody's laptop.
+    expect(row!.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
+  });
+
+  test("the backfill leaves a status line a lead chose alone", async () => {
+    const t = setup();
+    const chosen = { type: "command", command: "my-own-statusline" };
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: JSON.stringify({ statusLine: chosen }),
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(false);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    expect(JSON.parse(row!.claudeSettings).statusLine).toEqual(chosen);
+    expect(row!.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("running the backfill twice is a no-op the second time", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{}",
+        claudeSettingsUpdatedAt: 0,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
+      true,
+    );
+    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
+      false,
+    );
+
+    const entries = await t.run(async (ctx) =>
+      ctx.db
+        .query("auditLog")
+        .collect()
+        .then((rows) =>
+          rows.filter((row) => row.meta.via === "backfillStatusLine"),
+        ),
+    );
+    expect(entries).toHaveLength(1);
+  });
+
+  test("the backfill refuses to guess at settings it cannot parse", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{ not json",
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(false);
+    expect(result.reason).toMatch(/dashboard/i);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    // Replacing unreadable settings with generated ones would lose whatever the
+    // lead meant to write.
+    expect(row!.claudeSettings).toBe("{ not json");
+  });
 });
 
 describe("secret brokering", () => {

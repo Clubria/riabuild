@@ -37,11 +37,10 @@ runs on any Mac with one environment variable set.
 
 ## macOS, not merely preferably
 
-`security(1)`, the ad-hoc signed binary, Homebrew installs and the
-`~/Documents/Clubria` checkout location are macOS behaviour, and macOS is the
-only platform riabuild ships to. The script also runs on Linux — minus the
-Keychain assertions — so the flow can be debugged without a Mac, but the macOS
-run is the authoritative one.
+`security(1)`, the ad-hoc signed binary and the `~/Documents/Clubria` checkout
+location are macOS behaviour, and macOS is the platform riabuild ships to. The
+script also runs on Linux — minus the Keychain assertions — so the flow can be
+debugged without a Mac, but the macOS run is the authoritative one.
 
 ## What is real, and the one thing that is not
 

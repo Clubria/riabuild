@@ -11,9 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Ui {
     colour: bool,
     quiet: bool,
+    /// Whether there is a developer on the other end to answer a question.
+    interactive: bool,
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
     pending: AtomicUsize,
+    /// Answers a test feeds to `ask` in place of a terminal.
+    #[cfg(test)]
+    answers: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
 /// Spaces needed for `line` to cover a status line `previous` columns wide.
@@ -68,8 +73,27 @@ impl Ui {
         let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         Self {
             colour,
+            // Both halves matter. A piped stdin with a terminal stdout is the
+            // shape a CI job has, and a question asked there blocks until
+            // something times out. `cfg!(test)` is the same hazard indoors: a
+            // test run inherits the terminal `cargo test` was started from.
+            interactive: !cfg!(test)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal(),
             quiet,
             pending: AtomicUsize::new(0),
+            #[cfg(test)]
+            answers: Default::default(),
+        }
+    }
+
+    /// A `Ui` that answers its own questions, for tests.
+    #[cfg(test)]
+    pub fn scripted<'a>(answers: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            interactive: true,
+            answers: std::sync::Mutex::new(answers.into_iter().map(ToString::to_string).collect()),
+            ..Self::new(false)
         }
     }
 
@@ -162,6 +186,44 @@ impl Ui {
         // there is nothing left for `applied` to cover.
         self.take_pending();
         println!("    {}", self.paint("2", text));
+    }
+
+    /// Reads one line from the developer.
+    ///
+    /// `None` means there is no answer — they pressed Enter or ^D, or there is
+    /// no terminal to ask. Callers must therefore always have a default:
+    /// asking is how riabuild offers a choice, never how it obtains a value it
+    /// cannot otherwise get.
+    pub fn ask(&self, question: &str) -> Option<String> {
+        if !self.interactive {
+            return None;
+        }
+        // The question is written on its own line rather than on the end of
+        // any pending status line, which is already long enough to carry the
+        // reason a task is running.
+        self.take_pending();
+        let answer = self.read_answer(question)?;
+        let answer = answer.trim().to_string();
+        (!answer.is_empty()).then_some(answer)
+    }
+
+    #[cfg(not(test))]
+    fn read_answer(&self, question: &str) -> Option<String> {
+        println!();
+        print!("    {} ", self.paint("1", question));
+        let _ = std::io::stdout().flush();
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            // Zero bytes is ^D, which reads as "just use the default".
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    }
+
+    #[cfg(test)]
+    fn read_answer(&self, _question: &str) -> Option<String> {
+        self.answers.lock().unwrap().pop_front()
     }
 
     pub fn warn(&self, text: &str) {
@@ -311,6 +373,39 @@ mod tests {
     #[test]
     fn an_expired_credential_does_not_read_as_zero_minutes() {
         assert_eq!(duration_words(0), "less than a minute");
+    }
+
+    #[test]
+    fn no_terminal_means_no_answer() {
+        // Every caller must have a default: riabuild runs in CI and over pipes,
+        // where a blocking read would hang until something times out.
+        assert_eq!(Ui::new(false).ask("Where should this live?"), None);
+    }
+
+    #[test]
+    fn an_answer_is_returned_trimmed() {
+        let ui = Ui::scripted(["  ~/work/hub \n"]);
+        assert_eq!(ui.ask("Where?").as_deref(), Some("~/work/hub"));
+    }
+
+    #[test]
+    fn an_empty_answer_means_the_default() {
+        // Enter accepts whatever was offered.
+        assert_eq!(Ui::scripted([""]).ask("Where?"), None);
+    }
+
+    #[test]
+    fn running_out_of_answers_means_no_answer() {
+        // Stands in for the developer pressing ^D.
+        assert_eq!(Ui::scripted([] as [&str; 0]).ask("Where?"), None);
+    }
+
+    #[test]
+    fn a_question_ends_the_status_line_it_was_asked_under() {
+        let ui = Ui::scripted(["~/work/hub"]);
+        ui.working("Project checkout", "first run");
+        ui.ask("Where?");
+        assert_eq!(ui.take_pending(), 0);
     }
 
     #[test]

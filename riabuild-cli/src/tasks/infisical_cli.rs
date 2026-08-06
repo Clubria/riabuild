@@ -6,14 +6,18 @@
 
 use super::{Ctx, Status, Task, TaskId};
 use crate::runner::RunOptions;
+use crate::shims;
+use crate::tools;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 
 const MIN_VERSION: &str = "0.30.0";
 
 pub struct InfisicalCli;
 
+#[async_trait]
 impl Task for InfisicalCli {
     fn id(&self) -> TaskId {
         "infisical_cli"
@@ -23,64 +27,60 @@ impl Task for InfisicalCli {
         "Infisical CLI"
     }
 
+    /// Bumped to 2 when riabuild took ownership of `infisical` instead of
+    /// installing it with Homebrew.
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn depends_on(&self) -> &[TaskId] {
         &[]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
-        if ctx.runner.which("infisical").is_none() {
-            return Ok(Status::needs("infisical is not installed"));
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
+        let infisical = ctx.infisical();
+        if !tokio::fs::try_exists(&infisical).await.unwrap_or(false) {
+            return Ok(Status::needs(format!(
+                "riabuild has not installed infisical {} yet",
+                tools::INFISICAL_VERSION
+            )));
         }
         let output = ctx
             .runner
-            .run("infisical", &["--version"], &RunOptions::default())?;
+            .run(&infisical, &["--version"], &RunOptions::default())
+            .await?;
+        // Infisical prints its version banner on stderr in some builds, so both
+        // streams are searched.
         let reported = format!("{}{}", output.stdout, output.stderr);
         if !version::at_least(&reported, MIN_VERSION) {
             return Ok(Status::needs(format!(
-                "infisical is older than {MIN_VERSION}"
+                "the infisical in ~/.riabuild reports `{}`, which is not usable",
+                reported.trim()
             )));
         }
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        if ctx.runner.which("brew").is_none() {
-            return Err(Failure::new(
+    /// Downloads the pinned `infisical` into `~/.riabuild/infisical/<version>/`.
+    ///
+    /// Still installs **no token**. Credentials are brokered per use and piped
+    /// into `infisical export`; owning the binary changes nothing about that.
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+        let release = tools::infisical()?;
+        ctx.ui
+            .note(&format!("Downloading infisical {}…", release.version));
+
+        let tool_dir = ctx.paths.tool_dir(release.tool, release.version);
+        tools::install(&release, &tool_dir).await.map_err(|error| {
+            Failure::new(
                 "installing the Infisical CLI",
-                "Install Homebrew from https://brew.sh, then run `riabuild` again.",
+                "Check your network connection and run `riabuild` again. If it keeps \
+                 failing, send this to your team lead.",
             )
-            .detail("riabuild installs tools with Homebrew and could not find `brew`")
-            .into());
-        }
+            .detail(format!("{error:#}"))
+        })?;
 
-        ctx.ui.note("Installing infisical with Homebrew…");
-        let output = ctx.runner.run(
-            "brew",
-            &["install", "infisical/get-cli/infisical"],
-            &RunOptions::default(),
-        )?;
-
-        if !output.ok() {
-            // Already-installed-but-outdated takes a different verb.
-            let upgrade = ctx.runner.run(
-                "brew",
-                &["upgrade", "infisical/get-cli/infisical"],
-                &RunOptions::default(),
-            )?;
-            if !upgrade.ok() {
-                return Err(Failure::new(
-                    "installing the Infisical CLI",
-                    "Run `brew install infisical/get-cli/infisical` yourself and read what it says, then run `riabuild` again.",
-                )
-                .command("brew install infisical/get-cli/infisical")
-                .detail(output.stderr)
-                .into());
-            }
-        }
+        shims::write_tool(ctx, "infisical", &release.binary_in(&tool_dir)).await?;
         Ok(())
     }
 }
@@ -89,42 +89,61 @@ impl Task for InfisicalCli {
 mod tests {
     use super::*;
     use crate::runner::FakeRunner;
-    use crate::testing::ctx_with;
+    use crate::testing::{ctx_and_runner, ctx_with, ctx_with_tools, install_owned_tools};
 
-    #[test]
-    fn a_current_infisical_is_satisfied() {
-        let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
-        assert_eq!(InfisicalCli.check(&ctx).unwrap(), Status::Satisfied);
+    fn reporting(version: &str) -> FakeRunner {
+        FakeRunner::new().with("infisical --version", 0, version, "")
     }
 
-    #[test]
-    fn an_old_infisical_is_detected() {
-        let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.12.0", "");
-        let (ctx, _home) = ctx_with(runner);
-        assert!(matches!(
-            InfisicalCli.check(&ctx).unwrap(),
-            Status::Needs(_)
-        ));
+    #[tokio::test]
+    async fn a_current_infisical_is_satisfied() {
+        let (ctx, _home) = ctx_with_tools(reporting("Infisical CLI v0.43.120")).await;
+        assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn a_missing_infisical_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
-        assert!(matches!(
-            InfisicalCli.check(&ctx).unwrap(),
-            Status::Needs(_)
-        ));
+    #[tokio::test]
+    async fn a_version_banner_on_stderr_is_still_read() {
+        // Some builds print it there; searching only stdout reads as "not
+        // usable" on a perfectly good install.
+        let runner =
+            FakeRunner::new().with("infisical --version", 0, "", "Infisical CLI v0.43.120");
+        let (ctx, _home) = ctx_with_tools(runner).await;
+        assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn the_check_never_looks_for_a_stored_credential() {
+    #[tokio::test]
+    async fn a_corrupted_install_is_detected() {
+        // The owned copy is a known version, so a low one means a truncated or
+        // half-written download rather than an old release.
+        let (ctx, _home) = ctx_with_tools(reporting("Infisical CLI v0.12.0")).await;
+        let status = InfisicalCli.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("not usable"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn an_infisical_riabuild_has_not_installed_is_detected() {
+        // Including a system infisical on PATH: it is not the binary riabuild
+        // verified, so it does not count.
+        let (ctx, _home) = ctx_with(reporting("Infisical CLI v0.43.120")).await;
+        let status = InfisicalCli.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("has not installed infisical"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_check_never_looks_for_a_stored_credential() {
         // Guards the design rule: presence of a token is not part of "healthy",
-        // because riabuild never installs one.
-        let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
-        InfisicalCli.check(&ctx).unwrap();
-        let calls = format!("{:?}", ctx.runner.which("infisical"));
-        assert!(!calls.contains("login"));
+        // because riabuild never installs one. Owning the binary changed where
+        // infisical comes from, not that rule.
+        let (ctx, _home, runner) = ctx_and_runner(reporting("Infisical CLI v0.43.120")).await;
+        install_owned_tools(&ctx).await;
+        InfisicalCli.check(&ctx).await.unwrap();
+        let calls = runner.calls();
+        assert!(
+            !calls.iter().any(|call| call.contains("login")),
+            "{calls:?}"
+        );
     }
 }

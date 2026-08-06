@@ -64,6 +64,12 @@ pub enum Command {
     Status,
     /// Open the Clubria environment shell without checking anything.
     Shell,
+    /// Move the Clubria checkout somewhere else.
+    MoveProject {
+        /// Where to move it to. Asked for if left out.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
     /// Print the environment riabuild would apply, as `export` lines.
     Env,
 }
@@ -102,6 +108,23 @@ mod tests {
         let cli = Cli::parse_from(["riabuild", "--check", "status"]);
         assert!(cli.check);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn the_checkout_can_be_moved_with_or_without_a_path() {
+        // Without one it asks; with one it is scriptable, and usable over a
+        // session that has no terminal to ask through.
+        let cli = Cli::parse_from(["riabuild", "move-project"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::MoveProject { path: None })
+        ));
+
+        let cli = Cli::parse_from(["riabuild", "move-project", "~/work/hub"]);
+        let Some(Command::MoveProject { path }) = cli.command else {
+            panic!("expected move-project");
+        };
+        assert_eq!(path.as_deref(), Some("~/work/hub"));
     }
 
     #[test]

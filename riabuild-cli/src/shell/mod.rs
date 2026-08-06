@@ -128,14 +128,14 @@ pub fn already_inside() -> bool {
     std::env::var("RIABUILD_SHELL").is_ok_and(|value| value == "1")
 }
 
-pub fn spawn(ctx: &mut Ctx) -> Result<i32> {
+pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let shell = Shell::detect();
     let env = environment(ctx);
 
     let (args, extra_env) = match &shell {
-        Shell::Zsh => zsh::prepare(ctx)?,
-        Shell::Bash => bash::prepare(ctx)?,
-        Shell::Fish => fish::prepare(ctx)?,
+        Shell::Zsh => zsh::prepare(ctx).await?,
+        Shell::Bash => bash::prepare(ctx).await?,
+        Shell::Fish => fish::prepare(ctx).await?,
         // riabuild generates no startup file for a shell it does not know, so
         // there is nothing inside it to print the banner or touch the prompt.
         // The parent says it instead — and only here, so it is still said once.
@@ -155,6 +155,7 @@ pub fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     ctx.runner
         .run_interactive(&shell.program(), &arg_refs, &options)
+        .await
 }
 
 #[cfg(test)]
@@ -192,9 +193,9 @@ mod tests {
         assert!(coloured.contains(HEADLINE));
     }
 
-    #[test]
-    fn riabuild_paths_come_first() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn riabuild_paths_come_first() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.node_version = Some("22.23.1".into());
         let path = path_with_riabuild(&ctx, "/usr/bin:/bin");
 
@@ -209,9 +210,9 @@ mod tests {
         assert!(path.ends_with("/usr/bin:/bin"));
     }
 
-    #[test]
-    fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
         let env = environment(&ctx);
 

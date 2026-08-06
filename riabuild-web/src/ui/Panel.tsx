@@ -37,9 +37,19 @@ export function Panel({
       // so without it a DataTable's `overflow-x-auto` wrapper widens the panel
       // instead of scrolling, and a 60-character login pushes the whole
       // document sideways at 380px.
+      //
+      // `scroll-mt` is load-bearing for the same kind of reason. An `id` makes
+      // this section a jump target for the tab strip, but the title is notched
+      // *above* the border box, so aligning that box with the viewport top puts
+      // the title 8px above the fold — you follow `#profile` and land on a panel
+      // whose heading has been sliced in half. The margin matches the frame's
+      // own `py-5 sm:py-6`, so a jumped-to panel sits where the first panel sits
+      // when the page is at rest.
       className={`relative min-w-0 border ${BORDER_TONE[tone]} ${
         dense ? "px-3 py-3" : "px-3 py-4 sm:px-5 sm:py-5"
-      } ${labelled ? "mt-3" : ""}`}
+      } ${labelled ? "mt-3" : ""} ${
+        id !== undefined ? "scroll-mt-5 sm:scroll-mt-6" : ""
+      }`}
     >
       {labelled && (
         <h2 className="absolute -top-[0.75em] left-3 flex max-w-[calc(100%-1.5rem)] items-baseline gap-2 bg-bg px-2 text-xs tracking-widest uppercase">
