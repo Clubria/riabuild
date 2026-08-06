@@ -284,6 +284,9 @@ jobs:
           mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/riabuild"
           install -m0755 "$binary" "$root/usr/bin/riabuild"
           cp README.md "$root/usr/share/doc/riabuild/README.md"
+          # Debian looks for the licence under this name, and MIT asks that the
+          # notice travel with every copy — including a binary one.
+          cp LICENSE "$root/usr/share/doc/riabuild/copyright"
           sed -e "s|@VERSION@|$VERSION|g" -e "s|@DEB_ARCH@|$deb_arch|g" \
             packaging/debian/control.in > "$root/DEBIAN/control"
           # --root-owner-group so the package does not carry the runner's uid,
@@ -293,6 +296,7 @@ jobs:
 
           mkdir -p "build/src"
           install -m0755 "$binary" "build/src/riabuild"
+          cp LICENSE "build/src/LICENSE"
           sed -e "s|@VERSION@|$VERSION|g" -e "s|@RPM_ARCH@|$arch|g" \
             packaging/rpm/riabuild.spec.in > "build/riabuild.spec"
           rpmbuild -bb "build/riabuild.spec" \
@@ -325,12 +329,19 @@ jobs:
             dpkg-deb --contents "$deb" | grep -q './usr/bin/riabuild'
             dpkg-deb --field "$deb" Version | grep -qx "$VERSION"
             test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
+            # MIT asks that the notice travel with every copy, including a
+            # binary one. Debian looks for it under this exact name.
+            dpkg-deb --contents "$deb" | grep -q './usr/share/doc/riabuild/copyright'
           done
           for rpm in dist/*.rpm; do
             rpm -qip "$rpm"
             rpm -qlp "$rpm" | grep -qx '/usr/bin/riabuild'
             test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$VERSION"
             test "$(rpm -qp --queryformat '%{ARCH}' "$rpm")" = "${{ matrix.arch }}"
+            # `-qL` lists only what is marked %license, so this checks the
+            # marking rather than that a file called LICENSE got swept in.
+            rpm -qLp "$rpm" | grep -q 'LICENSE'
+            test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
           done
 
       # The real binary, installed by a real package manager, on the

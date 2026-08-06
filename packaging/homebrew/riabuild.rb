@@ -11,6 +11,7 @@ class Riabuild < Formula
   desc "Sets up a Clubria developer's machine and opens the Clubria environment"
   homepage "https://riabuild.clubria.com"
   version "@VERSION@"
+  license "MIT"
 
   # Homebrew runs on Linux and this formula would install there. It should not:
   # Linux is served by the apt and dnf repositories, and `update.rs` upgrades

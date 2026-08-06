@@ -28,8 +28,7 @@ Version:        @VERSION@
 # upgrades between them.
 Release:        1
 Summary:        Sets up a Clubria developer's machine and opens the Clubria environment
-# The repository is public and carries no licence, which is all rights reserved.
-License:        Proprietary
+License:        MIT
 URL:            https://riabuild.clubria.com
 BuildArch:      @RPM_ARCH@
 AutoReq:        no
@@ -54,8 +53,13 @@ riabuild itself, so this package depends on almost nothing.
 
 %install
 install -Dm0755 %{_sourcedir}/riabuild %{buildroot}%{_bindir}/riabuild
+# There is no %%prep, so the licence is not in the build directory for a bare
+# `%%license LICENSE` to pick up. It is installed by hand and marked below,
+# which is what puts it in `rpm -qL riabuild`.
+install -Dm0644 %{_sourcedir}/LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %files
+%license %{_licensedir}/%{name}/LICENSE
 %{_bindir}/riabuild
 
 %changelog

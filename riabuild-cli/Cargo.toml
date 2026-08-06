@@ -9,6 +9,7 @@ edition = "2024"
 description = "Sets up a Clubria developer's machine and opens the Clubria environment"
 homepage = "https://riabuild.clubria.com"
 repository = "https://github.com/Clubria/riabuild"
+license = "MIT"
 # riabuild is distributed through the Homebrew tap, never crates.io.
 publish = false
 
