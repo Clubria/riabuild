@@ -151,12 +151,12 @@ jobs:
           path: riabuild-web/e2e/__results__/
           if-no-files-found: ignore
 
-  # The release workflow renders this template only after the GitHub release is
-  # already published, so a template that does not parse would leave a released
-  # version with a stale tap. Checking it on every pull request is what keeps
-  # that from being discovered at release time.
+  # The release workflow renders these templates only after the GitHub release
+  # is already published, so one that does not parse would leave a released
+  # version with a stale tap or an empty apt repository. Checking them on every
+  # pull request is what keeps that from being discovered at release time.
   packaging:
-    name: Homebrew formula
+    name: Packaging templates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -189,3 +189,140 @@ jobs:
             fi
           done
           echo "Formula renders, parses, and points at the artifacts the release builds."
+
+      - name: Install the Linux packaging tools
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      # Built around a stub binary rather than a real one. What is under test
+      # here is the templates — whether the rendered control file and spec
+      # produce packages a real dpkg and a real rpm accept and install to the
+      # right path — and a two-line shell script exercises all of that without a
+      # musl toolchain and a five-minute build in front of it.
+      #
+      # Only the runner's own architecture gets an rpm. `rpmbuild --target
+      # aarch64` on an x86_64 host fails with "No compatible architectures found
+      # for build", and so does `rpmspec -P`, so the aarch64 spec cannot even be
+      # parsed here. It differs from the one below by a single substituted
+      # token, and the release workflow builds it for real on an arm64 runner.
+      - name: Render the Linux templates and build real packages
+        run: |
+          set -euo pipefail
+          version=2026.08.06
+          mkdir -p build dist
+
+          printf '#!/bin/sh\necho "riabuild %s"\n' "$version" > build/riabuild
+          chmod 0755 build/riabuild
+
+          # dpkg-deb does not care what it is packaging, so both architectures
+          # are built here — which is what catches a wrong Architecture field.
+          for deb_arch in amd64 arm64; do
+            root="build/deb-$deb_arch"
+            mkdir -p "$root/DEBIAN" "$root/usr/bin"
+            cp build/riabuild "$root/usr/bin/riabuild"
+            sed -e "s|@VERSION@|$version|g" -e "s|@DEB_ARCH@|$deb_arch|g" \
+              packaging/debian/control.in > "$root/DEBIAN/control"
+            dpkg-deb --build --root-owner-group "$root" \
+              "dist/riabuild_${version}_${deb_arch}.deb"
+            test "$(dpkg-deb --field "dist/riabuild_${version}_${deb_arch}.deb" Architecture)" = "$deb_arch"
+          done
+
+          mkdir -p build/src
+          cp build/riabuild build/src/riabuild
+          sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|x86_64|g" \
+            packaging/rpm/riabuild.spec.in > build/riabuild.spec
+          rpmbuild -bb build/riabuild.spec \
+            --define "_sourcedir $PWD/build/src" \
+            --define "_rpmdir $PWD/dist" \
+            --define "_topdir $PWD/build/rpm"
+          mv dist/x86_64/*.rpm dist/
+          rmdir dist/x86_64
+
+          # The aarch64 spec cannot be built here, but it can be rendered and
+          # checked for the mistake that actually happens: a placeholder the
+          # release workflow does not substitute.
+          sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|aarch64|g" \
+            packaging/rpm/riabuild.spec.in > build/riabuild-aarch64.spec
+          grep -qx 'BuildArch:      aarch64' build/riabuild-aarch64.spec
+
+          for rendered in build/deb-*/DEBIAN/control build/*.spec; do
+            if grep -q '@[A-Z0-9_]*@' "$rendered"; then
+              echo "::error::$rendered has a placeholder the release workflow does not substitute:"
+              grep -n '@[A-Z0-9_]*@' "$rendered"
+              exit 1
+            fi
+          done
+
+          # A package that does not put the binary on PATH installs nothing
+          # useful, and neither dpkg-deb nor rpmbuild would say so.
+          for deb in dist/*.deb; do
+            dpkg-deb --contents "$deb" | grep -q './usr/bin/riabuild'
+            dpkg-deb --field "$deb" Version | grep -qx "$version"
+          done
+          for rpm in dist/*.rpm; do
+            rpm -qlp "$rpm" | grep -qx '/usr/bin/riabuild'
+            test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version"
+            # AutoReq is off, so an explicit Requires is the only way git gets
+            # declared — and dropping it is invisible until someone installs on
+            # a machine without git and riabuild fails at the first checkout.
+            rpm -qp --requires "$rpm" | grep -qx 'git'
+          done
+
+          ls -l dist/
+
+      # The rendered templates producing a *file* is not the same as a package
+      # manager accepting it. A bad Depends line, a malformed description, or a
+      # spec that installs somewhere unexpected all pass every check above.
+      #
+      # `dpkg -S` and `rpm -qf` are asserted here because that is how update.rs
+      # decides which package manager owns the running binary: a package that
+      # installs but is not attributable would leave riabuild unable to upgrade
+      # itself, and nothing else in the suite would notice.
+      - name: Both package managers install it
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/dist:ro" debian:12 bash -eux -c '
+            apt-get update -qq
+            apt-get install -y -qq /dist/riabuild_2026.08.06_amd64.deb
+            test "$(riabuild)" = "riabuild 2026.08.06"
+            # How update.rs decides it can upgrade itself. A package that
+            # installs but is not attributable leaves riabuild stuck on the
+            # version it has, and nothing else in the suite would notice.
+            dpkg -S "$(command -v riabuild)" | grep -q riabuild
+          '
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 bash -eux -c '
+            dnf install -y /dist/riabuild-2026.08.06-1.x86_64.rpm
+            test "$(riabuild)" = "riabuild 2026.08.06"
+            rpm -qf "$(command -v riabuild)" | grep -q riabuild
+          '
+          echo "apt and dnf both install the rendered packages."
+
+      # riabuild's versions are zero-padded release dates, which exercise the
+      # parts of dpkg's and rpm's comparison that differ from semver. Getting
+      # this wrong means `apt upgrade` silently declines to move a developer
+      # forward, which looks like nothing happening at all.
+      - name: Both packagers order release dates the way version.rs does
+        run: |
+          set -euo pipefail
+
+          dpkg --compare-versions 2026.08.06 lt 2026.08.12
+          dpkg --compare-versions 2026.08.06 lt 2026.08.06.1
+          dpkg --compare-versions 2026.08.06 eq 2026.8.6
+          dpkg --compare-versions 2026.12.01 gt 2026.02.01
+
+          # rpm's own comparison, through the rpm binary rather than the
+          # rpmdevtools wrapper: one package fewer, and it answers 1/-1/0
+          # instead of exit codes 11/12/0.
+          check_rpm() {
+            actual=$(rpm --eval "%{lua:print(rpm.vercmp('$1','$2'))}")
+            if [ "$actual" != "$3" ]; then
+              echo "::error::rpm ordered $1 against $2 as $actual, expected $3"
+              exit 1
+            fi
+          }
+          check_rpm 2026.08.12 2026.08.06 1
+          check_rpm 2026.08.06 2026.08.06.1 -1
+          check_rpm 2026.08.06 2026.08.06 0
+          check_rpm 2026.08.06 2026.8.6 0
+          check_rpm 2026.12.01 2026.02.01 1
+
+          echo "dpkg and rpm agree with version.rs on riabuild's dates."

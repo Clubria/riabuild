@@ -237,6 +237,27 @@ impl Ui {
         self.answers.lock().unwrap().pop_front()
     }
 
+    /// Asks a yes/no question, defaulting to yes.
+    ///
+    /// `None` means the question could not be put — `--quiet`, or nobody on the
+    /// other end — which is a different answer from "no" and has to stay
+    /// distinguishable: a caller that treats it as a refusal silently skips
+    /// work, and one that treats it as consent runs `sudo` in a CI job.
+    ///
+    /// Built on `read_answer` rather than reading stdin directly, so it obeys
+    /// the same `interactive` rule as `ask` and can be driven by `scripted` in
+    /// a test. ^D reads as "could not ask" rather than as no: it is the absence
+    /// of an answer, and the caller already knows what to do without one.
+    pub fn confirm(&self, question: &str) -> Option<bool> {
+        if self.quiet || !self.interactive {
+            return None;
+        }
+        self.take_pending();
+        let answer = self.read_answer(&format!("{question} [Y/n]"))?;
+        let answer = answer.trim().to_lowercase();
+        Some(answer.is_empty() || answer == "y" || answer == "yes")
+    }
+
     pub fn warn(&self, text: &str) {
         eprintln!("  {} {}", self.paint("33", "▲"), text);
     }
@@ -417,6 +438,44 @@ mod tests {
         ui.working("Project checkout", "first run");
         ui.ask("Where?");
         assert_eq!(ui.take_pending(), 0);
+    }
+
+    #[test]
+    fn enter_accepts_a_confirmation() {
+        // The prompt says [Y/n], so Enter has to mean yes. Getting this
+        // backwards makes riabuild refuse its own upgrade for anyone who
+        // answers the way the prompt tells them to.
+        assert_eq!(Ui::scripted([""]).confirm("Upgrade?"), Some(true));
+        assert_eq!(Ui::scripted(["y"]).confirm("Upgrade?"), Some(true));
+        assert_eq!(Ui::scripted(["YES\n"]).confirm("Upgrade?"), Some(true));
+    }
+
+    #[test]
+    fn anything_else_declines() {
+        for answer in ["n", "no", "nope", "later"] {
+            assert_eq!(
+                Ui::scripted([answer]).confirm("Upgrade?"),
+                Some(false),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_put_is_not_a_no() {
+        // `None` is what tells update.rs to print the command instead of
+        // running sudo. Collapsing it into `Some(false)` would silently skip a
+        // mandatory upgrade; collapsing it into `Some(true)` would run sudo in
+        // a CI job with nobody there to type a password.
+        assert_eq!(Ui::new(false).confirm("Upgrade?"), None);
+        // --quiet, even with someone there and an answer waiting.
+        let quiet = Ui {
+            quiet: true,
+            ..Ui::scripted(["y"])
+        };
+        assert_eq!(quiet.confirm("Upgrade?"), None);
+        // ^D is the absence of an answer, not a refusal.
+        assert_eq!(Ui::scripted([] as [&str; 0]).confirm("Upgrade?"), None);
     }
 
     #[test]
