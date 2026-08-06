@@ -54,8 +54,10 @@ jobs:
             echo "have_token=false" >> "$GITHUB_OUTPUT"
             echo "::warning::secrets.E2E_GITHUB_TOKEN is not set, so riabuild was NOT tested end to end."
             echo "::warning::Fork pull requests never receive secrets; this is expected there."
-            echo "::warning::Otherwise: create a fine-grained PAT with Organization permissions ->"
-            echo "::warning::Members: Read, and run `gh secret set E2E_GITHUB_TOKEN`. See e2e/README.md."
+            # Single quotes: backticks inside a double-quoted string are command
+            # substitution, and this one would have run `gh secret set`.
+            echo '::warning::Otherwise: create a fine-grained PAT with Organization permissions ->'
+            echo '::warning::Members: Read, then run: gh secret set E2E_GITHUB_TOKEN. See e2e/README.md.'
           else
             echo "have_token=true" >> "$GITHUB_OUTPUT"
           fi
