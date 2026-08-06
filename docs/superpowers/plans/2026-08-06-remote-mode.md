@@ -2732,8 +2732,8 @@ mod tests {
         assert!(options.contains("UserKnownHostsFile="), "{options}");
         assert!(options.contains(".riabuild/ssh/known_hosts"), "{options}");
         assert!(options.contains("IdentitiesOnly=yes"), "{options}");
-        // riabuild never reads or writes the developer's own ssh config.
-        assert!(!options.contains(".ssh/config"), "{options}");
+        // riabuild ignores the developer's own ssh config outright.
+        assert!(options.contains("-F /dev/null"), "{options}");
     }
 
     #[test]
@@ -2805,6 +2805,12 @@ pub fn ssh_options(remote: &Remote, paths: &dyn Paths, identities_only: bool) ->
     let mut options = vec![
         "-p".to_string(),
         remote.port.to_string(),
+        // The developer's own ~/.ssh/config is read by `ssh` whether or not
+        // riabuild names it, and a `Host` block with ProxyCommand, RemoteCommand
+        // or Hostname would change what riabuild connects to and what runs
+        // there. "riabuild never touches ~/.ssh" is only true with this flag.
+        "-F".to_string(),
+        "/dev/null".to_string(),
         "-o".to_string(),
         format!(
             "UserKnownHostsFile={}",
@@ -2889,14 +2895,28 @@ pub async fn trust_host(
     } else {
         format!("[{}]:{}", remote.host, remote.port)
     };
-    if existing.lines().any(|line| line.starts_with(&entry_host)) {
+    // Exact first field, not a prefix: `build-01` and `build-01.fly.dev` are
+    // deliberately two different servers here, and `starts_with` would treat one
+    // as already trusted, skip the prompt, then fail under
+    // StrictHostKeyChecking=yes with nothing explaining why.
+    let already = existing.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|field| field.split(',').any(|name| name == entry_host))
+    });
+    if already {
         return Ok(());
     }
 
     let scan = runner
         .run(
             "ssh-keyscan",
-            &["-p", &remote.port.to_string(), "-T", "5", &remote.host],
+            // One key type. Scanning all of them and showing the first
+            // fingerprint would have the developer approve, typically, the RSA
+            // key while the ed25519 key they never saw was pinned beside it —
+            // and the fingerprint a cloud console hands them is the ed25519 one.
+            // This prompt is the trust anchor for everything after it.
+            &["-t", "ed25519", "-p", &remote.port.to_string(), "-T", "5", &remote.host],
             &RunOptions::default(),
         )
         .await?;
@@ -2926,6 +2946,22 @@ pub async fn trust_host(
         .await?;
     let fingerprint = fingerprint_of(&shown.stdout)
         .unwrap_or_else(|| "an unreadable fingerprint".to_string());
+
+    // A supplied fingerprint answers the prompt without weakening it: it has to
+    // match. There is no "accept anything" flag, and CI uses this rather than a
+    // TTY it does not have.
+    if let Some(expected) = accept {
+        if expected != fingerprint {
+            return Err(Failure::new(
+                format!("trusting {}", remote.host),
+                "Check the fingerprint with whoever runs that server.",
+            )
+            .detail(format!("expected {expected}, the server offered {fingerprint}"))
+            .into());
+        }
+        pin(paths, &known_hosts, existing, &keys).await?;
+        return Ok(());
+    }
 
     ui.note(&format!("fingerprint {fingerprint}"));
     if !ui.confirm("is that the server you expected?")? {
@@ -2968,16 +3004,30 @@ cannot carry a binary, so change it to `Option<Vec<u8>>` in `runner.rs`, write i
 `write_all(input)`, and update the existing call sites (`keychain.rs`'s `secret-tool store`
 is the one in the tree today) to `Some(token.as_bytes().to_vec())`.
 
-Add a test in `runner.rs`:
+Add a test that exercises `RealRunner`, not the struct field — asserting that a field
+returns what was just assigned to it proves nothing about the code that could get
+bytes-versus-UTF-8 wrong:
 
 ```rust
 #[tokio::test]
-async fn stdin_carries_bytes_that_are_not_text() {
-    // A gzip header is not valid UTF-8, and Task 17 streams a whole binary.
-    let options = RunOptions { stdin: Some(vec![0x1f, 0x8b, 0x08, 0x00]), ..Default::default() };
-    assert_eq!(options.stdin.as_deref(), Some(&[0x1f, 0x8b, 0x08, 0x00][..]));
+async fn a_child_receives_bytes_that_are_not_valid_utf8() {
+    // A gzip header is not valid UTF-8, and Task 17 streams a whole binary
+    // through here.
+    let bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe];
+    let output = RealRunner
+        .run(
+            "cat",
+            &[],
+            &RunOptions { stdin: Some(bytes.clone()), ..Default::default() },
+        )
+        .await
+        .expect("cat runs");
+    assert_eq!(output.stdout.as_bytes().len(), bytes.len());
 }
 ```
+
+**Do this step before Step 3**, which already writes `stdin: Some(…into_bytes())`: the type
+is `Option<String>` until this change lands.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -3042,8 +3092,17 @@ async fn a_publickey_only_server_gets_the_line_to_paste_rather_than_a_prompt() {
         .await
         .expect_err("must not claim success");
 
-    let text = format!("{error}");
-    assert!(text.contains("authorized_keys"), "{text}");
+    // `Failure`'s Display is "{attempting} — {action}" and does not include
+    // `detail`, so asserting on the formatted error cannot tell the three
+    // paste() branches apart — it would pass if `authorise` returned paste()
+    // unconditionally.
+    let failure = error.downcast_ref::<Failure>().expect("a Failure");
+    assert!(failure.action.contains("authorized_keys"), "{}", failure.action);
+    assert!(
+        failure.detail.contains("keys only"),
+        "the reason must distinguish this from a missing ssh-copy-id: {}",
+        failure.detail
+    );
     assert!(
         !fake.calls().iter().any(|call| call.starts_with("ssh-copy-id")),
         "ssh-copy-id cannot help here and must not be run"
@@ -3089,8 +3148,11 @@ async fn a_missing_ssh_copy_id_is_a_next_action_not_a_crash() {
             .with("ssh -o BatchMode=yes", 255, "", "Permission denied (publickey,password).")
             .with("ssh -o PreferredAuthentications=none", 255, "", "Permission denied (publickey,password)."),
     );
-    let error = authorise(&remote(), &paths, fake, &Ui::new(true)).await.expect_err("no ssh-copy-id");
-    assert!(format!("{error}").contains("authorized_keys"));
+    let error = authorise(&remote(), &paths, fake, &Ui::new(true))
+        .await
+        .expect_err("no ssh-copy-id");
+    let failure = error.downcast_ref::<Failure>().expect("a Failure");
+    assert!(failure.detail.contains("ssh-copy-id"), "{}", failure.detail);
 }
 ```
 
@@ -3188,15 +3250,24 @@ pub async fn authorise(
     }
 
     ui.working("Authorised", "installing the key");
-    let mut args = vec![
+    // Built explicitly rather than by extending `ssh_options`, which carries its
+    // own `-i` for the private key: ssh-copy-id parses `-i` with its own getopt
+    // and would see two. Deliberately without IdentitiesOnly — an existing key
+    // or the agent may be what proves who we are on a server with passwords
+    // disabled for everyone but us.
+    let args = vec![
         "-i".to_string(),
         public_key_path.to_string_lossy().into_owned(),
+        "-p".to_string(),
+        remote.port.to_string(),
+        "-F".to_string(),
+        "/dev/null".to_string(),
+        "-o".to_string(),
+        format!("UserKnownHostsFile={}", paths.known_hosts_file().to_string_lossy()),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        remote.target(),
     ];
-    // Deliberately without IdentitiesOnly: an existing key or the agent may be
-    // what proves who we are on a server with passwords disabled for everyone
-    // but us.
-    args.extend(ssh_options(remote, paths, false));
-    args.push(remote.target());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = runner
         .run_interactive("ssh-copy-id", &refs, &RunOptions::default())
@@ -3666,16 +3737,58 @@ use crate::ui::{Failure, Ui};
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn namespace(member_id: &str) -> String {
-    format!("~/.riabuild-remote/{member_id}")
+pub fn namespace(home: &str, member_id: &str) -> String {
+    format!("{home}/.riabuild-remote/{member_id}")
+}
+
+/// Writes one file into the namespace, through a shell riabuild names and with
+/// every path quoted. The bytes go on stdin so a secret never reaches argv.
+async fn write_into_namespace(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: &Arc<dyn CommandRunner>,
+    ns: &str,
+    name: &str,
+    contents: Vec<u8>,
+) -> Result<()> {
+    let target = format!("{ns}/{name}");
+    let script = shell_command(&format!(
+        "umask 077 && mkdir -p {ns} && cat {redirect} {target} && chmod 600 {target}",
+        ns = shell_quote(ns),
+        target = shell_quote(&target),
+        redirect = ">",
+    ));
+    let output = ssh_once(remote, paths, runner.clone(), &script).await?;
+    if !output.ok() {
+        return Err(Failure::new(
+            format!("writing {name} on {}", remote.host),
+            "Check there is space in your home directory on that server, then run `riabuild remote` again.",
+        )
+        .detail(output.stderr)
+        .into());
+    }
+    Ok(())
 }
 
 /// Who a namespace belongs to, for whoever has a shell on the box and finds a
 /// directory named after a UUID.
+///
+/// Through `serde_json`, not `format!`: the name is whatever the developer typed
+/// into their profile, and one containing a quote or a backslash would otherwise
+/// produce a file riabuild cannot read back when it names the other people
+/// sharing an account.
 pub fn owner_json(login: &str, name: &str, email: &str) -> String {
-    format!(
-        "{{\n  \"githubLogin\": \"{login}\",\n  \"name\": \"{name}\",\n  \"email\": \"{email}\"\n}}\n"
-    )
+    serde_json::json!({ "githubLogin": login, "name": name, "email": email }).to_string()
+}
+
+/// The git identity for this namespace.
+///
+/// `GIT_CONFIG_GLOBAL` makes git stop reading `~/.gitconfig` altogether, so
+/// setting that variable without writing this file is worse than doing neither:
+/// the first commit on the server fails with "Please tell me who you are", on a
+/// box where the developer never configured git in the first place.
+pub fn gitconfig(name: &str, email: &str) -> String {
+    format!("[user]\n\tname = {name}\n\temail = {email}\n")
 }
 
 pub async fn ensure(
@@ -3733,6 +3846,11 @@ pub async fn ensure(
         .into());
     }
 
+    // The git identity. Nothing else writes this file, and GIT_CONFIG_GLOBAL
+    // pointing at a file that does not exist is what makes `git commit` fail.
+    let identity = gitconfig(&member.display_name(), &member.email);
+    write_into_namespace(remote, paths, &runner, &ns, "gitconfig", identity.into_bytes()).await?;
+
     let owner = owner_json(&member.github_login, &member.display_name(), &member.email);
     let mut args = identity::ssh_options(remote, paths, true);
     args.push(remote.target());
@@ -3778,13 +3896,30 @@ git commit -m "Mint a session for the server and write it where the server can r
   - `GhSession::close(self, runner: Arc<dyn CommandRunner>) -> Result<()>`
   - `gh_session::sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Result<bool>` — true if the tree was wiped
 
-> **Deviation from the spec, to be folded into it in this task.** The spec also asks for
-> `SIGTERM`/`SIGHUP`/`SIGINT` handlers that wipe. This plan implements the sweep and the
-> normal-exit path only, and drops the signal handlers, because the shell is riabuild's
-> **child**: when mosh or ssh goes away the shell exits and `run_interactive` returns, so
-> the ordinary path already covers it. What remains is riabuild itself being killed, and
-> `SIGKILL` cannot be caught anyway — so a signal handler would be a second mechanism
-> covering a strict subset of what the sweep covers. Update the spec's bullet list.
+> **The mechanism this task must get right, and the one an earlier draft got wrong.**
+> Each SSH invocation is a **separate process**: the sweep, the seed, the setup run, the
+> shell, and any `riabuild` the developer types inside that shell are five of them. A
+> refcount that every process joins on start and wipes on last-out therefore has the seeding
+> process write `hosts.yml`, exit, find itself alone, and delete the credential it just
+> wrote — milliseconds later, before the setup run ever sees it.
+>
+> So **only the environment shell holds the credential open**:
+>
+> | Who | Marker | Wipes |
+> |---|---|---|
+> | `internal gh-sweep`, run by the laptop before seeding | no | yes, if nothing is live |
+> | the seeding run | no | no |
+> | the setup run | no | no |
+> | **the shell run** | yes | yes, when it was the last |
+> | a `riabuild` typed inside that shell | no | no |
+>
+> Sweeping **before** seeding rather than at the start of every run is what keeps this
+> honest: a sweep between seeding and the shell would delete what was just put there.
+>
+> Signal handlers stay. An earlier draft dropped them, reasoning that the shell is
+> riabuild's child so its death returns through the ordinary path — that is wrong for the
+> case that matters, because mosh exists precisely to keep a session alive when the client
+> goes away, and what eventually ends such a session is a signal.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3857,7 +3992,7 @@ mod tests {
         let session = GhSession::open(home.path(), "550e8400", 9999).await.expect("open");
         let dir = session.config_dir();
         tokio::fs::write(dir.join("hosts.yml"), "github.com:\n").await.expect("write");
-        std::mem::forget(session);
+        drop(session); // `close` is what wipes; dropping the handle does nothing
 
         let dead = Arc::new(FakeRunner::new().with("kill -0", 1, "", "No such process"));
         assert!(sweep(&dir, dead, 0).await.expect("sweep"));
@@ -3869,11 +4004,14 @@ mod tests {
         let home = tempfile::TempDir::new().expect("tempdir");
         let session = GhSession::open(home.path(), "550e8400", 1).await.expect("open");
         let dir = session.config_dir();
-        std::mem::forget(session);
+        drop(session); // `close` is what wipes; dropping the handle does nothing
 
         // The pid looks alive, but the marker is older than a day.
         let alive = Arc::new(FakeRunner::new().with("kill -0", 0, "", ""));
-        let a_week_later = 8 * 24 * 60 * 60;
+        // A real epoch, offset: `now_secs()` is ~1.78e9, so passing a bare
+        // 8-day duration would saturate the subtraction to zero and the marker
+        // would look fresh.
+        let a_week_later = crate::config::now_secs() + 8 * 24 * 60 * 60;
         assert!(sweep(&dir, alive, a_week_later).await.expect("sweep"));
         assert!(!dir.exists());
     }
@@ -3921,15 +4059,19 @@ pub struct GhSession {
 }
 
 impl GhSession {
-    pub async fn open(runtime: &Path, member_id: &str, pid: u32) -> Result<GhSession> {
+    /// The directory, created safely, with no claim on its lifetime. Used by the
+    /// seed and setup runs, and by a `riabuild` typed inside the shell.
+    pub async fn attach(runtime: &Path, member_id: &str) -> Result<PathBuf> {
         let dir = runtime.join(format!("riabuild-gh-{member_id}"));
-        let sessions = dir.join("sessions");
-        tokio::fs::create_dir_all(&sessions).await?;
-        // /tmp is world-writable and sticky, so the directory has to be private
-        // the moment it exists.
-        set_private(&dir).await?;
+        ensure_private_dir(&dir).await?;
+        ensure_private_dir(&dir.join("sessions")).await?;
+        Ok(dir)
+    }
 
-        let marker = sessions.join(pid.to_string());
+    /// Claims the directory for the life of an environment shell.
+    pub async fn open(runtime: &Path, member_id: &str, pid: u32) -> Result<GhSession> {
+        let dir = GhSession::attach(runtime, member_id).await?;
+        let marker = dir.join("sessions").join(pid.to_string());
         tokio::fs::write(&marker, crate::config::now_secs().to_string()).await?;
         Ok(GhSession { dir, marker })
     }
@@ -3966,15 +4108,17 @@ pub async fn sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Resu
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(0);
 
-            let expired = now.saturating_sub(written) > STALE_AFTER_SECS;
-            let running = !expired
-                && runner
-                    .run("kill", &["-0", pid], &RunOptions::default())
-                    .await
-                    .map(|output| output.ok())
-                    .unwrap_or(false);
+            let running = runner
+                .run("kill", &["-0", pid], &RunOptions::default())
+                .await
+                .map(|output| output.ok())
+                .unwrap_or(false);
 
-            if running {
+            // The age cap applies to a marker whose process is *gone*, to cover
+            // pid recycling. Applying it to a live one would delete a working
+            // developer's credential out from under them, and a mosh session
+            // older than a day is the normal case rather than the exception.
+            if running && now.saturating_sub(written) <= STALE_AFTER_SECS {
                 live += 1;
             } else {
                 let _ = tokio::fs::remove_file(&path).await;
@@ -3989,15 +4133,52 @@ pub async fn sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Resu
     Ok(false)
 }
 
+/// Creates a directory that is private from the instant it exists, and refuses
+/// one that is not ours.
+///
+/// `create_dir_all` then `chmod` is wrong twice on the documented `/tmp` floor:
+/// it succeeds on a directory another local user pre-created — the name is
+/// predictable, since a member id is public — and it leaves a window at 0755
+/// before `gh` writes an OAuth token inside. `mode()` on the builder closes the
+/// window; the ownership check closes the pre-creation.
 #[cfg(unix)]
-async fn set_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
-    Ok(())
+async fn ensure_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let created = tokio::task::block_in_place(|| {
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    });
+    match created {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(error.into());
+        }
+        Err(_) => {}
+    }
+
+    // It was already there. Trust it only if it is really ours.
+    let meta = tokio::fs::symlink_metadata(path).await?;
+    let ours = meta.is_dir()
+        && !meta.file_type().is_symlink()
+        && meta.uid() == users_uid()
+        && meta.permissions().mode() & 0o777 == 0o700;
+    if ours {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "opening a private directory for your GitHub sign-in",
+        format!(
+            "Remove {} on that server, or ask whoever owns it to, then run `riabuild remote` again.",
+            path.display()
+        ),
+    )
+    .detail("it exists and is not a private directory belonging to you")
+    .into())
 }
 
 #[cfg(not(unix))]
-async fn set_private(_path: &Path) -> Result<()> {
+async fn ensure_private_dir(path: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(path).await?;
     Ok(())
 }
 ```
@@ -4254,10 +4435,18 @@ git commit -m "Lend the server this laptop's GitHub sign-in, over stdin"
 
 ```rust
 #[test]
-fn the_remote_invocation_carries_the_namespace_and_the_server_name() {
-    let prefix = env_prefix("550e8400", "build-01");
-    assert!(prefix.contains("RIABUILD_ROOT=~/.riabuild-remote/550e8400"), "{prefix}");
-    assert!(prefix.contains("RIABUILD_REMOTE=build-01"), "{prefix}");
+fn the_remote_invocation_carries_an_absolute_namespace_and_the_server_name() {
+    let env = env_prefix("/home/dev", "550e8400-e29b-41d4-a716-446655440000", "build-01");
+    let command = env_command(
+        &env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+        "/home/dev/.riabuild/riabuild/2026.08.06/riabuild",
+        &["--no-shell"],
+    );
+    assert!(command.contains("/home/dev/.riabuild-remote/550e8400"), "{command}");
+    assert!(command.contains("RIABUILD_REMOTE=build-01"), "{command}");
+    // A tilde here is the bug: root_for refuses it, and before it did, every
+    // developer on the box silently shared one namespace.
+    assert!(!command.contains('~'), "{command}");
 }
 
 #[tokio::test]
@@ -4281,7 +4470,14 @@ async fn a_server_without_mosh_falls_back_to_ssh_rather_than_stopping() {
     // A blocked UDP port is a cloud-firewall default, not a developer error.
     let home = tempfile::TempDir::new().expect("tempdir");
     let paths = crate::paths::RealPaths::rooted_at(home.path());
-    let fake = Arc::new(FakeRunner::new().with("ssh", 1, "", "command not found"));
+    // `which` only knows stubbed programs, so mosh must be stubbed for the
+    // laptop-has-mosh branch to be the one under test; the server-side probe is
+    // what fails here.
+    let fake = Arc::new(
+        FakeRunner::new()
+            .with("mosh", 0, "", "")
+            .containing("command -v mosh-server", 1, "", "not found"),
+    );
 
     shell::open(&remote(), &paths, fake.clone(), &Ui::new(true), "riabuild shell")
         .await
@@ -4329,6 +4525,30 @@ async fn has_mosh_server(
         .unwrap_or(false)
 }
 
+/// mosh exits 5 when it could not establish a session at all — a blocked UDP
+/// port, typically. Any other code is the command's own.
+const MOSH_NO_SESSION: i32 = 5;
+
+/// Provisioning: always `ssh -t`, never mosh.
+///
+/// mosh does not propagate the remote command's exit status, so a failed setup
+/// would look like a success and the flow would open a shell on a broken box.
+/// mosh earns its place for the interactive shell, which is the only part that
+/// benefits from surviving sleep and roaming.
+pub async fn run_setup(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    command: &str,
+) -> Result<i32> {
+    let mut args = vec!["-t".to_string()];
+    args.extend(identity::ssh_options(remote, paths, true));
+    args.push(remote.target());
+    args.push(command.to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    runner.run_interactive("ssh", &refs, &RunOptions::default()).await
+}
+
 pub async fn open(
     remote: &Remote,
     paths: &dyn Paths,
@@ -4343,13 +4563,19 @@ pub async fn open(
             format!("--ssh={ssh}"),
             remote.target(),
             "--".to_string(),
+            // mosh `execvp`s this with no shell, so it is handed a complete
+            // argv-shaped command rather than something needing parsing.
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
             command.to_string(),
         ];
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let code = runner.run_interactive("mosh", &refs, &RunOptions::default()).await?;
-        // A mosh that cannot get its UDP through exits without a session. Falling
-        // back beats leaving a developer stranded behind a cloud firewall.
-        if code == 0 {
+        // Only mosh's own "could not connect" exit falls back. Treating *any*
+        // non-zero code as a connection failure would silently reconnect a
+        // developer who exited their shell with a non-zero status — and, on the
+        // setup path, would run the whole provisioning a second time.
+        if code != MOSH_NO_SESSION {
             return Ok(code);
         }
         ui.warn("mosh could not connect — falling back to ssh.");
@@ -4376,12 +4602,14 @@ pub async fn open(
 - [ ] **Step 4: Write the flow in `remote/mod.rs`**
 
 ```rust
-/// The environment the server's riabuild runs under.
-pub fn env_prefix(member_id: &str, name: &str) -> String {
-    format!(
-        "RIABUILD_ROOT={} RIABUILD_REMOTE={name}",
-        session::namespace(member_id)
-    )
+/// The environment the server's riabuild runs under, as an `env` invocation with
+/// absolute paths — never a `VAR=x` prefix, which fish rejects outright and mosh
+/// never gives a shell the chance to parse.
+pub fn env_prefix(home: &str, member_id: &str, name: &str) -> Vec<(String, String)> {
+    vec![
+        ("RIABUILD_ROOT".to_string(), session::namespace(home, member_id)),
+        ("RIABUILD_REMOTE".to_string(), name.to_string()),
+    ]
 }
 
 /// `riabuild remote` — the whole flow.
@@ -4399,10 +4627,17 @@ pub async fn run(
         None => {}
     }
 
-    // The laptop runs exactly two tasks: sign-in, because it mints the server's
-    // session, and GitHub, because the server borrows this laptop's sign-in.
-    // `github_cli`'s check also re-verifies org membership, so a departed
-    // developer fails here rather than on somebody's server.
+    // `main::connect` is what populates `ctx.member` and `ctx.org`, and it only
+    // runs from `provision` — which this command never reaches. Without it,
+    // `ctx.org()?` below fails on every single `riabuild remote` with "riabuild
+    // has not loaded the team configuration yet". Make it `pub(crate)` in this
+    // task and call it first.
+    crate::connect(ctx).await?;
+
+    // The laptop then runs exactly two tasks: sign-in, because it mints the
+    // server's session, and GitHub, because the server borrows this laptop's
+    // sign-in. `github_cli`'s check also re-verifies org membership, so a
+    // departed developer fails here rather than on somebody's server.
     ensure_local_prerequisites(ctx).await?;
 
     let remote = choose(ctx, &mut store, target).await?;
@@ -4412,6 +4647,9 @@ pub async fn run(
         .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
     let version = ctx.org()?.latest_cli_version.clone();
 
+    let home = resolve_home(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &mut store).await?;
+    let prefix = env_prefix(&home, &member.member_id, &remote.name);
+
     ctx.ui.heading(&format!("Connecting to {}", remote.target()));
     identity::ensure_key(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
     identity::trust_host(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
@@ -4419,6 +4657,21 @@ pub async fn run(
     let binary =
         install::ensure_riabuild(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui, &version)
             .await?;
+
+    // `--check` stops here. Everywhere else in riabuild that flag means *touch
+    // nothing*, and the two steps below mint a bearer token onto a remote
+    // filesystem and hand that server this developer's GitHub identity.
+    if cli.check {
+        ctx.ui.note("--check: not minting a session or lending a GitHub sign-in.");
+        let code = shell::run_setup(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &format!("{prefix} {binary} --check --no-shell"),
+        )
+        .await?;
+        return Ok(code);
+    }
 
     session::ensure(
         &remote,
@@ -4432,7 +4685,6 @@ pub async fn run(
     )
     .await?;
 
-    let prefix = env_prefix(&member.member_id, &remote.name);
     session::seed_github(
         &remote,
         ctx.paths.as_ref(),
@@ -4455,7 +4707,11 @@ pub async fn run(
     if let Some(project) = &cli.project {
         setup.push_str(&format!(" --project {project}"));
     }
-    let code = shell::open(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui, &setup).await?;
+    // `ssh -t`, never mosh. mosh does not propagate the remote command's exit
+    // status, so a failed setup would return 0 and the flow would open a shell
+    // on a broken box. mosh is for the shell, which is the only thing that
+    // benefits from surviving sleep and roaming.
+    let code = shell::run_setup(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &setup).await?;
     if code != 0 {
         return Ok(code);
     }
@@ -4571,19 +4827,44 @@ Expected: FAIL — `forget_remote` does not exist.
 
 - [ ] **Step 3: Implement `list` and `forget`**
 
-`list` prints each saved server as `name  user@host[:port]  used <when>`, using
-`ui::duration_words` for the last column. `forget_remote` does, in order: revoke the session
-through `DELETE /api/v1/cli/sessions` if the API exposes it — otherwise delete the keychain
-item, which is what stops this laptop using it — delete the key pair, remove the
-`remotes.json` entry, and then attempt the server-side cleanup:
+`list` prints each saved server as `name  user@host[:port]  used <when>`. `duration_words`
+takes **minutes elapsed**, not a timestamp, so the last column is
+`duration_words(now_secs().saturating_sub(record.last_used_at) / 60)` — handing it the
+stored epoch directly renders roughly "1236111 days". `forget_remote` works from the far end inwards, because every step after the first needs the
+key that the last step deletes:
+
+1. `DELETE /api/v1/cli/sessions/<id>` from Task 3b. **Stop here, loudly, if it failed** — the
+   token is live on the server, and removing the laptop's copy would hide that rather than
+   fix it.
+2. connect and run the cleanup below
+3. delete the keychain item, the key pair, and the `remotes.json` entry
+
+An earlier draft did this in the opposite order. That deleted the key first, left
+`ssh -o IdentitiesOnly=yes` unable to authenticate, silently skipped the server-side
+cleanup, and then dropped the entry so nobody could retry — leaving the token on disk
+forever.
+
+The cleanup itself:
 
 ```rust
-    let cleanup = format!(
-        "rm -rf {} && sed -i.bak '/riabuild {}/d' ~/.ssh/authorized_keys",
-        session::namespace(member_id),
-        remote.target()
-    );
+    // Matched on the member id, as a fixed string. On a shared account every
+    // developer's key comment carries the same `user@host`, so matching on that
+    // would delete Bob's and Carla's lines too and lock them out of the box with
+    // no diagnostic anywhere. `sed` would also read the hostname's dots as
+    // wildcards, and `-i.bak` would leave the "removed" key in a sibling file.
+    let keys = format!("{home}/.ssh/authorized_keys");
+    let cleanup = shell_command(&format!(
+        "rm -rf {ns}; if [ -f {keys} ]; then grep -vF {marker} {keys} {redirect} {keys}.new \
+         && cat {keys}.new {redirect} {keys} && rm -f {keys}.new; fi",
+        ns = shell_quote(&session::namespace(home, member_id)),
+        keys = shell_quote(&keys),
+        marker = shell_quote(&format!("riabuild {member_id}")),
+        redirect = ">",
+    ));
 ```
+
+The key comment therefore has to carry the member id — change Task 15's `ssh-keygen -C` to
+`riabuild <member-id> <user>@<host>:<port>`, and say so there.
 
 If the server cannot be reached, say exactly what was left behind rather than failing:
 
@@ -4601,6 +4882,13 @@ and that user's `authorized_keys` pre-seeded from a key CI generates. Pre-seedin
 deliberate and is a **stated gap**: it means the container run exercises everything except
 `ssh-copy-id`, which needs a password prompt no CI job can answer. That path stays covered
 by the unit tests in Task 16.
+
+**The host-key prompt is a second gap, and it has to be closed rather than stated.**
+`Ui::confirm` hard-fails when stdin is not a TTY, and CI has none, so the run would stop at
+the fingerprint before reaching any assertion. `run.sh` reads the container's fingerprint
+with `ssh-keyscan -t ed25519` and passes it as `--accept-host-key <fingerprint>` (Task 15) —
+which answers the prompt without weakening it, because a mismatch still fails. There is no
+"accept anything" flag, in CI or out of it.
 
 `e2e/remote/run.sh` then, against that container:
 
