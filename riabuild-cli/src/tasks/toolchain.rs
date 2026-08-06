@@ -6,6 +6,7 @@
 //! checkout exists. An undeclared edge means running against stale state.
 
 use super::{Ctx, Status, Task, TaskId};
+use crate::archive;
 use crate::download;
 use crate::runner::RunOptions;
 use crate::shims;
@@ -157,7 +158,7 @@ async fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
         .into());
     }
 
-    download::extract_node_tarball(&bytes, &ctx.paths.node_dir(node_version))?;
+    archive::extract_node_tarball(&bytes, &ctx.paths.node_dir(node_version))?;
     Ok(())
 }
 
@@ -177,7 +178,7 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
         // pnpm 11 is a launcher plus the `dist/` tree it loads from beside
         // itself, so it is installed as a tree and reached through a shim.
         let home = ctx.paths.pnpm_dir(pnpm_version);
-        download::extract_pnpm_tarball(&bytes, &home)?;
+        archive::extract_pnpm_tarball(&bytes, &home)?;
         let launcher = home.join("pnpm");
         if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
             return Err(Failure::new(
@@ -189,8 +190,8 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
             ))
             .into());
         }
-        download::make_executable(&launcher).await?;
-        write_executable(&target, shims::pnpm_shim(&launcher).as_bytes()).await?;
+        archive::make_executable(&launcher).await?;
+        write_executable(&target, shims::exec_shim(&launcher).as_bytes()).await?;
     } else {
         write_executable(&target, &bytes).await?;
     }
@@ -202,7 +203,7 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
 async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
     let staging = target.with_extension("partial");
     tokio::fs::write(&staging, bytes).await?;
-    download::make_executable(&staging).await?;
+    archive::make_executable(&staging).await?;
     tokio::fs::rename(&staging, target).await?;
     Ok(())
 }
@@ -258,16 +259,16 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let tree = home.path().join(FALLBACK_PNPM);
-        download::extract_pnpm_tarball(&bytes, &tree).unwrap();
+        archive::extract_pnpm_tarball(&bytes, &tree).unwrap();
         let launcher = tree.join("pnpm");
         assert!(
             tokio::fs::try_exists(&launcher).await.unwrap_or(false),
             "{asset} has no launcher at its root"
         );
-        download::make_executable(&launcher).await.unwrap();
+        archive::make_executable(&launcher).await.unwrap();
 
         let shim = home.path().join("pnpm");
-        write_executable(&shim, shims::pnpm_shim(&launcher).as_bytes())
+        write_executable(&shim, shims::exec_shim(&launcher).as_bytes())
             .await
             .unwrap();
 

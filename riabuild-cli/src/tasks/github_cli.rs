@@ -9,6 +9,8 @@
 
 use super::{Ctx, Status, Task, TaskId};
 use crate::runner::RunOptions;
+use crate::shims;
+use crate::tools;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
@@ -37,8 +39,11 @@ impl Task for GithubCli {
         "GitHub CLI"
     }
 
+    /// Bumped to 2 when riabuild took ownership of `gh` instead of installing
+    /// it with Homebrew. Every machine set up before that has a `gh` riabuild
+    /// does not manage, and `check()` alone would keep accepting it.
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn depends_on(&self) -> &[TaskId] {
@@ -46,21 +51,31 @@ impl Task for GithubCli {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        if ctx.runner.which("gh").is_none() {
-            return Ok(Status::needs("gh is not installed"));
+        let gh = ctx.gh();
+        if !tokio::fs::try_exists(&gh).await.unwrap_or(false) {
+            return Ok(Status::needs(format!(
+                "riabuild has not installed gh {} yet",
+                tools::GH_VERSION
+            )));
         }
 
+        // The owned copy is a known version, so this catches a truncated or
+        // corrupted install rather than an old release — which is why it
+        // reports what it found rather than "gh is too old".
         let version_output = ctx
             .runner
-            .run("gh", &["--version"], &RunOptions::default())
+            .run(&gh, &["--version"], &RunOptions::default())
             .await?;
         if !version::at_least(version_output.trimmed(), MIN_VERSION) {
-            return Ok(Status::needs(format!("gh is older than {MIN_VERSION}")));
+            return Ok(Status::needs(format!(
+                "the gh in ~/.riabuild reports `{}`, which is not usable",
+                version_output.trimmed()
+            )));
         }
 
         if !ctx
             .runner
-            .run("gh", &["auth", "status"], &RunOptions::default())
+            .run(&gh, &["auth", "status"], &RunOptions::default())
             .await?
             .ok()
         {
@@ -74,13 +89,13 @@ impl Task for GithubCli {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        if ctx.runner.which("gh").is_none() {
+        if !tokio::fs::try_exists(&ctx.gh()).await.unwrap_or(false) {
             install(ctx).await?;
         }
 
         if !ctx
             .runner
-            .run("gh", &["auth", "status"], &RunOptions::default())
+            .run(&ctx.gh(), &["auth", "status"], &RunOptions::default())
             .await?
             .ok()
         {
@@ -207,7 +222,7 @@ async fn membership(ctx: &Ctx) -> Result<Membership> {
     let output = ctx
         .runner
         .run(
-            "gh",
+            &ctx.gh(),
             &["api", &format!("/user/memberships/orgs/{ORG}")],
             &RunOptions::default(),
         )
@@ -293,7 +308,7 @@ async fn sign_in(ctx: &mut Ctx) -> Result<()> {
 async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> Result<()> {
     let code = ctx
         .runner
-        .run_interactive("gh", args, &RunOptions::default())
+        .run_interactive(&ctx.gh(), args, &RunOptions::default())
         .await?;
     if code != 0 {
         return Err(Failure::new(
@@ -307,29 +322,25 @@ async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>
     Ok(())
 }
 
+/// Downloads the pinned `gh` into `~/.riabuild/gh/<version>/`.
+///
+/// This used to be `brew install gh`, which meant riabuild could not set up a
+/// machine without Homebrew on it and had nothing to offer on Linux at all.
 async fn install(ctx: &mut Ctx) -> Result<()> {
-    if ctx.runner.which("brew").is_none() {
-        return Err(Failure::new(
+    let release = tools::gh()?;
+    ctx.ui.note(&format!("Downloading gh {}…", release.version));
+
+    let tool_dir = ctx.paths.tool_dir(release.tool, release.version);
+    tools::install(&release, &tool_dir).await.map_err(|error| {
+        Failure::new(
             "installing the GitHub CLI",
-            "Install Homebrew from https://brew.sh, then run `riabuild` again.",
+            "Check your network connection and run `riabuild` again. If it keeps \
+                 failing, send this to your team lead.",
         )
-        .detail("riabuild installs tools with Homebrew and could not find `brew`")
-        .into());
-    }
-    ctx.ui.note("Installing gh with Homebrew…");
-    let output = ctx
-        .runner
-        .run("brew", &["install", "gh"], &RunOptions::default())
-        .await?;
-    if !output.ok() {
-        return Err(Failure::new(
-            "installing the GitHub CLI",
-            "Run `brew install gh` yourself and read what it says, then run `riabuild` again.",
-        )
-        .command("brew install gh")
-        .detail(output.stderr)
-        .into());
-    }
+        .detail(format!("{error:#}"))
+    })?;
+
+    shims::write_tool(ctx, "gh", &release.binary_in(&tool_dir)).await?;
     Ok(())
 }
 
@@ -337,7 +348,7 @@ async fn install(ctx: &mut Ctx) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runner::FakeRunner;
-    use crate::testing::{ctx_and_runner, ctx_with};
+    use crate::testing::{ctx_and_runner, ctx_with, ctx_with_tools, install_owned_tools};
 
     const MEMBERSHIP: &str = "gh api /user/memberships/orgs/Clubria";
 
@@ -354,29 +365,32 @@ mod tests {
     }
 
     async fn reason(runner: FakeRunner) -> String {
-        let (ctx, _home) = ctx_with(runner).await;
+        let (ctx, _home) = ctx_with_tools(runner).await;
         format!("{:?}", GithubCli.check(&ctx).await.unwrap())
     }
 
     #[tokio::test]
     async fn a_healthy_machine_is_satisfied() {
-        let (ctx, _home) = ctx_with(healthy()).await;
+        let (ctx, _home) = ctx_with_tools(healthy()).await;
         assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
-    async fn a_missing_gh_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
-        assert!(matches!(
-            GithubCli.check(&ctx).await.unwrap(),
-            Status::Needs(_)
-        ));
+    async fn a_gh_riabuild_has_not_installed_is_detected() {
+        // A bare machine, and also a machine with a system gh on PATH: neither
+        // is the binary riabuild verified, so both need the install.
+        let (ctx, _home) = ctx_with(healthy()).await;
+        let status = GithubCli.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("has not installed gh"),
+            "{status:?}"
+        );
     }
 
     #[tokio::test]
     async fn an_old_gh_is_detected() {
         let runner = healthy().with("gh --version", 0, "gh version 2.10.0 (2023-01-01)", "");
-        assert!(reason(runner).await.contains("older"));
+        assert!(reason(runner).await.contains("not usable"));
     }
 
     #[tokio::test]
@@ -397,7 +411,7 @@ mod tests {
             "",
             "github.com\n  ✓ Logged in to github.com account ada\n  - Token scopes: 'admin:org', 'gist', 'repo'",
         );
-        let (ctx, _home) = ctx_with(runner).await;
+        let (ctx, _home) = ctx_with_tools(runner).await;
         assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
@@ -443,6 +457,7 @@ mod tests {
         // The regression that matters most: apply() must not demand a sign-in
         // from a developer whose token already answers the question.
         let (mut ctx, _home, runner) = ctx_and_runner(healthy()).await;
+        install_owned_tools(&ctx).await;
         GithubCli.apply(&mut ctx).await.unwrap();
         let calls = runner.calls();
         assert!(
@@ -459,6 +474,7 @@ mod tests {
             .with(MEMBERSHIP, 1, "", "gh: Forbidden (HTTP 403)")
             .with("gh auth refresh", 0, "", "");
         let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
+        install_owned_tools(&ctx).await;
 
         // The refresh runs, and because the stub still reports 403 afterwards,
         // apply() reports that rather than claiming success.
@@ -480,7 +496,7 @@ mod tests {
         let runner = healthy()
             .with("gh auth status", 1, "", "You are not logged into any hosts")
             .with("gh auth login", 1, "", "");
-        let (mut ctx, _home) = ctx_with(runner).await;
+        let (mut ctx, _home) = ctx_with_tools(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("signing you in"), "{error}");
     }
@@ -488,9 +504,32 @@ mod tests {
     #[tokio::test]
     async fn a_pending_invite_names_the_invite_rather_than_the_token() {
         let runner = healthy().with(MEMBERSHIP, 0, r#"{"state":"pending"}"#, "");
-        let (mut ctx, _home) = ctx_with(runner).await;
+        let (mut ctx, _home) = ctx_with_tools(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("Accept the Clubria invite"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn every_gh_call_goes_to_the_copy_riabuild_owns() {
+        // The point of owning gh: what riabuild verified and what riabuild runs
+        // are the same binary. Calling the bare name would resolve through PATH
+        // to whatever the developer happens to have — and during provisioning
+        // ~/.riabuild/bin is not on PATH, so it would usually miss the owned
+        // copy even when one is installed.
+        let (mut ctx, _home, runner) = ctx_and_runner(healthy()).await;
+        install_owned_tools(&ctx).await;
+        GithubCli.apply(&mut ctx).await.unwrap();
+
+        let owned = ctx.gh();
+        let gh_calls: Vec<String> = runner
+            .calls()
+            .into_iter()
+            .filter(|call| call.contains("gh"))
+            .collect();
+        assert!(!gh_calls.is_empty());
+        for call in &gh_calls {
+            assert!(call.starts_with(&owned), "ran `{call}`, not {owned}");
+        }
     }
 
     #[test]

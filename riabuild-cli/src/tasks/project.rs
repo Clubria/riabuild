@@ -190,7 +190,7 @@ impl Task for Project {
             let output = ctx
                 .runner
                 .run(
-                    "gh",
+                    &ctx.gh(),
                     &["repo", "clone", &org.repo_slug, &dir.to_string_lossy()],
                     &RunOptions::default(),
                 )

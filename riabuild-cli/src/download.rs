@@ -1,4 +1,8 @@
-//! Fetching and verifying the Node and pnpm distributions.
+//! Fetching and verifying the distributions riabuild owns.
+//!
+//! Where the bytes come from and whether they are the right bytes. Unpacking
+//! them is `archive.rs`, which only ever sees a buffer that has already matched
+//! a published digest.
 //!
 //! riabuild owns its Node rather than driving nvm: nvm is a bash function, not a
 //! binary, so Rust cannot drive it without spawning a login shell, it does not
@@ -6,10 +10,12 @@
 //! is not an option either — it was removed from Node.js 25+ distributions.
 //! Owning the tarball is a few dozen lines and removes a class of
 //! works-in-my-shell failures.
+//!
+//! The same reasoning extends to `gh` and `infisical` — see `tools.rs`, which
+//! describes where their releases live and what the assets are called.
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::time::Duration;
 
 /// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
@@ -100,6 +106,46 @@ pub fn digest_for(shasums: &str, filename: &str) -> Option<String> {
     })
 }
 
+/// Finds a digest across several published checksum files, trying each in turn.
+///
+/// A list rather than a URL because Infisical publishes three files and the one
+/// named after the release is not the one with the digests in it:
+///
+/// | File | Covers |
+/// |---|---|
+/// | `cli_<version>_checksums.txt` | one line, for `windows_amd64` |
+/// | `checksums.txt` | everything **except** darwin |
+/// | `checksums-darwin.txt` | the two darwin tarballs |
+///
+/// The darwin builds are produced separately — presumably notarised on a macOS
+/// runner — and their digests never reach the main file. Reading only the file
+/// named after the release finds nothing on any platform riabuild ships.
+///
+/// A digest in none of them is an error, never a skipped verification: an
+/// unverified download of a credential tool is worse than no download.
+pub async fn digest_from_any(urls: &[String], filename: &str) -> Result<String> {
+    let mut failures = Vec::new();
+    for url in urls {
+        match fetch_text(url).await {
+            Ok(body) => {
+                if let Some(digest) = digest_for(&body, filename) {
+                    return Ok(digest);
+                }
+                failures.push(format!("{url} does not list it"));
+            }
+            // A checksum file that 404s is ordinary — the list is deliberately
+            // wider than any one release needs — so it only matters if every
+            // entry fails.
+            Err(error) => failures.push(format!("{url} could not be read: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "riabuild could not find a published checksum for {filename}, so it \
+         refused to install it ({})",
+        failures.join("; ")
+    ))
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -140,67 +186,6 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 
 pub async fn fetch_text(url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&fetch_bytes(url).await?).into_owned())
-}
-
-/// Unpacks a `node-v*.tar.gz` into `target` so that `target/bin/node` is the
-/// binary: Node wraps everything in one `node-v22.23.1-darwin-arm64/` directory.
-pub fn extract_node_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 1)
-}
-
-/// pnpm has no wrapper directory: the `pnpm` launcher and the `dist/` tree it
-/// loads sit at the root of the archive, and must stay beside each other.
-pub fn extract_pnpm_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 0)
-}
-
-fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-
-    if target.exists() {
-        // A half-extracted directory from an interrupted run must not be
-        // mistaken for a working install — `apply()` starts from nothing.
-        std::fs::remove_dir_all(target)
-            .with_context(|| format!("could not clear {}", target.display()))?;
-    }
-    std::fs::create_dir_all(target)?;
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let mut components = path.components();
-        for _ in 0..strip_components {
-            components.next();
-        }
-        let relative: std::path::PathBuf = components.collect();
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let destination = target.join(relative);
-        // `unpack` will not create the directories above a file, and an
-        // archive is not obliged to carry an entry for every directory it
-        // uses. Both Node and pnpm happen to carry them today.
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        entry.unpack(destination)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-pub async fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = tokio::fs::metadata(path).await?.permissions();
-    permissions.set_mode(0o755);
-    tokio::fs::set_permissions(path, permissions).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub fn make_executable(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -251,43 +236,6 @@ mod tests {
             !legacy.contains("darwin"),
             "pnpm 10 calls macOS macos: {legacy}"
         );
-    }
-
-    fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::fast(),
-        ));
-        for (path, contents) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o755);
-            builder.append_data(&mut header, path, *contents).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap()
-    }
-
-    #[test]
-    fn a_node_archive_loses_its_wrapper_directory() {
-        let bytes = tarball(&[("node-v22.23.1-darwin-arm64/bin/node", b"binary")]);
-        let home = tempfile::TempDir::new().unwrap();
-        let target = home.path().join("22.23.1");
-        extract_node_tarball(&bytes, &target).unwrap();
-        assert!(target.join("bin/node").exists());
-    }
-
-    #[test]
-    fn a_pnpm_archive_keeps_its_launcher_beside_the_dist_tree() {
-        // pnpm's archive has no wrapper directory. Stripping one anyway would
-        // throw the launcher away and leave a `dist/` nothing can start — and
-        // the launcher loads `dist/` from beside itself, so the two cannot be
-        // separated either.
-        let bytes = tarball(&[("pnpm", b"launcher"), ("dist/pnpm.mjs", b"module")]);
-        let home = tempfile::TempDir::new().unwrap();
-        let target = home.path().join("11.11.0");
-        extract_pnpm_tarball(&bytes, &target).unwrap();
-        assert!(target.join("pnpm").exists());
-        assert!(target.join("dist/pnpm.mjs").exists());
     }
 
     #[test]

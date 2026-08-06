@@ -31,6 +31,13 @@ pub trait Paths: Send + Sync {
     fn pnpm_dir(&self, version: &str) -> PathBuf {
         self.root().join("pnpm").join(version)
     }
+    /// `~/.riabuild/<tool>/<version>` — an owned copy of a third-party CLI.
+    ///
+    /// Versioned, so bumping a pin installs beside the old copy rather than
+    /// writing over a binary that may be running.
+    fn tool_dir(&self, tool: &str, version: &str) -> PathBuf {
+        self.root().join(tool).join(version)
+    }
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
     }

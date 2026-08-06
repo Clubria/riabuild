@@ -124,7 +124,7 @@ impl Task for EnvLocal {
         let output = ctx
             .runner
             .run(
-                "infisical",
+                &ctx.infisical(),
                 &[
                     "export",
                     "--format=dotenv",
