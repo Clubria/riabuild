@@ -291,6 +291,7 @@ names a registered task.
 | 8 | `org_settings` | 1 | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
 | 9 | `env_local` | 1, 3, 5 | `.env.local` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. |
 | 10 | `claude_trust` | 5, 7 | the profile's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
+| 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
 
 Notes on specific tasks:
 
@@ -349,6 +350,15 @@ it does not own, and swaps the file in atomically because Claude Code may be run
 against it. It writes the key under both the literal and the resolved checkout path,
 since a symlinked checkout makes those different strings and trust under one is invisible
 under the other.
+
+**11 — `claude_statusline`.** The org settings ship a `statusLine` naming
+`node ~/.riabuild/claude-statusline.js`, a context-window bar. The two halves are
+deliberately split across the trust boundary: the server sends the *pointer*, and the
+*script* is compiled into the binary with `include_str!` and installed by this task.
+Serving the script body instead would be a one-key remote code execution channel — the
+task manifest this design already rejected, wearing a different name. `node` resolves
+because `path_with_riabuild` puts riabuild's Node and `~/.riabuild/bin` on `PATH`
+together, so the interpreter is present wherever the `c` launcher is.
 
 ### Startup update check
 

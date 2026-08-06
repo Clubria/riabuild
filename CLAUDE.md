@@ -45,6 +45,13 @@ the org Claude settings JSON, the repo slug, version floors, and brokered tokens
 server-driven task manifest would be a remote code execution channel onto every
 developer's laptop. Do not cross this boundary for convenience.
 
+The org settings may **name** a program and never **carry** one. The default status line
+is `node ~/.riabuild/claude-statusline.js`; the script lives in `riabuild-cli/assets/`,
+is compiled in with `include_str!`, and is installed by the `claude_statusline` task.
+Editing that string in the dashboard cannot change what runs on a laptop — only a
+`brew upgrade` can. A settings key whose value the server chose the *contents* of would
+be the manifest again under another name.
+
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
 written to a developer's machine. Infisical service tokens are deprecated — use machine
