@@ -175,6 +175,33 @@ impl Ui {
         println!("{text}");
     }
 
+    /// Asks a yes/no question, defaulting to no.
+    ///
+    /// `None` means there was nobody to ask — stdin is not a terminal — so the
+    /// caller refuses rather than reading silence as consent. Not suppressed by
+    /// `--quiet`: a prompt the developer cannot see is worse than a noisy one,
+    /// which is also why the question carries its own subject.
+    ///
+    /// Synchronous, under the stdio exception to the async-IO invariant. The
+    /// blocking read holds the runtime thread for as long as the developer
+    /// takes to answer, and that is the intent: riabuild is waiting on a human
+    /// and has nothing else to get on with. There is no future to starve, and
+    /// tokio's `io-std` feature is deliberately not enabled.
+    pub fn confirm(&self, question: &str) -> Option<bool> {
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        print!("\n{} {} ", question, self.paint("2", "[y/N]"));
+        let _ = std::io::stdout().flush();
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok()?;
+        Some(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
     /// The four things every failure must say.
     pub fn failure(&self, failure: &Failure) {
         eprintln!();

@@ -88,6 +88,7 @@ src/
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
+  reset.rs     removes ~/.riabuild
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
 ```

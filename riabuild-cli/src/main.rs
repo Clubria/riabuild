@@ -15,6 +15,7 @@ mod config;
 mod download;
 mod keychain;
 mod paths;
+mod reset;
 mod runner;
 mod shell;
 mod shims;
@@ -70,6 +71,23 @@ async fn main() {
 async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
+
+    // Dispatched before anything creates or reads the tree. riabuild must not
+    // recreate the directory it is about to remove, and a reset must not depend
+    // on a config or state file that may be the reason it was asked for.
+    if let Some(Command::Reset { yes }) = &cli.command {
+        return reset::run(
+            paths.as_ref(),
+            &ui,
+            reset::Request {
+                assume_yes: *yes,
+                dry_run: cli.check,
+                inside_shell: shell::already_inside(),
+            },
+        )
+        .await;
+    }
+
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     let keychain: Arc<dyn keychain::Keychain> = Arc::from(keychain::for_platform(runner.clone()));
 
@@ -109,6 +127,7 @@ async fn run(cli: Cli) -> Result<i32> {
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
+        Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
         Some(Command::Status) | None => {}
     }
 
