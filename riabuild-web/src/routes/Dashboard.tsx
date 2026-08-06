@@ -3,6 +3,7 @@ import { Member } from "../data/types";
 import { ErrorBoundary } from "../app/ErrorBoundary";
 import { Profile } from "../components/Profile";
 import { Sessions } from "../components/Sessions";
+import { Install } from "../components/Install";
 import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
 import { Alert, Badge, Command, Panel, Tab } from "../ui";
 
@@ -127,9 +128,10 @@ export function Dashboard({ member }: { member: Member }) {
 
       <Panel id="install" index="02" title="install riabuild">
         <p className="mb-3 max-w-prose text-fg-dim">
-          One formula, from the Clubria tap. Homebrew handles updates from here.
+          One package, from the Clubria repository for your platform. riabuild
+          keeps itself current from there.
         </p>
-        <Command command="brew install clubria/tap/riabuild" />
+        <Install />
       </Panel>
 
       <Panel index="03" title="run it">

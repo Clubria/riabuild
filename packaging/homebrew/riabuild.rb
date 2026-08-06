@@ -12,10 +12,14 @@ class Riabuild < Formula
   homepage "https://riabuild.clubria.com"
   version "@VERSION@"
 
-  # v1 targets macOS. paths.rs and keychain.rs are trait-shaped so Linux is an
-  # addition rather than a rewrite, but no Linux build is published yet, and a
-  # formula that installs a binary with a stub keychain would fail confusingly
-  # at the first `riabuild login` instead of here.
+  # Homebrew runs on Linux and this formula would install there. It should not:
+  # Linux is served by the apt and dnf repositories, and `update.rs` upgrades
+  # riabuild through whichever package manager owns the running binary. Homebrew
+  # on Linux owns it in a way neither `dpkg -S` nor `rpm -qf` can see, so a
+  # brew-installed Linux riabuild would quietly never update itself again.
+  #
+  # Refusing here makes that a clear message at install time rather than a
+  # machine that silently stops keeping up.
   depends_on :macos
 
   on_arm do
