@@ -7,34 +7,66 @@ decision.
 ```
 Lead      → invites the developer to the Clubria GitHub org
 Developer → riabuild.clubria.com → "Sign in with GitHub" → confirm profile
-          → brew install clubria/tap/riabuild
+          → install riabuild (below)
           → riabuild
 ```
 
 ## Install
 
+macOS on Apple silicon or Intel, Linux on x86_64 or aarch64. The dashboard shows
+the block for your platform; all three are here.
+
+**macOS**
+
 ```sh
 brew tap clubria/tap https://github.com/Clubria/riabuild
 brew install clubria/tap/riabuild
-riabuild
 ```
 
-macOS, Apple silicon or Intel. riabuild keeps itself current: it learns the
-published version from the dashboard and runs `brew upgrade` on its own when a
-newer one exists.
+**Debian, Ubuntu**
 
-This repository *is* the tap — the formula is `Formula/riabuild.rb`, written by
-the release workflow. The explicit `brew tap` line is what the second command
+```sh
+curl -fsSL https://clubria.github.io/riabuild/clubria.gpg \
+  | sudo tee /usr/share/keyrings/clubria.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/clubria.gpg] https://clubria.github.io/riabuild/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/clubria.list >/dev/null
+sudo apt update && sudo apt install riabuild
+```
+
+**Fedora, RHEL**
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/clubria.repo \
+  https://clubria.github.io/riabuild/rpm/clubria.repo
+sudo dnf install riabuild
+```
+
+Then `riabuild`.
+
+riabuild keeps itself current: it learns the published version from the
+dashboard and upgrades through whichever package manager installed it — asking
+first on Linux, where that needs sudo. A copy no package manager owns is never
+sudoed over; it prints the command instead.
+
+This repository *is* all three repositories. The formula is `Formula/riabuild.rb`,
+written by the release workflow; the apt and dnf indexes are rebuilt onto GitHub
+Pages on every release. The explicit `brew tap` line is what the macOS install
 needs: Homebrew only auto-taps `clubria/tap` when it can guess the repository
 name, and it guesses `Clubria/homebrew-tap`.
+
+The Linux binaries are statically linked against musl, so there is no
+distribution or glibc requirement beyond what the packages declare.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
+| `riabuild-cli/` | Rust CLI, shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `packaging/homebrew/` | the formula template — edit this one |
+| `packaging/debian/` | the `.deb` control template |
+| `packaging/rpm/` | the `.rpm` spec template and the dnf `.repo` file |
+| `packaging/pages/` | the landing page for the apt and dnf repositories |
 | `Formula/riabuild.rb` | the rendered formula `brew tap` reads — generated, do not edit |
 | `docs/superpowers/specs/` | design specs |
 | `docs/deploying.md` | putting it on the domain |

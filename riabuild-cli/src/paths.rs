@@ -96,29 +96,41 @@ impl Paths for RealPaths {
     }
 }
 
-/// The folder Clubria checkouts are grouped under on macOS.
-const MACOS_ORG_DIR: &str = "Clubria";
+/// The folder Clubria checkouts are grouped under.
+const ORG_DIR: &str = "Clubria";
 
 /// Where a repository is checked out when the developer has not chosen a place.
 ///
 /// This is the only decision riabuild makes from the operating system, which is
-/// why it lives in the file that is allowed to know about one. A Mac developer
-/// keeps work in `~/Documents`, and finding a checkout in `~/code` on macOS
-/// reads as riabuild dumping a folder somewhere arbitrary; `~/code` is the
-/// convention everywhere else.
+/// why it lives in the file that is allowed to know about one.
+///
+/// | | |
+/// |---|---|
+/// | macOS | `~/Documents/Clubria/<repo>` |
+/// | Linux | `~/Clubria/<repo>` |
+/// | anything else | `~/code/<repo>` |
+///
+/// A Mac developer keeps work in `~/Documents`, and finding a checkout in
+/// `~/code` on macOS reads as riabuild dumping a folder somewhere arbitrary.
+/// Linux has no `~/Documents` worth speaking of, so the same organisation
+/// grouping sits directly in the home directory.
+///
+/// The repository name comes from the org config's slug, so none of this is
+/// tied to one repository.
 ///
 /// It used to be a single string sent by the server, which cannot be right on
-/// both platforms at once. A developer who wants somewhere else passes
+/// every platform at once. A developer who wants somewhere else passes
 /// `riabuild --project <path>`, and that choice is remembered.
 pub fn default_project_dir(home: &Path, repo_name: &str) -> PathBuf {
     default_project_dir_on(std::env::consts::OS, home, repo_name)
 }
 
-/// Split out so both platforms' answers are testable from either platform —
-/// `cfg!` would compile one of these branches out of the test binary entirely.
+/// Split out so every platform's answer is testable from any platform —
+/// `cfg!` would compile all but one of these branches out of the test binary.
 fn default_project_dir_on(os: &str, home: &Path, repo_name: &str) -> PathBuf {
     match os {
-        "macos" => home.join("Documents").join(MACOS_ORG_DIR).join(repo_name),
+        "macos" => home.join("Documents").join(ORG_DIR).join(repo_name),
+        "linux" => home.join(ORG_DIR).join(repo_name),
         _ => home.join("code").join(repo_name),
     }
 }
@@ -171,13 +183,33 @@ mod tests {
     }
 
     #[test]
+    fn a_linux_checkout_lands_under_the_org_directory() {
+        // The same grouping macOS puts inside ~/Documents, minus the
+        // ~/Documents that Linux does not really have.
+        assert_eq!(
+            default_project_dir_on("linux", Path::new("/home/ada"), "ai-builders-hub"),
+            PathBuf::from("/home/ada/Clubria/ai-builders-hub")
+        );
+    }
+
+    #[test]
     fn everywhere_else_uses_the_code_directory() {
-        for os in ["linux", "freebsd"] {
+        for os in ["freebsd", "openbsd"] {
             assert_eq!(
                 default_project_dir_on(os, Path::new("/home/ada"), "ai-builders-hub"),
                 PathBuf::from("/home/ada/code/ai-builders-hub"),
                 "{os}"
             );
+        }
+    }
+
+    #[test]
+    fn the_repository_name_is_never_hardcoded() {
+        // The slug comes from the org config, so pointing riabuild at another
+        // repository must not still say ai-builders-hub.
+        for os in ["macos", "linux", "freebsd"] {
+            let dir = default_project_dir_on(os, Path::new("/home/ada"), "some-other-repo");
+            assert!(dir.ends_with("some-other-repo"), "{os}: {dir:?}");
         }
     }
 

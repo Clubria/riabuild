@@ -17,6 +17,8 @@ import {
   Tone,
 } from "../ui";
 import { SCENARIO_NAMES } from "../dev/scenarios";
+import { Install } from "../components/Install";
+import { Platform } from "../lib/platform";
 
 const TONES: Tone[] = ["default", "accent", "ok", "warn", "danger", "muted"];
 
@@ -154,6 +156,14 @@ export function Gallery() {
         <Command command="brew install clubria/tap/riabuild" />
         <Command command={`riabuild --flag ${"x".repeat(200)}`} />
         <Command command={"line one\nline two\nline three"} prompt=">" />
+      </Section>
+
+      {/* All three, forced, because the live panel only ever shows the one it
+          guessed — and apt is the widest thing the console renders. */}
+      <Section name="Install">
+        {(["macos", "apt", "dnf"] as Platform[]).map((platform) => (
+          <Install key={platform} platform={platform} />
+        ))}
       </Section>
 
       <Section name="KeyValue">

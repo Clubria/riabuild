@@ -16,9 +16,10 @@ anything structural.
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
+| `riabuild-cli/` | Rust CLI, shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `e2e/` | the CLI and the backend tested together on macOS — `e2e/README.md` |
+| `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies |
 | `docs/superpowers/specs/` | design specs |
 | `.claude/skills/` | repo skills — read the relevant one before the work it covers |
 
@@ -52,9 +53,15 @@ developer's laptop. Do not cross this boundary for convenience.
 The org settings may **name** a program and never **carry** one. The default status line
 is `node ~/.riabuild/claude-statusline.js`; the script lives in `riabuild-cli/assets/`,
 is compiled in with `include_str!`, and is installed by the `claude_statusline` task.
-Editing that string in the dashboard cannot change what runs on a laptop — only a
-`brew upgrade` can. A settings key whose value the server chose the *contents* of would
+Editing that string in the dashboard cannot change what runs on a laptop — only an
+upgrade can. A settings key whose value the server chose the *contents* of would
 be the manifest again under another name.
+
+**riabuild owns every tool it installs.** Node, pnpm, Claude Code, `gh`, and `infisical`
+are downloaded by riabuild and verified against a published digest. No task shells out to
+Homebrew, apt, or dnf to install a dependency — those exist to distribute riabuild itself,
+nothing else. A provisioner that needs a package manager already set up cannot be the
+first thing a developer runs.
 
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
