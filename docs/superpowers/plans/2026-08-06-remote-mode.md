@@ -4,7 +4,7 @@
 
 **Goal:** `riabuild remote` provisions a Linux or macOS server over SSH and opens a mosh shell on it, with the laptop holding the SSH identity, the server's riabuild session, and the GitHub sign-in the server borrows.
 
-**Architecture:** The laptop drives; the server runs its own riabuild binary, so setup logic is never pushed over SSH. Per-developer state on the server lives in `~/.riabuild-remote/<public-id>/` while tools stay shared in `~/.riabuild/`, which lets several developers share one Unix account. The GitHub credential is seeded from the laptop into a per-session runtime directory and wiped when the last session ends.
+**Architecture:** The laptop drives; the server runs its own riabuild binary, so setup logic is never pushed over SSH. Per-developer state on the server lives in `~/.riabuild-remote/<member-id>/` while tools stay shared in `~/.riabuild/`, which lets several developers share one Unix account. The GitHub credential is seeded from the laptop into a per-session runtime directory and wiped when the last session ends.
 
 **Tech Stack:** Rust 2024 on current-thread tokio, `async-trait`, `reqwest` with rustls, `clap`; Convex + React + Tailwind for riabuild-web; `vitest` + `convex-test` for the backend, Playwright for the dashboard.
 
@@ -20,7 +20,7 @@
 - **No secrets in `~/.riabuild/` on a laptop.** The one amendment this plan introduces is `<namespace>/session.token`, mode `0600`, on a **server only** — Task 20 also writes that amendment into `riabuild-cli/CLAUDE.md`.
 - **Secrets never appear in an argument list.** They go through `RunOptions.stdin` or `RunOptions.env`, the way `env_local` already passes `INFISICAL_TOKEN`.
 - **The version comes from the git tag.** Never `CARGO_PKG_VERSION`; local builds report `9999.0.0-dev`.
-- **`/api/v1` fields are added, never removed or retyped.** The one break this plan makes — a required `publicId` — is argued in the spec and is safe only because riabuild-web deploys before a CLI release ships.
+- **`/api/v1` fields are added, never removed or retyped.** The one break this plan makes — a required `memberId` — is argued in the spec and is safe only because riabuild-web deploys before a CLI release ships.
 - **Every file stays under roughly 300 lines.** One responsibility per file.
 - **Every PR runs** `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test` for the CLI, and `pnpm test` + `pnpm lint` for the web app. Work is not finished until PR CI has completed.
 - **Naming:** the user-facing name is **remote mode**; SSH is the transport, never the feature name.
@@ -35,10 +35,10 @@ Stage C cannot ship before the Linux design's PRs A and B are merged. It needs r
 
 | File | Responsibility |
 |---|---|
-| `convex/schema.ts` | `members.publicId` |
-| `convex/auth.ts` | mints a `publicId` when a member row is created |
-| `convex/members.ts` | `memberView`/`toView` carry `publicId`; the backfill mutation |
-| `convex/http.ts` | `memberPayload` returns `publicId` |
+| `convex/schema.ts` | `members.memberId` |
+| `convex/auth.ts` | mints a `memberId` when a member row is created |
+| `convex/members.ts` | `memberView`/`toView` carry `memberId`; the backfill mutation |
+| `convex/http.ts` | `memberPayload` returns `memberId` |
 | `convex/devSeed.ts` | fixture members carry one |
 | `src/ui/Copyable.tsx` | monospace value, truncated, with a copy button |
 | `src/components/Profile.tsx` | the developer's own member id |
@@ -75,7 +75,7 @@ Stage C cannot ship before the Linux design's PRs A and B are merged. It needs r
 
 Lands on its own. Ships the dashboard change and the schema the namespace depends on.
 
-### Task 1: `publicId` on members, minted and backfilled
+### Task 1: `memberId` on members, minted and backfilled
 
 **Files:**
 - Modify: `riabuild-web/convex/schema.ts`
@@ -86,19 +86,19 @@ Lands on its own. Ships the dashboard change and the schema the namespace depend
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `members.publicId?: string` in the schema; `internal.members.backfillPublicIds` as an `internalMutation` taking no args and returning `v.number()` (how many rows it filled).
+- Produces: `members.memberId?: string` in the schema; `internal.members.backfillPublicIds` as an `internalMutation` taking no args and returning `v.number()` (how many rows it filled).
 
 - [ ] **Step 1: Write the failing test**
 
 Add to `riabuild-web/convex/api.test.ts`:
 
 ```ts
-describe("member public ids", () => {
-  test("a member created through sign-in gets a public id", async () => {
+describe("member member ids", () => {
+  test("a member created through sign-in gets a member id", async () => {
     const t = setup();
     const { memberId } = await seedMemberWithPublicId(t);
     const member = await t.run(async (ctx) => await ctx.db.get(memberId));
-    expect(member?.publicId).toMatch(
+    expect(member?.memberId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );
   });
@@ -120,13 +120,13 @@ describe("member public ids", () => {
       });
     });
 
-    const before = await t.run(async (ctx) => (await ctx.db.get(withId.memberId))?.publicId);
+    const before = await t.run(async (ctx) => (await ctx.db.get(withId.memberId))?.memberId);
     const filled = await t.mutation(internal.members.backfillPublicIds, {});
 
     expect(filled).toBe(1);
     const after = await t.run(async (ctx) => ({
-      untouched: (await ctx.db.get(withId.memberId))?.publicId,
-      filled: (await ctx.db.get(withoutId))?.publicId,
+      untouched: (await ctx.db.get(withId.memberId))?.memberId,
+      filled: (await ctx.db.get(withoutId))?.memberId,
     }));
     expect(after.untouched).toBe(before);
     expect(after.filled).toBeTruthy();
@@ -156,7 +156,7 @@ async function seedMemberWithPublicId(
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "public id"`
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "member id"`
 Expected: FAIL — `internal.members.backfillPublicIds` does not exist.
 
 - [ ] **Step 3: Add the field, the minting and the backfill**
@@ -169,13 +169,13 @@ Expected: FAIL — `internal.members.backfillPublicIds` does not exist.
      * directory on a shared server, so it must outlive a GitHub rename.
      * Optional for exactly one deploy — see the backfill below.
      */
-    publicId: v.optional(v.string()),
+    memberId: v.optional(v.string()),
 ```
 
 `convex/auth.ts`, in the `ctx.db.insert("members", {...})` at line 186, add:
 
 ```ts
-      publicId: crypto.randomUUID(),
+      memberId: crypto.randomUUID(),
 ```
 
 `convex/devSeed.ts`, the same line in both inserts.
@@ -184,7 +184,7 @@ Expected: FAIL — `internal.members.backfillPublicIds` does not exist.
 
 ```ts
 /**
- * One-shot: gives every member row a `publicId` so the field can be made
+ * One-shot: gives every member row a `memberId` so the field can be made
  * required. Idempotent, and returns how many rows it changed so the deploy
  * step can be checked rather than assumed.
  */
@@ -195,8 +195,8 @@ export const backfillPublicIds = internalMutation({
     const members = await ctx.db.query("members").collect();
     let filled = 0;
     for (const member of members) {
-      if (member.publicId !== undefined) continue;
-      await ctx.db.patch(member._id, { publicId: crypto.randomUUID() });
+      if (member.memberId !== undefined) continue;
+      await ctx.db.patch(member._id, { memberId: crypto.randomUUID() });
       filled += 1;
     }
     return filled;
@@ -208,17 +208,17 @@ Import `internalMutation` from `./_generated/server` if it is not already import
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "public id"`
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "member id"`
 Expected: PASS, three tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add riabuild-web/convex
-git commit -m "Mint a public id for every member"
+git commit -m "Mint a member id for every member"
 ```
 
-### Task 2: Serve `publicId`, and make it required
+### Task 2: Serve `memberId`, and make it required
 
 **Files:**
 - Modify: `riabuild-web/convex/members.ts` (`memberView`, `toView`)
@@ -227,13 +227,13 @@ git commit -m "Mint a public id for every member"
 - Test: `riabuild-web/convex/api.test.ts`
 
 **Interfaces:**
-- Consumes: `members.publicId` from Task 1.
-- Produces: `publicId: string` in `memberView` and in every `/api/v1` member payload — `GET /api/v1/me` and `POST /api/v1/cli/token`.
+- Consumes: `members.memberId` from Task 1.
+- Produces: `memberId: string` in `memberView` and in every `/api/v1` member payload — `GET /api/v1/me` and `POST /api/v1/cli/token`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```ts
-test("every member payload carries the public id", async () => {
+test("every member payload carries the member id", async () => {
   const t = setup();
   const { memberId } = await seedMemberWithPublicId(t);
   const token = await seedSession(t, memberId);
@@ -244,7 +244,7 @@ test("every member payload carries the public id", async () => {
   const body = await response.json();
 
   expect(response.status).toBe(200);
-  expect(body.member.publicId).toBeTruthy();
+  expect(body.member.memberId).toBeTruthy();
 });
 ```
 
@@ -252,32 +252,32 @@ Use whichever session helper `api.test.ts` already defines for authenticated req
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "carries the public id"`
-Expected: FAIL — `body.member.publicId` is `undefined`.
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "carries the member id"`
+Expected: FAIL — `body.member.memberId` is `undefined`.
 
 - [ ] **Step 3: Serve the field**
 
 `convex/members.ts`, in `memberView`:
 
 ```ts
-  publicId: v.string(),
+  memberId: v.string(),
 ```
 
 and in `toView`:
 
 ```ts
-    publicId: member.publicId ?? "",
+    memberId: member.memberId ?? "",
 ```
 
 `convex/http.ts`, in `memberPayload`:
 
 ```ts
-    publicId: member.publicId,
+    memberId: member.memberId,
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "carries the public id"`
+Run: `cd riabuild-web && pnpm vitest run convex/api.test.ts -t "carries the member id"`
 Expected: PASS.
 
 - [ ] **Step 5: Make the field required and drop the fallback**
@@ -285,38 +285,38 @@ Expected: PASS.
 `convex/schema.ts`:
 
 ```ts
-    publicId: v.string(),
+    memberId: v.string(),
 ```
 
 `convex/members.ts`, in `toView`, now that no row can be missing one:
 
 ```ts
-    publicId: member.publicId,
+    memberId: member.memberId,
 ```
 
 - [ ] **Step 6: Run the whole backend suite**
 
 Run: `cd riabuild-web && pnpm vitest run convex`
-Expected: PASS. A failure here means a fixture inserts a member without a `publicId` — fix the fixture, not the schema.
+Expected: PASS. A failure here means a fixture inserts a member without a `memberId` — fix the fixture, not the schema.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add riabuild-web/convex
-git commit -m "Serve publicId, and require it"
+git commit -m "Serve memberId, and require it"
 ```
 
 > **Deploy note for the reviewer, not a code step.** Production takes this in three moves: deploy with the field optional, run `npx convex run members:backfillPublicIds --prod`, then deploy the required schema. The third deploy fails loudly if the backfill missed a row, which is the point of doing it in that order.
 
-### Task 3: The CLI reads `public_id`
+### Task 3: The CLI reads `member_id`
 
 **Files:**
 - Modify: `riabuild-cli/src/api/mod.rs:77-87` (`Member`)
 - Test: `riabuild-cli/src/api/mod.rs` tests module
 
 **Interfaces:**
-- Consumes: `publicId` from Task 2.
-- Produces: `Member::public_id: String`, non-optional, used by Stage C to name the server namespace.
+- Consumes: `memberId` from Task 2.
+- Produces: `Member::member_id: String`, non-optional, used by Stage C to name the server namespace.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -324,18 +324,18 @@ Add to the tests module in `riabuild-cli/src/api/mod.rs`:
 
 ```rust
 #[test]
-fn a_member_payload_carries_the_public_id() {
+fn a_member_payload_carries_the_member_id() {
     let member: Member = serde_json::from_str(
-        r#"{"githubLogin":"ada","githubId":"1234","publicId":"550e8400-e29b-41d4-a716-446655440000",
+        r#"{"githubLogin":"ada","githubId":"1234","memberId":"550e8400-e29b-41d4-a716-446655440000",
             "firstName":"Ada","lastName":"Lovelace","email":"ada@clubria.dev",
             "role":"developer","status":"active"}"#,
     )
     .expect("payload should parse");
-    assert_eq!(member.public_id, "550e8400-e29b-41d4-a716-446655440000");
+    assert_eq!(member.member_id, "550e8400-e29b-41d4-a716-446655440000");
 }
 
 #[test]
-fn a_payload_without_a_public_id_is_refused() {
+fn a_payload_without_a_member_id_is_refused() {
     // A deployment older than this binary. Failing here is correct: the
     // alternative is a namespace directory named after an empty string,
     // silently shared by every developer on a server.
@@ -343,14 +343,14 @@ fn a_payload_without_a_public_id_is_refused() {
         r#"{"githubLogin":"ada","githubId":"1234","firstName":"Ada","lastName":"Lovelace",
             "email":"ada@clubria.dev","role":"developer","status":"active"}"#,
     );
-    assert!(parsed.is_err(), "a missing publicId must not default");
+    assert!(parsed.is_err(), "a missing memberId must not default");
 }
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd riabuild-cli && cargo test a_member_payload_carries_the_public_id`
-Expected: FAIL — no field `public_id` on `Member`.
+Run: `cd riabuild-cli && cargo test a_member_payload_carries_the_member_id`
+Expected: FAIL — no field `member_id` on `Member`.
 
 - [ ] **Step 3: Add the field**
 
@@ -360,11 +360,11 @@ In `riabuild-cli/src/api/mod.rs`, inside `struct Member`:
     /// Immutable and ours. Names this developer's directory on a server.
     /// Deliberately not `#[serde(default)]`: an identifier that half the
     /// deployments might not send is not an identifier.
-    #[serde(rename = "publicId")]
-    pub public_id: String,
+    #[serde(rename = "memberId")]
+    pub member_id: String,
 ```
 
-Every construction of `Member` in tests across the crate now needs the field. Add `public_id: "550e8400-e29b-41d4-a716-446655440000".into()` to each; `cargo test` will list them.
+Every construction of `Member` in tests across the crate now needs the field. Add `member_id: "550e8400-e29b-41d4-a716-446655440000".into()` to each; `cargo test` will list them.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -390,7 +390,7 @@ In `riabuild-cli/src/api/mod.rs`, wherever a response body is deserialised into 
 ```bash
 cd riabuild-cli && cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
 git add riabuild-cli/src
-git commit -m "Read the member public id, and refuse a payload without one"
+git commit -m "Read the member member id, and refuse a payload without one"
 ```
 
 ### Task 4: A `Copyable` component
@@ -477,12 +477,12 @@ git commit -m "Add Copyable, for identifiers you copy rather than read"
 - Modify: `riabuild-web/src/dev/scenarios.ts` (every fixture member, and `overflow`)
 
 **Interfaces:**
-- Consumes: `Copyable` from Task 4, `publicId` from Task 2.
+- Consumes: `Copyable` from Task 4, `memberId` from Task 2.
 - Produces: nothing later tasks depend on.
 
 - [ ] **Step 1: Add the field to the client-side type and every fixture**
 
-In `src/data/types.ts`, add `publicId: string;` to `Member`. Then add a `publicId` to every fixture member in `src/dev/scenarios.ts`. In the `overflow` scenario use a full 36-character UUID, because an unbroken string with no spaces is exactly what that scenario exists to catch.
+In `src/data/types.ts`, add `memberId: string;` to `Member`. Then add a `memberId` to every fixture member in `src/dev/scenarios.ts`. In the `overflow` scenario use a full 36-character UUID, because an unbroken string with no spaces is exactly what that scenario exists to catch.
 
 - [ ] **Step 2: Add the profile row**
 
@@ -490,7 +490,7 @@ In `Profile.tsx`, inside the panel, above the form:
 
 ```tsx
 <KeyValue
-  rows={[{ label: "member id", value: <Copyable value={member.publicId} label="member id" /> }]}
+  rows={[{ label: "member id", value: <Copyable value={member.memberId} label="member id" /> }]}
 />
 ```
 
@@ -505,7 +505,7 @@ In `LeadPanel.tsx`, add to `columns` after the `name` column:
       key: "id",
       header: "member id",
       priority: "wide",
-      render: (m) => <Copyable value={m.publicId} label={`member id for @${m.githubLogin}`} />,
+      render: (m) => <Copyable value={m.memberId} label={`member id for @${m.githubLogin}`} />,
     },
 ```
 
@@ -553,7 +553,7 @@ exactly as it does today. It exists so Stage C has somewhere to stand.
   - `Paths::owner_file() -> PathBuf` — `<root>/owner.json`
   - `Paths::riabuild_dir(&self, version: &str) -> PathBuf` — `<tools_root>/riabuild/<version>`
   - `paths::root_for(home: &Path, override_root: Option<&str>) -> PathBuf`
-  - `paths::remote_namespace(home: &Path, public_id: &str) -> PathBuf`
+  - `paths::remote_namespace(home: &Path, member_id: &str) -> PathBuf`
   - `RealPaths::with_root(home, root)`
 
 - [ ] **Step 1: Write the failing tests**
@@ -737,8 +737,8 @@ pub fn root_for(home: &Path, override_root: Option<&str>) -> PathBuf {
 }
 
 /// One developer's namespace on a shared server.
-pub fn remote_namespace(home: &Path, public_id: &str) -> PathBuf {
-    home.join(".riabuild-remote").join(public_id)
+pub fn remote_namespace(home: &Path, member_id: &str) -> PathBuf {
+    home.join(".riabuild-remote").join(member_id)
 }
 ```
 
@@ -2938,12 +2938,12 @@ git commit -m "Install a verified riabuild on the server, over the SSH pipe"
 - Test: `riabuild-cli/src/remote/session.rs`, `riabuild-cli/src/keychain.rs`
 
 **Interfaces:**
-- Consumes: `Remote` (Task 13), `ssh_options` (Task 15), `Member::public_id` (Task 3).
+- Consumes: `Remote` (Task 13), `ssh_options` (Task 15), `Member::member_id` (Task 3).
 - Produces:
   - `keychain::for_account(runner, account: &str, session_token_file: Option<PathBuf>) -> Box<dyn Keychain>`
   - `keychain::remote_account(hash: &str) -> String` — `remote:<hash>`
   - `auth::login(api, runner, ui, web_url, version, label: &str)` — label now a parameter
-  - `session::namespace(public_id: &str) -> String` — `~/.riabuild-remote/<public-id>`
+  - `session::namespace(member_id: &str) -> String` — `~/.riabuild-remote/<member-id>`
   - `session::ensure(remote, paths, runner, ui, api, member, web_url, version) -> Result<()>`
 
 - [ ] **Step 1: Write the failing tests**
@@ -3085,8 +3085,8 @@ use crate::ui::{Failure, Ui};
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn namespace(public_id: &str) -> String {
-    format!("~/.riabuild-remote/{public_id}")
+pub fn namespace(member_id: &str) -> String {
+    format!("~/.riabuild-remote/{member_id}")
 }
 
 /// Who a namespace belongs to, for whoever has a shell on the box and finds a
@@ -3128,7 +3128,7 @@ pub async fn ensure(
         }
     };
 
-    let ns = namespace(&member.public_id);
+    let ns = namespace(&member.member_id);
     let write = format!(
         "umask 077 && mkdir -p {ns} && cat > {ns}/session.token && chmod 600 {ns}/session.token"
     );
@@ -3192,7 +3192,7 @@ git commit -m "Mint a session for the server and write it where the server can r
 - Consumes: `Scope` (Task 10), `ScopedRunner` (Task 8).
 - Produces:
   - `gh_session::choose_runtime_dir(xdg: Option<&str>, tmpdir: Option<&str>) -> PathBuf`
-  - `GhSession::open(runtime: &Path, public_id: &str, pid: u32) -> Result<GhSession>`
+  - `GhSession::open(runtime: &Path, member_id: &str, pid: u32) -> Result<GhSession>`
   - `GhSession::config_dir(&self) -> PathBuf`
   - `GhSession::close(self, runner: Arc<dyn CommandRunner>) -> Result<()>`
   - `gh_session::sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Result<bool>` — true if the tree was wiped
@@ -3340,8 +3340,8 @@ pub struct GhSession {
 }
 
 impl GhSession {
-    pub async fn open(runtime: &Path, public_id: &str, pid: u32) -> Result<GhSession> {
-        let dir = runtime.join(format!("riabuild-gh-{public_id}"));
+    pub async fn open(runtime: &Path, member_id: &str, pid: u32) -> Result<GhSession> {
+        let dir = runtime.join(format!("riabuild-gh-{member_id}"));
         let sessions = dir.join("sessions");
         tokio::fs::create_dir_all(&sessions).await?;
         // /tmp is world-writable and sticky, so the directory has to be private
@@ -3431,12 +3431,12 @@ When `scope.is_remote()`, before building `Ctx`:
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             std::env::var("TMPDIR").ok().as_deref(),
         );
-        let public_id = paths
+        let member_id = paths
             .root()
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Some(gh_session::GhSession::open(&runtime, &public_id, std::process::id()).await?)
+        Some(gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?)
     } else {
         None
     };
@@ -3665,7 +3665,7 @@ git commit -m "Lend the server this laptop's GitHub sign-in, over stdin"
 **Interfaces:**
 - Consumes: everything from Tasks 12–20.
 - Produces:
-  - `remote::env_prefix(public_id: &str, name: &str) -> String`
+  - `remote::env_prefix(member_id: &str, name: &str) -> String`
   - `shell::open(remote, paths, runner, ui, command) -> Result<i32>`
   - `remote::run(ctx: &mut Ctx, cli: &Cli, target: Option<String>, action: Option<RemoteAction>) -> Result<i32>`
 
@@ -3796,10 +3796,10 @@ pub async fn open(
 
 ```rust
 /// The environment the server's riabuild runs under.
-pub fn env_prefix(public_id: &str, name: &str) -> String {
+pub fn env_prefix(member_id: &str, name: &str) -> String {
     format!(
         "RIABUILD_ROOT={} RIABUILD_REMOTE={name}",
-        session::namespace(public_id)
+        session::namespace(member_id)
     )
 }
 
@@ -3851,7 +3851,7 @@ pub async fn run(
     )
     .await?;
 
-    let prefix = env_prefix(&member.public_id, &remote.name);
+    let prefix = env_prefix(&member.member_id, &remote.name);
     session::seed_github(
         &remote,
         ctx.paths.as_ref(),
@@ -3999,7 +3999,7 @@ item, which is what stops this laptop using it — delete the key pair, remove t
 ```rust
     let cleanup = format!(
         "rm -rf {} && sed -i.bak '/riabuild {}/d' ~/.ssh/authorized_keys",
-        session::namespace(public_id),
+        session::namespace(member_id),
         remote.target()
     );
 ```
@@ -4025,7 +4025,7 @@ by the unit tests in Task 16.
 
 1. runs `riabuild remote testuser@localhost:2222` as one developer, with a stub
    riabuild-web, and asserts the flow completes
-2. repeats as a second developer with a different `publicId`
+2. repeats as a second developer with a different `memberId`
 3. asserts `~/.riabuild-remote/<id-a>` and `<id-b>` both exist and hold their own
    `state.json`, `gitconfig` and `owner.json`
 4. asserts `~/.riabuild/node/<version>` exists exactly once — one toolchain, two developers

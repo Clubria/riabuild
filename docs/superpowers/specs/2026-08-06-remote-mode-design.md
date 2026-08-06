@@ -53,8 +53,8 @@ underneath a new command would bury them.
 
 | PR | Contents |
 |---|---|
-| **A** | `members.publicId` as required schema, the backfill and its staged deploy, the `memberPayload` field, `Member.public_id` in the CLI, and the dashboard showing member ids |
-| **B** | `Paths::tools_root()` and the root override, the namespace environment on `Ctx`, remote token-store selection, a target parameter on `download.rs` |
+| **A** | `members.memberId` as required schema, the backfill and its staged deploy, the `memberPayload` field, `DELETE /api/v1/cli/sessions/<id>`, `Member.member_id` in the CLI, and the dashboard showing member ids |
+| **B** | `Paths::tools_root()` and the root override, the scoped runner, remote token-store selection, digest-verified tools, a target parameter on `download.rs` |
 | **C** | `riabuild remote` — identity, host trust, install, setup, shell, the per-session GitHub credential — and the container test |
 
 ---
@@ -133,33 +133,93 @@ Which server?
 `--check`, `--quiet` and `--project` forward to the remote run. `--no-shell` stops after
 provisioning. Everything else is the same flag it always was.
 
-`forget` does three things and reports on each: deletes the local key pair and the
-`remotes.json` entry, revokes the server's session, and connects to remove riabuild's own
-`authorized_keys` line and the namespace directory. If the server is unreachable it says
-exactly what it could not clean up, so that the leftovers are known rather than assumed
-gone. The shared toolchain is never removed — it belongs to whoever else is on that box.
+`forget` works from the far end inwards, because every step after the first needs the key
+the last step deletes:
 
-## What the laptop sets on the remote invocation
+1. revoke the session — and stop here, loudly, if that failed
+2. connect and remove this developer's `authorized_keys` line and their namespace
+3. delete the local key pair and the `remotes.json` entry
+
+Doing it in the other order would delete the key, leave `ssh -o IdentitiesOnly=yes` unable
+to authenticate, silently skip the server-side cleanup, and then drop the entry that would
+have let anyone retry.
+
+Two details that matter on a shared account. The `authorized_keys` line is matched by the
+**member id** in its comment, with a fixed-string `grep -vF` into a new file rather than a
+`sed` pattern — on a shared account every developer's key comment contains the same
+`user@host`, so matching on that would lock everybody else out of the box, and an unescaped
+hostname in a regex matches more than it should. And no `.bak` is left behind, because the
+whole point was removing a key rather than moving it next door.
+
+The shared toolchain is never removed — it belongs to whoever else is on that box. If the
+server is unreachable, `forget` says exactly what it could not clean up rather than
+pretending.
+
+`--check` never provisions. It reports what a run would do and stops before minting a
+session, writing a token, or lending the server a GitHub sign-in — everywhere else in
+riabuild that flag means *touch nothing*, and a check that ships your GitHub identity to a
+server would be an unpleasant surprise.
+
+## How a command reaches the server
+
+**Never through the login shell, and never with a `~` in it.** `sshd` runs a remote command
+string with the *user's* login shell, and this product supports fish — where
+`RIABUILD_ROOT=… riabuild` is a syntax error rather than an assignment, and where a tilde in
+an assignment is not expanded. csh differs again. mosh is worse: it `execvp`s the command
+with no shell at all, so neither a `VAR=` prefix nor a `~` means anything.
+
+So riabuild resolves the server's home directory once, on the first connection, and uses
+absolute paths and `env` thereafter:
 
 ```
-RIABUILD_ROOT=~/.riabuild-remote/<public-id>
-RIABUILD_REMOTE=1
+ssh … <host> /bin/sh -c 'printf %s "$HOME"'        once, cached in remotes.json
+ssh … <host> env RIABUILD_ROOT=/home/dev/.riabuild-remote/<member-id> \
+                 RIABUILD_REMOTE=build-01 \
+                 /home/dev/.riabuild/riabuild/2026.08.06/riabuild --no-shell
+mosh … -- /bin/sh -lc '<the same, quoted>'
 ```
 
-Two variables, and the server's riabuild derives the rest. `GIT_CONFIG_GLOBAL` and the
-Claude profile directory hang off `root()`; `GH_CONFIG_DIR` hangs off the runtime directory
-instead, for the reasons in *The GitHub credential lives only as long as a session*.
-Deriving them rather than passing them means the server's own re-runs — from inside the
-mosh shell, with no laptop attached — produce exactly the same environment.
+Anything with more than one step — the install, writing the session file — is wrapped in an
+explicit `/bin/sh -c '…'` rather than trusted to whatever shell the account happens to use.
+`ssh` is always given `-F /dev/null` so a `Host` block in the developer's own
+`~/.ssh/config` cannot redirect the connection or inject a `RemoteCommand`.
 
-`RIABUILD_REMOTE=1` means four things, and they are one idea: this riabuild is managed from
-a laptop. It selects the file token store over the platform keychain, it puts the GitHub
+**Every interpolated value is single-quoted** through the `shell_quote` already in
+`main.rs`, and every value that reaches a command line is validated at the boundary it
+arrives on: `memberId` must be a UUID and `latestCliVersion` must be digits and dots,
+both refused as a `Failure` otherwise. These arrive from a database field, and the root
+`CLAUDE.md` calls the server-ships-data boundary load-bearing — a value from Convex
+reaching an unquoted `ssh host "…"` is precisely the remote-execution channel that rule
+exists to prevent.
+
+### The two variables
+
+`RIABUILD_ROOT` is an absolute path. `RIABUILD_REMOTE` carries the server's name, and any
+non-empty value means remote — one variable serving both the decision and the shell banner.
+
+`RIABUILD_REMOTE` means four things, and they are one idea: this riabuild is managed from a
+laptop. It selects the file token store over the platform keychain, it puts the GitHub
 configuration in a per-session runtime directory, it suppresses the self-update check
-because no package manager owns that binary, and it puts the server's name in the shell
-banner.
+because no package manager owns that binary, and it names the server in the shell banner.
 
-The `<public-id>` is the driving developer's own, taken from the member record the laptop
-already holds.
+The server derives everything else from `root()` — `GIT_CONFIG_GLOBAL`, the Claude profile
+directory — so a re-run from inside the mosh shell, with no laptop attached, produces
+exactly the same environment.
+
+**A `RIABUILD_ROOT` that is not absolute is a hard failure, never a default.** Silently
+falling back to `~/.riabuild` would put every developer on the box in one namespace: one
+`session.token`, so a candidate's riabuild would broker Infisical at a lead's role, and one
+`gh` configuration, which is the silent wrong-identity bug this design exists to prevent.
+The same check refuses `RIABUILD_REMOTE` set without a valid `RIABUILD_ROOT`, because
+"remote but un-namespaced" must not be a state riabuild can be in.
+
+## The git identity
+
+`GIT_CONFIG_GLOBAL` points at `<namespace>/gitconfig`, and **riabuild writes that file** —
+`user.name` and `user.email` from the member record — when it writes the namespace. Setting
+the variable without creating the file would be worse than doing nothing: git stops reading
+`~/.gitconfig` too, so the first commit on the server fails with *"Please tell me who you
+are"* on a box where the developer never configured git in the first place.
 
 ## Prompts
 
@@ -202,17 +262,35 @@ predictable, which beats being clever about it.
 
 ## Host keys
 
-Before anything is sent to the server, `ssh-keyscan` fetches its host key, riabuild shows
-the fingerprint, and the developer confirms once. It is then pinned in riabuild's own
-`known_hosts` and every later connection runs with `StrictHostKeyChecking=yes` against
-that file.
+Before anything is sent to the server, `ssh-keyscan -t ed25519` fetches its host key,
+riabuild shows the fingerprint, and the developer confirms once. It is then pinned in
+riabuild's own `known_hosts`, and every later connection runs with
+`StrictHostKeyChecking=yes` against that file.
 
-**riabuild never reads or writes `~/.ssh`.** No managed block, no Include, no entry in the
-developer's own `known_hosts`. A bad write to those files breaks SSH for everything on the
-machine, not just for riabuild.
+**One key type, and only what was shown gets pinned.** Scanning every type and displaying
+the first fingerprint would have the developer approve, typically, the RSA key while the
+ed25519 and ecdsa keys they never saw were pinned alongside it — and the fingerprint a cloud
+console gives them to compare against is usually the ed25519 one. This prompt is the trust
+anchor for everything after it: the next thing that happens is a GitHub token and a riabuild
+session going to whatever answered.
+
+Matching an existing entry is on the exact host field, not a prefix. `build-01` and
+`build-01.fly.dev` are deliberately two different servers here, and a `starts_with` would
+treat one as already trusted, skip the prompt, and then fail under
+`StrictHostKeyChecking=yes` with nothing explaining why.
+
+**riabuild never writes `~/.ssh`, and ignores `~/.ssh/config`.** No managed block, no
+Include, no entry in the developer's own `known_hosts`. Every invocation passes
+`-F /dev/null`, because a `Host` block with `ProxyCommand`, `RemoteCommand` or `Hostname`
+would otherwise change what riabuild connects to and what runs there. Saying "riabuild never
+reads `~/.ssh`" without that flag would have been false: `ssh` reads it whether or not
+riabuild names it.
 
 A host key that changes later is a hard stop with `safe_to_rerun: false`. Never an
 auto-accept.
+
+For automation and the container test, `--accept-host-key <fingerprint>` supplies the answer
+the prompt would have asked for; it matches or it fails. There is no "accept anything" flag.
 
 ## Authorising the key
 
@@ -252,10 +330,35 @@ Saying so beats prompting for something that cannot work.
 The laptop mints it, and writes it down on the server.
 
 1. `riabuild remote` runs the ordinary loopback-OAuth login on the laptop, labelled after
-   the server — `build-01.fly.dev`. The dashboard lists it as its own device, revocable on
-   its own. **No `/api/v1` change**: the label is already a parameter of the flow.
-2. The token is stored on the server at `<namespace>/session.token`, mode 0600.
-3. `riabuild remote forget` revokes it.
+   the server — `build-01.fly.dev`. The dashboard lists it as its own device.
+2. The token is stored on the server at `<namespace>/session.token`, mode 0600, and a copy
+   stays in the laptop's own keychain under the account `remote:<hash>`.
+3. `riabuild remote forget` **revokes** it — see below.
+
+## Revocation has to be real
+
+The whole case for writing a bearer token to a server's disk is that it can be taken back.
+`/api/v1` had no way to do that, so this design adds one:
+
+```
+DELETE /api/v1/cli/sessions/<id>
+  → authenticate the session, confirm the member is active, re-verify org membership
+  → refuse unless the session belongs to this member, or the caller is a lead
+  → set revokedAt, write an auditLog entry
+```
+
+That is a second `/api/v1` change beyond `memberId`, and it is deliberate. Without it,
+`forget` deletes the laptop's copy of a credential that remains live on the server, readable
+by every co-tenant, and usable from any machine until it expires — so "its blast radius is
+that server" would be false, and the amendment to the no-secrets invariant would rest on
+something that does not happen. **`forget` fails loudly if revocation did not succeed**,
+rather than reporting a tidy-up it did not perform.
+
+The laptop also checks the stored token before reusing it: `sessionExpiresAt` from
+`remotes.json`, and a `GET /api/v1/me` under that token when it is close to expiry or has
+been revoked elsewhere. A server cannot re-mint for itself — the loopback flow needs a
+browser it does not have — so handing it a dead token strands it with a 401 and no way
+forward.
 
 No browser on the server, no keyring on the server, no SSH forwarding, no broker process.
 The server can re-run `riabuild` on its own afterwards — including re-pulling rotated
@@ -319,7 +422,7 @@ no `com.apple.quarantine` extended attribute, so Gatekeeper never enters the pic
 The laptop compares the server's binary against the org's `minCliVersion` and
 `latestCliVersion` on every connect, and repairs drift before setup runs. The server's
 riabuild therefore never self-updates: no package manager owns that binary, the laptop
-does. `RIABUILD_REMOTE=1` suppresses the update check on the remote side.
+does. `RIABUILD_REMOTE` suppresses the update check on the remote side.
 
 No `sudo`. Nothing outside the developer's home directory. Which is also what makes the
 whole flow work on a container, a hardened host, or a box the developer does not
@@ -334,7 +437,7 @@ riabuild uses whatever account the SSH login lands in and never creates users, s
 in this flow needs root.
 
 ```
-~/.riabuild-remote/<public-id>/
+~/.riabuild-remote/<member-id>/
 ```
 
 A single-user VPS gets the same layout with one namespace, so there is no shared-versus-solo
@@ -375,6 +478,11 @@ namespace's `config.json` the first time it is chosen, so a later GitHub rename 
 nothing — the directory simply keeps the name it had. If the default path already exists
 and belongs to another namespace, riabuild claims `<login>-2` rather than sharing a tree.
 
+This is a change to the `project` task, not a free function nobody calls: on a server it
+asks for the namespaced path instead of `default_project_dir`. Left unwired, a macOS server
+would put the checkout back in `~/Documents` — the TCC-protected directory this rule exists
+to avoid — and two developers sharing an account would land in one working tree.
+
 ## The trust boundary, stated plainly
 
 **Namespaces prevent collisions, not snooping.** Every namespace is owned by the same Unix
@@ -384,8 +492,20 @@ the GitHub credential per-session narrows *when* that last one is there; it does
 it private.
 
 Sharing an account is therefore a decision that those developers are mutually trusted —
-which they largely already are, holding the same Infisical secrets. What they gain over
-each other is impersonation: acting as Bob in riabuild and on GitHub.
+which they largely already are, holding the same Infisical secrets. What they gain over each
+other is impersonation: acting as Bob in riabuild and on GitHub.
+
+**And, without care, more than impersonation.** The toolchain is shared, so a co-tenant can
+pre-create `~/.riabuild/riabuild/<next-version>/riabuild`, or a `node` or a `gh`, as a script
+of their choosing — and every other developer would then execute it, with their own session
+token in the environment. That is arbitrary code execution as each other, which is a
+different thing from reading each other's files, and it is not something a shared account
+should be assumed to have conceded.
+
+What holds it shut is the rule in *the shared toolchain*, below: **riabuild verifies the
+digest of what is on disk, not the version it claims**. A planted binary fails that check
+and is replaced. This is the one place where the convenience of a shared toolchain has a
+sharp edge, and it is worth knowing that the digest check is what dulls it.
 
 A box shared by people who should not be able to impersonate each other gets separate Unix
 accounts instead. That needs no riabuild support: the identity hash already keys on
@@ -407,16 +527,28 @@ place it should sit at rest. So it is the one piece of state that is **not** nam
 disk:
 
 ```
-GH_CONFIG_DIR = <runtime>/riabuild-gh-<public-id>/
+GH_CONFIG_DIR = <runtime>/riabuild-gh-<member-id>/
 ```
 
-`<runtime>` is the first of `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp` that exists. The order
-matters: `$XDG_RUNTIME_DIR` is a per-uid tmpfs that logind clears, so on a systemd host the
-token never touches a disk at all; `$TMPDIR` is the per-user directory macOS provides; `/tmp`
-is the floor that always works. The directory is created 0700 with `mkdtemp` semantics,
-because `/tmp` is world-writable and sticky and a predictable name there is an invitation.
+`<runtime>` is the first of `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp` that exists and is a
+directory this user can write. The order matters: `$XDG_RUNTIME_DIR` is a per-uid tmpfs that
+logind clears, so on a systemd host the token never touches a disk at all; `$TMPDIR` is the
+per-user directory macOS provides; `/tmp` is the floor that always exists. If none qualifies,
+riabuild **stops** rather than falling back into the namespace — the property was the point.
 
-The tree is removed when the last session using it ends.
+### Creating it safely
+
+The name is predictable — a member id is public, printed in the dashboard and visible as a
+directory name on the box — and `/tmp` is world-writable and sticky. `create_dir_all`
+followed by `chmod` is therefore wrong twice over: it succeeds on a directory another user
+pre-created, and it leaves a window in which the directory exists at `0755` before `gh`
+writes an OAuth token into it.
+
+So the directory is created with `DirBuilder::mode(0o700).create()`, which fails if anything
+is already there. If it does already exist, riabuild `lstat`s it and refuses unless it is a
+real directory — not a symlink — owned by this uid, at mode `0700`. Anything else is a
+`Failure`, not something to repair: on the documented `/tmp` floor, the alternative is
+handing a developer's whole GitHub account to whichever local user got there first.
 
 ## What this is, and is not
 
@@ -456,36 +588,72 @@ persist so that the server stays self-sufficient; the stronger one cannot.
 it at runtime, so it cannot be ephemeral without breaking the thing riabuild exists to set
 up. Naming it here makes it a decision rather than an oversight.
 
-## Refcounting, and cleaning up after a crash
+## Who holds the credential open
 
-The wipe has to survive a mosh session that dies with the laptop's battery, so it cannot
-rest on a clean exit path.
+The obvious design — every riabuild process on the server registers on start and wipes when
+the last one leaves — does not work, and the reason is worth writing down because it is not
+obvious until it is: **each SSH invocation is a separate process**. Seeding, provisioning
+and the shell are three of them. A per-process refcount would have the seeding process write
+`hosts.yml`, exit, find itself the last one out, and delete the credential it had just
+written. Milliseconds.
+
+So the lifetime belongs to the one process that is actually long-lived: **the environment
+shell**.
 
 ```
-<runtime>/riabuild-gh-<public-id>/
+<runtime>/riabuild-gh-<member-id>/
   hosts.yml            gh's own
-  sessions/<pid>       one marker per live riabuild session
+  sessions/<pid>       one marker per live environment shell
 ```
 
-- **On start**, a session writes its marker and, if `hosts.yml` already exists with a live
-  sibling marker, reuses the sign-in rather than seeding again. Two terminals into one
-  server therefore move the token across once, not twice.
-- **On exit**, it removes its marker; the last one out removes the tree.
-- **On every riabuild run on that server**, before anything else: markers whose pid is dead
-  are swept, and a directory left with no live markers is wiped. This is the backstop that
-  actually matters, because it is the one that does not depend on the dying process getting
-  a chance to run code.
-- **`SIGTERM`, `SIGHUP` and `SIGINT`** wipe too, best effort. `SIGKILL` cannot be caught,
-  which is exactly why the sweep above exists.
-- A directory older than 24 hours with no live markers is wiped regardless, since pids are
-  recycled and a stale marker could otherwise match a live unrelated process.
+| Who | Does |
+|---|---|
+| the laptop, before seeding | asks the server to sweep — `riabuild internal gh-sweep` |
+| the seeding run | writes `hosts.yml` through `gh`. No marker, no wipe. |
+| the setup run | reads it. No marker, no wipe. |
+| **the shell run** | writes its marker at start, removes it at exit, and wipes the tree if it was the last |
+| a `riabuild` run *inside* that shell | reads it. No marker, no wipe. |
+
+Sweeping **before** seeding rather than at the start of every run is what keeps the ordering
+honest: a sweep between seeding and the shell would delete the credential that was just put
+there.
+
+Two terminals into one server share one sign-in, because the second shell finds a live
+sibling marker and the laptop skips re-seeding.
+
+**The sweep.** A marker whose process is gone — `kill -0`, through `CommandRunner` like
+everything else — is removed. A directory left with no live marker at all is wiped, and only
+*then* does the 24-hour age cap apply, to a tree whose markers all look dead. Applying the
+cap to a live marker would delete a running developer's credential out from under them:
+mosh sessions older than a day are the normal case, not the exception.
+
+**Signals.** `SIGTERM`, `SIGHUP` and `SIGINT` wipe too. This is not redundant with the
+sweep, and the earlier draft of this design was wrong to call it so. The reasoning was that
+the shell is riabuild's child, so its death returns through the ordinary path — but mosh
+exists precisely to keep a session alive when the client goes away, so a laptop that never
+comes back leaves the shell up, and what eventually ends it is a signal from an
+administrator or a reboot script. `SIGKILL` still cannot be caught, which is what the sweep
+is for.
+
+## What "at rest" honestly means
+
+Even with all of the above, a credential survives as long as its session does, and a mosh
+session can outlive a laptop indefinitely by design. If a developer never returns to that
+server, nothing runs there to clean up until somebody connects again or the machine reboots.
+
+So the property is: **no GitHub credential outlives the session that created it, and a
+session that died without cleaning up is cleaned up before the next one starts.** That is
+worth having. It is not "the token is gone within N minutes", and the spec should not be
+read as promising that.
 
 ## Seeded from the laptop, not signed in on the server
 
-The server never runs a device-code dance. Before the setup run, riabuild opens one
-non-interactive SSH connection and seeds the credential:
+The server never runs a device-code dance. Before the setup run, riabuild sweeps whatever a
+dead session left behind, then opens one non-interactive SSH connection and seeds the
+credential:
 
 ```
+server:  riabuild internal gh-sweep            first, so it cannot delete what we are about to write
 laptop:  gh auth token                         the laptop's own sign-in
     ↓    ssh … riabuild internal seed-github   token on stdin, never in argv
 server:  gh auth login --with-token            gh writes its own hosts.yml, 0600
@@ -529,14 +697,14 @@ developer's own machine keeps the gh sign-in it has always had.
 
 # Immutable user ids
 
-The namespace is keyed by `members.publicId`, a UUID minted when the member row is
+The namespace is keyed by `members.memberId`, a UUID minted when the member row is
 created. A namespace must outlive a GitHub rename; keying it on `githubLogin` would orphan
 a developer's whole environment the day they renamed their account, silently
 re-provisioning them from scratch.
 
 ## It is core schema, not an optional extra
 
-`publicId` is a **required** field on `members` and a **required** field of every member
+`memberId` is a **required** field on `members` and a **required** field of every member
 payload. It is not optional anywhere, and no code path tolerates its absence.
 
 That is a deliberate break rather than the additive change the `riabuild-api` skill
@@ -554,11 +722,25 @@ laptop.
 
 | Where | What |
 |---|---|
-| `convex/schema.ts` | `publicId: v.string()` on `members` — required |
+| `convex/schema.ts` | `memberId: v.string()` on `members` — required |
 | member creation | mints `crypto.randomUUID()` |
 | `convex/devSeed.ts` and the dashboard scenario fixtures | every fixture member carries one |
-| `convex/http.ts` | `memberPayload` always returns `publicId` |
-| `api/mod.rs` | `Member` gains `#[serde(rename = "publicId")] pub public_id: String`, no `default` |
+| `convex/http.ts` | `memberPayload` always returns `memberId` |
+| `api/mod.rs` | `Member` gains `#[serde(rename = "memberId")] pub member_id: String`, no `default` |
+
+**Not to be confused with `cliSessions.memberId`**, which already exists and holds a Convex
+`v.id("members")` — the document reference. `members.memberId` is the durable public
+identifier this design keys namespaces on. Two different values, one word; the schema
+comments have to say so.
+
+**Validated where it is decoded, not where it is used.** `member_id` is refused unless it is
+a lowercase UUID, through a `serde` deserializer rather than a check somewhere downstream.
+Two failures ride on this. It reaches a remote command line, so a value from the database is
+otherwise a shell-injection channel into every developer's server. And an *empty* one makes
+`~/.riabuild-remote/<member-id>` collapse to `~/.riabuild-remote`, which would put every
+developer in one namespace and, worse, make `forget`'s cleanup `rm -rf` the directory
+holding all of them. "An identifier that half the deployments might not send is not an
+identifier" has to mean shape as well as presence.
 
 ## Reaching a required field takes two deploys
 
@@ -573,7 +755,7 @@ mechanic, not a design compromise, and the end state is the same either way:
 Step 3 is the gate: it fails loudly if step 2 missed a row, which is the property worth
 having. All three land in one pull request; only the deploy is staged.
 
-No `by_publicId` index. Nothing looks a member up by it — the namespace is computed on the
+No `by_memberId` index. Nothing looks a member up by it — the namespace is computed on the
 CLI side from the member payload — and the Convex guidelines are explicit that indexes get
 added when a caller needs one.
 
@@ -600,7 +782,7 @@ Per `visual-testing`, `Copyable` gets a `/__ui` gallery entry, and the `overflow
 gains a member id — a 36-character unbroken string with no spaces is precisely the
 adversarial case that scenario exists for.
 
-**Known limit:** a member deleted and re-created gets a new `publicId` and therefore a
+**Known limit:** a member deleted and re-created gets a new `memberId` and therefore a
 fresh namespace, orphaning the old one. `owner.json` is what makes an orphan identifiable.
 Reclaiming them is not in scope.
 
@@ -617,7 +799,7 @@ account. Only per-developer state is namespaced.
   gh/2.97.0/  infisical/0.43.120/     prefix, so it shares without being asked to
   riabuild/2026.08.06/riabuild        two developers on two versions coexist
 
-~/.riabuild-remote/<public-id>/       one developer's
+~/.riabuild-remote/<member-id>/       one developer's
   state.json  config.json  org-settings.json
   session.token                       0600
   claude/<uuid>/                      CLAUDE_CONFIG_DIR
@@ -641,6 +823,18 @@ Two developers can now decide the same version is missing at the same moment.
 concurrent reader sees a complete tree or nothing, never a half-extracted one. The loser of
 the race finds the destination already present and treats that as success — which is
 `apply()` being safe to run twice, not a special case.
+
+The temporary name carries the pid and a random suffix. A fixed `.part` name would have two
+developers installing the same version at the same moment writing into one file and renaming
+the interleaved result into place — and "an ordinary situation on a shared box" is exactly
+how this design describes that race.
+
+**A tool is trusted by its digest, never by what it says its version is.** `check()` hashes
+the binary on disk and compares it with the digest riabuild downloaded it against; a version
+string is something any script can print. This is what stops a co-tenant planting an
+executable that every other developer on the box then runs — see the trust boundary above.
+On a laptop it costs one hash of a file that is already in the page cache; on a shared server
+it is the difference between a toolchain and a foothold.
 
 **No lock files.** A stale lock on a shared box is a worse failure than a wasted download,
 and it is a failure nobody can diagnose from the developer's end.
@@ -734,7 +928,13 @@ Each one has its own remedy, so each one is detected separately.
 | Host key changed since last time | hard stop, `safe_to_rerun: false` |
 | Architecture with no published build | stop; linux and macOS, x86_64 and aarch64 only |
 | Remote riabuild below `minCliVersion` | the laptop repairs the binary before setup runs |
-| Deployment older than this CLI, so no `publicId` | the member payload fails to decode; riabuild says the dashboard needs deploying, rather than reporting a serde error as its own bug |
+| A shared tool fails its digest | replaced, not trusted, whatever version it claims to be |
+| `RIABUILD_ROOT` missing or not absolute on a server | hard stop; never a silent fall back to the shared root |
+| `memberId` is not a lowercase UUID | hard stop at decode, before any command is built |
+| Runtime directory exists but is not ours, or is not 0700 | hard stop; a GitHub token is not written into somebody else's directory |
+| Session revocation failed during `forget` | hard stop, naming what is still live and where |
+| Server's login shell is fish or csh | nothing to handle: no command riabuild sends is parsed by it |
+| Deployment older than this CLI, so no `memberId` | the member payload fails to decode; riabuild says the dashboard needs deploying, rather than reporting a serde error as its own bug |
 | `mosh-server` missing, or UDP blocked | falls back to `ssh -t`, notes the install command |
 | Default checkout path owned by another namespace | claims `<login>-2` |
 | No writable runtime directory for the gh configuration | stop rather than fall back to the namespace; the property was the point |
@@ -782,9 +982,15 @@ entire flow testable with no server anywhere.
 | Crash cleanup | a marker naming a dead pid is swept and its directory wiped on the next run, with no clean exit anywhere in the test |
 | Seeding the credential | the token reaches `gh auth login --with-token` on stdin and appears in no recorded argument list — the same assertion `keychain.rs` already makes about `secret-tool` |
 | Seeding failure | a rejected token leaves `github_cli` to sign in for itself, and the run still completes |
-| `publicId` is required | a `/api/v1/me` payload without the field is a decode failure carrying the deploy-ordering message — never a default, never an unnamed namespace |
-| The backfill | a fixture member row without `publicId` gains one, and the required-schema push rejects a table the backfill missed |
+| `memberId` is required | a `/api/v1/me` payload without the field is a decode failure carrying the deploy-ordering message — never a default, never an unnamed namespace |
+| The backfill | a fixture member row without `memberId` gains one, and the required-schema push rejects a table the backfill missed |
 | Shared installs | two concurrent installs of one version, asserting one complete tree and two successes |
+| Digest over version string | a planted binary that prints the right `--version` is replaced, not trusted |
+| Remote command construction | every interpolated value single-quoted; a value containing `'`, `;`, `$(`, a space and a newline round-trips inertly |
+| Namespace refusal | a relative or empty `RIABUILD_ROOT` on a server is a `Failure`, never the shared root |
+| Runtime directory safety | a pre-existing directory owned by another uid, and a symlink, are both refused |
+| Credential lifetime | seed, setup and an inner run leave `hosts.yml` in place; the shell run's exit removes it |
+| Revocation | `forget` against a server whose revoke call fails stops and says so, leaving the entry in place |
 | End to end | CI runs `riabuild remote` against an sshd container: two namespaces in one account, asserting isolated gh configuration, git identity and checkouts, one shared toolchain, and no GitHub credential anywhere on the filesystem once both sessions have ended |
 
 That last row earns its cost for the same reason the Linux design's container test does. A
@@ -804,4 +1010,5 @@ healthy in every log and attributes a developer's work to somebody else.
 - Protecting developers sharing one Unix account from each other. See the trust boundary.
 - Revoking a GitHub token on sign-out. `gh` deletes the local credential and GitHub keeps
   the grant; revocation is a github.com action riabuild does not drive.
-- Any change to `/api/v1` beyond the required `publicId` field
+- Any change to `/api/v1` beyond the required `memberId` field and
+  `DELETE /api/v1/cli/sessions/<id>`
