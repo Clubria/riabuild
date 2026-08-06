@@ -129,3 +129,7 @@ holds a placeholder. `docs/releasing.md` covers why, and the rest.
 
 All work goes through a pull request, and is not finished until CI has passed. See
 `CLAUDE.md`.
+
+MIT licensed — see `LICENSE`. The `.deb` carries it as
+`/usr/share/doc/riabuild/copyright` and the `.rpm` as `rpm -qL riabuild`, so the
+notice travels with the binary rather than only with the source.

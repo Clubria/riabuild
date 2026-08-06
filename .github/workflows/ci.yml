@@ -228,6 +228,7 @@ jobs:
 
           mkdir -p build/src
           cp build/riabuild build/src/riabuild
+          cp LICENSE build/src/LICENSE
           sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|x86_64|g" \
             packaging/rpm/riabuild.spec.in > build/riabuild.spec
           rpmbuild -bb build/riabuild.spec \
@@ -265,6 +266,11 @@ jobs:
             # declared — and dropping it is invisible until someone installs on
             # a machine without git and riabuild fails at the first checkout.
             rpm -qp --requires "$rpm" | grep -qx 'git'
+            # MIT asks that the notice travel with every copy. `-qL` lists only
+            # files marked %license, so this checks the marking too, not merely
+            # that a file called LICENSE got swept into the payload.
+            rpm -qLp "$rpm" | grep -q 'LICENSE'
+            test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
           done
 
           ls -l dist/
