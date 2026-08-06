@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Both triggers above are webhook-delivered. On 2026-08-06 an Actions incident
+  # throttled webhooks for hours: pushes produced no runs at all and there was
+  # no way to ask for one, because `gh workflow run` needs this trigger to
+  # exist. It goes through the REST API instead, which stayed up throughout.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
