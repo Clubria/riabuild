@@ -34,8 +34,13 @@ pub struct Plan {
     pub entries: Vec<String>,
 }
 
-/// `None` when there is nothing there — a reset on a clean machine is not an
-/// error, it is a no-op worth saying out loud.
+/// `None` only when the directory is not there — a reset on a machine that was
+/// never provisioned is not an error, it is a no-op worth saying out loud.
+///
+/// An *empty* directory is still a `Plan` with no entries. `main` creates
+/// `~/.riabuild` before any task runs, so a first run that failed early leaves
+/// one behind, and a reset that reported it missing would be contradicted by
+/// `ls`.
 pub async fn plan(paths: &dyn Paths) -> Option<Plan> {
     let root = paths.root();
     // `tokio::fs::read_dir` is a cursor rather than an iterator, so collecting
@@ -44,9 +49,6 @@ pub async fn plan(paths: &dyn Paths) -> Option<Plan> {
     let mut entries = Vec::new();
     while let Ok(Some(entry)) = cursor.next_entry().await {
         entries.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    if entries.is_empty() {
-        return None;
     }
     entries.sort();
     Some(Plan { root, entries })
@@ -89,9 +91,13 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 
     let shown = contract_tilde(&plan.root, &home);
     ui.info(&format!("riabuild reset will remove {shown}"));
-    ui.note(&plan.entries.join(", "));
-    ui.note("this includes the Claude Code history kept in your Clubria profile");
-    ui.note("your checkout and your riabuild sign-in are not touched");
+    if plan.entries.is_empty() {
+        ui.note("it is empty");
+    } else {
+        ui.note(&plan.entries.join(", "));
+        ui.note("this includes the Claude Code history kept in your Clubria profile");
+        ui.note("your checkout and your riabuild sign-in are not touched");
+    }
 
     if request.dry_run {
         ui.info("");
@@ -172,6 +178,37 @@ mod tests {
         let paths = RealPaths::rooted_at(home.path());
 
         assert_eq!(plan(&paths).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_directory_is_still_removed() {
+        // `main` creates ~/.riabuild before any task runs, so a first run that
+        // failed early leaves an empty one behind. Telling that developer it is
+        // "not there" while `ls` shows it there is a small lie, and a
+        // provisioner that shades the truth about the machine is worth less
+        // than one that says nothing.
+        let home = TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("create ~/.riabuild");
+
+        let plan = plan(&paths).await.expect("an empty tree is still a tree");
+        assert!(plan.entries.is_empty());
+
+        run(
+            &paths,
+            &quiet_ui(),
+            Request {
+                assume_yes: true,
+                dry_run: false,
+                inside_shell: false,
+            },
+        )
+        .await
+        .expect("reset succeeds");
+
+        assert!(!paths.root().exists(), "the empty directory is removed too");
     }
 
     #[tokio::test]
