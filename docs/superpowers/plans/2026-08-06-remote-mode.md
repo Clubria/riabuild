@@ -82,6 +82,88 @@ Stage C cannot ship before the Linux design's PRs A and B are merged. It needs r
 
 ---
 
+# Stage 0 — one thing to find out before Stage C
+
+### Task 0: Does `CLAUDE_CONFIG_DIR` isolate credentials on macOS?
+
+**Files:**
+- Modify: `riabuild-cli/src/shims/mod.rs` (extend the existing ignored smoke test)
+- Modify: `docs/superpowers/specs/2026-08-06-remote-mode-design.md` (record the answer)
+
+**Interfaces:** none. This is a verification task, and its output is a decision.
+
+Runs on any Mac with Claude Code. No server, no Stage C, no dependency on anything else in
+this plan — do it early, because the answer changes what the macOS section of the spec says
+and possibly what remote mode supports.
+
+**The question.** riabuild's whole profile model assumes `CLAUDE_CONFIG_DIR` isolates Claude
+Code's state; `shims/mod.rs:136` already pins that with an ignored smoke test, because the
+variable is undocumented. What is *not* pinned is whether it isolates the **credentials**.
+On Linux they are a file under the config directory. On macOS, Claude Code has kept them in
+the login keychain — a per-Unix-account store no environment variable partitions.
+
+**Why it matters beyond servers.** If the credential is per-account rather than per-config
+directory, then two riabuild profiles on one Mac **already** share one Claude sign-in today,
+which is a hole in the profile feature that remote mode did not introduce. Remote mode turns
+multi-profile into multi-developer, so the same hole becomes Alice's usage landing on Bob's
+Anthropic account.
+
+- [ ] **Step 1: Extend the smoke test**
+
+In `riabuild-cli/src/shims/mod.rs`, beside `claude_config_dir_smoke`:
+
+```rust
+/// Does `CLAUDE_CONFIG_DIR` isolate *credentials*, or only configuration?
+///
+/// The profile model assumes the former. On macOS, Claude Code has historically
+/// kept credentials in the login keychain, which no environment variable
+/// partitions — and if that is still true, two riabuild profiles on one Mac
+/// share one Claude sign-in, and two developers sharing a Unix account on a Mac
+/// server share one too.
+///
+/// Ignored by default: it needs a real Claude Code install and a real sign-in.
+/// Run it with `cargo test -- --ignored` on a Mac before every Claude Code
+/// version bump, the way `claude_config_dir_smoke` already is.
+#[tokio::test]
+#[ignore = "requires Claude Code and an interactive sign-in"]
+async fn claude_credentials_follow_the_config_dir() {
+    // Manual protocol, because a sign-in cannot be scripted:
+    //   1. CLAUDE_CONFIG_DIR=$(mktemp -d) claude   → sign in, then exit
+    //   2. ls that directory for a credentials file
+    //   3. CLAUDE_CONFIG_DIR=$(mktemp -d) claude   → does it ask again?
+    //   4. security find-generic-password -s "Claude Code-credentials" -g
+    //      → one item, or one per directory?
+    //
+    // Record the answer in the spec's macOS section and delete this comment in
+    // favour of an assertion once the behaviour is known.
+    panic!("run the protocol in this comment by hand and record the answer");
+}
+```
+
+- [ ] **Step 2: Run the protocol on a Mac**
+
+Run: `cd riabuild-cli && cargo test -- --ignored claude_credentials`
+Then follow the four steps in the comment by hand.
+
+- [ ] **Step 3: Record the answer in the spec, and act on it**
+
+| If | Then |
+|---|---|
+| credentials live under `CLAUDE_CONFIG_DIR` | delete the shared-sign-in half of the macOS warning in Task 21; keep the locked-keychain half |
+| credentials live in the login keychain | keep the warning as specced; add a line to the spec's trust boundary saying a shared macOS account shares one Claude sign-in; **and** raise the profile-feature hole separately, because it affects laptops today |
+
+Replace the `panic!` with an assertion that pins whichever answer is true, so a future Claude
+Code release that changes it fails this test rather than surprising somebody.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add riabuild-cli/src/shims/mod.rs docs/superpowers/specs
+git commit -m "Pin whether CLAUDE_CONFIG_DIR isolates credentials on macOS"
+```
+
+---
+
 # Stage A — member ids
 
 Lands on its own. Ships the dashboard change and the schema the namespace depends on.
@@ -1140,6 +1222,139 @@ git add riabuild-cli/src/paths.rs
 git commit -m "Group server checkouts by developer, outside Documents"
 ```
 
+### Task 7b: Wire the server checkout path into the `project` task
+
+**Files:**
+- Modify: `riabuild-cli/src/tasks/project.rs`
+- Modify: `riabuild-cli/src/tasks/mod.rs` (`Ctx`)
+- Test: `riabuild-cli/src/tasks/project.rs` tests module
+
+**Interfaces:**
+- Consumes: `paths::remote_project_dir` (Task 7), `Scope` (Task 10).
+- Produces: `Ctx::default_checkout(&self) -> PathBuf`.
+
+Task 7 adds `remote_project_dir` and **nothing calls it**. Left that way, a server checkout
+still goes through `default_project_dir`: on Linux to `~/code/<repo>`, un-grouped, so two
+developers sharing a Unix account land in one working tree with two sets of branches and one
+`.env.local`; and on a macOS server to `~/Documents/Clubria/<repo>`, which is the
+TCC-protected directory that returns *Operation not permitted* over SSH — the exact failure
+Task 7's doc comment says it exists to avoid.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn a_laptop_checkout_is_unchanged() {
+    let (ctx, home) = ctx_with(FakeRunner::new()).await;
+    assert_eq!(
+        ctx.default_checkout(),
+        crate::paths::default_project_dir(&home.path().to_path_buf(), "ai-builders-hub")
+    );
+}
+
+#[tokio::test]
+async fn a_server_checkout_is_grouped_by_developer() {
+    let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+    ctx.server = Some("build-01".into());
+    ctx.member = Some(member_named("ada"));
+
+    assert_eq!(
+        ctx.default_checkout(),
+        home.path().join("Clubria").join("ada").join("ai-builders-hub")
+    );
+}
+
+#[tokio::test]
+async fn a_taken_default_is_claimed_beside_rather_than_shared() {
+    // Two developers, one Unix account, and a login that already has a tree —
+    // a reused GitHub login, or somebody who set it up by hand. Sharing it
+    // would put two people's branches and one .env.local in one checkout.
+    let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+    ctx.server = Some("build-01".into());
+    ctx.member = Some(member_named("ada"));
+    let taken = home.path().join("Clubria").join("ada");
+    tokio::fs::create_dir_all(taken.join("ai-builders-hub")).await.expect("mkdir");
+    tokio::fs::write(taken.join("ai-builders-hub/.riabuild-owner"), "someone-else")
+        .await
+        .expect("write");
+
+    assert_eq!(
+        ctx.default_checkout(),
+        home.path().join("Clubria").join("ada-2").join("ai-builders-hub")
+    );
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd riabuild-cli && cargo test project::`
+Expected: FAIL — `Ctx::default_checkout` does not exist.
+
+- [ ] **Step 3: Implement**
+
+Add to `Ctx` the one field remote mode needs a task to see — the server's name, `None` on a
+laptop — set in `main.rs` from `Scope`:
+
+```rust
+    /// The server this riabuild is managed from, when it is on one.
+    ///
+    /// The only remote-mode fact a task is allowed to branch on. Everything else
+    /// arrives through `ScopedRunner` and `Paths`, precisely so tasks do not
+    /// grow remote-mode branches.
+    pub server: Option<String>,
+```
+
+and:
+
+```rust
+    /// Where a checkout goes when the developer has not chosen a place.
+    pub fn default_checkout(&self) -> PathBuf {
+        let repo = self.org.as_ref().map(|org| org.repo_name()).unwrap_or("repo");
+        let home = self.paths.home();
+        let Some(login) = self
+            .server
+            .as_ref()
+            .and(self.member.as_ref())
+            .map(|member| member.github_login.clone())
+        else {
+            return crate::paths::default_project_dir(&home, repo);
+        };
+
+        // A GitHub login can be freed and taken by somebody else, and a
+        // directory can predate riabuild. Claim beside it rather than into it.
+        for suffix in 1.. {
+            let name = if suffix == 1 { login.clone() } else { format!("{login}-{suffix}") };
+            let candidate = crate::paths::remote_project_dir(&home, &name, repo);
+            if !candidate.exists() || owned_by_this_namespace(&candidate) {
+                return candidate;
+            }
+        }
+        crate::paths::remote_project_dir(&home, &login, repo)
+    }
+```
+
+`owned_by_this_namespace` compares a `.riabuild-owner` marker written beside the checkout
+against `self.paths.root()`. Write that marker in `project::apply` when the directory is
+created, so a re-run recognises its own tree rather than claiming `-2` every time.
+
+Then change `project.rs` to call `ctx.default_checkout()` where it calls
+`default_project_dir` today, and `repo_status`/`env_local` follow automatically because they
+read `ctx.project_dir()`.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cd riabuild-cli && cargo test`
+Expected: PASS. The laptop test is the one that matters most here — this must change nothing
+for a developer who never uses remote mode.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd riabuild-cli && cargo fmt --all && cargo clippy --all-targets -- -D warnings
+git add riabuild-cli/src
+git commit -m "Put a server's checkout in the developer's own directory"
+```
+
 ### Task 8: `ScopedRunner`, so a task cannot forget the namespace
 
 **Files:**
@@ -1753,7 +1968,21 @@ In `provision`, guard the update check so a managed binary never upgrades itself
     {
 ```
 
-In `open_shell`, replace `ctx.ui.info(shell::BANNER)` with `ctx.ui.info(&scope.banner())`.
+**The banner is not printed by `open_shell`.** `main.rs:250-263` deliberately does not print
+it — the comment there records that printing it in both places made every developer see it
+twice. It comes from the generated rcfile, through `shell::banner(colour)` at
+`shell/mod.rs:42`. So the server's name has to be threaded into *that* function and into the
+rcfile generation in `shell/{bash,zsh,fish}.rs`, not into `open_shell`. Wiring it where the
+plan first said would have left "the banner names the server" quietly undelivered.
+
+Give `shell::banner` the server as a parameter:
+
+```rust
+pub fn banner(colour: bool, server: Option<&str>) -> String
+```
+
+and have each rcfile generator pass `ctx.server.as_deref()`. Add a test that a laptop's
+banner is byte-for-byte what it is today, and that a server's names the server.
 
 Thread `&Scope` into `provision` and `open_shell` as a parameter rather than storing it on
 `Ctx`. It is read three times in one file, and putting it on `Ctx` would invite tasks to
@@ -3369,13 +3598,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_already_running_the_right_version_is_left_alone() {
+    async fn a_server_already_holding_the_right_binary_is_left_alone() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "2026.08.06\n", "")
-        );
+        // The digest of what is on disk, not the version it claims. A co-tenant
+        // can put a script at that path that prints any version string.
+        let fake = Arc::new(FakeRunner::new().containing("sha256sum", 0, &format!("{EXPECTED}\n"), ""));
 
         let path = ensure_riabuild(&remote(), &paths, fake.clone(), &Ui::new(true), "2026.08.06")
             .await
@@ -3393,11 +3621,14 @@ mod tests {
     async fn an_unpublished_architecture_stops_before_anything_is_written() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
-        // No version on the box, and a 32-bit uname.
+        // Scripted with `containing`, not `with`: every remote invocation shares
+        // the `ssh -p … -o …` prefix, and the part that distinguishes the digest
+        // probe from `uname -sm` is the last argument. A prefix stub on "ssh"
+        // answers both and the test passes while exercising nothing.
         let fake = Arc::new(
             FakeRunner::new()
-                .with("ssh", 1, "", "No such file")
-                .with("ssh -p 2222 -o UserKnownHostsFile", 0, "Linux i686\n", ""),
+                .containing("sha256sum", 1, "", "No such file")
+                .containing("uname -sm", 0, "Linux i686\n", ""),
         );
         let error = ensure_riabuild(&remote(), &paths, fake, &Ui::new(true), "2026.08.06")
             .await
@@ -3825,13 +4056,29 @@ pub async fn ensure(
         None,
     );
 
-    let token = match store.get().await? {
+    // A stored token is not automatically a live one. It expires, and `forget`
+    // on another laptop may have revoked it. Writing a dead token to the server
+    // strands it: the loopback login needs a browser the server does not have,
+    // so its riabuild 401s with no way forward.
+    let usable = match store.get().await? {
+        Some(token) if !expires_soon(record) => {
+            let probe = ApiClient::new(version);
+            probe.set_token(Some(token.clone()));
+            probe.me().await.is_ok().then_some(token)
+        }
+        _ => None,
+    };
+
+    let token = match usable {
         Some(token) => token,
         None => {
             ui.note(&format!(
                 "Signing {} in to riabuild — approve it in your browser",
                 remote.name
             ));
+            // Record the expiry so the check above can do its job next time, and
+            // so `riabuild remote list` can show it.
+            record.session_expires_at = crate::config::now_millis() + SESSION_TTL_MS;
             // Laptop's browser, server's name: the dashboard lists this as its
             // own device, revocable without signing the laptop out.
             let (token, _) = auth::login(api, runner.as_ref(), ui, web_url, version, &remote.host).await?;
@@ -4233,19 +4480,33 @@ When `scope.is_remote()`, before building `Ctx`:
     };
 ```
 
-At every `return` from `run`, close the session. Restructure `run` so the body is an inner
-function and `run` closes `gh` around it:
+At every `return` from `run`, close the session. Restructure `run` so its body is an inner
+function and `run` closes `gh` around it. Three details the first draft of this step left
+out, each of which stops it compiling or working:
 
 ```rust
+    // Bound *before* the shadowing below, which moves `runner` in both arms.
+    let base_runner = runner.clone();
+    let runner: Arc<dyn CommandRunner> = match &gh { /* … as above … */ };
+
     let code = run_inner(&cli, &scope, ctx).await;
-    if let Some(session) = gh {
-        let _ = session.close(base_runner.clone()).await;
+    if let Some(session) = gh
+        && let Err(error) = session.close(base_runner.clone()).await
+    {
+        // Not `let _`: a credential that failed to wipe is exactly the thing the
+        // developer needs told about.
+        ctx.ui.warn(&format!("could not remove this session's GitHub sign-in: {error}"));
     }
     code
 ```
 
-`base_runner` is the unwrapped `RealRunner` — `kill -0` needs no namespace environment, and
-closing must work even if the scoped runner is gone.
+1. `base_runner` must be bound before the shadowing `match`, which moves `runner` in both
+   arms. It is the unwrapped `RealRunner`: `kill -0` needs no namespace environment, and
+   closing has to work even when the scoped runner is gone.
+2. Moving the body into `run_inner` forces `match &cli.command`, which is why Task 14 derives
+   `Clone` on `Command` and `RemoteAction`.
+3. `open_shell` is called from the `Some(Command::Shell)` arm as well as from `provision`, so
+   both call sites need the `&Scope` that Task 10 threads through.
 
 - [ ] **Step 5: Update the spec's cleanup bullets**
 
