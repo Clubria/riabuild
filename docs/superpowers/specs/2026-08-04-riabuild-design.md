@@ -13,6 +13,11 @@ environment decision.
 Everything in this document serves that sentence. A feature that does not shorten or
 de-risk that path does not belong in v1.
 
+One decision is deliberately offered rather than made: where the checkout goes. See
+`2026-08-06-project-path-choice-design.md`. It is a decision developers reliably have an
+opinion about, and the only one riabuild cannot quietly correct afterwards — but the
+default is still riabuild's, and Enter accepts it.
+
 ## Non-goals
 
 riabuild is a **provisioner**, not a platform. Out of scope for v1:

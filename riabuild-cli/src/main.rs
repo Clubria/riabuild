@@ -13,7 +13,9 @@ mod api;
 mod cli;
 mod config;
 mod download;
+mod fs_move;
 mod keychain;
+mod move_project;
 mod paths;
 mod runner;
 mod shell;
@@ -102,6 +104,9 @@ async fn run(cli: Cli) -> Result<i32> {
         Some(Command::Logout) => return logout(&mut ctx).await,
         Some(Command::Env) => return print_env(&ctx),
         Some(Command::Shell) => return open_shell(&mut ctx).await,
+        Some(Command::MoveProject { path }) => {
+            return move_project::run(&mut ctx, path.as_deref()).await;
+        }
         Some(Command::Login) => {
             use tasks::Task;
             connect(&mut ctx).await?;
