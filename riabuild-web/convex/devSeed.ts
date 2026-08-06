@@ -77,6 +77,53 @@ export const seedForE2e = internalMutation({
 });
 
 /**
+ * Points a local deployment at whatever the end-to-end run needs the org to
+ * look like: which repository to clone, which versions to demand, which Claude
+ * settings to serve.
+ *
+ * Separate from `seedForE2e` because the two answer different questions — who
+ * is signed in, versus what the org has configured — and `e2e/run.sh` sets them
+ * at different moments for different reasons.
+ *
+ * `latestCliVersion` is worth choosing deliberately. A locally built binary
+ * reports `9999.0.0-dev`, so any real date leaves it ahead of the published
+ * version and `update::decide` leaves it alone. Seed a version above that and
+ * the run shells out to `brew upgrade` and replaces the binary under test.
+ *
+ * Same three gates as `seedForE2e`: internal, admin key, RIABUILD_DEV_SEED=1.
+ */
+export const seedOrgConfigForE2e = internalMutation({
+  args: {
+    repoSlug: v.string(),
+    claudeSettings: v.string(),
+    minCliVersion: v.string(),
+    latestCliVersion: v.string(),
+    secretsUpdatedAt: v.optional(v.number()),
+  },
+  returns: v.id("orgConfig"),
+  handler: async (ctx, args) => {
+    requireDevSeed();
+
+    const next = {
+      claudeSettings: args.claudeSettings,
+      claudeSettingsUpdatedAt: Date.now(),
+      repoSlug: args.repoSlug,
+      minCliVersion: args.minCliVersion,
+      latestCliVersion: args.latestCliVersion,
+      secretsUpdatedAt: args.secretsUpdatedAt ?? 0,
+    };
+
+    // `replace`, not `patch`: it drops the retired `defaultProjectPath` if an
+    // earlier row still carries it, which is what org.ts documents as the way
+    // that field finally goes away.
+    const row = await ctx.db.query("orgConfig").first();
+    if (row === null) return await ctx.db.insert("orgConfig", next);
+    await ctx.db.replace("orgConfig", row._id, next);
+    return row._id;
+  },
+});
+
+/**
  * Populates a local deployment with an org worth looking at: a developer, a
  * candidate, a suspended member, and sessions that are active, expired and
  * revoked.

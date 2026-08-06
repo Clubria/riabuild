@@ -8,3 +8,6 @@ target/
 
 # OS
 .DS_Store
+
+# Written by e2e/run.sh when a run fails, and uploaded as a CI artifact.
+e2e-logs/
