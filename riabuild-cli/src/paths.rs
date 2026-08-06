@@ -23,6 +23,14 @@ pub trait Paths: Send + Sync {
     fn bin_dir(&self) -> PathBuf {
         self.root().join("bin")
     }
+    /// The Claude Code status line script. It sits beside `org-settings.json`
+    /// rather than in `bin/` because it is a Node script Claude Code runs by
+    /// name, not something that belongs on `PATH`. The org settings name this
+    /// path as `node ~/.riabuild/claude-statusline.js`, so it cannot move
+    /// without them.
+    fn claude_statusline_file(&self) -> PathBuf {
+        self.root().join("claude-statusline.js")
+    }
     fn node_dir(&self, version: &str) -> PathBuf {
         self.root().join("node").join(version)
     }
@@ -31,8 +39,24 @@ pub trait Paths: Send + Sync {
     fn pnpm_dir(&self, version: &str) -> PathBuf {
         self.root().join("pnpm").join(version)
     }
+    /// `~/.riabuild/<tool>/<version>` — an owned copy of a third-party CLI.
+    ///
+    /// Versioned, so bumping a pin installs beside the old copy rather than
+    /// writing over a binary that may be running.
+    fn tool_dir(&self, tool: &str, version: &str) -> PathBuf {
+        self.root().join(tool).join(version)
+    }
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
+    }
+    /// One developer's Claude Code profile — what `CLAUDE_CONFIG_DIR` points at.
+    fn claude_profile_dir(&self, profile: &str) -> PathBuf {
+        self.claude_dir().join(profile)
+    }
+    /// Claude Code's own state for that profile. Named by Claude Code, not by
+    /// riabuild: it puts `.claude.json` inside whatever `CLAUDE_CONFIG_DIR` is.
+    fn claude_config_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join(".claude.json")
     }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)

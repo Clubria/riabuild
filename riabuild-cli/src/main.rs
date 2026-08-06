@@ -10,10 +10,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod api;
+mod archive;
 mod cli;
 mod config;
 mod download;
+mod fs_move;
 mod keychain;
+mod move_project;
 mod paths;
 mod reset;
 mod runner;
@@ -21,6 +24,7 @@ mod shell;
 mod shims;
 mod tasks;
 mod testing;
+mod tools;
 mod ui;
 mod update;
 mod version;
@@ -120,6 +124,9 @@ async fn run(cli: Cli) -> Result<i32> {
         Some(Command::Logout) => return logout(&mut ctx).await,
         Some(Command::Env) => return print_env(&ctx),
         Some(Command::Shell) => return open_shell(&mut ctx).await,
+        Some(Command::MoveProject { path }) => {
+            return move_project::run(&mut ctx, path.as_deref()).await;
+        }
         Some(Command::Login) => {
             use tasks::Task;
             connect(&mut ctx).await?;

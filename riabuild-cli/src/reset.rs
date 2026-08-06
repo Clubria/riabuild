@@ -102,20 +102,23 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
     }
 
     if !request.assume_yes {
-        match ui.confirm(&format!("Remove {shown} and everything in it?")) {
-            Some(true) => {}
-            Some(false) => {
-                ui.info("Left alone.");
-                return Ok(0);
-            }
-            None => {
-                return Err(Failure::new(
-                    "asking whether to remove riabuild's directory",
-                    "re-run as `riabuild reset --yes` if you meant to remove it unattended",
-                )
-                .detail("riabuild has no terminal to ask on, and will not assume yes.")
-                .into());
-            }
+        // Checked before asking, because `ask` returns None both for "they
+        // chose the default" and for "there was nobody to ask", and a recursive
+        // delete has to tell those apart.
+        if !ui.interactive() {
+            return Err(Failure::new(
+                "asking whether to remove riabuild's directory",
+                "re-run as `riabuild reset --yes` if you meant to remove it unattended",
+            )
+            .detail("riabuild has no terminal to ask on, and will not assume yes.")
+            .into());
+        }
+        let answer = ui.ask(&format!("Remove {shown} and everything in it? [y/N]"));
+        let confirmed = answer
+            .is_some_and(|answer| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"));
+        if !confirmed {
+            ui.info("Left alone.");
+            return Ok(0);
         }
     }
 
@@ -354,6 +357,68 @@ mod tests {
             .expect("refusal is an actionable failure");
         assert!(failure.action.contains("exit"));
         assert!(paths.root().exists(), "nothing is removed when refused");
+    }
+
+    #[tokio::test]
+    async fn answering_yes_removes_the_tree() {
+        let (_home, paths) = provisioned().await;
+
+        run(
+            &paths,
+            &Ui::scripted(["y"]),
+            Request {
+                assume_yes: false,
+                dry_run: false,
+                inside_shell: false,
+            },
+        )
+        .await
+        .expect("reset succeeds");
+
+        assert!(!paths.root().exists());
+    }
+
+    #[tokio::test]
+    async fn answering_no_leaves_the_tree_alone() {
+        let (_home, paths) = provisioned().await;
+
+        let code = run(
+            &paths,
+            &Ui::scripted(["n"]),
+            Request {
+                assume_yes: false,
+                dry_run: false,
+                inside_shell: false,
+            },
+        )
+        .await
+        .expect("declining is not a failure");
+
+        assert_eq!(code, 0);
+        assert!(paths.root().exists(), "a declined reset removes nothing");
+    }
+
+    #[tokio::test]
+    async fn pressing_enter_declines_rather_than_removing() {
+        // A terminal that answers nothing is a developer choosing the default,
+        // which for a recursive delete must be no. Distinct from having no
+        // terminal at all, which is refused outright.
+        let (_home, paths) = provisioned().await;
+
+        let code = run(
+            &paths,
+            &Ui::scripted([]),
+            Request {
+                assume_yes: false,
+                dry_run: false,
+                inside_shell: false,
+            },
+        )
+        .await
+        .expect("an empty answer is not a failure");
+
+        assert_eq!(code, 0);
+        assert!(paths.root().exists());
     }
 
     #[tokio::test]
