@@ -892,10 +892,24 @@ unreachable Mac gets a failure naming System Settings → General → Sharing �
 
 ## The warning at connect
 
-Claude Code keeps its credentials in the macOS login keychain rather than in
-`CLAUDE_CONFIG_DIR`. Two consequences follow, and both are told to the developer on **every
-connect to a macOS server**, naming who else is affected from the sibling `owner.json`
-files, so it reads as information rather than boilerplate:
+**This section rests on a claim that is not established, and is likely false.** Earlier
+drafts asserted that Claude Code keeps its credentials in the macOS login keychain rather
+than in `CLAUDE_CONFIG_DIR`. Three things point the other way: the settings documentation
+says the OAuth session lives in `~/.claude.json`, a developer on this team reports two
+config directories on one Mac holding **distinct logins**, and `shims/mod.rs` already pins
+`CLAUDE_CONFIG_DIR`'s isolation because the whole profile feature depends on it.
+
+Task 0 in the plan settles it before Stage C ships. Until it does, treat the rest of this
+section as the pessimistic branch, not as fact:
+
+- **If credentials follow `CLAUDE_CONFIG_DIR`** — the expected answer — this entire section
+  is deleted. Namespacing already isolates them, there is no keychain to unlock over SSH,
+  and a shared macOS account is no different from a shared Linux one.
+- **If they do not**, the warning below ships as written.
+
+The pessimistic branch, if it turns out to be the real one: two consequences, both told to
+the developer on **every connect to a macOS server**, naming who else is affected from the
+sibling `owner.json` files, so it reads as information rather than boilerplate:
 
 ```
 ▲ macOS server: Claude Code keeps its credentials in this account's login

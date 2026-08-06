@@ -99,8 +99,17 @@ and possibly what remote mode supports.
 **The question.** riabuild's whole profile model assumes `CLAUDE_CONFIG_DIR` isolates Claude
 Code's state; `shims/mod.rs:136` already pins that with an ignored smoke test, because the
 variable is undocumented. What is *not* pinned is whether it isolates the **credentials**.
-On Linux they are a file under the config directory. On macOS, Claude Code has kept them in
-the login keychain — a per-Unix-account store no environment variable partitions.
+
+**The expected answer is yes, and this task is confirmation rather than investigation.** The
+settings documentation states that `~/.claude.json` "contains your OAuth session" — a file,
+not a keychain — and a developer on this team reports two config directories on one Mac
+holding distinct logins. Neither the settings nor the environment-variable reference
+documents any credential-path option; `apiKeyHelper` exists but generates an API key, not an
+OAuth session, so it is not a relocation knob.
+
+What remains worth pinning is the **mechanism**, because it decides whether a macOS server
+needs a keychain unlocked over SSH at all: a per-directory file needs nothing, a keychain
+item keyed per directory still isolates but stays locked in an SSH session.
 
 **Why it matters beyond servers.** If the credential is per-account rather than per-config
 directory, then two riabuild profiles on one Mac **already** share one Claude sign-in today,
@@ -127,15 +136,17 @@ In `riabuild-cli/src/shims/mod.rs`, beside `claude_config_dir_smoke`:
 #[tokio::test]
 #[ignore = "requires Claude Code and an interactive sign-in"]
 async fn claude_credentials_follow_the_config_dir() {
-    // Manual protocol, because a sign-in cannot be scripted:
-    //   1. CLAUDE_CONFIG_DIR=$(mktemp -d) claude   → sign in, then exit
-    //   2. ls that directory for a credentials file
-    //   3. CLAUDE_CONFIG_DIR=$(mktemp -d) claude   → does it ask again?
-    //   4. security find-generic-password -s "Claude Code-credentials" -g
-    //      → one item, or one per directory?
+    // Manual protocol, because a sign-in cannot be scripted. No step prints a
+    // secret — no `-w`, no file contents:
+    //   1. security find-generic-password -s "Claude Code-credentials"
+    //      → is there a keychain item at all?
+    //   2. for each existing config dir: ls -la, looking for a credentials file
+    //      or a per-directory .claude.json
+    //   3. CLAUDE_CONFIG_DIR=$(mktemp -d) claude → does it demand a fresh login?
+    //   4. if step 1 found an item, is there one, or one per config directory?
     //
-    // Record the answer in the spec's macOS section and delete this comment in
-    // favour of an assertion once the behaviour is known.
+    // Replace this comment with an assertion pinning whichever answer is true,
+    // so a future Claude Code release that changes it fails here.
     panic!("run the protocol in this comment by hand and record the answer");
 }
 ```
