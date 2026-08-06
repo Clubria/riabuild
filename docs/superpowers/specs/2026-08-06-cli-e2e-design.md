@@ -132,11 +132,31 @@ Assertions are on filesystem state, exit codes, `riabuild env`'s `export` lines
 and the run log's `applied=[…]` — never on human-facing output, which is meant to
 change.
 
-## Two findings, deliberately not fixed here
+## Three findings
 
-Both were found by writing this test. Both are product behaviour, both are
-recorded rather than papered over, and neither belongs in a change whose subject
-is CI.
+All three were found by this test. The first is fixed here because it is what
+the test caught and because leaving it would mean shipping a red assertion; the
+other two are recorded rather than papered over, and belong in changes of their
+own.
+
+### Fixed: a signed-out `riabuild --check` failed instead of reporting
+
+`org_settings::check()` compares the cached settings against the server. With a
+valid cache on disk and no session it asked anyway, took a 401, and `?` turned
+that into a hard error — so `riabuild --check` refused to report on exactly the
+machine whose problem was an expired session, which is the moment that command
+matters most.
+
+Its sibling tasks already guard for this — `project` and `env_local` both return
+`Needs("waiting for sign-in")` when there is no session — so the fix is the same
+guard, plus a regression test.
+
+Worth noting how narrow the window is: in a real run `login` applies first and
+everything downstream is authenticated, so only `--check` while signed out ever
+reached it. No unit test could have found it, because it only exists once the
+tasks run in order against a real server.
+
+### Not fixed
 
 **`--check` is not read-only.** It is documented as *"Check everything and
 report, changing nothing"*, and it rewrites `state.json` and the

@@ -691,9 +691,19 @@ if [ "$PLATFORM" = macos ]; then
   check_missing "the token is gone from the Keychain" \
     "$(keychain find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)" \
     "$SESSION_TOKEN"
-  # Must not open a browser, and must not fail: `--check` reports, it never applies.
-  riabuild --check --no-shell >/dev/null 2>&1 && pass "a signed-out --check still reports" \
-    || fail "a signed-out --check did not exit 0"
+  # Must not open a browser, and must not fail: `--check` reports, it never
+  # applies. An expired session is the single most likely reason someone runs
+  # this, so it has to answer rather than refuse.
+  #
+  # The output is captured rather than discarded: the first time this failed it
+  # printed nothing, and the cause — a task asking the server unauthenticated —
+  # took a code read to find rather than a glance at the log.
+  if SIGNED_OUT="$(riabuild --check --no-shell 2>&1)"; then
+    pass "a signed-out --check still reports"
+  else
+    fail "a signed-out --check did not exit 0"
+    printf '%s\n' "$SIGNED_OUT" | sed 's/^/         | /' >&2
+  fi
 fi
 
 # ---------------------------------------------------------------------------
