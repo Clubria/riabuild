@@ -127,7 +127,9 @@ impl Task for ClaudeProfiles {
         };
         tokio::fs::create_dir_all(claude_dir.join(&profile)).await?;
 
-        ctx.config.claude_profile = Some(profile);
+        if !ctx.config.claude_accounts.contains(&profile) {
+            ctx.config.claude_accounts.push(profile);
+        }
         ctx.config.save(ctx.paths.as_ref()).await?;
         Ok(())
     }
@@ -219,7 +221,7 @@ mod tests {
         tokio::fs::create_dir_all(ctx.paths.claude_dir())
             .await
             .unwrap();
-        ctx.config.claude_profile = Some(new_profile_id());
+        ctx.config.claude_accounts = vec![new_profile_id()];
         ctx.runner =
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
         // The directory recorded in config.json is gone from disk.
@@ -236,7 +238,7 @@ mod tests {
         tokio::fs::create_dir_all(ctx.paths.claude_dir().join(&profile))
             .await
             .unwrap();
-        ctx.config.claude_profile = Some(profile);
+        ctx.config.claude_accounts = vec![profile];
         ctx.runner =
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
         assert_eq!(ClaudeProfiles.check(&ctx).await.unwrap(), Status::Satisfied);

@@ -95,7 +95,7 @@ impl Task for ClaudeTrust {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        let Some(profile) = ctx.config.claude_profile.clone() else {
+        let Some(profile) = ctx.config.primary_account().map(str::to_string) else {
             return Ok(Status::needs("no Claude Code profile yet"));
         };
         let Some(dir) = ctx.project_dir() else {
@@ -127,7 +127,7 @@ impl Task for ClaudeTrust {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let Some(profile) = ctx.config.claude_profile.clone() else {
+        let Some(profile) = ctx.config.primary_account().map(str::to_string) else {
             return Err(Failure::new(
                 "trusting the checkout",
                 "Run `riabuild` again — the Claude Code profile has to exist first.",
@@ -216,7 +216,7 @@ mod tests {
         let dir = home.path().join("code/hub");
         tokio::fs::create_dir_all(&dir).await.expect("checkout");
 
-        ctx.config.claude_profile = Some(profile.clone());
+        ctx.config.claude_accounts = vec![profile.clone()];
         ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
         (ctx, home, profile, dir)
     }

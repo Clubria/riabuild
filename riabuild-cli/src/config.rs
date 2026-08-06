@@ -66,8 +66,19 @@ pub struct UserConfig {
     pub node_version: Option<String>,
     #[serde(default)]
     pub pnpm_version: Option<String>,
-    /// The Claude Code profile directory name (a UUID).
+    /// Claude Code config directories, in the order the developer numbers them.
+    ///
+    /// Position *is* the number: account 3 is index 2, and removing it makes
+    /// what was account 4 into account 3 with no renumbering code at all. The
+    /// UUID is the only identity anything persists.
     #[serde(default)]
+    pub claude_accounts: Vec<String>,
+    /// The single profile older riabuilds recorded.
+    ///
+    /// Read on load and folded into `claude_accounts`, never written back —
+    /// which is what `skip_serializing` is for. Keeping it means a developer
+    /// who upgrades does not lose the account they are already signed in to.
+    #[serde(default, skip_serializing)]
     pub claude_profile: Option<String>,
     /// When this machine's riabuild session runs out, so `login` can refresh
     /// before a developer is interrupted. Not a secret — the token itself lives
@@ -81,15 +92,36 @@ pub struct UserConfig {
 
 impl UserConfig {
     pub async fn load(paths: &dyn Paths) -> Self {
-        tokio::fs::read_to_string(paths.config_file())
+        let mut config: UserConfig = tokio::fs::read_to_string(paths.config_file())
             .await
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        config.fold_legacy_profile();
+        config
     }
 
     pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
         write_json(&paths.config_file(), self).await
+    }
+
+    /// The account `claude` runs.
+    pub fn primary_account(&self) -> Option<&str> {
+        self.claude_accounts.first().map(String::as_str)
+    }
+
+    /// Folds the single profile of an older riabuild into the account list.
+    ///
+    /// Takes the field rather than copying it, so no caller can read a value
+    /// that will not be saved.
+    fn fold_legacy_profile(&mut self) {
+        // Taken unconditionally: a value that will not be saved must not be
+        // readable either. `extend` over the Option keeps this one statement
+        // rather than a nested `if`, which `clippy::collapsible_if` rejects.
+        let legacy = self.claude_profile.take();
+        if self.claude_accounts.is_empty() {
+            self.claude_accounts.extend(legacy);
+        }
     }
 }
 
@@ -179,5 +211,68 @@ mod tests {
         assert_eq!(loaded.project_path.as_deref(), Some("/Users/ada/code/hub"));
         assert_eq!(loaded.node_version.as_deref(), Some("22.23.1"));
         assert_eq!(loaded.claude_profile, None);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_profile_becomes_the_first_account() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root()).await.unwrap();
+        tokio::fs::write(
+            paths.config_file(),
+            r#"{"claude_profile":"11111111-2222-4333-8444-555555555555"}"#,
+        )
+        .await
+        .unwrap();
+
+        let config = UserConfig::load(&paths).await;
+        assert_eq!(
+            config.claude_accounts,
+            vec!["11111111-2222-4333-8444-555555555555".to_string()]
+        );
+        // Folded in on load, so nothing downstream ever sees the old field.
+        assert_eq!(config.claude_profile, None);
+        assert_eq!(
+            config.primary_account(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_list_wins_over_a_legacy_profile() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root()).await.unwrap();
+        tokio::fs::write(
+            paths.config_file(),
+            r#"{"claude_profile":"aaaaaaaa-2222-4333-8444-555555555555",
+                "claude_accounts":["bbbbbbbb-2222-4333-8444-555555555555"]}"#,
+        )
+        .await
+        .unwrap();
+
+        let config = UserConfig::load(&paths).await;
+        assert_eq!(
+            config.claude_accounts,
+            vec!["bbbbbbbb-2222-4333-8444-555555555555".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_drops_the_legacy_profile_from_the_file() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        let config = UserConfig {
+            claude_accounts: vec!["11111111-2222-4333-8444-555555555555".into()],
+            claude_profile: Some("11111111-2222-4333-8444-555555555555".into()),
+            ..Default::default()
+        };
+        config.save(&paths).await.unwrap();
+
+        let text = tokio::fs::read_to_string(paths.config_file())
+            .await
+            .unwrap();
+        assert!(!text.contains("claude_profile"), "{text}");
+        assert!(text.contains("claude_accounts"), "{text}");
     }
 }

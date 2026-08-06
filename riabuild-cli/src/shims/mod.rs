@@ -82,7 +82,7 @@ pub async fn write_tool(ctx: &Ctx, name: &str, binary: &Path) -> Result<()> {
 }
 
 pub async fn write_all(ctx: &Ctx) -> Result<()> {
-    let Some(profile) = &ctx.config.claude_profile else {
+    let Some(profile) = ctx.config.primary_account() else {
         return Ok(());
     };
 
@@ -168,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn writing_the_shim_twice_is_safe() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
+        ctx.config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
         write_all(&ctx).await.unwrap();
         write_all(&ctx).await.unwrap();
 

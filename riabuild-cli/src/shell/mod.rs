@@ -106,7 +106,7 @@ pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
         ("PATH".to_string(), path_with_riabuild(ctx, &current_path)),
         ("RIABUILD_SHELL".to_string(), "1".to_string()),
     ];
-    if let Some(profile) = &ctx.config.claude_profile {
+    if let Some(profile) = ctx.config.primary_account() {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             ctx.paths
@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
+        ctx.config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
         let env = environment(&ctx);
 
         let lookup = |key: &str| {
