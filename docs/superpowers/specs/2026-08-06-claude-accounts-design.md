@@ -1,6 +1,7 @@
 # Claude Code account management
 
 Status: approved, not yet implemented.
+Written against `main` at `70f52c2`.
 Supersedes task 7 (`claude_profiles`) in `2026-08-04-riabuild-design.md`.
 
 A Clubria developer runs more than one Claude Code account — a personal subscription and
@@ -11,7 +12,7 @@ left.
 
 This spec replaces the single profile with an ordered list of accounts, each its own
 `CLAUDE_CONFIG_DIR`, each launched by its own command, all of them under the org's Claude
-settings.
+settings and all of them trusting the checkout.
 
 ## What the developer sees
 
@@ -33,7 +34,8 @@ Your Claude Code accounts:
 
 Hints appear only when they would work. With one account, `delete` refuses and `primary`
 is meaningless, so neither line is shown; the `Log in:` line appears only while some
-account is logged out. Every line on screen is a command that succeeds right now.
+account is logged out; `Add an account:` disappears at nine. Every line on screen is a
+command that succeeds right now.
 
 Deleting account 3 makes account 4 into account 3. The developer never types a UUID.
 
@@ -64,14 +66,21 @@ item nothing can ever reach again. Hence the deletion order in `riabuild claude 
 `loggedIn: false`. This is a supported CLI surface, so riabuild reads identity from it
 rather than parsing undocumented keys out of `.claude.json`.
 
-Non-zero here is an expected answer, never a `Failure`.
+riabuild reads the `loggedIn` field and **not** the exit code. Both say the same thing
+today, but an exit code is a single channel that a future release could also use for
+"could not reach the server", and conflating that with "signed out" would have the box
+state something false. Non-zero is never a `Failure` here.
+
+**A global `--settings` is accepted ahead of a subcommand.** `claude --settings <file>
+auth status` works. Every shim passes `--settings` unconditionally, so `claude-3 auth
+login` — which the box tells developers to run — depends on this.
 
 **It costs about 450 ms per call**, almost all CPU. That is why the account list is
-gathered in parallel rather than serially.
+gathered concurrently rather than serially.
 
 ## Data model
 
-`UserConfig` gains one field and loses one:
+`UserConfig` gains one field, and demotes another to legacy:
 
 ```rust
 /// Claude Code config directories, in the order the developer numbers them.
@@ -79,6 +88,11 @@ gathered in parallel rather than serially.
 /// identity anything persists.
 #[serde(default)]
 pub claude_accounts: Vec<String>,
+
+/// The single profile older riabuilds recorded. Folded into `claude_accounts`
+/// when the config is loaded, and never written back.
+#[serde(default, skip_serializing)]
+pub claude_profile: Option<String>,
 ```
 
 Position *is* the number. `delete N` is `Vec::remove(N - 1)` and every later account's
@@ -90,12 +104,12 @@ The list is capped at 9, so shim names stay single-digit and `riabuild claude de
 is rejected as obviously wrong rather than interpreted.
 
 The disk layout does not change: accounts remain `~/.riabuild/claude/<uuid>/`, and
-`paths.rs` needs no new entries. What changes is that riabuild now expects more than one.
+`paths.rs` needs no new entries — `claude_profile_dir` and `claude_config_file` already
+take an id. What changes is that riabuild now expects more than one.
 
 ### Migration
 
-`claude_profile: Option<String>` stays on the struct as a read-only legacy field, marked
-`skip_serializing`, and is folded in when the config is loaded:
+`UserConfig::load` folds the legacy field in, so no caller ever sees it:
 
 | On disk | Loaded as |
 |---|---|
@@ -104,9 +118,9 @@ The disk layout does not change: accounts remain `~/.riabuild/claude/<uuid>/`, a
 | both | `claude_accounts` wins |
 | neither | `[]` — the task creates account 1 |
 
-The field disappears from `config.json` on the next save. The stale `claude_profiles` key
-is dropped from `state.json` at the same point, so a renamed task does not leave a dead
-record behind forever.
+`skip_serializing` makes the field disappear from `config.json` on the next save. The
+stale `claude_profiles` key is dropped from `state.json` at the same point, so a renamed
+task does not leave a dead record behind forever.
 
 ## Reading the accounts — `accounts/status.rs`
 
@@ -124,23 +138,45 @@ pub enum Identity {
 }
 ```
 
-One `claude auth status --json` per account, each with its own `CLAUDE_CONFIG_DIR`, fanned
-out over `std::thread::scope` and joined. Wall clock is one call, not N.
+One `claude auth status --json` per account, each with its own `CLAUDE_CONFIG_DIR`, all
+spawned into a `tokio::task::JoinSet` and joined. Wall clock is one call, not N.
 
-`Unknown` is a distinct state on purpose. Exit 1 means Claude Code answered "logged out";
-a missing binary or unparseable JSON means riabuild does not know, and rendering that as
-`(logged out)` would assert a fact it does not have. `github_cli.rs` documents the same
-distinction at length — a captive portal must not read as "you were removed from the org".
+The runtime is current-thread by construction (`Cargo.toml` takes `rt` without
+`rt-multi-thread`), and that is fine: the 450 ms is the child process's CPU, not
+riabuild's. Every task blocks on a subprocess it is awaiting, so the reactor interleaves
+them and all N children run at once.
+
+`Unknown` is a distinct state on purpose. `loggedIn: false` means Claude Code answered
+"signed out"; a missing binary or unparseable output means riabuild does not know, and
+rendering that as `(logged out)` would assert a fact it does not have. `github_cli.rs`
+documents the same distinction at length — a captive portal must not read as "you were
+removed from the org".
 
 The box renders `Unknown` as `(cannot tell — <reason>)`, in one form everywhere it is
 printed. A second, more verbose rendering would mean two things to keep in agreement.
+
+## Finding the binary — `Ctx::claude()`
+
+Every call to Claude Code goes through an absolute path, exactly as `ctx.gh()` and
+`ctx.infisical()` already do:
+
+```rust
+/// The Claude Code riabuild installed, by absolute path.
+pub fn claude(&self) -> String
+```
+
+`~/.riabuild/node/<pinned>/bin/claude` when a Node version is pinned, and the bare name
+otherwise, which is all a machine with no toolchain yet could use. This replaces the
+`runner.which("claude")` in today's `claude_profiles`, which reads the ambient `PATH` —
+during provisioning that does not contain riabuild's Node, so it finds whatever the
+developer happens to have installed, or nothing at all just after riabuild installed one.
 
 ## Shims — `shims/mod.rs`
 
 `c` is removed. It is deleted from `bin/` on the next run, and from the README and the v1
 design spec.
 
-Generated instead, from a single `launcher_script(config_dir)`:
+Generated instead, from a single `launcher_script`:
 
 | Script | Account |
 |---|---|
@@ -157,19 +193,19 @@ layer of shell.
 set -e
 CLAUDE_CONFIG_DIR="/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"
 export CLAUDE_CONFIG_DIR
-REAL="/Users/ada/.riabuild/node/22.23.1/bin/claude"
-if [ ! -x "$REAL" ]; then
+claude_binary="/Users/ada/.riabuild/node/22.23.1/bin/claude"
+if [ ! -x "$claude_binary" ]; then
   # The recorded binary is gone — a `claude update` that migrated to a native
-  # install, or a Node version change. Fall back to PATH with riabuild's own
-  # bin/ removed, so this script cannot find itself.
+  # install, or a Node version change since the last run. Fall back to PATH with
+  # riabuild's own bin/ removed, so this script cannot find itself.
   PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "/Users/ada/.riabuild/bin" | paste -sd: -)
   export PATH
-  REAL=claude
+  claude_binary=claude
 fi
 if [ -f "/Users/ada/.riabuild/org-settings.json" ]; then
-  exec "$REAL" --settings "/Users/ada/.riabuild/org-settings.json" "$@"
+  exec "$claude_binary" --settings "/Users/ada/.riabuild/org-settings.json" "$@"
 fi
-exec "$REAL" "$@"
+exec "$claude_binary" "$@"
 ```
 
 **The absolute path is not an optimisation, it is the only correct form.**
@@ -177,7 +213,8 @@ exec "$REAL" "$@"
 — which is what today's `c` does — finds itself and recurses until the shell runs out of
 processes. The PATH-stripping fallback exists so that a `claude update` between provisions
 cannot leave `claude` a dead command in the developer's shell, which would read as *Claude
-Code is uninstalled*.
+Code is uninstalled*. `paste -sd: -` rather than `tr '\n' ':'`: the latter leaves a
+trailing colon, and an empty `PATH` entry means the current directory.
 
 Two properties fall out of the shim shape rather than needing code:
 
@@ -185,12 +222,11 @@ Two properties fall out of the shim shape rather than needing code:
   `--settings org-settings.json`. Layering at launch was already the design; nothing about
   it needed to change for N accounts.
 - **`claude-3 auth login`, `claude-2 --resume` work**, because every shim passes `"$@"`.
-  The box's `Log in:` hint is not a special case.
 
-`write_all` prunes `bin/c` and any `claude-<n>` with `n` greater than the account count.
-An orphaned shim is worse than a missing one: it points at a deleted directory, so Claude
-Code would create it fresh, prompt for a login, and leave an unregistered account that no
-riabuild command can see.
+`write_all` prunes `bin/c` and any `claude-<n>` above the account count. An orphaned shim
+is worse than a missing one: it points at a deleted directory, so Claude Code would create
+it fresh, prompt for a login, and leave an unregistered account no riabuild command can
+see.
 
 ### The `CLAUDE_CONFIG_DIR` export is removed
 
@@ -207,18 +243,35 @@ shims that each set it themselves, that export only causes harm:
 
 The shims become the single source of truth for both *which account* and *which settings*.
 
+## Trust applies to every account — `tasks/claude_trust.rs`
+
+`claude_trust` writes `hasTrustDialogAccepted` into a profile's `.claude.json`, keyed by
+the checkout's absolute path. It is per-config-directory state that no settings file can
+express, which is exactly why the task exists — and exactly why it cannot stay
+single-account. An untrusted `claude-2` opens a modal on first launch and holds back the
+org's settings as untrusted, which is the one dialog this task exists to prevent.
+
+`check()` is satisfied only when **every** account trusts the checkout; `apply()` writes
+the trust key into each account's config file. The existing read-modify-write, the
+symlink-aware `trust_keys`, and the move-aside of an unreadable config are unchanged and
+simply run once per account.
+
+`claude_statusline` needs no such change: it installs one script at
+`~/.riabuild/claude-statusline.js` that the org settings name by path, and every account
+gets those settings through `--settings`.
+
 ## Commands — `accounts/command.rs`
 
 ```
 riabuild claude                 the box
 riabuild claude list            the box (alias, for people who expect a verb)
 riabuild claude new             add an account and sign it in
-riabuild claude delete N        remove an account
+riabuild claude delete N [--yes]  remove an account
 riabuild claude primary N       make account N the primary
 ```
 
-Bare `claude` and `list` print identical output. Both work outside the riabuild shell,
-resolving the real binary the same way the shims do.
+Bare `claude` and `list` print identical output. All of them work outside the riabuild
+shell, resolving the real binary through `ctx.claude()` the same way the shims do.
 
 ### `riabuild claude new`
 
@@ -250,12 +303,18 @@ $ riabuild claude delete 3
   ● Account 4 is now account 3
 ```
 
+The confirmation follows `reset.rs` exactly, because it is the same kind of irreversible
+delete: a `--yes` flag skips it; `!ui.interactive()` is a `Failure` naming `--yes` rather
+than an assumed answer; the question is `ui.ask("… [y/N]")` and only `y`/`yes` proceeds.
+`Ui::confirm` is not used — it defaults to **yes**, which is right for "shall I install
+this" and wrong for a delete. An empty answer must decline.
+
+The confirmation names the email, not just the number, because renumbering means a
+mistyped index destroys a different account's history than intended, unrecoverably.
+
 Order is load-bearing: `claude auth logout` runs **before** the directory is removed,
 because the keychain item is keyed by `sha256(configDir)` and removing the directory first
 orphans a credential permanently.
-
-The confirmation names the email, not the number, because renumbering means a mistyped
-index destroys a different account's history than intended, unrecoverably.
 
 Deleting the only account is refused:
 
@@ -276,37 +335,36 @@ session history to achieve a reordering.
 ## Provisioning — `tasks/claude_accounts.rs`
 
 Replaces `tasks/claude_profiles.rs`. Task id becomes `claude_accounts`; `depends_on` stays
-`["toolchain"]`.
+`["toolchain"]`; `claude_trust` depends on it under the new name.
 
 `check()` reports `Needs` when:
 
 | Condition | Reason shown |
 |---|---|
-| `claude` not on PATH | `Claude Code is not installed` |
+| Claude Code is not installed | `Claude Code is not installed` |
 | `claude --version` < 2.0.0 | `Claude Code is older than 2.0.0` |
 | no accounts registered | `no Claude Code account yet` |
 | a registered directory is missing | `a Claude Code account directory is missing` |
 | an unregistered UUID directory exists | `a Claude Code account is not registered` |
-| account 1 is logged out | `account 1 is not signed in` |
+| account 1 is signed out | `account 1 is not signed in` |
 
 `apply()`:
 
 1. Install Claude Code with riabuild's npm if missing (unchanged).
-2. Fold in the legacy `claude_profile`.
-3. Drop registered accounts whose directories are gone.
-4. **Adopt** unregistered UUID directories, oldest `mtime` first.
-5. Create account 1 if the list is empty.
-6. Run `claude auth login` interactively for account 1 if it is logged out, and hard-error
+2. Drop registered accounts whose directories are gone.
+3. **Adopt** unregistered UUID directories, oldest `mtime` first.
+4. Create account 1 if the list is empty.
+5. Run `claude auth login` interactively for account 1 if it is signed out, and hard-error
    if that is abandoned.
-7. Save the config and rewrite the shims.
+6. Save the config and rewrite the shims.
 
-Step 4 is what rescues a developer whose `config.json` was lost while their profile
+Step 3 is what rescues a developer whose `config.json` was lost while their profile
 directory, sessions and login are all still on disk. Discovering that state and ignoring
 it would strand real work behind a directory riabuild refuses to name.
 
-Step 6 follows `github_cli.rs`: an interactive browser sign-in inside `apply()`, with the
+Step 5 follows `github_cli.rs`: an interactive browser sign-in inside `apply()`, with the
 exit code checked, because riabuild's job is "running Claude Code against our codebase"
-and a logged-out Claude Code is not that. Accounts 2 through 9 are never blocking —
+and a signed-out Claude Code is not that. Accounts 2 through 9 are never blocking —
 `check()` ignores their login state and the box reports it.
 
 Only account 1's status is read during `check()`, so the added cost is one ~450 ms call in
@@ -314,86 +372,88 @@ a phase that already makes network round trips.
 
 ## Where the box prints
 
-Into the generated rcfile, after the developer's own configuration is sourced, so a noisy
-`.zshrc` cannot scroll it off screen. `shell::prepare` takes a rendered prelude — the box
-followed by `BANNER` — and each shell quotes it in its own way, as it already does for the
-banner.
+Into the generated rcfile, alongside the banner. `shell::prelude` renders the box followed
+by the banner, and each shell wraps it in the `banner_command` it already has — so the
+`[[ -t 1 ]]` guard that keeps the banner out of captured output covers the box too, and
+the "printed once, after the developer's own config" property is inherited rather than
+re-derived. `Shell::Other` has no rcfile, and its branch in `spawn` prints the prelude
+itself, exactly as it already does for the banner.
 
-This also fixes a live duplication: `BANNER` is currently printed twice for zsh and bash,
-once by `main.rs` before spawning and again by the rcfile. After this change the rcfile
-prints the prelude, and `main.rs` prints it only for `Shell::Other`, which has no rcfile.
-
-`riabuild claude new`, `delete` and `primary` print the box on stdout when they finish.
+`riabuild claude new`, `delete`, `primary` and `list` print the box on stdout.
 
 ## Layout
 
 ```
-src/accounts/mod.rs      registry: order, add, remove, promote, dirs, cap, migration
-src/accounts/status.rs   parallel `claude auth status` → Vec<Account>
+src/accounts/mod.rs      registry: order, add, remove, promote, ids, cap of 9
+src/accounts/status.rs   concurrent `claude auth status` → Vec<Account>
 src/accounts/render.rs   the box
 src/accounts/command.rs  riabuild claude new|delete|primary|list
 src/shims/mod.rs         claude + claude-1..N, prune c and stale numbers
 src/tasks/claude_accounts.rs   replaces claude_profiles.rs
+src/tasks/claude_trust.rs      every account, not just one
 src/cli.rs               Command::Claude subcommand
-src/shell/{mod,zsh,bash,fish}.rs   prelude printed once
+src/shell/{mod,zsh,bash,fish}.rs   prelude carries the box
 src/config.rs            claude_accounts, legacy fold
+src/tasks/mod.rs         Ctx::claude()
 src/runner.rs            FakeRunner matches declared env pairs
+src/reset.rs             warns about N accounts, not one profile
 ```
 
-`accounts/mod.rs` owns UUID generation and `looks_like_profile_id`, both moved out of
+`accounts/mod.rs` owns UUID generation and the id predicate, both moved out of
 `claude_profiles.rs`, so the task file is about machine state and the account module is
 about the registry.
 
 ## Testing
 
-**`FakeRunner` must match on environment.** `claude auth status` is the same command string
-for every account; only `CLAUDE_CONFIG_DIR` differs, and `FakeRunner::run` currently
-ignores `RunOptions.env` entirely. Until it does not, the test *"account 1 is logged in,
-account 2 is logged out"* cannot be written — which is the central behaviour of this
-feature. Add:
+**`FakeRunner` must match on environment.** `claude auth status --json` is the same command
+string for every account; only `CLAUDE_CONFIG_DIR` differs, and `FakeRunner::run` ignores
+`RunOptions.env` entirely. Until it does not, the test *"account 1 is signed in, account 2
+is signed out"* cannot be written — which is the central behaviour of this feature. Add:
 
 ```rust
 pub fn with_env(self, invocation: &str, env: &[(&str, &str)],
                 code: i32, stdout: &str, stderr: &str) -> Self
 ```
 
-A stub matches when the invocation prefix matches *and* every declared env pair is present;
+A stub matches when the invocation matches *and* every declared env pair is present;
 longest invocation wins, then most env pairs. Existing `with` stubs keep working as
 env-agnostic matches. This is not incidental test plumbing: `CommandRunner` exists to make
 `check()` testable, and a fake that cannot model the axis riabuild varies does not do that.
 
-Unit tests, all with `FakeRunner`:
+Unit tests, all against `FakeRunner`:
 
-- renumbering: delete 3 of 5 → 4 becomes 3, 5 becomes 4, UUIDs otherwise unmoved
+- renumbering: delete 3 of 5 → 4 becomes 3, 5 becomes 4, other ids unmoved
 - `primary 3` moves one account and preserves the relative order of the rest
-- the cap: a 10th account is refused with the account count in the message
-- migration: legacy `claude_profile` becomes account 1; both fields present prefers the list
+- the cap: a tenth account is refused, and the message says how many there are
+- migration: legacy `claude_profile` becomes account 1; both fields present prefers the
+  list; the legacy key is gone from the file after a save
 - adoption: an unregistered UUID directory is adopted, oldest first
 - pruning: a registered directory that vanished is dropped from the list
-- the box: three accounts with one logged out, one logged in, one `Unknown`; a single
-  account hides `delete` and `primary`; a fully logged-in list hides `Log in:`
-- shims: the script execs an absolute path and never the bare word `claude` on the exec
-  line; `"$@"` reaches it; `--settings` is passed; `bin/c` and `claude-4` are pruned when
-  three accounts remain
+- status: one signed-in and one signed-out account, told apart by `CLAUDE_CONFIG_DIR`
+- status: output that will not parse is `Unknown`, never `LoggedOut`
+- the box: three accounts, one of each identity; a single account hides `delete` and
+  `primary`; a fully signed-in list hides `Log in:`; nine accounts hide `Add an account:`
+- shims: the script never execs the bare word `claude`; `"$@"` reaches it; `--settings` is
+  passed; `bin/c` and `claude-4` are pruned when three accounts remain
+- shell: `CLAUDE_CONFIG_DIR` is not in `environment()`
 - `delete`: logout is called before the directory is removed (assert call order)
 - `delete`: the only account is refused, and nothing is removed
+- `delete`: no terminal and no `--yes` is a `Failure`, and nothing is removed
 - `new`: a failed login removes the directory and leaves the list unchanged
+- trust: two accounts, one trusted, is `Needs`; `apply` trusts both
 - task: each `check()` row above, including `account 1 is not signed in`
 - task: an abandoned `claude auth login` in `apply()` is an error, not a success
 
-Two `#[ignore]`d tests, run on a machine with Claude Code installed and before every
+Three `#[ignore]`d tests, run on a machine with Claude Code installed and before every
 Claude Code version bump, extending the existing `claude_config_dir_smoke`:
 
 - `auth_status_is_scoped_to_the_config_dir` — a fresh directory reports `loggedIn: false`
-  and exits 1 while the developer's own reports an email and exits 0. This is the
-  behaviour the whole feature rests on; an upstream change must surface as a test failure
-  rather than as two accounts sharing one login.
+  while the developer's own reports an email. This is the behaviour the whole feature
+  rests on; an upstream change must surface as a test failure rather than as two accounts
+  sharing one login.
 - `auth_status_reports_an_email_field` — the JSON key the box reads still exists.
 - `settings_flag_survives_a_subcommand` — `claude --settings <file> auth status` is
-  accepted. Verified working on 2.1.223, and the box's `Log in: claude-3 auth login` hint
-  depends on it: every shim passes `--settings` unconditionally, so a Claude Code release
-  that rejected a global flag ahead of a subcommand would break per-account login through
-  the shims.
+  accepted, so per-account login through the shims keeps working.
 
 ## Out of scope
 
