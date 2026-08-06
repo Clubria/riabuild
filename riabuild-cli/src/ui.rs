@@ -226,6 +226,27 @@ impl Ui {
         self.answers.lock().unwrap().pop_front()
     }
 
+    /// Asks a yes/no question, defaulting to yes.
+    ///
+    /// `None` means the question could not be put — `--quiet`, or nobody on the
+    /// other end — which is a different answer from "no" and has to stay
+    /// distinguishable: a caller that treats it as a refusal silently skips
+    /// work, and one that treats it as consent runs `sudo` in a CI job.
+    ///
+    /// Built on `read_answer` rather than reading stdin directly, so it obeys
+    /// the same `interactive` rule as `ask` and can be driven by `scripted` in
+    /// a test. ^D reads as "could not ask" rather than as no: it is the absence
+    /// of an answer, and the caller already knows what to do without one.
+    pub fn confirm(&self, question: &str) -> Option<bool> {
+        if self.quiet || !self.interactive {
+            return None;
+        }
+        self.take_pending();
+        let answer = self.read_answer(&format!("{question} [Y/n]"))?;
+        let answer = answer.trim().to_lowercase();
+        Some(answer.is_empty() || answer == "y" || answer == "yes")
+    }
+
     pub fn warn(&self, text: &str) {
         eprintln!("  {} {}", self.paint("33", "▲"), text);
     }

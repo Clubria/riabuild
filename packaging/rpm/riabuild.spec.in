@@ -1,0 +1,64 @@
+# Template for the RPM the dnf repository serves.
+#
+# `.github/workflows/release.yml` substitutes the at-sign-delimited placeholders
+# and builds this with `rpmbuild -bb`. Edit this file; the rendered copy is a
+# build artefact and is never committed.
+#
+# The workflow rejects a rendered spec that still contains a placeholder, so
+# this comment describes their shape rather than spelling one out.
+
+# riabuild ships a prebuilt static binary, so there is nothing for rpmbuild's
+# usual machinery to do and several things it would get wrong:
+#
+#   debug_package    there are no debug symbols to split out — the release
+#                    profile strips them — and rpmbuild fails the build rather
+#                    than shrugging when it finds none.
+#   _build_id_links  a musl static binary carries no GNU build-id, and the
+#                    default `alldebug` links refer to one.
+#   AutoReq          dependency detection reads the ELF's dynamic section. A
+#                    static binary has none, so this can only produce noise.
+%global debug_package %{nil}
+%global _build_id_links none
+%global __strip /bin/true
+
+Name:           riabuild
+Version:        @VERSION@
+# Deliberately no %%{?dist}: one build serves every distribution, so tagging it
+# with whichever the runner happened to be would be a lie that also breaks
+# upgrades between them.
+Release:        1
+Summary:        Sets up a Clubria developer's machine and opens the Clubria environment
+# The repository is public and carries no licence, which is all rights reserved.
+License:        Proprietary
+URL:            https://riabuild.clubria.com
+BuildArch:      @RPM_ARCH@
+AutoReq:        no
+AutoProv:       no
+
+Requires:       git
+# secret-tool, where the session token lives. A Recommends rather than a
+# Requires: on a headless box RIABUILD_TOKEN is the right answer, and pulling a
+# keyring onto a machine with no session to unlock it helps nobody.
+Recommends:     libsecret
+# xdg-open, used once, to put the browser in front of the GitHub sign-in.
+Recommends:     xdg-utils
+
+%description
+riabuild gets a developer from "accepted a GitHub org invite" to "running
+Claude Code against the Clubria codebase with working secrets" without them
+making a single environment decision.
+
+It keeps its state in ~/.riabuild and the session token in the system keyring.
+Node, pnpm, Claude Code, gh, and infisical are downloaded and verified by
+riabuild itself, so this package depends on almost nothing.
+
+%install
+install -Dm0755 %{_sourcedir}/riabuild %{buildroot}%{_bindir}/riabuild
+
+%files
+%{_bindir}/riabuild
+
+%changelog
+# Intentionally empty. riabuild is versioned by release date and its history
+# lives in git; a changelog rebuilt from a template on every release would say
+# nothing that `git log` does not.

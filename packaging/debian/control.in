@@ -1,0 +1,23 @@
+Package: riabuild
+Version: @VERSION@
+Architecture: @DEB_ARCH@
+Maintainer: Clubria <engineering@clubria.com>
+Section: devel
+Priority: optional
+Homepage: https://riabuild.clubria.com
+Depends: git
+Recommends: libsecret-tools, xdg-utils
+Description: Sets up a Clubria developer's machine and opens the Clubria environment
+ riabuild gets a developer from "accepted a GitHub org invite" to "running
+ Claude Code against the Clubria codebase with working secrets" without them
+ making a single environment decision.
+ .
+ It keeps its state in ~/.riabuild and the session token in the system keyring.
+ Node, pnpm, Claude Code, gh, and infisical are downloaded and verified by
+ riabuild itself, so this package depends on almost nothing.
+ .
+ git is a hard dependency: riabuild reports on the checkout every time it runs.
+ libsecret-tools provides secret-tool, which is where the session token lives —
+ without it riabuild works only with RIABUILD_TOKEN set, which is the right
+ answer on a headless box and the wrong one on a laptop. xdg-utils provides
+ xdg-open, used once, to put the browser in front of the GitHub sign-in.

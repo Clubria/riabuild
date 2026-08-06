@@ -1,0 +1,25 @@
+# The dnf repository riabuild is served from.
+#
+# Installed by copying this file into /etc/yum.repos.d/ rather than through
+# `dnf config-manager`, whose spelling changed between dnf4 (`--add-repo`) and
+# dnf5 (`addrepo --from-repofile=`). A curl into the directory works on both and
+# will keep working.
+#
+#   sudo curl -fsSL -o /etc/yum.repos.d/clubria.repo \
+#     https://clubria.github.io/riabuild/rpm/clubria.repo
+#   sudo dnf install riabuild
+#
+# $basearch expands to x86_64 or aarch64, which is exactly how the repository is
+# laid out.
+
+[clubria]
+name=Clubria
+baseurl=https://clubria.github.io/riabuild/rpm/$basearch
+enabled=1
+# Both, and both mean something: the packages are signed with rpmsign and the
+# repository metadata is signed separately. gpgcheck alone would accept a
+# repomd.xml anyone could serve; repo_gpgcheck alone would accept any package a
+# valid index happened to point at.
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://clubria.github.io/riabuild/clubria.asc

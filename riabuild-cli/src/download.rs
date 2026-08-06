@@ -252,6 +252,28 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert_eq!(digest_for(shasums, "node-v99.0.0-linux-x64.tar.gz"), None);
     }
 
+    /// Proves this build can resolve a name, complete a TLS handshake, and
+    /// read a real body.
+    ///
+    /// Ignored by default because it needs the network. CI runs it against the
+    /// musl artefact, where it is the only thing standing between us and a
+    /// static binary that builds, links, reports its version, and then cannot
+    /// reach anything on a developer's machine — the two ways that happens are
+    /// `rustls-tls-native-roots` finding no certificate store and musl's
+    /// resolver behaving differently from glibc's, and neither is visible
+    /// without actually making a request.
+    #[tokio::test]
+    #[ignore = "requires network; pins TLS and DNS for this build"]
+    async fn tls_and_dns_work_on_this_build() {
+        let shasums = fetch_text(&node_shasums_url("22.23.1"))
+            .await
+            .expect("fetch");
+        assert!(
+            digest_for(&shasums, "node-v22.23.1-linux-x64.tar.gz").is_some(),
+            "reached nodejs.org but the body was not SHASUMS256.txt"
+        );
+    }
+
     #[test]
     fn hashes_match_the_published_format() {
         // Lowercase hex, the same shape SHASUMS256.txt uses.
