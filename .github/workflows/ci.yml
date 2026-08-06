@@ -279,6 +279,9 @@ jobs:
             apt-get update -qq
             apt-get install -y -qq /dist/riabuild_2026.08.06_amd64.deb
             test "$(riabuild)" = "riabuild 2026.08.06"
+            # How update.rs decides it can upgrade itself. A package that
+            # installs but is not attributable leaves riabuild stuck on the
+            # version it has, and nothing else in the suite would notice.
             dpkg -S "$(command -v riabuild)" | grep -q riabuild
           '
           docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 bash -eux -c '

@@ -268,7 +268,7 @@ jobs:
       # packaging what it just built sidesteps that entirely, and has the useful
       # side effect that the install test below runs natively too.
       - name: Build the packages
-        working-directory: .
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           mkdir -p dist build
@@ -315,7 +315,7 @@ jobs:
           ls -l dist/
 
       - name: Verify the packages describe what they contain
-        working-directory: .
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           for deb in dist/*.deb; do
@@ -337,20 +337,33 @@ jobs:
       # architecture it was built for. Everything above this line can pass while
       # the package still installs something that will not start.
       - name: Both package managers install the real thing
-        working-directory: .
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/dist:/dist:ro" debian:12 bash -eux -c "
-            apt-get update -qq
-            apt-get install -y -qq /dist/riabuild_${VERSION}_${{ matrix.deb_arch }}.deb
-            test \"\$(riabuild --version)\" = 'riabuild $VERSION'
-            dpkg -S \"\$(command -v riabuild)\" | grep -q riabuild
-          "
-          docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 bash -eux -c "
-            dnf install -y /dist/riabuild-${VERSION}-1.${{ matrix.arch }}.rpm
-            test \"\$(riabuild --version)\" = 'riabuild $VERSION'
-            rpm -qf \"\$(command -v riabuild)\" | grep -q riabuild
-          "
+          # Names computed out here and passed through the environment, so the
+          # container scripts can be single-quoted. A double-quoted one has to
+          # escape every `$` it wants the container to expand, and the first
+          # missed backslash silently interpolates on the host instead.
+          export DEB="riabuild_${VERSION}_${{ matrix.deb_arch }}.deb"
+          export RPM="riabuild-${VERSION}-1.${{ matrix.arch }}.rpm"
+
+          docker run --rm -e VERSION -e DEB -v "$PWD/dist:/dist:ro" debian:12 \
+            bash -eux -c '
+              apt-get update -qq
+              apt-get install -y -qq "/dist/$DEB"
+              test "$(riabuild --version)" = "riabuild $VERSION"
+              # How update.rs decides it can upgrade itself. A package that
+              # installs but is not attributable leaves riabuild stuck.
+              dpkg -S "$(command -v riabuild)" | grep -q riabuild
+            '
+
+          docker run --rm -e VERSION -e RPM -v "$PWD/dist:/dist:ro" fedora:41 \
+            bash -eux -c '
+              dnf install -y "/dist/$RPM"
+              test "$(riabuild --version)" = "riabuild $VERSION"
+              rpm -qf "$(command -v riabuild)" | grep -q riabuild
+            '
+
           echo "apt and dnf both installed riabuild $VERSION on ${{ matrix.arch }}."
 
       - uses: actions/upload-artifact@v4
