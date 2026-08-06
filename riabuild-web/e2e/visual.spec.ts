@@ -59,6 +59,50 @@ test("404 renders with no backend at all", async ({
 });
 
 /**
+ * A tab that jumps to a panel must land with that panel's title on screen.
+ *
+ * The title is notched into the top rule — absolutely positioned *above* the
+ * section's own border box — so the scroll target starts below the panel's
+ * visible top edge. With no scroll margin the browser parks the border box at
+ * y=0 and the heading is sliced off above the fold, which is the reader
+ * arriving at "01 · CONFIRM YOUR PROFILE" and seeing the bottom half of it.
+ *
+ * A screenshot of the page at rest cannot catch this: it only exists after the
+ * jump.
+ */
+test.describe("section anchors", () => {
+  test("landing on a panel shows its title", async ({ page }) => {
+    await page.goto("/?scenario=lead");
+
+    const tabs = page.locator('nav[aria-label="Sections"] a');
+    const hrefs = await tabs.evaluateAll((els) =>
+      els.map((el) => el.getAttribute("href") ?? ""),
+    );
+    expect(hrefs.length, "dashboard tabs to jump to").toBeGreaterThan(0);
+
+    const clipped: string[] = [];
+    for (const href of hrefs) {
+      await page.locator(`nav[aria-label="Sections"] a[href="${href}"]`).click();
+      // The jump is the browser's, not ours; give it a frame to settle.
+      await page.waitForTimeout(300);
+
+      const top = await page.evaluate((selector) => {
+        const title = document.querySelector(selector)?.querySelector("h2");
+        return title === null || title === undefined
+          ? null
+          : Math.round(title.getBoundingClientRect().top);
+      }, href);
+
+      if (top === null || top < 0) clipped.push(`${href} title at y=${top}`);
+    }
+
+    expect(clipped, "panel titles cut off above the fold after a tab jump").toEqual(
+      [],
+    );
+  });
+});
+
+/**
  * Failure states that only exist after someone clicks something. A scenario that
  * renders them at rest would be lying about how they are reached.
  */
