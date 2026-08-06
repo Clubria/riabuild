@@ -26,6 +26,16 @@ export default defineSchema({
     userId: v.id("users"),
     githubLogin: v.string(),
     githubId: v.string(),
+    /**
+     * Immutable, ours, and independent of GitHub. Names a developer's
+     * directory on a shared server, so it must outlive a GitHub rename.
+     * Optional for exactly one deploy — see the backfill below.
+     *
+     * Not the same thing as `cliSessions.memberId` below: that one is a
+     * document reference (`v.id("members")`); this one is a UUID string
+     * stored on the row itself. Same name, unrelated types — do not unify.
+     */
+    memberId: v.optional(v.string()),
     firstName: v.string(),
     lastName: v.string(),
     email: v.string(),
@@ -37,6 +47,7 @@ export default defineSchema({
 
   /** Live CLI sessions. `tokenHash` is the lookup key — the raw token is never stored. */
   cliSessions: defineTable({
+    /** A document reference — not the UUID `members.memberId` above. Same name, different type. */
     memberId: v.id("members"),
     tokenHash: v.string(),
     deviceLabel: v.string(),

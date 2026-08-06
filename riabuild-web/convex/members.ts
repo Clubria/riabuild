@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import {
+  internalMutation,
   internalQuery,
   mutation,
   query,
@@ -223,6 +224,26 @@ export const byId = internalQuery({
   handler: async (ctx, args) => {
     const member = await ctx.db.get("members", args.memberId);
     return member === null ? null : toView(member);
+  },
+});
+
+/**
+ * One-shot: gives every member row a `memberId` so the field can be made
+ * required. Idempotent, and returns how many rows it changed so the deploy
+ * step can be checked rather than assumed.
+ */
+export const backfillMemberIds = internalMutation({
+  args: {},
+  returns: v.number(),
+  handler: async (ctx) => {
+    const members = await ctx.db.query("members").collect();
+    let filled = 0;
+    for (const member of members) {
+      if (member.memberId !== undefined) continue;
+      await ctx.db.patch("members", member._id, { memberId: crypto.randomUUID() });
+      filled += 1;
+    }
+    return filled;
   },
 });
 

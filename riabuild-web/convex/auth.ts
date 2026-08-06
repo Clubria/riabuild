@@ -187,6 +187,7 @@ async function upsertMember(
       userId: args.userId,
       githubLogin: args.githubLogin,
       githubId: args.githubId,
+      memberId: crypto.randomUUID(),
       firstName,
       lastName,
       email: args.email,

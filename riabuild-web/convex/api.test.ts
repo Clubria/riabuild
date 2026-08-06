@@ -27,17 +27,20 @@ async function seedMember(
       name: "Ada Lovelace",
       email: "ada@clubria.dev",
     });
-    const memberId = await ctx.db.insert("members", {
+    // `rowId` — not `memberId` — because `members.memberId` is now a distinct
+    // UUID field on the row itself; see the schema comment.
+    const rowId = await ctx.db.insert("members", {
       userId,
       githubLogin: overrides.login ?? "ada",
       githubId: "1234",
+      memberId: crypto.randomUUID(),
       firstName: "Ada",
       lastName: "Lovelace",
       email: "ada@clubria.dev",
       role: overrides.role ?? "developer",
       status: overrides.status ?? "active",
     });
-    return { userId, memberId };
+    return { userId, rowId };
   });
 }
 
@@ -69,10 +72,62 @@ function bearer(token: string, version?: string): HeadersInit {
   return headers;
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+describe("member ids", () => {
+  test("a member created through sign-in gets a member id", async () => {
+    // Exercises the insert in auth.ts. Reaching this through the backfill
+    // instead would pass with auth.ts unchanged, which is the whole bug this
+    // test is here to catch.
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const member = await t.run(async (ctx) => await ctx.db.get("members", rowId));
+    expect(member?.memberId).toMatch(UUID);
+  });
+
+  // These two go away in Task 2, when the field becomes required — see the
+  // note there. They cover the one production deploy the mutation exists for.
+  test("the backfill fills only the rows that are missing one", async () => {
+    const t = setup();
+    const withId = await seedMember(t);
+    const withoutId = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { name: "Bob", email: "bob@clubria.dev" });
+      return await ctx.db.insert("members", {
+        userId,
+        githubLogin: "bob",
+        githubId: "5678",
+        firstName: "Bob",
+        lastName: "Stone",
+        email: "bob@clubria.dev",
+        role: "developer" as const,
+        status: "active" as const,
+      });
+    });
+
+    const before = await t.run(async (ctx) => (await ctx.db.get("members", withId.rowId))?.memberId);
+    const filled = await t.mutation(internal.members.backfillMemberIds, {});
+
+    expect(filled).toBe(1);
+    const after = await t.run(async (ctx) => ({
+      untouched: (await ctx.db.get("members", withId.rowId))?.memberId,
+      filled: (await ctx.db.get("members", withoutId))?.memberId,
+    }));
+    expect(after.untouched).toBe(before);
+    expect(after.filled).toBeTruthy();
+  });
+
+  test("running the backfill twice changes nothing the second time", async () => {
+    const t = setup();
+    await seedMember(t);
+    await t.mutation(internal.members.backfillMemberIds, {});
+    expect(await t.mutation(internal.members.backfillMemberIds, {})).toBe(0);
+  });
+});
+
 describe("CLI login — loopback code exchange", () => {
   test("approves in the browser, redeems in the terminal", async () => {
     const t = setup();
-    const { userId, memberId } = await seedMember(t);
+    const { userId, rowId } = await seedMember(t);
     const verifier = randomToken(32);
 
     const asAda = t.withIdentity({ subject: `${userId}|session` });
@@ -105,7 +160,7 @@ describe("CLI login — loopback code exchange", () => {
     expect(stored).toHaveLength(1);
     expect(stored[0]).not.toBe(body.token);
     expect(stored[0]).toBe(await sha256Hex(body.token));
-    expect(memberId).toBeDefined();
+    expect(rowId).toBeDefined();
   });
 
   test("a code presented with the wrong verifier is refused", async () => {
@@ -187,8 +242,8 @@ describe("session authentication", () => {
 
   test("a revoked session says so, so the CLI can re-login", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId, { revoked: true });
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId, { revoked: true });
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("session_revoked");
@@ -196,8 +251,8 @@ describe("session authentication", () => {
 
   test("an expired session says so", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId, { expiresAt: 1 });
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId, { expiresAt: 1 });
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("session_expired");
@@ -205,8 +260,8 @@ describe("session authentication", () => {
 
   test("a suspended member is 403, never 401", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { status: "suspended" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { status: "suspended" });
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     // 401 would make the CLI re-authenticate, succeed, and loop forever.
     expect(response.status).toBe(403);
@@ -215,8 +270,8 @@ describe("session authentication", () => {
 
   test("a successful request records when the machine was last seen", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.fetch("/api/v1/me", { headers: bearer(token) });
     const lastUsed = await t.run(async (ctx) => {
       const session = await ctx.db.query("cliSessions").first();
@@ -229,8 +284,8 @@ describe("session authentication", () => {
 describe("version floors", () => {
   test("an outdated CLI is turned away with 409", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: "{}",
@@ -252,8 +307,8 @@ describe("version floors", () => {
 
   test("org config still answers an outdated CLI — it is how it learns", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: "{}",
@@ -279,8 +334,8 @@ describe("version floors", () => {
 describe("org config and claude settings", () => {
   test("a fresh deployment serves defaults rather than an error", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/org/config", {
       headers: bearer(token),
     });
@@ -290,8 +345,8 @@ describe("org config and claude settings", () => {
 
   test("the retired checkout path is still sent, so older CLIs can parse this", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/org/config", {
       headers: bearer(token),
     });
@@ -333,8 +388,8 @@ describe("org config and claude settings", () => {
 
   test("claude settings come back parsed, with their timestamp", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: JSON.stringify({ env: { CLUBRIA: "1" } }),
@@ -401,8 +456,8 @@ describe("secret brokering", () => {
 
   test("an org member gets a short-lived token and an audit entry", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { role: "developer" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
     let loginBody: unknown = null;
     stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
 
@@ -429,8 +484,8 @@ describe("secret brokering", () => {
 
   test("a candidate is brokered through the narrower identity", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { role: "candidate" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
     let loginBody: unknown = null;
     stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
 
@@ -447,8 +502,8 @@ describe("secret brokering", () => {
   test("leaving the GitHub org ends access, whatever Convex says", async () => {
     const t = setup();
     // Still `developer` and still `active` in Convex — GitHub is the gate.
-    const { memberId } = await seedMember(t, { role: "developer" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
     stubUpstreams({ membership: 404 });
 
     const response = await t.fetch("/api/v1/secrets/token", {
@@ -461,8 +516,8 @@ describe("secret brokering", () => {
 
   test("an unusable org token fails closed, and says it could not check", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     vi.stubEnv("GITHUB_ORG_TOKEN", "");
     stubUpstreams({ membership: 204 });
 
@@ -477,8 +532,8 @@ describe("secret brokering", () => {
 
   test("an Infisical outage is translated, not forwarded", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     stubUpstreams({
       membership: 204,
       infisical: { status: 500, body: { message: "identity mi-developer" } },
@@ -504,7 +559,7 @@ describe("member administration", () => {
 
     await expect(
       asDeveloper.mutation(api.members.setRole, {
-        memberId: other.memberId,
+        memberId: other.rowId,
         role: "lead",
       }),
     ).rejects.toThrow(/team leads/i);
@@ -517,7 +572,7 @@ describe("member administration", () => {
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
 
     await asLead.mutation(api.members.setRole, {
-      memberId: subject.memberId,
+      memberId: subject.rowId,
       role: "developer",
     });
 
@@ -536,7 +591,7 @@ describe("member administration", () => {
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
     await expect(
       asLead.mutation(api.members.setRole, {
-        memberId: lead.memberId,
+        memberId: lead.rowId,
         role: "candidate",
       }),
     ).rejects.toThrow(/another lead/i);
@@ -546,11 +601,11 @@ describe("member administration", () => {
     const t = setup();
     const lead = await seedMember(t, { login: "lead", role: "lead" });
     const subject = await seedMember(t, { login: "grace" });
-    const token = await issueSession(t, subject.memberId);
+    const token = await issueSession(t, subject.rowId);
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
 
     await asLead.mutation(api.members.setStatus, {
-      memberId: subject.memberId,
+      memberId: subject.rowId,
       status: "suspended",
     });
 
@@ -679,8 +734,8 @@ describe("member administration", () => {
 
   test("internal member lookup returns the stored profile", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const member = await t.query(internal.members.byId, { memberId });
+    const { rowId } = await seedMember(t);
+    const member = await t.query(internal.members.byId, { memberId: rowId });
     expect(member?.githubLogin).toBe("ada");
   });
 });
