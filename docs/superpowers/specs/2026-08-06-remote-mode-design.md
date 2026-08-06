@@ -36,9 +36,14 @@ Exactly two commands are ever pushed at a server:
 
 Everything after that is riabuild talking to itself over SSH.
 
-**The laptop is not provisioned.** `riabuild remote` runs the `login` task locally and
-nothing else. A laptop that has never been set up can still drive a server, which is the
-point of a thin-client workflow.
+**The laptop runs two tasks, and no more.** `riabuild remote` runs `login` and
+`github_cli` locally: the first because the laptop mints the server's riabuild session, the
+second because the laptop's GitHub sign-in is what the server borrows. Everything else —
+Node, pnpm, the checkout, Claude Code, secrets — happens on the server.
+
+Running `github_cli` locally is also a pre-flight worth having. Its check re-verifies
+Clubria org membership, so a suspended or departed developer fails on their own laptop
+before riabuild touches a server.
 
 ## Shape of the change
 
@@ -48,7 +53,7 @@ underneath a new command would bury them.
 
 | PR | Contents |
 |---|---|
-| **A** | `members.publicId` as required schema, the backfill and its staged deploy, the `memberPayload` field, and `Member.public_id` in the CLI |
+| **A** | `members.publicId` as required schema, the backfill and its staged deploy, the `memberPayload` field, `Member.public_id` in the CLI, and the dashboard showing member ids |
 | **B** | `Paths::tools_root()` and the root override, the namespace environment on `Ctx`, remote token-store selection, a target parameter on `download.rs` |
 | **C** | `riabuild remote` — identity, host trust, install, setup, shell, the per-session GitHub credential — and the container test |
 
@@ -63,6 +68,10 @@ $ riabuild remote
 
 riabuild · Clubria environment
   signed in as Ada Lovelace <ada@clubria.dev> · developer · token in your macOS Keychain
+
+Checking this laptop
+  ● riabuild sign-in
+  ● GitHub CLI
 
 Adding a server
   Hostname   build-01.fly.dev
@@ -80,10 +89,7 @@ Connecting to ada@build-01.fly.dev
 
 Checking build-01
   ● riabuild sign-in
-  ◐ GitHub CLI — gh is not signed in to GitHub
-    ! First copy your one-time code: 1A2B-3C4D
-      Open https://github.com/login/device in your browser
-  ● GitHub CLI
+  ● GitHub CLI — signed in as @ada, from this laptop
   ● Node and pnpm
   ● Project checkout
   ● Project secrets
@@ -419,11 +425,21 @@ snapshot, or somebody who gets a shell on that box tomorrow finds nothing.
 
 **It is not** protection from a co-tenant during a live session. Alice and Bob share a uid,
 so while Alice's session is up her `hosts.yml` is as readable to Bob as anything else of
-hers. `0700` is doing nothing between them.
+hers. `0700` is doing nothing between them. See *the token is the developer's own*, below —
+on a shared box this is the sharpest edge in the design.
 
 **It is not revocation.** `gh` deletes the local credential; the OAuth grant stays valid on
 GitHub's side. A token captured during a live session keeps working afterwards. Only
 revoking it on github.com stops that.
+
+**And the token is the developer's own.** Because the server borrows the laptop's sign-in
+rather than minting a separate one, what sits in that runtime directory during a session is
+the credential that developer uses everywhere. GitHub revokes OAuth App authorizations per
+app rather than per token, so the remedy for a captured one is revoking "GitHub CLI" for
+the whole account and signing in again — on the laptop as well as the server.
+
+That is the trade the seamless path makes, and it is only a trade at all on a **shared**
+account. A server the developer has to themselves exposes the token to nobody but root.
 
 Calling this "per-use" the way the Infisical brokering is per-use would be a lie. It
 narrows a window; it does not close one.
@@ -452,8 +468,8 @@ rest on a clean exit path.
 ```
 
 - **On start**, a session writes its marker and, if `hosts.yml` already exists with a live
-  sibling marker, reuses the sign-in. Two terminals into one server therefore cost one
-  device-code dance, not two.
+  sibling marker, reuses the sign-in rather than seeding again. Two terminals into one
+  server therefore move the token across once, not twice.
 - **On exit**, it removes its marker; the last one out removes the tree.
 - **On every riabuild run on that server**, before anything else: markers whose pid is dead
   are swept, and a directory left with no live markers is wiped. This is the backstop that
@@ -464,20 +480,42 @@ rest on a clean exit path.
 - A directory older than 24 hours with no live markers is wiped regardless, since pids are
   recycled and a stale marker could otherwise match a live unrelated process.
 
+## Seeded from the laptop, not signed in on the server
+
+The server never runs a device-code dance. Before the setup run, riabuild opens one
+non-interactive SSH connection and seeds the credential:
+
+```
+laptop:  gh auth token                         the laptop's own sign-in
+    ↓    ssh … riabuild internal seed-github   token on stdin, never in argv
+server:  gh auth login --with-token            gh writes its own hosts.yml, 0600
+```
+
+Three things make this the shape it is. The token travels on **stdin**, because an argument
+list is world-readable through `ps` — the same rule `env_local` already follows for the
+Infisical token. It is a **separate, non-interactive connection**, because the setup run
+that follows needs `ssh -t` and a TTY leaves no clean stdin to write to. And the write goes
+through **`gh auth login --with-token`** rather than riabuild hand-writing `hosts.yml`, so
+gh owns its own file format and permissions while riabuild owns only the environment it
+runs in.
+
+`riabuild remote` is therefore unattended after the first key exchange: no device code, no
+prompts, clone and secrets and all.
+
+If seeding fails — a token the server rejects, an SSH hiccup — nothing special happens.
+`github_cli`'s existing `check()` finds gh not signed in and its existing `apply()` runs the
+device-code login over the TTY that setup already has. The fallback costs no new code
+because it is the behaviour the task always had.
+
 ## What the developer sees
 
-`gh auth login` is now part of a normal session start rather than a sign that something
-drifted, so `github_cli` says so:
-
 ```
-  ◐ GitHub CLI — signing in for this session
-    ! First copy your one-time code: 1A2B-3C4D
-      Open https://github.com/login/device in your browser
+  ● GitHub CLI — signed in as @ada, from this laptop
 ```
 
-This is the cost of the property, paid once per server per session — and once per *server*,
-not once per terminal, which is what the refcounting buys. `riabuild remote --check` reports
-GitHub CLI as needing sign-in, correctly, because on a server it always will.
+Once per server per session, and once per *server* rather than once per terminal, which is
+what the refcounting buys. `riabuild remote --check` reports GitHub CLI as satisfied, since
+the seed happens before the check runs.
 
 `GIT_CONFIG_GLOBAL` stays in the namespace. What `gh auth setup-git` writes there is a
 credential *helper* line delegating to `gh`, not a credential, so it holds nothing worth
@@ -538,6 +576,29 @@ having. All three land in one pull request; only the deploy is staged.
 No `by_publicId` index. Nothing looks a member up by it — the namespace is computed on the
 CLI side from the member payload — and the Convex guidelines are explicit that indexes get
 added when a caller needs one.
+
+## Shown in the dashboard
+
+An id that names a directory on a shared server has to be readable by a human somewhere.
+`owner.json` answers "whose namespace is this?" for somebody with a shell on the box; the
+dashboard answers it for everybody else, and answers the reverse — "which directory is
+mine?" — for the developer.
+
+| Where | What |
+|---|---|
+| `Profile` | a `KeyValue` row, `member id`, so a developer can find their own |
+| `LeadPanel`'s member table | an `id` column, `priority: "wide"` so it drops on a narrow viewport before `github` does |
+
+A 36-character UUID is not a table cell. Both render through a new `Copyable` in
+`src/ui/` — monospace, truncated to its first segment, full value in the accessible name,
+with the copy affordance `Command` already implements. It is a new component rather than a
+`Command` prop because `Command`'s `$` prompt means *this is a shell command*, and an
+identifier is not one; the `riabuild-ui` rule to generalize rather than fork applies to
+components that almost fit, and that one does not.
+
+Per `visual-testing`, `Copyable` gets a `/__ui` gallery entry, and the `overflow` scenario
+gains a member id — a 36-character unbroken string with no spaces is precisely the
+adversarial case that scenario exists for.
 
 **Known limit:** a member deleted and re-created gets a new `publicId` and therefore a
 fresh namespace, orphaning the old one. `owner.json` is what makes an orphan identifiable.
@@ -677,6 +738,8 @@ Each one has its own remedy, so each one is detected separately.
 | `mosh-server` missing, or UDP blocked | falls back to `ssh -t`, notes the install command |
 | Default checkout path owned by another namespace | claims `<login>-2` |
 | No writable runtime directory for the gh configuration | stop rather than fall back to the namespace; the property was the point |
+| The laptop's own gh is not signed in | fixed on the laptop by the `github_cli` task, before the server is touched |
+| Seeding the credential failed | `github_cli` on the server falls back to its own device-code sign-in over the setup TTY |
 
 ---
 
@@ -717,6 +780,8 @@ entire flow testable with no server anywhere.
 | Runtime directory choice | `$XDG_RUNTIME_DIR`, then `$TMPDIR`, then `/tmp`, with the directory asserted 0700 |
 | Session refcounting | two sessions share one sign-in; the first to exit wipes nothing; the second wipes the tree |
 | Crash cleanup | a marker naming a dead pid is swept and its directory wiped on the next run, with no clean exit anywhere in the test |
+| Seeding the credential | the token reaches `gh auth login --with-token` on stdin and appears in no recorded argument list — the same assertion `keychain.rs` already makes about `secret-tool` |
+| Seeding failure | a rejected token leaves `github_cli` to sign in for itself, and the run still completes |
 | `publicId` is required | a `/api/v1/me` payload without the field is a decode failure carrying the deploy-ordering message — never a default, never an unnamed namespace |
 | The backfill | a fixture member row without `publicId` gains one, and the required-schema push rejects a table the backfill missed |
 | Shared installs | two concurrent installs of one version, asserting one complete tree and two successes |
