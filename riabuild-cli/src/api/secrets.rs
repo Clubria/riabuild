@@ -28,8 +28,9 @@ fn root_path() -> String {
     "/".to_string()
 }
 
-pub fn broker(api: &ApiClient) -> Result<BrokeredToken> {
+pub async fn broker(api: &ApiClient) -> Result<BrokeredToken> {
     api.post_json("/api/v1/secrets/token", serde_json::json!({}))
+        .await
 }
 
 #[cfg(test)]

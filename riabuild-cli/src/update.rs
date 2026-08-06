@@ -48,7 +48,7 @@ pub fn already_updated() -> bool {
 }
 
 /// Runs `brew upgrade` and re-execs this binary with the original arguments.
-pub fn upgrade_and_reexec(
+pub async fn upgrade_and_reexec(
     runner: &dyn CommandRunner,
     ui: &Ui,
     to: &str,
@@ -56,11 +56,13 @@ pub fn upgrade_and_reexec(
 ) -> Result<()> {
     ui.info(&format!("Updating riabuild to {to}…"));
 
-    let output = runner.run(
-        "brew",
-        &["upgrade", "clubria/tap/riabuild"],
-        &RunOptions::default(),
-    )?;
+    let output = runner
+        .run(
+            "brew",
+            &["upgrade", "clubria/tap/riabuild"],
+            &RunOptions::default(),
+        )
+        .await?;
 
     if !output.ok() {
         if mandatory {
@@ -81,15 +83,17 @@ pub fn upgrade_and_reexec(
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let code = runner.run_interactive(
-        &executable.to_string_lossy(),
-        &arg_refs,
-        &RunOptions {
-            // Prevents an upgrade loop if the new build still reports old.
-            env: vec![("RIABUILD_UPDATED".into(), "1".into())],
-            ..Default::default()
-        },
-    )?;
+    let code = runner
+        .run_interactive(
+            &executable.to_string_lossy(),
+            &arg_refs,
+            &RunOptions {
+                // Prevents an upgrade loop if the new build still reports old.
+                env: vec![("RIABUILD_UPDATED".into(), "1".into())],
+                ..Default::default()
+            },
+        )
+        .await?;
     std::process::exit(code);
 }
 

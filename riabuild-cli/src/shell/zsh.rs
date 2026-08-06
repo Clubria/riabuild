@@ -75,9 +75,9 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-pub fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
     let dir = ctx.paths.shell_dir("zsh");
-    std::fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
 
     // Respect a developer who already moved their zsh config somewhere else.
     let user_zdotdir = std::env::var("ZDOTDIR")
@@ -85,14 +85,15 @@ pub fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         .unwrap_or_else(|_| ctx.paths.home());
 
     let colour = ctx.ui.colour();
-    std::fs::write(
+    tokio::fs::write(
         dir.join(".zshrc"),
         rcfile(
             &user_zdotdir,
             &banner_command(&super::banner(colour)),
             &prompt_command(colour),
         ),
-    )?;
+    )
+    .await?;
 
     Ok((
         vec!["-i".to_string()],

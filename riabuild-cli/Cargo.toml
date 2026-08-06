@@ -44,16 +44,42 @@ unwrap_used = "deny"
 
 [dependencies]
 anyhow = "1.0"
+# `async fn` in a trait is not dyn-compatible — it returns an anonymous future
+# with no known size, so there is no vtable layout for it. Ctx holds every IO
+# trait behind `Arc<dyn …>`, and that indirection is what the whole test suite
+# is built on, so the returned futures get boxed instead.
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
 flate2 = "1.0"
 rand = "0.9"
+# `rustls-tls-native-roots` reads the OS trust store rather than bundling
+# webpki-roots. A developer behind a corporate TLS-inspecting proxy has that
+# MITM root installed already; bundled roots reject it, and the symptom is an
+# opaque TLS error from every riabuild command on an otherwise working laptop.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "http2",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4"
-ureq = { version = "2.12", features = ["json"] }
+# `rt` without `rt-multi-thread`: the runtime is current-thread by construction,
+# so a stray `Runtime::new()` cannot quietly spawn a worker pool. Note this
+# describes the reactor — `tokio::fs` is std::fs on a blocking pool, because no
+# portable async file API exists, so the process still has threads.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "fs",
+    "process",
+    "net",
+    "io-util",
+    "time",
+] }
 
 [dev-dependencies]
 tempfile = "3"

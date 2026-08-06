@@ -103,14 +103,28 @@ pub struct ApiClient {
     api_url: String,
     token: Option<String>,
     version: String,
+    /// One client for the process. Cloning an `ApiClient` shares this pool
+    /// rather than copying it, which is why `Clone` is still cheap.
+    client: reqwest::Client,
 }
 
 impl ApiClient {
     pub fn new(version: impl Into<String>) -> Self {
+        let version = version.into();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(format!("riabuild/{version}"))
+            .build()
+            // A client that will not build is a broken TLS backend, not a
+            // developer's mistake. `default()` still produces a usable client,
+            // and every request through it will report its own failure with an
+            // action attached — better than panicking during startup.
+            .unwrap_or_default();
         Self {
             api_url: api_url(),
             token: None,
-            version: version.into(),
+            version,
+            client,
         }
     }
 
@@ -118,70 +132,90 @@ impl ApiClient {
         self.token = token;
     }
 
-    fn request(&self, method: &str, path: &str) -> ureq::Request {
-        let request = ureq::request(method, &format!("{}{path}", self.api_url))
-            .timeout(Duration::from_secs(30))
-            .set("x-riabuild-cli-version", &self.version)
-            .set("user-agent", &format!("riabuild/{}", self.version));
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .request(method, format!("{}{path}", self.api_url))
+            .header("x-riabuild-cli-version", &self.version);
         match &self.token {
-            Some(token) => request.set("authorization", &format!("Bearer {token}")),
+            Some(token) => request.bearer_auth(token),
             None => request,
         }
     }
 
-    pub fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        interpret(self.request("GET", path).call(), path)
+    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        interpret(self.request(reqwest::Method::GET, path).send().await, path).await
     }
 
-    pub fn post_json<T: serde::de::DeserializeOwned>(
+    pub async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: serde_json::Value,
     ) -> Result<T> {
-        interpret(self.request("POST", path).send_json(body), path)
+        interpret(
+            self.request(reqwest::Method::POST, path)
+                .json(&body)
+                .send()
+                .await,
+            path,
+        )
+        .await
     }
 
     /// `GET /api/v1/me`
-    pub fn me(&self) -> Result<Member> {
+    pub async fn me(&self) -> Result<Member> {
         #[derive(Deserialize)]
         struct Envelope {
             member: Member,
         }
-        Ok(self.get_json::<Envelope>("/api/v1/me")?.member)
+        Ok(self.get_json::<Envelope>("/api/v1/me").await?.member)
     }
 }
 
-fn interpret<T: serde::de::DeserializeOwned>(
-    result: Result<ureq::Response, ureq::Error>,
+/// Turns a reqwest result into either the decoded body or an `ApiError`.
+///
+/// The shape differs from the ureq version in one way that matters: ureq
+/// signalled an HTTP failure through `Err(Error::Status(..))`, whereas reqwest
+/// returns `Ok(response)` and expects the status to be inspected. Dropping that
+/// check would silently treat every 4xx as a successful reply.
+async fn interpret<T: serde::de::DeserializeOwned>(
+    result: Result<reqwest::Response, reqwest::Error>,
     path: &str,
 ) -> Result<T> {
-    match result {
-        Ok(response) => response
-            .into_json::<T>()
-            .with_context(|| format!("riabuild could not read the reply from {path}")),
-        Err(ureq::Error::Status(status, response)) => {
-            // A structured error is the server explaining itself; anything else
-            // is a proxy or an outage, and gets a generic shape.
-            match response.into_json::<ErrorEnvelope>() {
-                Ok(envelope) => {
-                    let mut error = envelope.error;
-                    error.status = status;
-                    Err(error.into())
-                }
-                Err(_) => Err(ApiError {
-                    status,
-                    code: "upstream_error".into(),
-                    message: format!("riabuild.clubria.com replied with HTTP {status}."),
-                    action: "Try again in a minute; if it persists, tell your team lead.".into(),
-                }
-                .into()),
+    let response = match result {
+        Ok(response) => response,
+        Err(transport) => {
+            return Err(ApiError {
+                status: 0,
+                code: "unreachable".into(),
+                message: format!("riabuild could not reach riabuild-web ({transport})."),
+                action: "Check your network connection and try again.".into(),
             }
+            .into());
         }
-        Err(transport) => Err(ApiError {
-            status: 0,
-            code: "unreachable".into(),
-            message: format!("riabuild could not reach riabuild-web ({transport})."),
-            action: "Check your network connection and try again.".into(),
+    };
+
+    let status = response.status().as_u16();
+    if response.status().is_success() {
+        return response
+            .json::<T>()
+            .await
+            .with_context(|| format!("riabuild could not read the reply from {path}"));
+    }
+
+    // A structured error is the server explaining itself; anything else is a
+    // proxy or an outage, and gets a generic shape.
+    match response.json::<ErrorEnvelope>().await {
+        Ok(envelope) => {
+            let mut error = envelope.error;
+            error.status = status;
+            Err(error.into())
+        }
+        Err(_) => Err(ApiError {
+            status,
+            code: "upstream_error".into(),
+            message: format!("riabuild.clubria.com replied with HTTP {status}."),
+            action: "Try again in a minute; if it persists, tell your team lead.".into(),
         }
         .into()),
     }
@@ -191,8 +225,8 @@ fn interpret<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_403_is_never_treated_as_a_login_problem() {
+    #[tokio::test]
+    async fn a_403_is_never_treated_as_a_login_problem() {
         // Re-authenticating after losing org membership would succeed and loop.
         let lost_org = ApiError {
             status: 403,

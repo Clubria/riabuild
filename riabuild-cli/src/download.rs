@@ -9,9 +9,12 @@
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
+
+/// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
+/// the body in one call, so the cap is checked after the fact instead.
+const MAX_DOWNLOAD: usize = 400 * 1024 * 1024;
 
 /// The Node distribution name for this machine, e.g. `darwin-arm64`.
 pub fn node_platform() -> Result<String> {
@@ -102,23 +105,41 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = ureq::get(url)
+/// Reads a whole distribution into memory.
+///
+/// Deliberately not streamed to disk: the sha256 in `verify` is checked against
+/// the complete buffer *before* anything is extracted. Streaming would mean
+/// writing unverified bytes into a developer's toolchain directory and checking
+/// them afterwards, which is a weaker property for a tool that installs
+/// executables.
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
-        .call()
+        .build()
+        .with_context(|| format!("could not download {url}"))?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("could not download {url}"))?
+        .error_for_status()
         .with_context(|| format!("could not download {url}"))?;
 
-    let mut buffer = Vec::new();
-    response
-        .into_reader()
-        .take(400 * 1024 * 1024)
-        .read_to_end(&mut buffer)
+    let bytes = response
+        .bytes()
+        .await
         .with_context(|| format!("download of {url} was cut short"))?;
-    Ok(buffer)
+
+    if bytes.len() > MAX_DOWNLOAD {
+        return Err(anyhow!(
+            "{url} is {} bytes, more than riabuild will download",
+            bytes.len()
+        ));
+    }
+    Ok(bytes.to_vec())
 }
 
-pub fn fetch_text(url: &str) -> Result<String> {
-    Ok(String::from_utf8_lossy(&fetch_bytes(url)?).into_owned())
+pub async fn fetch_text(url: &str) -> Result<String> {
+    Ok(String::from_utf8_lossy(&fetch_bytes(url).await?).into_owned())
 }
 
 /// Unpacks a `node-v*.tar.gz` into `target` so that `target/bin/node` is the
@@ -169,11 +190,11 @@ fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Resu
 }
 
 #[cfg(unix)]
-pub fn make_executable(path: &Path) -> Result<()> {
+pub async fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path)?.permissions();
+    let mut permissions = tokio::fs::metadata(path).await?.permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions)?;
+    tokio::fs::set_permissions(path, permissions).await?;
     Ok(())
 }
 

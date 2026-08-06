@@ -6,10 +6,12 @@
 //! and the suite gets abandoned.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -38,15 +40,30 @@ pub struct RunOptions {
     pub stdin: Option<String>,
 }
 
+#[async_trait]
 pub trait CommandRunner: Send + Sync {
-    fn run(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<CommandOutput>;
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<CommandOutput>;
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
-    fn run_interactive(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32>;
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32>;
 
     /// Resolves a program on `PATH`, so `check()` can distinguish "not
     /// installed" from "installed but wrong version".
+    ///
+    /// Stays synchronous: it reads `PATH` and stats the candidates, which is
+    /// cheap enough that making it async would infect every `check()` for no
+    /// gain.
     fn which(&self, program: &str) -> Option<PathBuf>;
 }
 
@@ -66,8 +83,14 @@ impl RealRunner {
     }
 }
 
+#[async_trait]
 impl CommandRunner for RealRunner {
-    fn run(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<CommandOutput> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<CommandOutput> {
         let mut command = RealRunner::build(program, args, options);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.stdin(if options.stdin.is_some() {
@@ -81,13 +104,20 @@ impl CommandRunner for RealRunner {
             .with_context(|| format!("could not start `{program}`"))?;
 
         if let Some(input) = &options.stdin {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().expect("stdin was piped");
-            stdin.write_all(input.as_bytes())?;
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().context("stdin was piped")?;
+            stdin.write_all(input.as_bytes()).await?;
+            // Closing the pipe is what tells the child there is no more input.
+            // The blocking version got this free when the `if let` block ended;
+            // here the handle would otherwise live until the end of the
+            // function, and a child reading to EOF — `infisical export` does —
+            // would wait forever.
+            drop(stdin);
         }
 
         let output = child
             .wait_with_output()
+            .await
             .with_context(|| format!("`{program}` did not finish"))?;
 
         Ok(CommandOutput {
@@ -97,9 +127,15 @@ impl CommandRunner for RealRunner {
         })
     }
 
-    fn run_interactive(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
         let status = RealRunner::build(program, args, options)
             .status()
+            .await
             .with_context(|| format!("could not start `{program}`"))?;
         Ok(status.code().unwrap_or(1))
     }
@@ -186,15 +222,26 @@ impl FakeRunner {
 }
 
 #[cfg(test)]
+#[async_trait]
 impl CommandRunner for FakeRunner {
-    fn run(&self, program: &str, args: &[&str], _options: &RunOptions) -> Result<CommandOutput> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<CommandOutput> {
         let invocation = format!("{program} {}", args.join(" "));
         let invocation = invocation.trim_end().to_string();
         self.calls.lock().unwrap().push(invocation.clone());
         Ok(self.lookup(&invocation))
     }
 
-    fn run_interactive(&self, program: &str, args: &[&str], _options: &RunOptions) -> Result<i32> {
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<i32> {
         let invocation = format!("{program} {}", args.join(" "));
         let invocation = invocation.trim_end().to_string();
         self.calls.lock().unwrap().push(invocation.clone());

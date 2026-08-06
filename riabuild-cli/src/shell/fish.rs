@@ -79,24 +79,25 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"\'"))
 }
 
-pub fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
     let root = ctx.paths.shell_dir("fish");
     let fish_dir = root.join("fish");
-    std::fs::create_dir_all(&fish_dir)?;
+    tokio::fs::create_dir_all(&fish_dir).await?;
 
     let user_config_dir = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| ctx.paths.home().join(".config"));
 
     let colour = ctx.ui.colour();
-    std::fs::write(
+    tokio::fs::write(
         fish_dir.join("config.fish"),
         config(
             &user_config_dir,
             &banner_command(&super::banner(colour)),
             &prompt_command(colour),
         ),
-    )?;
+    )
+    .await?;
 
     Ok((
         vec!["-i".to_string()],

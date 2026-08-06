@@ -60,12 +60,12 @@ pub struct ClaudeSettings {
     pub updated_at: u64,
 }
 
-pub fn fetch_config(api: &ApiClient) -> Result<OrgConfig> {
-    api.get_json("/api/v1/org/config")
+pub async fn fetch_config(api: &ApiClient) -> Result<OrgConfig> {
+    api.get_json("/api/v1/org/config").await
 }
 
-pub fn fetch_claude_settings(api: &ApiClient) -> Result<ClaudeSettings> {
-    api.get_json("/api/v1/org/claude-settings")
+pub async fn fetch_claude_settings(api: &ApiClient) -> Result<ClaudeSettings> {
+    api.get_json("/api/v1/org/claude-settings").await
 }
 
 #[cfg(test)]

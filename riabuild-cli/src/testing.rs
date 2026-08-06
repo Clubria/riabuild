@@ -26,16 +26,17 @@ pub fn org_config() -> OrgConfig {
     }
 }
 
-pub fn test_ctx() -> (Ctx, TempDir) {
+pub async fn test_ctx() -> (Ctx, TempDir) {
     let (ctx, home, _) = build(
         FakeRunner::new(),
         MemoryKeychain::with_token("rb_test_token"),
-    );
+    )
+    .await;
     (ctx, home)
 }
 
-pub fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
-    let (ctx, home, _) = ctx_and_runner(runner);
+pub async fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
+    let (ctx, home, _) = ctx_and_runner(runner).await;
     (ctx, home)
 }
 
@@ -44,14 +45,16 @@ pub fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
 /// Some things a task must get right are only visible in *what it ran*: that a
 /// developer whose machine is already fine is not sent through a browser
 /// sign-in, for instance, cannot be seen in the returned `Status` at all.
-pub fn ctx_and_runner(runner: FakeRunner) -> (Ctx, TempDir, Arc<FakeRunner>) {
-    build(runner, MemoryKeychain::with_token("rb_test_token"))
+pub async fn ctx_and_runner(runner: FakeRunner) -> (Ctx, TempDir, Arc<FakeRunner>) {
+    build(runner, MemoryKeychain::with_token("rb_test_token")).await
 }
 
-fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, Arc<FakeRunner>) {
+async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, Arc<FakeRunner>) {
     let home = TempDir::new().expect("tempdir");
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
-    std::fs::create_dir_all(paths.root()).expect("create ~/.riabuild");
+    tokio::fs::create_dir_all(paths.root())
+        .await
+        .expect("create ~/.riabuild");
 
     let fake = Arc::new(runner);
     let runner: Arc<dyn CommandRunner> = fake.clone();
@@ -77,9 +80,11 @@ fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, Arc<Fak
 }
 
 /// Writes a file and every directory above it.
-pub fn write_file(path: &std::path::Path, contents: &str) {
+pub async fn write_file(path: &std::path::Path, contents: &str) {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent");
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("create parent");
     }
-    std::fs::write(path, contents).expect("write file");
+    tokio::fs::write(path, contents).await.expect("write file");
 }

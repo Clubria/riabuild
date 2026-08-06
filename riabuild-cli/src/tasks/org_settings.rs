@@ -12,9 +12,11 @@
 use super::{Ctx, Status, Task, TaskId};
 use crate::api::org;
 use anyhow::Result;
+use async_trait::async_trait;
 
 pub struct OrgSettings;
 
+#[async_trait]
 impl Task for OrgSettings {
     fn id(&self) -> TaskId {
         "org_settings"
@@ -32,13 +34,13 @@ impl Task for OrgSettings {
         &["login"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let file = ctx.paths.org_settings_file();
-        if !file.exists() {
+        if !tokio::fs::try_exists(&file).await.unwrap_or(false) {
             return Ok(Status::needs("the team settings have not been fetched yet"));
         }
 
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = tokio::fs::read_to_string(&file).await else {
             return Ok(Status::needs("the cached team settings cannot be read"));
         };
         if serde_json::from_str::<serde_json::Value>(&text).is_err() {
@@ -48,23 +50,23 @@ impl Task for OrgSettings {
         }
 
         // The authoritative comparison: what the server says it published.
-        let remote = org::fetch_claude_settings(&ctx.api)?;
+        let remote = org::fetch_claude_settings(&ctx.api).await?;
         match ctx.config.org_settings_updated_at {
             Some(cached) if cached == remote.updated_at => Ok(Status::Satisfied),
             _ => Ok(Status::needs("the team settings changed")),
         }
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let remote = org::fetch_claude_settings(&ctx.api)?;
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+        let remote = org::fetch_claude_settings(&ctx.api).await?;
         let file = ctx.paths.org_settings_file();
         if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        std::fs::write(&file, serde_json::to_string_pretty(&remote.settings)?)?;
+        tokio::fs::write(&file, serde_json::to_string_pretty(&remote.settings)?).await?;
 
         ctx.config.org_settings_updated_at = Some(remote.updated_at);
-        ctx.config.save(ctx.paths.as_ref())?;
+        ctx.config.save(ctx.paths.as_ref()).await?;
         Ok(())
     }
 }
@@ -75,23 +77,23 @@ mod tests {
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
 
-    #[test]
-    fn a_missing_cache_needs_fetching() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
-        let status = OrgSettings.check(&ctx).unwrap();
+    #[tokio::test]
+    async fn a_missing_cache_needs_fetching() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let status = OrgSettings.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("not been fetched"),
             "{status:?}"
         );
     }
 
-    #[test]
-    fn a_corrupt_cache_is_detected_without_asking_the_server() {
+    #[tokio::test]
+    async fn a_corrupt_cache_is_detected_without_asking_the_server() {
         // No network here on purpose: invalid JSON on disk is enough to know the
         // machine is wrong.
-        let (ctx, _home) = ctx_with(FakeRunner::new());
-        write_file(&ctx.paths.org_settings_file(), "{ not json");
-        let status = OrgSettings.check(&ctx).unwrap();
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_file(&ctx.paths.org_settings_file(), "{ not json").await;
+        let status = OrgSettings.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("not valid JSON"),
             "{status:?}"

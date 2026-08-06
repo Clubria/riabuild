@@ -25,6 +25,27 @@ outside `runner.rs`. This is what makes `check()` unit-testable against canned `
 `git`, `node`, and `claude` output. Bypassing it means the only way to test a task is to
 have a real machine in a real state, and the suite gets abandoned.
 
+**All IO is async.** riabuild runs on a current-thread tokio runtime. Filesystem work goes
+through `tokio::fs`, HTTP through `reqwest`, and subprocesses through `tokio::process` —
+never `std::fs` or `std::process`. A blocking call on the runtime thread stalls every
+other future on it, and the symptom is a provisioner that hangs on someone else's laptop
+with no output and no error to send anyone.
+
+The exception is **stdio**. `ui.rs` writes with `println!`/`eprintln!`, and
+`run_interactive` hands the terminal to a child process — that is a handoff, not IO
+riabuild performs. Async stdout buys nothing for line-at-a-time terminal output.
+
+Three things are synchronous because they are not IO, and are not exceptions to anything:
+`paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
+candidates, and tarball extraction is CPU work over an in-memory buffer — `extract_tarball`
+writes through the `tar` crate, which is synchronous, so making the directory calls around
+it async would be theatre.
+
+Note that `tokio::fs` is `std::fs` on a blocking threadpool: no portable async file API
+exists. "Current-thread" describes the reactor, not the process, and the binary does have
+threads. Closures cannot be async, so `and_then`/`unwrap_or_else` chains around IO have to
+be unrolled into `match` or `let else` rather than kept for tidiness.
+
 **`apply()` must be safe to run twice.** Tasks re-run whenever a dependency changes, a
 version bumps, or a check fails. There is no "already done" branch to rely on.
 

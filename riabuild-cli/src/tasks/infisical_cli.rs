@@ -9,11 +9,13 @@ use crate::runner::RunOptions;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 
 const MIN_VERSION: &str = "0.30.0";
 
 pub struct InfisicalCli;
 
+#[async_trait]
 impl Task for InfisicalCli {
     fn id(&self) -> TaskId {
         "infisical_cli"
@@ -31,13 +33,14 @@ impl Task for InfisicalCli {
         &[]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         if ctx.runner.which("infisical").is_none() {
             return Ok(Status::needs("infisical is not installed"));
         }
         let output = ctx
             .runner
-            .run("infisical", &["--version"], &RunOptions::default())?;
+            .run("infisical", &["--version"], &RunOptions::default())
+            .await?;
         let reported = format!("{}{}", output.stdout, output.stderr);
         if !version::at_least(&reported, MIN_VERSION) {
             return Ok(Status::needs(format!(
@@ -47,7 +50,7 @@ impl Task for InfisicalCli {
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         if ctx.runner.which("brew").is_none() {
             return Err(Failure::new(
                 "installing the Infisical CLI",
@@ -58,19 +61,25 @@ impl Task for InfisicalCli {
         }
 
         ctx.ui.note("Installing infisical with Homebrew…");
-        let output = ctx.runner.run(
-            "brew",
-            &["install", "infisical/get-cli/infisical"],
-            &RunOptions::default(),
-        )?;
+        let output = ctx
+            .runner
+            .run(
+                "brew",
+                &["install", "infisical/get-cli/infisical"],
+                &RunOptions::default(),
+            )
+            .await?;
 
         if !output.ok() {
             // Already-installed-but-outdated takes a different verb.
-            let upgrade = ctx.runner.run(
-                "brew",
-                &["upgrade", "infisical/get-cli/infisical"],
-                &RunOptions::default(),
-            )?;
+            let upgrade = ctx
+                .runner
+                .run(
+                    "brew",
+                    &["upgrade", "infisical/get-cli/infisical"],
+                    &RunOptions::default(),
+                )
+                .await?;
             if !upgrade.ok() {
                 return Err(Failure::new(
                     "installing the Infisical CLI",
@@ -91,39 +100,39 @@ mod tests {
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
 
-    #[test]
-    fn a_current_infisical_is_satisfied() {
+    #[tokio::test]
+    async fn a_current_infisical_is_satisfied() {
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
-        assert_eq!(InfisicalCli.check(&ctx).unwrap(), Status::Satisfied);
+        let (ctx, _home) = ctx_with(runner).await;
+        assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
-    #[test]
-    fn an_old_infisical_is_detected() {
+    #[tokio::test]
+    async fn an_old_infisical_is_detected() {
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.12.0", "");
-        let (ctx, _home) = ctx_with(runner);
+        let (ctx, _home) = ctx_with(runner).await;
         assert!(matches!(
-            InfisicalCli.check(&ctx).unwrap(),
+            InfisicalCli.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn a_missing_infisical_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn a_missing_infisical_is_detected() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
-            InfisicalCli.check(&ctx).unwrap(),
+            InfisicalCli.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn the_check_never_looks_for_a_stored_credential() {
+    #[tokio::test]
+    async fn the_check_never_looks_for_a_stored_credential() {
         // Guards the design rule: presence of a token is not part of "healthy",
         // because riabuild never installs one.
         let runner = FakeRunner::new().with("infisical --version", 0, "Infisical CLI v0.41.89", "");
-        let (ctx, _home) = ctx_with(runner);
-        InfisicalCli.check(&ctx).unwrap();
+        let (ctx, _home) = ctx_with(runner).await;
+        InfisicalCli.check(&ctx).await.unwrap();
         let calls = format!("{:?}", ctx.runner.which("infisical"));
         assert!(!calls.contains("login"));
     }

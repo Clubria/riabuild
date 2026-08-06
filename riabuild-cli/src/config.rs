@@ -25,18 +25,19 @@ pub struct State {
 }
 
 impl State {
-    pub fn load(paths: &dyn Paths) -> Self {
+    pub async fn load(paths: &dyn Paths) -> Self {
         // Deliberately infallible: a state file we cannot read means we do not
         // know what has been done, and the correct response to that is to check
         // everything again.
-        std::fs::read_to_string(paths.state_file())
+        tokio::fs::read_to_string(paths.state_file())
+            .await
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
     }
 
-    pub fn save(&self, paths: &dyn Paths) -> Result<()> {
-        write_json(&paths.state_file(), self)
+    pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
+        write_json(&paths.state_file(), self).await
     }
 
     pub fn mark_satisfied(&mut self, id: &str, version: u32, reason: &str) {
@@ -79,25 +80,28 @@ pub struct UserConfig {
 }
 
 impl UserConfig {
-    pub fn load(paths: &dyn Paths) -> Self {
-        std::fs::read_to_string(paths.config_file())
+    pub async fn load(paths: &dyn Paths) -> Self {
+        tokio::fs::read_to_string(paths.config_file())
+            .await
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
     }
 
-    pub fn save(&self, paths: &dyn Paths) -> Result<()> {
-        write_json(&paths.config_file(), self)
+    pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
+        write_json(&paths.config_file(), self).await
     }
 }
 
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, format!("{text}\n"))
+    tokio::fs::write(path, format!("{text}\n"))
+        .await
         .with_context(|| format!("could not write {}", path.display()))?;
     Ok(())
 }
@@ -117,8 +121,9 @@ pub fn now_millis() -> u64 {
 }
 
 /// Modification time of a file in epoch milliseconds, or 0 if unknown.
-pub fn modified_millis(path: &Path) -> u64 {
-    std::fs::metadata(path)
+pub async fn modified_millis(path: &Path) -> u64 {
+    tokio::fs::metadata(path)
+        .await
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -132,33 +137,35 @@ mod tests {
     use crate::paths::RealPaths;
     use tempfile::TempDir;
 
-    #[test]
-    fn round_trips_state() {
+    #[tokio::test]
+    async fn round_trips_state() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
 
         let mut state = State::default();
         state.mark_satisfied("login", 1, "never_run");
-        state.save(&paths).unwrap();
+        state.save(&paths).await.unwrap();
 
-        let loaded = State::load(&paths);
+        let loaded = State::load(&paths).await;
         assert_eq!(loaded.tasks["login"].version, 1);
         assert_eq!(loaded.tasks["login"].last_reason, "never_run");
     }
 
-    #[test]
-    fn unreadable_state_means_run_everything() {
+    #[tokio::test]
+    async fn unreadable_state_means_run_everything() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
-        std::fs::create_dir_all(paths.root()).unwrap();
-        std::fs::write(paths.state_file(), "{{{ not json").unwrap();
+        tokio::fs::create_dir_all(paths.root()).await.unwrap();
+        tokio::fs::write(paths.state_file(), "{{{ not json")
+            .await
+            .unwrap();
 
         // Not an error: a machine we cannot describe is a machine we re-check.
-        assert!(State::load(&paths).tasks.is_empty());
+        assert!(State::load(&paths).await.tasks.is_empty());
     }
 
-    #[test]
-    fn round_trips_user_config() {
+    #[tokio::test]
+    async fn round_trips_user_config() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
         let config = UserConfig {
@@ -166,9 +173,9 @@ mod tests {
             node_version: Some("22.23.1".into()),
             ..Default::default()
         };
-        config.save(&paths).unwrap();
+        config.save(&paths).await.unwrap();
 
-        let loaded = UserConfig::load(&paths);
+        let loaded = UserConfig::load(&paths).await;
         assert_eq!(loaded.project_path.as_deref(), Some("/Users/ada/code/hub"));
         assert_eq!(loaded.node_version.as_deref(), Some("22.23.1"));
         assert_eq!(loaded.claude_profile, None);

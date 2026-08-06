@@ -18,9 +18,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -137,72 +138,82 @@ fn urldecode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn respond(stream: &mut TcpStream, title: &str, detail: &str) {
+/// Errors are swallowed on purpose: a browser that hangs up before reading the
+/// courtesy page must not fail a login that has already succeeded.
+async fn respond(stream: &mut TcpStream, title: &str, detail: &str) {
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>riabuild</title>\
          <body style=\"font:16px/1.5 -apple-system,system-ui,sans-serif;padding:3rem\">\
          <h1 style=\"font-size:1.4rem\">{title}</h1><p>{detail}</p></body>"
     );
-    let _ = write!(
-        stream,
+    let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.flush();
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
 }
 
 /// Waits for the browser to come back. Rejects any callback whose `state` is not
 /// the one this process generated.
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
+async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
+    // The timeout wraps the whole accept loop rather than a single accept:
+    // favicon requests and stray probes `continue`, and a per-accept timeout
+    // would hand each of them a fresh three-minute budget.
+    let wait = async {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
 
-    while Instant::now() < deadline {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                let mut line = String::new();
-                BufReader::new(&stream).read_line(&mut line)?;
+            let mut line = String::new();
+            let mut reader = BufReader::new(&mut stream);
+            // One connection that opens and then says nothing must not park a
+            // real callback behind it. The outer timeout would eventually fire,
+            // but this keeps a stalled probe from consuming the whole window.
+            if timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .is_err()
+            {
+                continue;
+            }
 
-                match parse_callback(line.trim_end()) {
-                    Some((code, state)) if state == expected_state => {
-                        respond(
-                            &mut stream,
-                            "You are signed in.",
-                            "riabuild has what it needs. You can close this tab.",
-                        );
-                        return Ok(code);
-                    }
-                    Some(_) => {
-                        respond(
-                            &mut stream,
-                            "That did not come from riabuild.",
-                            "The sign-in was not the one this terminal started. Run <code>riabuild login</code> again.",
-                        );
-                        return Err(anyhow!(
-                            "the browser came back with a sign-in riabuild did not start"
-                        ));
-                    }
-                    None => {
-                        // Favicon requests and stray probes land here.
-                        respond(&mut stream, "riabuild", "Nothing to do here.");
-                    }
+            match parse_callback(line.trim_end()) {
+                Some((code, state)) if state == expected_state => {
+                    respond(
+                        &mut stream,
+                        "You are signed in.",
+                        "riabuild has what it needs. You can close this tab.",
+                    )
+                    .await;
+                    return Ok(code);
+                }
+                Some(_) => {
+                    respond(
+                        &mut stream,
+                        "That did not come from riabuild.",
+                        "The sign-in was not the one this terminal started. Run <code>riabuild login</code> again.",
+                    )
+                    .await;
+                    return Err(anyhow!(
+                        "the browser came back with a sign-in riabuild did not start"
+                    ));
+                }
+                None => {
+                    // Favicon requests and stray probes land here.
+                    respond(&mut stream, "riabuild", "Nothing to do here.").await;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(120));
-            }
-            Err(error) => return Err(error.into()),
         }
-    }
+    };
 
-    Err(anyhow!("no reply from the browser within three minutes"))
+    timeout(LOGIN_TIMEOUT, wait)
+        .await
+        .map_err(|_| anyhow!("no reply from the browser within three minutes"))?
 }
 
-fn device_label(runner: &dyn CommandRunner) -> String {
+async fn device_label(runner: &dyn CommandRunner) -> String {
     let hostname = runner
         .run("hostname", &[], &RunOptions::default())
+        .await
         .ok()
         .filter(|output| output.ok())
         .map(|output| output.trimmed().to_string())
@@ -210,7 +221,7 @@ fn device_label(runner: &dyn CommandRunner) -> String {
     hostname.unwrap_or_else(|| "this machine".to_string())
 }
 
-fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
+async fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -218,6 +229,7 @@ fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
     };
     runner
         .run(opener, &[url], &RunOptions::default())
+        .await
         .map(|output| output.ok())
         .unwrap_or(false)
 }
@@ -230,14 +242,14 @@ struct TokenResponse {
 
 /// Runs the whole flow and returns the session token. The caller stores it in
 /// the keychain; it is never written to `~/.riabuild`.
-pub fn login(
+pub async fn login(
     api: &ApiClient,
     runner: &dyn CommandRunner,
     ui: &Ui,
     web_url: &str,
     version: &str,
 ) -> Result<(String, Member)> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| {
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
         Failure::new(
             "opening a local port for the browser to come back to",
             "Check whether something is blocking loopback connections, then run `riabuild login` again.",
@@ -247,27 +259,31 @@ pub fn login(
     let port = listener.local_addr()?.port();
 
     let flow = LoginFlow::new();
-    let label = device_label(runner);
+    let label = device_label(runner).await;
     let url = flow.authorize_url(web_url, port, &label, version);
 
     ui.heading("Signing this machine in to riabuild");
-    if !open_browser(runner, &url) {
+    if !open_browser(runner, &url).await {
         ui.note("Could not open your browser. Open this link yourself:");
     }
     ui.note(&url);
 
-    let code = wait_for_code(&listener, &flow.state).map_err(|error| {
-        Failure::new(
-            "waiting for you to approve this machine in the browser",
-            "Run `riabuild login` again and approve the request.",
-        )
-        .detail(error.to_string())
-    })?;
+    let code = wait_for_code(&listener, &flow.state)
+        .await
+        .map_err(|error| {
+            Failure::new(
+                "waiting for you to approve this machine in the browser",
+                "Run `riabuild login` again and approve the request.",
+            )
+            .detail(error.to_string())
+        })?;
 
-    let response: TokenResponse = api.post_json(
-        "/api/v1/cli/token",
-        serde_json::json!({ "code": code, "verifier": flow.verifier }),
-    )?;
+    let response: TokenResponse = api
+        .post_json(
+            "/api/v1/cli/token",
+            serde_json::json!({ "code": code, "verifier": flow.verifier }),
+        )
+        .await?;
 
     Ok((response.token, response.member))
 }

@@ -9,6 +9,7 @@ use crate::runner::RunOptions;
 use crate::ui::Failure;
 use crate::version;
 use anyhow::Result;
+use async_trait::async_trait;
 use rand::RngCore;
 use std::path::Path;
 
@@ -43,15 +44,28 @@ pub fn looks_like_profile_id(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-fn existing_profile(claude_dir: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(claude_dir).ok()?;
-    entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find(|name| looks_like_profile_id(name))
+async fn existing_profile(claude_dir: &Path) -> Option<String> {
+    // tokio::fs::read_dir is a cursor rather than an iterator, so this cannot
+    // stay a combinator chain: each step needs its own await.
+    let mut entries = tokio::fs::read_dir(claude_dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if looks_like_profile_id(&name) {
+            return Some(name);
+        }
+    }
+    None
 }
 
+#[async_trait]
 impl Task for ClaudeProfiles {
     fn id(&self) -> TaskId {
         "claude_profiles"
@@ -71,13 +85,14 @@ impl Task for ClaudeProfiles {
         &["toolchain"]
     }
 
-    fn check(&self, ctx: &Ctx) -> Result<Status> {
+    async fn check(&self, ctx: &Ctx) -> Result<Status> {
         if ctx.runner.which("claude").is_none() {
             return Ok(Status::needs("Claude Code is not installed"));
         }
         let reported = ctx
             .runner
-            .run("claude", &["--version"], &RunOptions::default())?;
+            .run("claude", &["--version"], &RunOptions::default())
+            .await?;
         if !version::at_least(reported.trimmed(), MIN_VERSION) {
             return Ok(Status::needs(format!(
                 "Claude Code is older than {MIN_VERSION}"
@@ -85,7 +100,7 @@ impl Task for ClaudeProfiles {
         }
 
         let claude_dir = ctx.paths.claude_dir();
-        let Some(profile) = existing_profile(&claude_dir) else {
+        let Some(profile) = existing_profile(&claude_dir).await else {
             return Ok(Status::needs("no Claude Code profile yet"));
         };
         // A recorded profile that has since been deleted is drift a file-exists
@@ -97,32 +112,36 @@ impl Task for ClaudeProfiles {
         Ok(Status::Satisfied)
     }
 
-    fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         if ctx.runner.which("claude").is_none() {
-            install_claude(ctx)?;
+            install_claude(ctx).await?;
         }
 
         let claude_dir = ctx.paths.claude_dir();
-        std::fs::create_dir_all(&claude_dir)?;
+        tokio::fs::create_dir_all(&claude_dir).await?;
 
-        let profile = existing_profile(&claude_dir).unwrap_or_else(new_profile_id);
-        std::fs::create_dir_all(claude_dir.join(&profile))?;
+        // Not `unwrap_or_else`: the lookup awaits, and a closure cannot.
+        let profile = match existing_profile(&claude_dir).await {
+            Some(found) => found,
+            None => new_profile_id(),
+        };
+        tokio::fs::create_dir_all(claude_dir.join(&profile)).await?;
 
         ctx.config.claude_profile = Some(profile);
-        ctx.config.save(ctx.paths.as_ref())?;
+        ctx.config.save(ctx.paths.as_ref()).await?;
         Ok(())
     }
 }
 
-fn install_claude(ctx: &mut Ctx) -> Result<()> {
-    let node_version = ctx
-        .config
-        .node_version
-        .clone()
-        .unwrap_or_else(|| super::toolchain::desired_node(ctx.project_dir().as_deref()));
+async fn install_claude(ctx: &mut Ctx) -> Result<()> {
+    let node_version = match ctx.config.node_version.clone() {
+        Some(pinned) => pinned,
+        // Not `unwrap_or_else`: the fallback awaits, and a closure cannot.
+        None => super::toolchain::desired_node(ctx.project_dir().as_deref()).await,
+    };
     let npm = ctx.paths.node_dir(&node_version).join("bin").join("npm");
 
-    if !npm.exists() {
+    if !tokio::fs::try_exists(&npm).await.unwrap_or(false) {
         return Err(Failure::new(
             "installing Claude Code",
             "Run `riabuild` again — the Node install has to finish first.",
@@ -132,11 +151,14 @@ fn install_claude(ctx: &mut Ctx) -> Result<()> {
     }
 
     ctx.ui.note("Installing Claude Code…");
-    let output = ctx.runner.run(
-        &npm.to_string_lossy(),
-        &["install", "-g", "@anthropic-ai/claude-code"],
-        &RunOptions::default(),
-    )?;
+    let output = ctx
+        .runner
+        .run(
+            &npm.to_string_lossy(),
+            &["install", "-g", "@anthropic-ai/claude-code"],
+            &RunOptions::default(),
+        )
+        .await?;
     if !output.ok() {
         return Err(Failure::new(
             "installing Claude Code",
@@ -173,45 +195,50 @@ mod tests {
         assert!(!looks_like_profile_id(""));
     }
 
-    #[test]
-    fn a_missing_claude_is_detected() {
-        let (ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn a_missing_claude_is_detected() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(matches!(
-            ClaudeProfiles.check(&ctx).unwrap(),
+            ClaudeProfiles.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn an_installed_claude_without_a_profile_is_detected() {
+    #[tokio::test]
+    async fn an_installed_claude_without_a_profile_is_detected() {
         let (ctx, _home) =
-            ctx_with(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
-        let status = ClaudeProfiles.check(&ctx).unwrap();
+            ctx_with(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""))
+                .await;
+        let status = ClaudeProfiles.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("profile"), "{status:?}");
     }
 
-    #[test]
-    fn a_deleted_profile_directory_is_noticed() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
-        std::fs::create_dir_all(ctx.paths.claude_dir()).unwrap();
+    #[tokio::test]
+    async fn a_deleted_profile_directory_is_noticed() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        tokio::fs::create_dir_all(ctx.paths.claude_dir())
+            .await
+            .unwrap();
         ctx.config.claude_profile = Some(new_profile_id());
         ctx.runner =
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
         // The directory recorded in config.json is gone from disk.
         assert!(matches!(
-            ClaudeProfiles.check(&ctx).unwrap(),
+            ClaudeProfiles.check(&ctx).await.unwrap(),
             Status::Needs(_)
         ));
     }
 
-    #[test]
-    fn a_profile_on_disk_is_satisfied() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new());
+    #[tokio::test]
+    async fn a_profile_on_disk_is_satisfied() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         let profile = new_profile_id();
-        std::fs::create_dir_all(ctx.paths.claude_dir().join(&profile)).unwrap();
+        tokio::fs::create_dir_all(ctx.paths.claude_dir().join(&profile))
+            .await
+            .unwrap();
         ctx.config.claude_profile = Some(profile);
         ctx.runner =
             Arc::new(FakeRunner::new().with("claude --version", 0, "2.1.221 (Claude Code)", ""));
-        assert_eq!(ClaudeProfiles.check(&ctx).unwrap(), Status::Satisfied);
+        assert_eq!(ClaudeProfiles.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 }
