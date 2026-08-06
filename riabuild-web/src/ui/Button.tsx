@@ -61,7 +61,7 @@ export function Button({
 }) {
   const spinner = useSpinner(pending);
   const className =
-    "inline-flex max-w-full items-center gap-1.5 border px-2.5 py-1 text-xs tracking-wider uppercase no-underline transition-colors disabled:cursor-not-allowed disabled:opacity-45 " +
+    "appearance-none inline-flex max-w-full items-center gap-1.5 border px-2.5 py-1 text-xs tracking-wider uppercase no-underline transition-colors disabled:cursor-not-allowed disabled:opacity-45 " +
     VARIANT[variant];
 
   const label = (

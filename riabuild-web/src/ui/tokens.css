@@ -59,6 +59,42 @@ body {
   border-radius: 1px;
 }
 
+/* Every control we style is `appearance: none` first (see CONTROL_CLASS). That
+   strips the select's arrow along with the rest of the OS widget, so the shell
+   draws one back. The caret is a pseudo-element for the same reason the frame
+   corners are: it is decoration, and a screen reader reading "black
+   down-pointing small triangle" after every value is noise. */
+.select-shell {
+  position: relative;
+}
+
+.select-shell > select {
+  padding-right: 1.5rem;
+  cursor: pointer;
+}
+
+.select-shell::after {
+  content: "▾";
+  position: absolute;
+  top: 50%;
+  right: 0.5rem;
+  translate: 0 -50%;
+  color: var(--color-fg-dim);
+  pointer-events: none;
+}
+
+.select-shell:has(> select:disabled)::after {
+  opacity: 0.5;
+}
+
+/* The open list is drawn by the OS and takes almost no styling. These two
+   properties are the part that lands, and they keep the popup on our own
+   background instead of system grey. */
+.select-shell option {
+  background: var(--color-bg-raised);
+  color: var(--color-fg);
+}
+
 /* The one moving thing on the page. */
 @keyframes blink {
   0%,

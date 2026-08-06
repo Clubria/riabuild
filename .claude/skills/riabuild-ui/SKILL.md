@@ -1,6 +1,6 @@
 ---
 name: riabuild-ui
-description: Use when building, changing, styling or reviewing any user interface in riabuild-web — a page, a route, a component, a form, a table, a state, an error screen, CSS or design tokens. Covers the fake-TUI visual system, the src/ui component library, and the rules for extending it.
+description: Use when building, changing, styling or reviewing any user interface in riabuild-web — a page, a route, a component, a form, a table, a state, an error screen, CSS or design tokens — or when a control looks out of place, unstyled, native, or as though the operating system drew it instead of the page. Covers the fake-TUI visual system, the src/ui component library, and the rules for extending it.
 ---
 
 # The riabuild console
@@ -51,7 +51,10 @@ not ours.
 | `KeyValue` | the machine-fact grid |
 | `DataTable` | **any** list of rows with actions |
 
-A page never hand-rolls a button, an input, a badge or a box.
+A page never hand-rolls a button, an input, a badge or a box. **A raw `<select>`,
+`<input>`, `<button>` or `<textarea>` outside `src/ui/` is a bug** — it is how a control
+ends up styled once, inconsistently, with `appearance: none` forgotten. Needs something the
+library lacks? Extend the library (below); do not style an element locally.
 
 ### Extending it
 
@@ -82,6 +85,32 @@ are the same red.
 **Every foreground token clears 4.5:1 against every background token.** If you change one,
 recompute — `fg-faint` was originally 3.18:1 and axe caught it across 18 nodes. There is a
 contrast script pattern in the spec; the visual suite fails on any regression.
+
+### Controls we draw ourselves
+
+**Every element we give our own look sets `appearance: none` first.** Not "usually", not
+"when it looks off" — every one, including `<button>`.
+
+`tokens.css` sets `color-scheme: dark`, so a control without it gets the browser's *dark*
+native widget — its own fill, radius, arrow and font — drawn **inside** our border rather
+than instead of it. Two nested controls, one of them foreign, and it looks foreign on
+macOS long before it looks wrong in headless Chrome. `select`, `button`, checkbox, radio,
+range, file and number inputs all do this by default. One is enough to stop the page being
+a terminal.
+
+Reuse `CONTROL_CLASS` from `src/ui/Field.tsx` — it leads with `appearance-none`. A control
+that cannot reuse it puts `appearance-none` first in its own class list.
+
+**Stripping the widget takes its affordances with it. Draw them back.** `Select` is the
+worked example: no native arrow survives `appearance: none`, so `.select-shell::after`
+draws a `▾`. Note where it lives — a pseudo-element, per the rule below, because a caret in
+the DOM gets announced after every value. Losing the arrow is the rule working, not a
+reason to drop it.
+
+Prefer a real element with our styling over a re-implementation. `Select` stays a native
+`<select>` underneath: the browser's keyboard handling, typeahead and mobile picker are
+worth more than a styleable option list. The open list is OS-drawn and barely styleable —
+that is the trade, and it is the right one.
 
 ### Drawing the frame
 
