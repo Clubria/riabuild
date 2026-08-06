@@ -50,7 +50,7 @@ underneath a new command would bury them.
 |---|---|
 | **A** | `members.publicId` as required schema, the backfill and its staged deploy, the `memberPayload` field, and `Member.public_id` in the CLI |
 | **B** | `Paths::tools_root()` and the root override, the namespace environment on `Ctx`, remote token-store selection, a target parameter on `download.rs` |
-| **C** | `riabuild remote` — identity, host trust, install, setup, shell — and the container test |
+| **C** | `riabuild remote` — identity, host trust, install, setup, shell, the per-session GitHub credential — and the container test |
 
 ---
 
@@ -140,15 +140,17 @@ RIABUILD_ROOT=~/.riabuild-remote/<public-id>
 RIABUILD_REMOTE=1
 ```
 
-Two variables, and the server's riabuild derives the rest: `GH_CONFIG_DIR`,
-`GIT_CONFIG_GLOBAL` and the Claude profile directory all hang off `root()`. Deriving them
-rather than passing them means the server's own re-runs — from inside the mosh shell, with
-no laptop attached — produce exactly the same environment.
+Two variables, and the server's riabuild derives the rest. `GIT_CONFIG_GLOBAL` and the
+Claude profile directory hang off `root()`; `GH_CONFIG_DIR` hangs off the runtime directory
+instead, for the reasons in *The GitHub credential lives only as long as a session*.
+Deriving them rather than passing them means the server's own re-runs — from inside the
+mosh shell, with no laptop attached — produce exactly the same environment.
 
-`RIABUILD_REMOTE=1` means three things, and they are one idea: this riabuild is managed
-from a laptop. It selects the file token store over the platform keychain, it suppresses
-the self-update check because no package manager owns that binary, and it puts the server's
-name in the shell banner.
+`RIABUILD_REMOTE=1` means four things, and they are one idea: this riabuild is managed from
+a laptop. It selects the file token store over the platform keychain, it puts the GitHub
+configuration in a per-session runtime directory, it suppresses the self-update check
+because no package manager owns that binary, and it puts the server's name in the shell
+banner.
 
 The `<public-id>` is the driving developer's own, taken from the member record the laptop
 already holds.
@@ -342,7 +344,7 @@ sit outside it, and the first is dangerous because it fails silently:
 
 | Shared state | What goes wrong | Fix |
 |---|---|---|
-| `~/.config/gh/hosts.yml` | Bob's `gh` is authenticated as Alice: clones, PRs and the org-membership check all run as the wrong person, and nothing errors | `GH_CONFIG_DIR=<ns>/gh-config` |
+| `~/.config/gh/hosts.yml` | Bob's `gh` is authenticated as Alice: clones, PRs and the org-membership check all run as the wrong person, and nothing errors | `GH_CONFIG_DIR` into a per-session runtime directory — see below |
 | `~/.gitconfig` | commits attributed to whoever provisioned last; `gh`'s credential helper writes here too | `GIT_CONFIG_GLOBAL=<ns>/gitconfig`, written with the member's own name and email |
 | `~/Clubria/<repo>` | two developers, one working tree, two sets of branches, one `.env.local` | the checkout moves to `~/Clubria/<login>/<repo>` |
 
@@ -371,7 +373,9 @@ and belongs to another namespace, riabuild claims `<login>-2` rather than sharin
 
 **Namespaces prevent collisions, not snooping.** Every namespace is owned by the same Unix
 user, so mode bits buy nothing between developers on that box: Alice can read Bob's
-`session.token`, his `.env.local`, and his gh token.
+`session.token`, his `.env.local`, and — while his session is live — his gh token. Making
+the GitHub credential per-session narrows *when* that last one is there; it does not make
+it private.
 
 Sharing an account is therefore a decision that those developers are mutually trusted —
 which they largely already are, holding the same Infisical secrets. What they gain over
@@ -387,6 +391,101 @@ Each namespace holds one, naming the member it belongs to — login, display nam
 The directory name is an opaque id, and somebody with a shell on that box has to be able
 to tell whose namespace they are looking at. riabuild also reads its siblings, to name who
 else shares the account when that matters.
+
+---
+
+# The GitHub credential lives only as long as a session
+
+A `gh` OAuth token is the developer's whole GitHub account, and a shared box is the last
+place it should sit at rest. So it is the one piece of state that is **not** namespaced onto
+disk:
+
+```
+GH_CONFIG_DIR = <runtime>/riabuild-gh-<public-id>/
+```
+
+`<runtime>` is the first of `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp` that exists. The order
+matters: `$XDG_RUNTIME_DIR` is a per-uid tmpfs that logind clears, so on a systemd host the
+token never touches a disk at all; `$TMPDIR` is the per-user directory macOS provides; `/tmp`
+is the floor that always works. The directory is created 0700 with `mkdtemp` semantics,
+because `/tmp` is world-writable and sticky and a predictable name there is an invitation.
+
+The tree is removed when the last session using it ends.
+
+## What this is, and is not
+
+**It is:** no GitHub credential at rest between sessions. A backup, a disk image, a
+snapshot, or somebody who gets a shell on that box tomorrow finds nothing.
+
+**It is not** protection from a co-tenant during a live session. Alice and Bob share a uid,
+so while Alice's session is up her `hosts.yml` is as readable to Bob as anything else of
+hers. `0700` is doing nothing between them.
+
+**It is not revocation.** `gh` deletes the local credential; the OAuth grant stays valid on
+GitHub's side. A token captured during a live session keeps working afterwards. Only
+revoking it on github.com stops that.
+
+Calling this "per-use" the way the Infisical brokering is per-use would be a lie. It
+narrows a window; it does not close one.
+
+## Why the riabuild session is treated differently
+
+`session.token` stays in the namespace, persistent, while the GitHub token does not. That
+asymmetry is deliberate: the riabuild session is minted for one server, labelled after it,
+listed in the dashboard and revocable in a click, so its blast radius is that server. A
+GitHub token is the developer's identity everywhere. The weaker credential can afford to
+persist so that the server stays self-sufficient; the stronger one cannot.
+
+`.env.local` is the other secret at rest on that box, and it stays — the application reads
+it at runtime, so it cannot be ephemeral without breaking the thing riabuild exists to set
+up. Naming it here makes it a decision rather than an oversight.
+
+## Refcounting, and cleaning up after a crash
+
+The wipe has to survive a mosh session that dies with the laptop's battery, so it cannot
+rest on a clean exit path.
+
+```
+<runtime>/riabuild-gh-<public-id>/
+  hosts.yml            gh's own
+  sessions/<pid>       one marker per live riabuild session
+```
+
+- **On start**, a session writes its marker and, if `hosts.yml` already exists with a live
+  sibling marker, reuses the sign-in. Two terminals into one server therefore cost one
+  device-code dance, not two.
+- **On exit**, it removes its marker; the last one out removes the tree.
+- **On every riabuild run on that server**, before anything else: markers whose pid is dead
+  are swept, and a directory left with no live markers is wiped. This is the backstop that
+  actually matters, because it is the one that does not depend on the dying process getting
+  a chance to run code.
+- **`SIGTERM`, `SIGHUP` and `SIGINT`** wipe too, best effort. `SIGKILL` cannot be caught,
+  which is exactly why the sweep above exists.
+- A directory older than 24 hours with no live markers is wiped regardless, since pids are
+  recycled and a stale marker could otherwise match a live unrelated process.
+
+## What the developer sees
+
+`gh auth login` is now part of a normal session start rather than a sign that something
+drifted, so `github_cli` says so:
+
+```
+  ◐ GitHub CLI — signing in for this session
+    ! First copy your one-time code: 1A2B-3C4D
+      Open https://github.com/login/device in your browser
+```
+
+This is the cost of the property, paid once per server per session — and once per *server*,
+not once per terminal, which is what the refcounting buys. `riabuild remote --check` reports
+GitHub CLI as needing sign-in, correctly, because on a server it always will.
+
+`GIT_CONFIG_GLOBAL` stays in the namespace. What `gh auth setup-git` writes there is a
+credential *helper* line delegating to `gh`, not a credential, so it holds nothing worth
+wiping — and when the gh config is gone, `git push` fails until the next sign-in, which is
+the intended behaviour rather than a bug to work around.
+
+A laptop is untouched by all of this: `GH_CONFIG_DIR` is only set in remote mode, and a
+developer's own machine keeps the gh sign-in it has always had.
 
 ---
 
@@ -461,7 +560,6 @@ account. Only per-developer state is namespaced.
   state.json  config.json  org-settings.json
   session.token                       0600
   claude/<uuid>/                      CLAUDE_CONFIG_DIR
-  gh-config/                          GH_CONFIG_DIR
   gitconfig                           GIT_CONFIG_GLOBAL
   shell/  bin/  logs/
   owner.json
@@ -578,6 +676,7 @@ Each one has its own remedy, so each one is detected separately.
 | Deployment older than this CLI, so no `publicId` | the member payload fails to decode; riabuild says the dashboard needs deploying, rather than reporting a serde error as its own bug |
 | `mosh-server` missing, or UDP blocked | falls back to `ssh -t`, notes the install command |
 | Default checkout path owned by another namespace | claims `<login>-2` |
+| No writable runtime directory for the gh configuration | stop rather than fall back to the namespace; the property was the point |
 
 ---
 
@@ -615,10 +714,13 @@ entire flow testable with no server anywhere.
 | Auth-method probing | canned sshd refusals for password, keyboard-interactive and publickey-only |
 | Asset selection | `uname -sm` output per platform asserted against the exact release asset names |
 | Namespace environment | a task's `RunOptions` asserted to carry `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL` and the namespaced root — the check that stops the silent wrong-identity bug |
+| Runtime directory choice | `$XDG_RUNTIME_DIR`, then `$TMPDIR`, then `/tmp`, with the directory asserted 0700 |
+| Session refcounting | two sessions share one sign-in; the first to exit wipes nothing; the second wipes the tree |
+| Crash cleanup | a marker naming a dead pid is swept and its directory wiped on the next run, with no clean exit anywhere in the test |
 | `publicId` is required | a `/api/v1/me` payload without the field is a decode failure carrying the deploy-ordering message — never a default, never an unnamed namespace |
 | The backfill | a fixture member row without `publicId` gains one, and the required-schema push rejects a table the backfill missed |
 | Shared installs | two concurrent installs of one version, asserting one complete tree and two successes |
-| End to end | CI runs `riabuild remote` against an sshd container: two namespaces in one account, asserting isolated gh configuration, git identity and checkouts, and one shared toolchain |
+| End to end | CI runs `riabuild remote` against an sshd container: two namespaces in one account, asserting isolated gh configuration, git identity and checkouts, one shared toolchain, and no GitHub credential anywhere on the filesystem once both sessions have ended |
 
 That last row earns its cost for the same reason the Linux design's container test does. A
 namespace variable missing from one `gh` invocation produces a run that looks perfectly
@@ -635,4 +737,6 @@ healthy in every log and attributes a developer's work to somebody else.
   death; tmux is a separate change if it is wanted.
 - Reclaiming orphaned namespaces or superseded tool versions
 - Protecting developers sharing one Unix account from each other. See the trust boundary.
+- Revoking a GitHub token on sign-out. `gh` deletes the local credential and GitHub keeps
+  the grant; revocation is a github.com action riabuild does not drive.
 - Any change to `/api/v1` beyond the required `publicId` field
