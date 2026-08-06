@@ -164,7 +164,6 @@ info "scratch: $SCRATCH"
 CONVEX_PID=""
 STUB_PID=""
 KEYCHAIN=""
-SAVED_KEYCHAINS=""
 SAVED_ENV_LOCAL=""
 
 # Everything worth reading after a failure, with the two live credentials
@@ -194,12 +193,10 @@ teardown() {
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
   # `convex dev` spawns the backend as a child that does not always go with it.
   pkill -f convex-local-backend 2>/dev/null || true
-  if [ -n "$KEYCHAIN" ]; then
-    # Restore the search list before deleting, or `security` is left pointing at
-    # a keychain that no longer exists for the rest of the session.
-    [ -n "$SAVED_KEYCHAINS" ] && eval "security list-keychains -s $SAVED_KEYCHAINS" 2>/dev/null || true
-    security delete-keychain "$KEYCHAIN" 2>/dev/null || true
-  fi
+  # The keychain and the search list that names it both live inside the scratch
+  # tree, so the developer's own keychains were never touched and there is
+  # nothing to put back. Deleting it explicitly just tidies up securityd's view.
+  [ -n "$KEYCHAIN" ] && env HOME="$E2E_HOME" security delete-keychain "$KEYCHAIN" 2>/dev/null || true
   if [ -n "$SAVED_ENV_LOCAL" ] && [ -f "$SAVED_ENV_LOCAL" ]; then
     cp "$SAVED_ENV_LOCAL" "$REPO/riabuild-web/.env.local"
     printf 'restored riabuild-web/.env.local\n'
@@ -393,30 +390,38 @@ info "binary: $RIABUILD ($("$RIABUILD" --version))"
 step "Session token"
 
 if [ "$PLATFORM" = macos ]; then
-  # A keychain of our own, added to the search list rather than replacing it.
-  # riabuild's `security find-generic-password` has no -k, so it searches the
-  # list — which is what makes an isolated keychain work without teaching the
-  # product anything about tests.
+  # Every `security` call below runs with the same redirected HOME riabuild will
+  # run with, and that is the whole trick.
+  #
+  # The keychain *search list* is a per-user preference living in
+  # ~/Library/Preferences, not a global session setting. Register a keychain
+  # against the real home and a process whose HOME points elsewhere cannot see
+  # it — `security find-generic-password` searches a list that is simply not
+  # there. An earlier version of this set the keychain up with the real HOME,
+  # verified the read, passed, and then left riabuild reporting "not signed in",
+  # opening a browser and timing out three minutes later. The verification
+  # passed *because* it ran in the wrong environment.
+  KEYCHAIN="$SCRATCH/riabuild-e2e.keychain-db"
+  mkdir -p "$E2E_HOME/Library/Preferences"
+  keychain() { env HOME="$E2E_HOME" security "$@"; }
+
+  keychain create-keychain -p e2e "$KEYCHAIN"
+  keychain set-keychain-settings "$KEYCHAIN"   # no auto-lock
+  keychain unlock-keychain -p e2e "$KEYCHAIN"
+  # Ours is the only entry: nothing else in this throwaway home needs a
+  # keychain, so there is no real search list to save and put back either.
+  keychain list-keychains -s "$KEYCHAIN"
+  # The keychain is the trailing positional argument — `add-generic-password`
+  # has no -k, and passing one makes it fail rather than fall back.
   #
   # -A grants every application access. Without it the first read raises a GUI
   # authorisation prompt, and on a headless runner that is an indefinite hang
   # rather than a failure.
-  KEYCHAIN="$SCRATCH/riabuild-e2e.keychain-db"
-  SAVED_KEYCHAINS="$(security list-keychains -d user | sed 's/^ *//;s/"//g' | tr '\n' ' ')"
-  security create-keychain -p e2e "$KEYCHAIN"
-  security unlock-keychain -p e2e "$KEYCHAIN"
-  security set-keychain-settings "$KEYCHAIN"   # no lock timeout
-  # shellcheck disable=SC2086
-  security list-keychains -s $SAVED_KEYCHAINS "$KEYCHAIN"
-  # The keychain is the trailing positional argument — `add-generic-password`
-  # has no -k, and passing one makes it fail rather than fall back.
-  security add-generic-password -U -A \
+  keychain add-generic-password -U -A \
     -s com.clubria.riabuild -a session-token -w "$SESSION_TOKEN" "$KEYCHAIN"
 
-  # Prove it before the CLI depends on it. This is the read riabuild itself
-  # makes, so if the ACL or the search list is wrong it fails here, named,
-  # instead of as "this machine is not signed in" nine steps later.
-  STORED="$(security find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)"
+  # Read it back the way riabuild does, in the environment riabuild does it in.
+  STORED="$(keychain find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)"
   [ "$STORED" = "$SESSION_TOKEN" ] \
     || die "the token did not come back out of the Keychain (got: ${STORED:0:40})"
   pass "token stored in a dedicated Keychain and readable the way riabuild reads it"
@@ -681,8 +686,10 @@ fi
 if [ "$PLATFORM" = macos ]; then
   step "Signing out"
   riabuild logout >/dev/null 2>&1 || fail "logout did not exit 0"
+  # Same redirected HOME as everywhere else — asking with the real one would
+  # search a different keychain list and report success for the wrong reason.
   check_missing "the token is gone from the Keychain" \
-    "$(security find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)" \
+    "$(keychain find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)" \
     "$SESSION_TOKEN"
   # Must not open a browser, and must not fail: `--check` reports, it never applies.
   riabuild --check --no-shell >/dev/null 2>&1 && pass "a signed-out --check still reports" \
