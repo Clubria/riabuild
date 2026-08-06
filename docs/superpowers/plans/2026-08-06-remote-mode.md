@@ -1561,6 +1561,12 @@ async fn write_private_token(path: &Path, contents: &str) -> Result<()> {
         .open(path)
         .await?;
     file.write_all(contents.as_bytes()).await?;
+    drop(file);
+    // `OpenOptions::mode` applies at creation only, and `truncate` does not reset
+    // permissions. A file left looser by an interrupted write would otherwise be
+    // rewritten at its old mode — and this is the one file the "no secrets in
+    // ~/.riabuild" invariant is being amended for.
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
     Ok(())
 }
 
@@ -2675,9 +2681,15 @@ pub enum RemoteAction {
 }
 ```
 
-Add a `Some(Command::Remote { .. })` arm to the `match` in `main.rs::run` that dispatches
-to `remote::run(...)`, defined in Task 21. Until then, have it return `Ok(0)` so the tree
+Add a `Some(Command::Remote { .. })` arm to the `match` in `main.rs::run` that dispatches to
+`remote::run(...)`, defined in Task 21. Until then, have it return `Ok(0)` so the tree
 compiles.
+
+**`main.rs:101` matches `cli.command` by value, and line 115 then borrows `&cli`.** Binding
+`target` and `action` out of the new variant moves them, so that later borrow is of a
+partially-moved value and will not compile. Derive `Clone` on `Command` and `RemoteAction`
+and match on `&cli.command`, cloning the two fields into the arm — Task 21's `remote::run`
+takes them owned.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -3715,9 +3727,15 @@ using it for a server's session would give every server the same token.
 - [ ] **Step 4: Let the caller choose the device label**
 
 In `api/auth.rs`, change `login` to take `label: &str` and delete the internal
-`device_label(runner)` call; move that helper's use into `tasks/login.rs`, which passes
+`device_label(runner)` call; make `device_label` **`pub`** (it is private today, at
+`api/auth.rs:213`) and move its use into `tasks/login.rs`, which passes
 `device_label(ctx.runner.as_ref()).await`. Remote mode passes the server's hostname, so the
 dashboard lists the session as that server.
+
+`login` also prints `ui.heading("Signing this machine in to riabuild")`, which is wrong at
+its new second call site — it is signing a *server* in. Take the heading out of `login` and
+have each caller print its own: `tasks/login.rs` keeps today's wording, and `session::ensure`
+says which server it is minting for.
 
 - [ ] **Step 5: Write `remote/session.rs`**
 
@@ -4324,19 +4342,41 @@ In `cli.rs`:
 ```
 
 ```rust
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum InternalAction {
     /// Read a GitHub token on stdin and hand it to `gh`.
     SeedGithub,
+    /// Remove what a session that died without cleaning up left behind.
+    GhSweep,
 }
 ```
+
+`member_id_from_root` is the last path component of `RIABUILD_ROOT`, which Task 6 has
+already refused unless it is absolute. Have it return a `Failure` rather than an empty
+string when there is no component to read: an empty member id is what makes every developer
+share one runtime directory.
 
 In `main.rs`, dispatch it:
 
 ```rust
+        Some(Command::Internal { action: cli::InternalAction::GhSweep }) => {
+            // Run by the laptop before seeding, so a dead session's leftovers go
+            // before the new credential arrives rather than after.
+            let runtime = gh_session::choose_runtime_dir(
+                std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+                std::env::var("TMPDIR").ok().as_deref(),
+            )?;
+            let dir = gh_session::GhSession::attach(&runtime, &member_id_from_root(&paths)?).await?;
+            gh_session::sweep(&dir, runner.clone(), config::now_secs()).await?;
+            return Ok(0);
+        }
         Some(Command::Internal { action: cli::InternalAction::SeedGithub }) => {
+            // `tokio::io`, not `std::io`: a blocking read on the current-thread
+            // runtime stalls every other future on it, which is the invariant in
+            // riabuild-cli/CLAUDE.md.
+            use tokio::io::AsyncReadExt;
             let mut token = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut token)?;
+            tokio::io::stdin().read_to_string(&mut token).await?;
             let output = ctx
                 .runner
                 .run(
