@@ -48,7 +48,7 @@ underneath a new command would bury them.
 
 | PR | Contents |
 |---|---|
-| **A** | `members.publicId`, the backfill, the `memberPayload` field, and `Member.public_id` in the CLI |
+| **A** | `members.publicId` as required schema, the backfill and its staged deploy, the `memberPayload` field, and `Member.public_id` in the CLI |
 | **B** | `Paths::tools_root()` and the root override, the namespace environment on `Ctx`, remote token-store selection, a target parameter on `download.rs` |
 | **C** | `riabuild remote` — identity, host trust, install, setup, shell — and the container test |
 
@@ -397,27 +397,48 @@ created. A namespace must outlive a GitHub rename; keying it on `githubLogin` wo
 a developer's whole environment the day they renamed their account, silently
 re-provisioning them from scratch.
 
-## The change
+## It is core schema, not an optional extra
+
+`publicId` is a **required** field on `members` and a **required** field of every member
+payload. It is not optional anywhere, and no code path tolerates its absence.
+
+That is a deliberate break rather than the additive change the `riabuild-api` skill
+prescribes by default. The skill's rule protects *old CLIs in the field* against a server
+that changed underneath them, and nothing here removes or repurposes a field they read —
+they ignore an unknown one and keep working. The direction being broken is the other one:
+a **new** CLI against an **old** deployment, which is ordered, not accidental. riabuild-web
+deploys before a CLI release ships, always.
+
+An identifier that half the rows might not have is not an identifier. Making it optional
+would put an `unwrap_or_default()` between a developer and their home directory, and the
+failure it produces — a namespace named nothing, shared by everyone whose row predates the
+migration — is exactly the class of bug that is expensive to find on somebody else's
+laptop.
 
 | Where | What |
 |---|---|
-| `convex/schema.ts` | `publicId: v.optional(v.string())` on `members` |
+| `convex/schema.ts` | `publicId: v.string()` on `members` — required |
 | member creation | mints `crypto.randomUUID()` |
-| a one-shot `internalMutation` | backfills existing rows |
-| `convex/http.ts` | `memberPayload` returns `publicId` |
-| `api/mod.rs` | `Member` gains `#[serde(rename = "publicId", default)] pub public_id: String` |
+| `convex/devSeed.ts` and the dashboard scenario fixtures | every fixture member carries one |
+| `convex/http.ts` | `memberPayload` always returns `publicId` |
+| `api/mod.rs` | `Member` gains `#[serde(rename = "publicId")] pub public_id: String`, no `default` |
 
-Optional first, backfilled, then made required in a follow-up change, because Convex
-validates existing documents against the schema at deploy time and a required field would
-reject the deployment that introduces it.
+## Reaching a required field takes two deploys
 
-`#[serde(default)]` on the Rust side is the compatibility rule from the `riabuild-api`
-skill applied in the other direction: a CLI that hard-required the field would break
-against any deployment that predates it. An empty `public_id` means the server is older
-than remote mode, and `riabuild remote` says exactly that instead of creating a namespace
-called nothing.
+Convex validates existing documents against the schema at push time, so a required field
+cannot be introduced onto a populated table in one step. The sequence is a deployment
+mechanic, not a design compromise, and the end state is the same either way:
 
-`publicId` is additive, so every CLI in the field ignores it and keeps working.
+1. push the field as optional, changing nothing that reads it
+2. run the one-shot `internalMutation` that mints a UUID for every row without one
+3. push it as required
+
+Step 3 is the gate: it fails loudly if step 2 missed a row, which is the property worth
+having. All three land in one pull request; only the deploy is staged.
+
+No `by_publicId` index. Nothing looks a member up by it — the namespace is computed on the
+CLI side from the member payload — and the Convex guidelines are explicit that indexes get
+added when a caller needs one.
 
 **Known limit:** a member deleted and re-created gets a new `publicId` and therefore a
 fresh namespace, orphaning the old one. `owner.json` is what makes an orphan identifiable.
@@ -554,7 +575,7 @@ Each one has its own remedy, so each one is detected separately.
 | Host key changed since last time | hard stop, `safe_to_rerun: false` |
 | Architecture with no published build | stop; linux and macOS, x86_64 and aarch64 only |
 | Remote riabuild below `minCliVersion` | the laptop repairs the binary before setup runs |
-| Server too old to return `publicId` | stop, naming the dashboard version, rather than creating an unnamed namespace |
+| Deployment older than this CLI, so no `publicId` | the member payload fails to decode; riabuild says the dashboard needs deploying, rather than reporting a serde error as its own bug |
 | `mosh-server` missing, or UDP blocked | falls back to `ssh -t`, notes the install command |
 | Default checkout path owned by another namespace | claims `<login>-2` |
 
@@ -594,7 +615,8 @@ entire flow testable with no server anywhere.
 | Auth-method probing | canned sshd refusals for password, keyboard-interactive and publickey-only |
 | Asset selection | `uname -sm` output per platform asserted against the exact release asset names |
 | Namespace environment | a task's `RunOptions` asserted to carry `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL` and the namespaced root — the check that stops the silent wrong-identity bug |
-| `publicId` compatibility | a `/api/v1/me` payload without the field deserialises, and remote mode refuses with the version message |
+| `publicId` is required | a `/api/v1/me` payload without the field is a decode failure carrying the deploy-ordering message — never a default, never an unnamed namespace |
+| The backfill | a fixture member row without `publicId` gains one, and the required-schema push rejects a table the backfill missed |
 | Shared installs | two concurrent installs of one version, asserting one complete tree and two successes |
 | End to end | CI runs `riabuild remote` against an sshd container: two namespaces in one account, asserting isolated gh configuration, git identity and checkouts, and one shared toolchain |
 
@@ -613,4 +635,4 @@ healthy in every log and attributes a developer's work to somebody else.
   death; tmux is a separate change if it is wanted.
 - Reclaiming orphaned namespaces or superseded tool versions
 - Protecting developers sharing one Unix account from each other. See the trust boundary.
-- Any change to `/api/v1` beyond the additive `publicId` field
+- Any change to `/api/v1` beyond the required `publicId` field
