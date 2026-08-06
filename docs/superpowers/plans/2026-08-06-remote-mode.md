@@ -767,6 +767,56 @@ git commit -m "Let a session be revoked, so forget can mean something"
 
 Read `.claude/skills/riabuild-ui/SKILL.md` and `.claude/skills/visual-testing/SKILL.md` before writing any component code. They carry the no-keystrokes rule, the use-extend-generalize rule, and the requirement that a new component gets a gallery entry and a scenario.
 
+- [ ] **Step 1b: Write the failing test**
+
+`riabuild-web/src/ui/Copyable.test.tsx`, matching whatever the repo's component tests already
+do (`vitest` plus Testing Library):
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, test, vi } from "vitest";
+import { Copyable } from "./Copyable";
+
+const UUID = "550e8400-e29b-41d4-a716-446655440000";
+
+describe("Copyable", () => {
+  test("shows a short form but copies and announces the whole value", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    render(<Copyable value={UUID} label="member id" />);
+    // Truncated on screen, complete to a screen reader and to the clipboard.
+    expect(screen.getByText("550e8400…")).toBeVisible();
+    expect(screen.getByText(UUID)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /copy member id/i }));
+    expect(writeText).toHaveBeenCalledWith(UUID);
+    expect(await screen.findByRole("button", { name: /copy member id/i })).toHaveTextContent("copied");
+  });
+
+  test("a clipboard that is absent is a rendered state, not an unhandled rejection", async () => {
+    // e2e/helpers.ts asserts no unhandled rejections on every page, and
+    // navigator.clipboard is undefined in an insecure context.
+    vi.stubGlobal("navigator", {});
+    render(<Copyable value={UUID} label="member id" />);
+    await userEvent.click(screen.getByRole("button", { name: /copy member id/i }));
+    expect(screen.getByRole("button", { name: /copy member id/i })).toHaveTextContent("copy failed");
+  });
+
+  test("an empty value does not render an empty button", () => {
+    vi.stubGlobal("navigator", {});
+    render(<Copyable value="" label="member id" />);
+    expect(screen.getByRole("button", { name: /copy member id/i })).toBeVisible();
+  });
+});
+```
+
+- [ ] **Step 1c: Run it to verify it fails**
+
+Run: `cd riabuild-web && pnpm vitest run src/ui/Copyable.test.tsx`
+Expected: FAIL — the module does not exist.
+
 - [ ] **Step 2: Write the component**
 
 Read `riabuild-web/src/ui/Command.tsx` first and copy its clipboard handling exactly. It
@@ -888,6 +938,25 @@ In `LeadPanel.tsx`, add to `columns` after the `name` column:
 ```
 
 `priority: "wide"` so it is the first thing dropped on a narrow viewport — a member id matters less than knowing whose row it is.
+
+- [ ] **Step 3b: Write the failing test for both placements**
+
+```tsx
+test("a lead sees a member id column, and it drops on a narrow viewport", () => {
+  render(<LeadPanel {...leadFixture} />);
+  expect(screen.getByRole("columnheader", { name: /member id/i })).toBeInTheDocument();
+});
+
+test("a developer sees their own member id in their profile", () => {
+  render(<Profile member={{ ...memberFixture, memberId: UUID }} />);
+  expect(screen.getByText("member id")).toBeVisible();
+  expect(screen.getByText(UUID)).toBeInTheDocument();
+});
+```
+
+Use whichever render helper and fixtures the existing component tests use — `src/dev/scenarios.ts`
+already carries a `developer` and a `lead` fixture, and this test should read from those rather
+than build a third shape by hand.
 
 - [ ] **Step 4: Run both suites and look at the screenshots**
 
@@ -1047,6 +1116,12 @@ Add to the `Paths` trait in `riabuild-cli/src/paths.rs`:
     }
 ```
 
+`owner_file()` and `riabuild_dir()` must have callers by the end of Stage C or be deleted:
+Task 18 writes `owner.json` through `owner_file()`'s basename, and Task 17's
+`remote_binary_path` derives from `riabuild_dir()` rather than formatting the layout a second
+time. A `Paths` method nothing calls is a second definition of a layout waiting to disagree
+with the first.
+
 Change `node_dir` and `pnpm_dir` to hang off `tools_root()`:
 
 ```rust
@@ -1138,6 +1213,11 @@ pub fn root_for(home: &Path, override_root: Option<&str>) -> anyhow::Result<Path
 }
 
 /// One developer's namespace on a shared server.
+///
+/// The single definition of that layout. `remote/session.rs` needs the same path
+/// as a `String`, for a remote command rather than a local `PathBuf`, and calls
+/// this rather than formatting its own — two spellings of one layout is how the
+/// two drift apart, and one of them is what `rm -rf` is pointed at.
 pub fn remote_namespace(home: &Path, member_id: &str) -> PathBuf {
     home.join(".riabuild-remote").join(member_id)
 }
@@ -3986,8 +4066,15 @@ use crate::ui::{Failure, Ui};
 use anyhow::Result;
 use std::sync::Arc;
 
+/// The namespace as a string, for a remote command line.
+///
+/// Delegates to `paths::remote_namespace` rather than formatting its own copy:
+/// this value is what `forget` hands to `rm -rf`, and two spellings of one
+/// layout is exactly the drift that makes that dangerous.
 pub fn namespace(home: &str, member_id: &str) -> String {
-    format!("{home}/.riabuild-remote/{member_id}")
+    crate::paths::remote_namespace(std::path::Path::new(home), member_id)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Writes one file into the namespace, through a shell riabuild names and with
@@ -5032,18 +5119,239 @@ pub async fn run(
 }
 ```
 
-Write `ensure_local_prerequisites`, `choose`, `remember`, `list`, `forget` and
-`warn_about_macos_claude` as small private functions in the same file. `choose` asks the
-three questions from Task 12 when there is nothing saved, offers a numbered list when there
-is more than one, and reconnects silently when there is exactly one. If `mod.rs` passes
-roughly 300 lines, move `choose`, `list` and `forget` into `store.rs`, which is where the
-saved servers already live.
+The five helpers `run` leans on. `choose`, `list` and `forget_remote` go in `store.rs`, where
+the saved servers already live, so `mod.rs` stays under 300 lines.
 
-`warn_about_macos_claude` runs `uname -s` on the server and, on `Darwin`, prints the warning
-from the design — Claude Code keeps its credentials in the account's login keychain rather
-than in `CLAUDE_CONFIG_DIR`, so everyone sharing that account shares one Claude sign-in, and
-unlocking the keychain over SSH exposes it to them. Name the other developers by reading the
-sibling `owner.json` files.
+```rust
+/// The two tasks a laptop runs before it touches a server.
+async fn ensure_local_prerequisites(ctx: &mut Ctx) -> Result<()> {
+    use crate::tasks::Task;
+    for task in [
+        Box::new(crate::tasks::login::Login) as Box<dyn Task>,
+        Box::new(crate::tasks::github_cli::GithubCli),
+    ] {
+        if let Status::Needs(reason) = task.check(ctx).await? {
+            ctx.ui.working(task.title(), &reason.describe());
+            task.apply(ctx).await?;
+            // The invariant: apply is always followed by a re-run of check.
+            if let Status::Needs(reason) = task.check(ctx).await? {
+                return Err(Failure::new(
+                    format!("getting {} ready on this laptop", task.title()),
+                    "Run `riabuild` on this machine and see what it says.",
+                )
+                .detail(reason.describe())
+                .into());
+            }
+            ctx.ui.applied(task.title());
+        } else {
+            ctx.ui.satisfied(task.title());
+        }
+    }
+    Ok(())
+}
+```
+
+```rust
+/// Which server this invocation is about.
+pub async fn choose(
+    ctx: &mut Ctx,
+    store: &mut Store,
+    target: Option<String>,
+) -> Result<Remote> {
+    // `riabuild remote build-01` or `riabuild remote ada@host:2222`.
+    if let Some(target) = target {
+        if let Some(record) = store.find(&target) {
+            return Ok(record.into());
+        }
+        let user = whoami();
+        let mut remote = Remote::parse(&target, &user)?;
+        remote.name = allocate_name(&remote.host, &store.names());
+        add(store, &remote);
+        return Ok(remote);
+    }
+
+    match store.remotes.len() {
+        0 => {
+            let remote = ask_for_one(ctx, store).await?;
+            add(store, &remote);
+            Ok(remote)
+        }
+        1 => {
+            let record = &store.remotes[0];
+            ctx.ui.info(&format!(
+                "Reconnecting to {} · {}@{}",
+                record.name, record.user, record.host
+            ));
+            Ok(record.into())
+        }
+        _ => {
+            ctx.ui.heading("Which server?");
+            for (index, record) in store.remotes.iter().enumerate() {
+                ctx.ui.info(&format!(
+                    "  {}  {:<10} {}@{}{}   used {}",
+                    index + 1,
+                    record.name,
+                    record.user,
+                    record.host,
+                    if record.port == 22 { String::new() } else { format!(":{}", record.port) },
+                    crate::ui::duration_words(
+                        crate::config::now_secs().saturating_sub(record.last_used_at) / 60
+                    ),
+                ));
+            }
+            let answer = ctx.ui.ask("", Some("1"))?;
+            let index: usize = answer.trim().parse().unwrap_or(1);
+            let record = store
+                .remotes
+                .get(index.saturating_sub(1))
+                .ok_or_else(|| anyhow!("there is no server {index}"))?;
+            Ok(record.into())
+        }
+    }
+}
+
+/// The three questions, once, on a first run.
+async fn ask_for_one(ctx: &mut Ctx, store: &Store) -> Result<Remote> {
+    ctx.ui.heading("Adding a server");
+    let host = ctx.ui.ask("Hostname  ", None)?;
+    let port: u16 = ctx.ui.ask("Port      ", Some("22"))?.parse().unwrap_or(22);
+    let user = ctx.ui.ask("Username  ", Some(&whoami()))?;
+    let name = allocate_name(&host, &store.names());
+    ctx.ui.note(&format!("This server will be known as {name}."));
+    Ok(Remote { name, host, port, user })
+}
+```
+
+```rust
+/// What a successful connect leaves behind.
+async fn remember(
+    ctx: &Ctx,
+    store: &mut Store,
+    remote: &Remote,
+    version: &str,
+) -> Result<()> {
+    if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
+        record.last_used_at = crate::config::now_secs();
+        record.last_seen_cli_version = version.to_string();
+    }
+    store.save(ctx.paths.as_ref()).await
+}
+```
+
+```rust
+/// `riabuild remote list`.
+pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
+    if store.remotes.is_empty() {
+        ctx.ui.info("No servers yet. Run `riabuild remote` to add one.");
+        return Ok(0);
+    }
+    for record in &store.remotes {
+        ctx.ui.info(&format!(
+            "  {:<10} {}@{}{}   used {}",
+            record.name,
+            record.user,
+            record.host,
+            if record.port == 22 { String::new() } else { format!(":{}", record.port) },
+            // `duration_words` takes minutes elapsed, not a timestamp.
+            crate::ui::duration_words(
+                crate::config::now_secs().saturating_sub(record.last_used_at) / 60
+            ),
+        ));
+    }
+    Ok(0)
+}
+```
+
+```rust
+/// Says, on a macOS server, what namespacing cannot fix.
+async fn warn_about_macos_claude(ctx: &Ctx, remote: &Remote, home: &str) -> Result<()> {
+    let uname = ssh_once(remote, ctx.paths.as_ref(), ctx.runner.clone(), "uname -s").await?;
+    if uname.trimmed() != "Darwin" {
+        return Ok(());
+    }
+
+    let others = siblings(ctx, remote, home).await.unwrap_or_default();
+    let names = if others.is_empty() {
+        "anyone else who uses this account".to_string()
+    } else {
+        others.join(" and ")
+    };
+    ctx.ui.warn(&format!(
+        "macOS server: Claude Code keeps its credentials in this account's login keychain, \
+         not in your riabuild profile. You share one Claude sign-in with {names}, and \
+         unlocking the keychain over SSH exposes it to them."
+    ));
+    Ok(())
+}
+
+/// The other developers in this account, from their `owner.json` files.
+async fn siblings(ctx: &Ctx, remote: &Remote, home: &str) -> Result<Vec<String>> {
+    let command = shell_command(&format!(
+        "cat {}/.riabuild-remote/*/owner.json 2>/dev/null || true",
+        shell_quote(home)
+    ));
+    let output = ssh_once(remote, ctx.paths.as_ref(), ctx.runner.clone(), &command).await?;
+    let mine = ctx.member.as_ref().map(|m| m.github_login.clone()).unwrap_or_default();
+    Ok(output
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|owner| owner.get("githubLogin")?.as_str().map(str::to_string))
+        .filter(|login| *login != mine)
+        .map(|login| format!("@{login}"))
+        .collect())
+}
+```
+
+`whoami()` reads `$USER`, falling back to `$LOGNAME` and then to `"root"`; `add()` pushes a
+`Record` built from a `Remote` with `added_at` set; `impl From<&Record> for Remote` carries
+the four identity fields. All three are three-liners in `store.rs`.
+
+Note `siblings` reads `owner.json` files written by `serde_json::to_string` — one object per
+file, so the `cat` of several produces one JSON object per line only because
+`owner_json` emits compact output. Keep it compact for that reason, and parse defensively:
+another developer's file is not something to trust into a panic.
+
+- [ ] **Step 4b: Test the parts that have no server in them**
+
+```rust
+#[tokio::test]
+async fn one_saved_server_reconnects_without_asking() {
+    let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+    let mut store = Store::default();
+    store.remotes.push(record_for(&remote()));
+
+    // `Ui::ask` would fail outright without a TTY, so reaching a prompt here is
+    // itself the failure this asserts against.
+    let chosen = choose(&mut ctx, &mut store, None).await.expect("reconnects");
+    assert_eq!(chosen.name, "build-01");
+}
+
+#[tokio::test]
+async fn a_named_server_that_is_not_saved_is_parsed_and_added() {
+    let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+    let mut store = Store::default();
+
+    let chosen = choose(&mut ctx, &mut store, Some("ada@gpu.internal:2222".into()))
+        .await
+        .expect("parses");
+    assert_eq!(chosen.user, "ada");
+    assert_eq!(chosen.port, 2222);
+    assert_eq!(store.remotes.len(), 1);
+}
+
+#[test]
+fn the_last_used_column_is_a_duration_not_a_timestamp() {
+    let (ctx, _home) = futures::executor::block_on(ctx_with(FakeRunner::new()));
+    let mut store = Store::default();
+    let mut record = record_for(&remote());
+    record.last_used_at = crate::config::now_secs().saturating_sub(3 * 3600);
+    store.remotes.push(record);
+    // Asserting the arithmetic rather than the wording: handing `duration_words`
+    // the raw epoch renders roughly "1236111 days".
+    assert_eq!(list(&ctx, &store).expect("lists"), 0);
+}
+```
 
 - [ ] **Step 5: Dispatch it from `main.rs`**
 
@@ -5191,20 +5499,105 @@ with `ssh-keyscan -t ed25519` and passes it as `--accept-host-key <fingerprint>`
 which answers the prompt without weakening it, because a mismatch still fails. There is no
 "accept anything" flag, in CI or out of it.
 
-`e2e/remote/run.sh` then, against that container:
+`e2e/remote/Dockerfile`:
 
-1. runs `riabuild remote testuser@localhost:2222` as one developer, with a stub
-   riabuild-web, and asserts the flow completes
-2. repeats as a second developer with a different `memberId`
-3. asserts `~/.riabuild-remote/<id-a>` and `<id-b>` both exist and hold their own
-   `state.json`, `gitconfig` and `owner.json`
-4. asserts `~/.riabuild/node/<version>` exists exactly once — one toolchain, two developers
-5. asserts each developer's checkout is under `~/Clubria/<login>/`
-6. asserts that after both sessions end, `find / -name hosts.yml` finds nothing under any
-   runtime directory
+```dockerfile
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/sh shared \
+ && mkdir -p /run/sshd /home/shared/.ssh \
+ && chown -R shared:shared /home/shared/.ssh \
+ && chmod 700 /home/shared/.ssh
+# One account, several developers — the shape this test exists to exercise.
+COPY --chown=shared:shared authorized_keys /home/shared/.ssh/authorized_keys
+RUN chmod 600 /home/shared/.ssh/authorized_keys
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+```
 
-Add a `remote-mode` job to `.github/workflows/ci.yml` that builds the image and runs the
-script.
+`e2e/remote/run.sh`:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+work="$(mktemp -d)"
+trap 'docker rm -f riabuild-e2e >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+
+# One key, two developers: they share the Unix account, which is the point.
+ssh-keygen -t ed25519 -N "" -f "$work/id" -C "riabuild e2e" >/dev/null
+cp "$work/id.pub" "$here/authorized_keys"
+docker build -q -t riabuild-e2e "$here"
+docker run -d --name riabuild-e2e -p 2222:22 riabuild-e2e >/dev/null
+
+# Wait for sshd rather than sleeping a guessed number of seconds.
+for _ in $(seq 1 30); do
+  if ssh-keyscan -p 2222 -t ed25519 localhost 2>/dev/null | grep -q ssh-ed25519; then break; fi
+  sleep 1
+done
+
+# The fingerprint answers the prompt without weakening it: a mismatch still fails.
+fingerprint="$(ssh-keyscan -p 2222 -t ed25519 localhost 2>/dev/null \
+  | ssh-keygen -lf - | awk '{print $2}')"
+
+run_as() {                       # run_as <member-id> <login>
+  HOME="$work/laptop-$2" \
+  RIABUILD_WEB_URL="$STUB_URL" \
+  RIABUILD_TOKEN="test-token-$2" \
+  "$RIABUILD_BIN" remote "shared@localhost:2222" \
+    --accept-host-key "$fingerprint" --no-shell
+}
+
+run_as "$MEMBER_A" ada
+run_as "$MEMBER_B" bob
+
+in_container() { docker exec riabuild-e2e su - shared -c "$1"; }
+
+# 1. two namespaces, each with its own state
+in_container "test -f ~/.riabuild-remote/$MEMBER_A/state.json"
+in_container "test -f ~/.riabuild-remote/$MEMBER_B/state.json"
+# 2. a git identity per developer, and they differ
+in_container "grep -q 'ada@' ~/.riabuild-remote/$MEMBER_A/gitconfig"
+in_container "grep -q 'bob@' ~/.riabuild-remote/$MEMBER_B/gitconfig"
+# 3. one toolchain for both
+test "$(in_container 'ls ~/.riabuild/node | wc -l')" -eq 1
+# 4. checkouts grouped by developer, not shared
+in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
+# 5. gh configuration is isolated while a session is live…
+in_container "test -d \"\${XDG_RUNTIME_DIR:-/tmp}/riabuild-gh-$MEMBER_A\"" || true
+# 6. …and nothing is left once both sessions have ended
+test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
+
+echo "remote mode e2e: all assertions passed"
+```
+
+`MEMBER_A`/`MEMBER_B` are two UUIDs the stub riabuild-web returns from `/api/v1/me` keyed on
+`RIABUILD_TOKEN`; `STUB_URL` points at it. Reuse the stub the existing e2e suite already
+stands up rather than writing a second one — if there is none, that stub is part of this
+task, not an afterthought.
+
+`.github/workflows/ci.yml` gains:
+
+```yaml
+  remote-mode:
+    name: Remote mode against a container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+        working-directory: riabuild-cli
+      - run: bash e2e/remote/run.sh
+        env:
+          RIABUILD_BIN: ${{ github.workspace }}/riabuild-cli/target/release/riabuild
+```
+
+**Two stated gaps, both deliberate.** `ssh-copy-id` is not exercised, because it needs a
+password prompt no CI job can answer — that path is covered by Task 16's unit tests. And
+mosh is not exercised, because the shell is interactive; `--no-shell` stops before it, and
+`shell::open`'s fallback is covered by Task 21's unit tests.
 
 - [ ] **Step 5: Run it locally**
 
