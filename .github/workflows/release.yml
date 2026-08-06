@@ -543,6 +543,23 @@ jobs:
             exit 1
           fi
 
+          # rpm 4.14 — RHEL 8 and its rebuilds — cannot verify an ed25519
+          # signature, and reports the failure as `digests SIGNATURES NOT OK`,
+          # which dnf shows as a corrupt package. Nothing in this workflow would
+          # notice: signing succeeds, the repository publishes, and only a RHEL 8
+          # machine finds out. GnuPG 2.4 generates ed25519 by default, so this is
+          # one wrong flag away on any future rotation.
+          #
+          # Field 4 of a `sec:` record is the OpenPGP algorithm id. 1 is RSA.
+          algo=$(gpg --list-keys --with-colons "$SIGNING_KEY_ID" \
+            | awk -F: '/^pub:/ {print $4; exit}')
+          if [ "$algo" != "1" ]; then
+            echo "::error::The signing key is not RSA (OpenPGP algorithm id $algo)."
+            echo "::error::RHEL 8 cannot verify it and will call the package corrupt."
+            echo "::error::Generate the key with rsa4096, not default — see docs/releasing.md."
+            exit 1
+          fi
+
           echo "%_gpg_name $SIGNING_KEY_ID" > ~/.rpmmacros
 
       - name: Collect the newest releases
@@ -697,13 +714,20 @@ jobs:
             riabuild --version
           '
 
-          docker run --rm --network host -v "$PWD/site:/site:ro" fedora:41 bash -eux -c '
-            rpm --import /site/clubria.asc
-            sed "s|https://clubria.github.io/riabuild|http://127.0.0.1:8080|" \
-              /site/rpm/clubria.repo > /etc/yum.repos.d/clubria.repo
-            dnf install -y riabuild
-            riabuild --version
-          '
+          # Fedora for the newest rpm, Rocky 8 for the oldest one still in
+          # support. They disagree about which signatures they accept: rpm 4.14
+          # on Rocky 8 cannot verify ed25519 and calls such a package corrupt,
+          # while Fedora takes it happily. Testing only the newer one would
+          # publish a repository that half the RPM world silently rejects.
+          for image in fedora:41 rockylinux:8; do
+            docker run --rm --network host -v "$PWD/site:/site:ro" "$image" bash -eux -c '
+              rpm --import /site/clubria.asc
+              sed "s|https://clubria.github.io/riabuild|http://127.0.0.1:8080|" \
+                /site/rpm/clubria.repo > /etc/yum.repos.d/clubria.repo
+              dnf install -y riabuild
+              riabuild --version
+            '
+          done
 
           echo "apt and dnf both installed riabuild from the generated repositories."
 

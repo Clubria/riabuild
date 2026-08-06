@@ -35,36 +35,51 @@ sudo dnf install riabuild
 riabuild upgrades itself from whichever of these installed it — see
 [Self-update](#self-update-asks-the-package-manager-that-owns-the-binary).
 
-## One-time setup
+## The signing key
 
-Two things have to exist before a release can reach a Linux developer. Without
-them the release still builds and publishes; the `pages` job warns that nobody
-was offered it, the same way `announce` does without `CONVEX_DEPLOY_KEY`.
+apt refuses an unsigned repository outright, and the alternative — telling every
+developer to write `[trusted=yes]` — trains them to accept unsigned packages
+from anywhere. So the repositories are signed, and the key lives in two
+repository secrets: `PACKAGE_SIGNING_KEY` (armoured private key) and
+`PACKAGE_SIGNING_KEY_ID` (fingerprint).
 
-**1. A package signing key.** apt refuses an unsigned repository outright, and
-the alternative — telling every developer to write `[trusted=yes]` — trains
-them to accept unsigned packages from anywhere.
+Both are set, along with Pages serving from GitHub Actions. Nothing here needs
+doing before the next release. This section is the rotation procedure.
 
 ```sh
 gpg --batch --quick-gen-key --passphrase '' \
-  'Clubria <engineering@clubria.com>' default default never
+  'Clubria Package Signing <engineering@clubria.com>' rsa4096 sign never
 gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}'   # the key id
 gpg --armor --export-secret-keys <key id>                                    # the private key
 ```
 
-Add both as repository secrets: `PACKAGE_SIGNING_KEY` (the armoured private
-key) and `PACKAGE_SIGNING_KEY_ID` (the fingerprint).
+Three things about that command are load-bearing, and the workflow rejects a key
+that gets any of them wrong rather than failing somewhere less obvious.
 
-**The key must have no passphrase**, which is what `--passphrase ''` above is
-for. `rpmsign` drives gpg with no terminal attached, so a passphrase-protected
-key hangs the build waiting for a pinentry that can never appear. The secret is
-what protects the key; a passphrase sitting beside it in a second repository
-secret protects nothing and takes the release down. The workflow checks this and
-fails with that explanation rather than timing out.
+**`rsa4096`, not `default`.** GnuPG 2.4 resolves `default` to ed25519, and
+rpm 4.14 — RHEL 8 and every rebuild of it — cannot verify an ed25519 signature.
+It reports `digests SIGNATURES NOT OK`, which `dnf` surfaces as a corrupt
+package rather than as an unsupported algorithm, so the failure points at the
+wrong thing entirely. RHEL 9 and Fedora both accept ed25519; RHEL 8 is the
+cutoff, and it is supported until 2029. RSA is also what Fedora, EPEL, and
+Docker sign with.
 
-**2. GitHub Pages, serving from GitHub Actions.** Settings → Pages → Source →
-"GitHub Actions". The workflow uploads the repositories as a Pages artefact
-rather than pushing them to a branch, so nothing accumulates in git.
+**No passphrase**, which is what `--passphrase ''` is for. `rpmsign` drives gpg
+with no terminal attached, so a passphrase-protected key hangs the build waiting
+for a pinentry that can never appear. The repository secret is what protects the
+key; a passphrase sitting beside it in a second secret protects nothing and
+takes the release down.
+
+**`never` expires.** An expired repository key breaks `apt update` on every
+installed machine at once, and there is no renewal step in this pipeline to
+catch it coming.
+
+Rotation is expensive, which is the reason for the care above: the key is
+trusted by being pinned into `/usr/share/keyrings/clubria.gpg` and the rpm
+keyring, so replacing it means every already-provisioned machine has to import
+the new one by hand before it can update again. Keep the private key and its
+revocation certificate in a password manager — a GitHub secret cannot be read
+back, so the copy you keep is the only retrievable one.
 
 ## Versioning is by release date
 
@@ -295,8 +310,10 @@ already been published.
 | `brew install` cannot find the formula | The developer skipped `brew tap`, or the formula has not landed on main yet. |
 | `riabuild` installs but is killed on launch | A signing problem — check the `Sign` step ran. |
 | Nobody is offered the new version | The `announce` job was skipped — `CONVEX_DEPLOY_KEY` is unset. |
-| No Linux developer is offered the version | The `pages` job warned and stopped — `PACKAGE_SIGNING_KEY` is unset. See [One-time setup](#one-time-setup). |
+| No Linux developer is offered the version | The `pages` job warned and stopped — `PACKAGE_SIGNING_KEY` is unset. See [The signing key](#the-signing-key). |
 | `pages` fails on "The signing key needs a passphrase" | The key in `PACKAGE_SIGNING_KEY` is passphrase-protected. Generate a passphrase-less one. |
+| `pages` fails on "signing key is not RSA" | The key was generated with `default` rather than `rsa4096`. See [The signing key](#the-signing-key). |
+| `dnf` reports the package is corrupt on RHEL 8, but installs fine on Fedora | An ed25519 signing key. rpm 4.14 cannot verify one and says so as a digest failure. Rotate to RSA. |
 | `apt update` reports `NO_PUBKEY` or a bad signature | The signing key was rotated. Developers need the new `clubria.gpg`; the old keyring file is stale. |
 | `apt install riabuild` says it is not found after a successful `apt update` | An architecture mismatch — check `[arch=…]` in the sources line matches `dpkg --print-architecture`. |
 | `dnf` reports the repository is not signed | The `pages` job did not finish; `repomd.xml.asc` is missing. Re-run it. |
