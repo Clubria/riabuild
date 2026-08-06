@@ -6,9 +6,12 @@ use crate::runner::RunOptions;
 use crate::ui::Failure;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Project;
+
+/// How many times riabuild will re-ask before falling back to its own answer.
+const ATTEMPTS: usize = 3;
 
 /// `git -C <dir> remote get-url origin`, or `None` if this is not a checkout.
 async fn origin_url(ctx: &Ctx, dir: &Path) -> Option<String> {
@@ -22,6 +25,77 @@ async fn origin_url(ctx: &Ctx, dir: &Path) -> Option<String> {
         .await
         .ok()?;
     output.ok().then(|| output.trimmed().to_string())
+}
+
+/// Where the checkout should go, offering riabuild's answer and letting the
+/// developer say otherwise.
+///
+/// The default is what riabuild would have done silently before, so a developer
+/// with no opinion still makes no decision: Enter, no terminal, or an answer
+/// riabuild cannot use all land on it.
+async fn choose_dir(ctx: &Ctx, home: &Path, repo_name: &str) -> PathBuf {
+    // Where this lands is riabuild's decision, and it differs per platform —
+    // see `paths::default_project_dir`.
+    let default = crate::paths::default_project_dir(home, repo_name);
+    let question = format!(
+        "The repository will be installed at {}. Choose a different path? (press enter for default)",
+        contract_tilde(&default, home)
+    );
+
+    // Bounded, because a developer who cannot give a usable path is better
+    // served by riabuild picking one than by being asked forever.
+    for _ in 0..ATTEMPTS {
+        let Some(answer) = ctx.ui.ask(&question) else {
+            break;
+        };
+        let chosen = expand_tilde(&answer, home);
+        match objection(&chosen).await {
+            None => return chosen,
+            Some(objection) => ctx.ui.warn(&objection),
+        }
+    }
+
+    ctx.ui.note(&format!(
+        "Using {} for the checkout",
+        contract_tilde(&default, home)
+    ));
+    default
+}
+
+/// Why riabuild cannot clone into a path the developer typed, if it cannot.
+///
+/// Checked while they are still being asked. The alternative is learning it
+/// from a failed `gh repo clone` several seconds later, by which point the
+/// answer has been recorded and the developer has to work out how to change it.
+async fn objection(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return Some(format!(
+            "{} is relative — give a path starting with / or ~/",
+            path.display()
+        ));
+    }
+
+    // A checkout already sitting there is not an obstacle: `apply` adopts one,
+    // and adopting the checkout a developer already has is half the reason to
+    // offer the choice at all.
+    if tokio::fs::try_exists(path.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let Ok(mut reader) = tokio::fs::read_dir(path).await else {
+        // Nothing there yet, which is the ordinary case.
+        return None;
+    };
+    match reader.next_entry().await {
+        Ok(Some(_)) => Some(format!(
+            "{} already has files in it — git will not clone into it",
+            path.display()
+        )),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -83,16 +157,7 @@ impl Task for Project {
 
         let dir = match ctx.config.project_path.clone() {
             Some(path) => expand_tilde(&path, &home),
-            None => {
-                // Where this lands is riabuild's decision, and it differs per
-                // platform — see `paths::default_project_dir`.
-                let default = crate::paths::default_project_dir(&home, org.repo_name());
-                ctx.ui.note(&format!(
-                    "Using {} for the checkout",
-                    contract_tilde(&default, &home)
-                ));
-                default
-            }
+            None => choose_dir(ctx, &home, org.repo_name()).await,
         };
 
         if tokio::fs::try_exists(&dir.join(".git"))
@@ -153,6 +218,7 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
+    use crate::ui::Ui;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -177,6 +243,78 @@ mod tests {
         );
         // Named after the repository, not the whole owner/repo slug.
         assert!(expected.ends_with("ai-builders-hub"), "{expected:?}");
+    }
+
+    #[tokio::test]
+    async fn a_typed_answer_is_used_instead_of_the_default() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        let chosen = home.path().join("work/hub");
+        ctx.ui = Ui::scripted([chosen.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(chosen.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_answer_is_refused() {
+        // Storing a relative path would make the checkout's location depend on
+        // where riabuild happened to be run from.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.ui = Ui::scripted(["code/hub"]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        let default = crate::paths::default_project_dir(home.path(), "ai-builders-hub");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(default.to_string_lossy().as_ref()),
+            "a refused answer must fall back to the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_already_has_files_in_it_is_refused() {
+        // `gh repo clone` will not clone into it, and the developer should
+        // learn that while they are being asked, not after the clone fails.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        let occupied = home.path().join("work/hub");
+        write_file(&occupied.join("notes.txt"), "mine\n").await;
+        ctx.ui = Ui::scripted([occupied.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        let default = crate::paths::default_project_dir(home.path(), "ai-builders-hub");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(default.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_checkout_of_the_right_repo_is_accepted() {
+        // Adopting a checkout the developer already has is the whole point of
+        // being asked, so "it has files in it" must not refuse this one.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with(
+            "git -C",
+            0,
+            "git@github.com:Clubria/ai-builders-hub.git",
+            "",
+        ))
+        .await;
+        let existing = home.path().join("work/hub");
+        write_file(&existing.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        ctx.ui = Ui::scripted([existing.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(existing.to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

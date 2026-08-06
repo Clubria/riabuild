@@ -46,6 +46,13 @@ exists. "Current-thread" describes the reactor, not the process, and the binary 
 threads. Closures cannot be async, so `and_then`/`unwrap_or_else` chains around IO have to
 be unrolled into `match` or `let else` rather than kept for tidiness.
 
+**Every prompt has a default.** `Ui::ask` returns `None` when there is no terminal — in
+CI, over a pipe, under `cargo test` — so a question is how riabuild offers a choice, never
+how it obtains a value it cannot otherwise get. A prompt that is the only route to an
+answer turns an unattended run into one that hangs with no output until something times
+out. Prompts also belong in `apply()` or a subcommand, never in `check()`, which runs
+under `--check`.
+
 **`apply()` must be safe to run twice.** Tasks re-run whenever a dependency changes, a
 version bumps, or a check fails. There is no "already done" branch to rely on.
 
@@ -88,6 +95,7 @@ src/
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
+  move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
 ```

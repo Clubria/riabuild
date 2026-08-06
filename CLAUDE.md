@@ -4,6 +4,11 @@ Provisioning tool that gets a Clubria developer from "accepted a GitHub org invi
 "running Claude Code against our codebase with working secrets" without them making a
 single environment decision.
 
+The one exception is where their own source code lives, which riabuild offers rather than
+imposes: first setup shows the path it would use and takes Enter for yes, and
+`riabuild move-project` changes it later. Everything else stays riabuild's decision — a
+developer who presses Enter has still decided nothing.
+
 Design: `docs/superpowers/specs/2026-08-04-riabuild-design.md`. Read it before changing
 anything structural.
 
