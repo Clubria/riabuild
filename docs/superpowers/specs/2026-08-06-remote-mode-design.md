@@ -873,8 +873,9 @@ session and no network. The banner names the server.
 
 # macOS servers
 
-Supported, on aarch64 and x86_64. Three things differ, and two of them make the design
-simpler rather than more complicated.
+Supported, on aarch64 and x86_64. Three things differ, and all three make the design simpler
+rather than more complicated — the fourth, a Claude Code sign-in shared across a Unix
+account, turned out not to exist.
 
 **The token store stops being platform-chosen.** Over SSH the login keychain is locked, so
 `security find-generic-password` fails. Remote mode already selects the file store by being
@@ -890,43 +891,35 @@ around it.
 **Remote Login is the developer's job.** riabuild cannot enable sshd over SSH. An
 unreachable Mac gets a failure naming System Settings → General → Sharing → Remote Login.
 
-## The warning at connect
+## Claude Code needs no special handling here
 
-**This section rests on a claim that is not established, and is likely false.** Earlier
-drafts asserted that Claude Code keeps its credentials in the macOS login keychain rather
-than in `CLAUDE_CONFIG_DIR`. Three things point the other way: the settings documentation
-says the OAuth session lives in `~/.claude.json`, a developer on this team reports two
-config directories on one Mac holding **distinct logins**, and `shims/mod.rs` already pins
-`CLAUDE_CONFIG_DIR`'s isolation because the whole profile feature depends on it.
+**There is no warning here, and an earlier draft was wrong to plan one.** That draft
+asserted Claude Code keeps its credentials in the macOS login keychain rather than in
+`CLAUDE_CONFIG_DIR`, and specified a connect-time warning saying everyone sharing a Mac
+account shares one Claude sign-in.
 
-Task 0 in the plan settles it before Stage C ships. Until it does, treat the rest of this
-section as the pessimistic branch, not as fact:
+Tested directly: `CLAUDE_CONFIG_DIR=/tmp/asd claude` on macOS **prompts for a fresh login**.
+The credential is keyed to the config directory, not to the Unix account, so two developers
+sharing an account on a Mac server get separate Claude sign-ins exactly as they do on Linux.
+Namespacing already covers it, and there is no collision to warn anybody about.
 
-- **If credentials follow `CLAUDE_CONFIG_DIR`** — the expected answer — this entire section
-  is deleted. Namespacing already isolates them, there is no keychain to unlock over SSH,
-  and a shared macOS account is no different from a shared Linux one.
-- **If they do not**, the warning below ships as written.
+The claim had also survived three adversarial reviews, because it was written as a
+hedge — "an open item, to be verified against a real macOS host" — and a stated uncertainty
+reads as diligence rather than as an unsupported premise doing load-bearing work. It had
+already produced a warning, a trust-boundary paragraph, and a scope caveat by the time it
+was checked.
 
-The pessimistic branch, if it turns out to be the real one: two consequences, both told to
-the developer on **every connect to a macOS server**, naming who else is affected from the
-sibling `owner.json` files, so it reads as information rather than boilerplate:
+Two smaller things remain true and are worth keeping:
 
-```
-▲ macOS server: Claude Code keeps its credentials in this account's login
-  keychain, not in your riabuild profile. You share one Claude sign-in with
-  @bob and @carla, and unlocking the keychain over SSH exposes it to them.
-```
-
-- The keychain is locked over SSH, so a Claude sign-in there needs
-  `security unlock-keychain`, which does prompt correctly over SSH.
-- If the keychain item is keyed only by service name and not by `CLAUDE_CONFIG_DIR`, two
-  namespaces in one Unix account share one Claude sign-in. This is the one collision
-  namespacing cannot fix.
-
-Whether the second is true is an **open item for the implementation plan** — it is to be
-verified against a real macOS host, not assumed. If it holds, a shared macOS account
-supports one Claude sign-in at a time and the warning above is the whole mitigation. Linux
-servers are unaffected, Claude Code using a file there.
+- **The profile feature depends on this behaviour**, and it is undocumented — `shims/mod.rs`
+  says so. Task 0 in the plan turns the observation above into an assertion, so a future
+  Claude Code release that changes it fails a test rather than silently merging two
+  developers' sign-ins.
+- **Whether the store is a file or a per-directory keychain item is still unknown**, and it
+  only matters in one narrow case: if it is a keychain item, a Claude sign-in *on a macOS
+  server over SSH* may need `security unlock-keychain` first. That is one command in a
+  failure message, not a design constraint, and the first person to use a Mac as a server
+  will find out. Linux servers cannot hit it at all.
 
 ---
 

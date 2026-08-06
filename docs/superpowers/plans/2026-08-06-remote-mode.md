@@ -100,22 +100,24 @@ and possibly what remote mode supports.
 Code's state; `shims/mod.rs:136` already pins that with an ignored smoke test, because the
 variable is undocumented. What is *not* pinned is whether it isolates the **credentials**.
 
-**The expected answer is yes, and this task is confirmation rather than investigation.** The
-settings documentation states that `~/.claude.json` "contains your OAuth session" — a file,
-not a keychain — and a developer on this team reports two config directories on one Mac
-holding distinct logins. Neither the settings nor the environment-variable reference
-documents any credential-path option; `apiKeyHelper` exists but generates an API key, not an
-OAuth session, so it is not a relocation knob.
+**Already answered; this task pins it.** Run on macOS:
+`CLAUDE_CONFIG_DIR=/tmp/asd claude` **prompts for a fresh login**. The credential is keyed
+to the config directory, not to the Unix account, so two developers sharing an account on a
+Mac server get separate Claude sign-ins — the same as on Linux. The connect-time warning an
+earlier draft specified has been deleted from both documents.
 
-What remains worth pinning is the **mechanism**, because it decides whether a macOS server
-needs a keychain unlocked over SSH at all: a per-directory file needs nothing, a keychain
-item keyed per directory still isolates but stays locked in an SSH session.
+What this task does is convert that observation into an assertion, because the behaviour is
+undocumented — neither the settings nor the environment-variable reference mentions
+`CLAUDE_CONFIG_DIR` at all — and riabuild's whole profile feature rests on it. A future
+Claude Code release that changed it would otherwise merge two developers' sign-ins with
+nothing failing.
 
-**Why it matters beyond servers.** If the credential is per-account rather than per-config
-directory, then two riabuild profiles on one Mac **already** share one Claude sign-in today,
-which is a hole in the profile feature that remote mode did not introduce. Remote mode turns
-multi-profile into multi-developer, so the same hole becomes Alice's usage landing on Bob's
-Anthropic account.
+**Why it is worth a test rather than a note.** Had the answer gone the other way, two
+riabuild profiles on one Mac would already share one Claude sign-in today — a hole in the
+existing profile feature that remote mode did not introduce, and that remote mode would have
+escalated from multi-profile to multi-developer. The answer is good, but it is good by
+observation of an undocumented behaviour, which is exactly the kind of thing that regresses
+quietly.
 
 - [ ] **Step 1: Extend the smoke test**
 
@@ -158,13 +160,15 @@ Then follow the four steps in the comment by hand.
 
 - [ ] **Step 3: Record the answer in the spec, and act on it**
 
-| If | Then |
-|---|---|
-| credentials live under `CLAUDE_CONFIG_DIR` | delete the shared-sign-in half of the macOS warning in Task 21; keep the locked-keychain half |
-| credentials live in the login keychain | keep the warning as specced; add a line to the spec's trust boundary saying a shared macOS account shares one Claude sign-in; **and** raise the profile-feature hole separately, because it affects laptops today |
+Replace the `panic!` with an assertion that a fresh `CLAUDE_CONFIG_DIR` is not already
+authenticated — which is what "logins are per config directory" means operationally, and
+what a regression would break.
 
-Replace the `panic!` with an assertion that pins whichever answer is true, so a future Claude
-Code release that changes it fails this test rather than surprising somebody.
+One loose end, deliberately left loose: whether the credential is a file under the config
+directory or a keychain item keyed to it is still unknown, and it only matters if somebody
+signs Claude in *on a macOS server over SSH*, where a keychain would need
+`security unlock-keychain` first. That is a line in a failure message when it happens, not a
+design constraint, and no Linux server can hit it.
 
 - [ ] **Step 4: Commit**
 
@@ -5093,8 +5097,6 @@ pub async fn run(
     )
     .await?;
 
-    warn_about_macos_claude(ctx, &remote).await;
-
     ctx.ui.heading(&format!("Checking {}", remote.name));
     let mut setup = format!("{prefix} {binary} --no-shell");
     if cli.check {
@@ -5273,46 +5275,12 @@ pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
 }
 ```
 
-```rust
-/// Says, on a macOS server, what namespacing cannot fix.
-async fn warn_about_macos_claude(ctx: &Ctx, remote: &Remote, home: &str) -> Result<()> {
-    let uname = ssh_once(remote, ctx.paths.as_ref(), ctx.runner.clone(), "uname -s").await?;
-    if uname.trimmed() != "Darwin" {
-        return Ok(());
-    }
-
-    let others = siblings(ctx, remote, home).await.unwrap_or_default();
-    let names = if others.is_empty() {
-        "anyone else who uses this account".to_string()
-    } else {
-        others.join(" and ")
-    };
-    ctx.ui.warn(&format!(
-        "macOS server: Claude Code keeps its credentials in this account's login keychain, \
-         not in your riabuild profile. You share one Claude sign-in with {names}, and \
-         unlocking the keychain over SSH exposes it to them."
-    ));
-    Ok(())
-}
-
-/// The other developers in this account, from their `owner.json` files.
-async fn siblings(ctx: &Ctx, remote: &Remote, home: &str) -> Result<Vec<String>> {
-    let command = shell_command(&format!(
-        "cat {}/.riabuild-remote/*/owner.json 2>/dev/null || true",
-        shell_quote(home)
-    ));
-    let output = ssh_once(remote, ctx.paths.as_ref(), ctx.runner.clone(), &command).await?;
-    let mine = ctx.member.as_ref().map(|m| m.github_login.clone()).unwrap_or_default();
-    Ok(output
-        .stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|owner| owner.get("githubLogin")?.as_str().map(str::to_string))
-        .filter(|login| *login != mine)
-        .map(|login| format!("@{login}"))
-        .collect())
-}
-```
+(The earlier draft had a `warn_about_macos_claude` here, plus a `siblings` helper that read
+every sibling `owner.json` to name the other developers. Both are deleted: the warning
+described a collision that does not happen — `CLAUDE_CONFIG_DIR=/tmp/asd claude` prompts for
+a fresh login, so credentials are keyed to the config directory, not to the Unix account.
+Task 0 keeps the behaviour pinned; nothing needs to be said to the developer at connect
+time.)
 
 `whoami()` reads `$USER`, falling back to `$LOGNAME` and then to `"root"`; `add()` pushes a
 `Record` built from a `Remote` with `added_at` set; `impl From<&Record> for Remote` carries
