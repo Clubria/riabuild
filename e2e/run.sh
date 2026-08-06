@@ -493,7 +493,11 @@ check_contains "it reported work to do" "$CHECK_OUT" "would run"
 if [ "$PLATFORM" = macos ]; then
   DEFAULT_CHECKOUT="$E2E_HOME/Documents/Clubria/$E2E_REPO_NAME"
 else
-  DEFAULT_CHECKOUT="$E2E_HOME/code/$E2E_REPO_NAME"
+  # Linux groups checkouts under ~/Clubria — the same grouping macOS puts
+  # inside ~/Documents. This must track `paths::default_project_dir`: the
+  # assertion below is that the directory does *not* exist, so a stale path
+  # here does not fail, it passes without checking anything.
+  DEFAULT_CHECKOUT="$E2E_HOME/Clubria/$E2E_REPO_NAME"
 fi
 check "the dry run cloned nothing" test ! -d "$DEFAULT_CHECKOUT"
 
