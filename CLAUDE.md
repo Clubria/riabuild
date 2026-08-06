@@ -18,8 +18,12 @@ anything structural.
 |---|---|
 | `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
+| `e2e/` | the CLI and the backend tested together on macOS — `e2e/README.md` |
 | `docs/superpowers/specs/` | design specs |
 | `.claude/skills/` | repo skills — read the relevant one before the work it covers |
+
+`riabuild-web/e2e/` is a different thing: the dashboard's Playwright suite. The
+`e2e/` directory at the root tests the two deployables against each other.
 
 Each subproject has its own `CLAUDE.md` with conventions specific to it.
 
