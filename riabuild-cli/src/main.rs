@@ -9,6 +9,7 @@
 // binary target, which is the build that reaches a developer's laptop.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod accounts;
 mod api;
 mod archive;
 mod cli;
