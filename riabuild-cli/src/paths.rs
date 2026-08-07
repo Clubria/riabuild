@@ -33,7 +33,7 @@ pub trait Paths: Send + Sync {
     }
     /// A server's own riabuild session. Never used on a laptop, where the
     /// platform keychain holds it instead.
-    #[allow(dead_code)] // consumed by Task 9
+    #[allow(dead_code)] // consumed by Task 10 (Task 9 only threads it through as an Option<PathBuf>)
     fn session_token_file(&self) -> PathBuf {
         self.root().join("session.token")
     }
@@ -85,7 +85,11 @@ impl RealPaths {
 
     /// A root chosen for this developer already — used on a shared server,
     /// where `root` is a per-developer namespace under `~/.riabuild-remote/`.
-    #[allow(dead_code)] // consumed by a later remote-mode task; see task-6 report
+    ///
+    /// Also how a layout method (`riabuild_dir`, `owner_file`, ...) gets evaluated
+    /// against a *remote* home from the laptop side: root it here rather than
+    /// formatting that layout a second time.
+    #[allow(dead_code)] // consumed by Task 17, deriving remote_binary_path from riabuild_dir()
     pub fn with_root(home: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
         Self {
             home: home.as_ref().to_path_buf(),
@@ -93,11 +97,14 @@ impl RealPaths {
         }
     }
 
+    /// The laptop shape: root and home coincide at `~/.riabuild`. Delegates to
+    /// `with_root` rather than repeating the struct literal, so there is exactly
+    /// one definition of "construct a `RealPaths`".
     #[cfg(test)]
     pub fn rooted_at(home: impl AsRef<Path>) -> Self {
         let home = home.as_ref().to_path_buf();
         let root = home.join(".riabuild");
-        Self { home, root }
+        Self::with_root(home, root)
     }
 }
 
@@ -129,6 +136,11 @@ pub fn root_for(home: &Path, override_root: Option<&str>) -> anyhow::Result<Path
     match override_root {
         None => Ok(home.join(".riabuild")),
         Some(path) if Path::new(path).is_absolute() => Ok(PathBuf::from(path)),
+        // RIABUILD_ROOT deliberately appears in both `action` and `.detail()`: `action`
+        // is part of `Failure`'s `Display`, so it is what any consumer that only sees
+        // `to_string()` (including `anyhow::Error::to_string()`) gets; `.detail()` is
+        // extra context `ui::failure()` prints to the terminal but `Display` does not
+        // render (see `ui.rs:249-253`).
         Some(path) => Err(Failure::new(
             "working out where riabuild keeps your files",
             "Run `riabuild remote <server>` from your laptop again — it sets RIABUILD_ROOT, \
