@@ -24,6 +24,7 @@ const DAY = 24 * 60 * MINUTE;
 
 const LEAD: Member = {
   _id: "m_lead",
+  memberId: "4a1e9c2d-6b3f-4a17-9d2e-8c5f1a3b7e60",
   githubLogin: "ilya",
   githubId: "1",
   firstName: "Ilya",
@@ -36,6 +37,7 @@ const LEAD: Member = {
 
 const DEVELOPER: Member = {
   _id: "m_dev",
+  memberId: "7f2b3d5a-9c1e-4b26-8a4f-2d6e9b1c5f83",
   githubLogin: "dana",
   githubId: "2",
   firstName: "Dana",
@@ -48,6 +50,7 @@ const DEVELOPER: Member = {
 
 const CANDIDATE: Member = {
   _id: "m_cand",
+  memberId: "1c8e4f6b-2a9d-4e37-b1c8-5f3a7d2e9b41",
   githubLogin: "sam",
   githubId: "3",
   firstName: "Sam",
@@ -60,6 +63,7 @@ const CANDIDATE: Member = {
 
 const SUSPENDED: Member = {
   _id: "m_susp",
+  memberId: "9d3a7c1e-5b8f-4c92-a6d1-3e7b9c2f5a84",
   githubLogin: "rowan",
   githubId: "4",
   firstName: "Rowan",
@@ -77,6 +81,9 @@ const SUSPENDED: Member = {
  */
 const HOSTILE: Member = {
   _id: "m_hostile",
+  // A full, unbroken 36-character UUID — the `overflow` scenario exists to
+  // catch exactly this shape. A shorter stand-in here would not exercise it.
+  memberId: "2e6b9d4a-8c1f-4a53-9b7e-6d1a3c8f5b92",
   githubLogin: "a".repeat(60),
   githubId: "5",
   firstName: "",
@@ -89,6 +96,7 @@ const HOSTILE: Member = {
 
 const UNICODE: Member = {
   _id: "m_unicode",
+  memberId: "5c1f8a3d-9b6e-4d74-8c2a-7e9b1d5f3a60",
   githubLogin: "田中さん",
   githubId: "6",
   firstName: "محمد",
