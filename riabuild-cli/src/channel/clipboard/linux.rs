@@ -80,6 +80,36 @@ impl Clipboard for X11Clipboard {
         }
         Ok(Some(output.stdout))
     }
+
+    async fn write(&self, mime_type: &str, bytes: &[u8]) -> Result<bool> {
+        let Some(atom) = mime::from_mime(Vocabulary::X11, mime_type) else {
+            return Ok(false);
+        };
+
+        let code = self
+            .runner
+            .run_forking(
+                "xclip",
+                &["-selection", "clipboard", "-t", atom, "-i"],
+                &RunOptions {
+                    stdin: Some(bytes.to_vec()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("could not write the clipboard with xclip")?;
+
+        if code != 0 {
+            bail!(write_failed("xclip", code));
+        }
+        Ok(true)
+    }
+}
+
+/// A write has no stderr to quote — the fork holds that pipe — so the exit
+/// status is the whole diagnostic and the message has to carry it.
+fn write_failed(tool: &str, code: i32) -> anyhow::Error {
+    anyhow::anyhow!("`{tool}` could not take the laptop's clipboard (exit {code})")
 }
 
 pub struct WaylandClipboard {
@@ -133,6 +163,32 @@ impl Clipboard for WaylandClipboard {
             return Ok(None);
         }
         Ok(Some(output.stdout))
+    }
+
+    /// Writes go to `wl-copy`; only reads go to `wl-paste`. The pair is one
+    /// package and one session, so a laptop that can paste can also copy.
+    async fn write(&self, mime_type: &str, bytes: &[u8]) -> Result<bool> {
+        let Some(native) = mime::from_mime(Vocabulary::Wayland, mime_type) else {
+            return Ok(false);
+        };
+
+        let code = self
+            .runner
+            .run_forking(
+                "wl-copy",
+                &["--type", native],
+                &RunOptions {
+                    stdin: Some(bytes.to_vec()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("could not write the clipboard with wl-copy")?;
+
+        if code != 0 {
+            bail!(write_failed("wl-copy", code));
+        }
+        Ok(true)
     }
 }
 
@@ -243,6 +299,94 @@ mod tests {
         let clipboard = X11Clipboard::new(runner.clone());
         assert_eq!(clipboard.read("application/pdf").await.unwrap(), None);
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// The bytes reach xclip on stdin, not in the argument list — the whole
+    /// point of piping a write rather than passing it.
+    #[tokio::test]
+    async fn x11_writes_the_bytes_through_stdin() {
+        let png = [0x89u8, b'P', b'N', b'G', 0xFF];
+        let runner = Arc::new(FakeRunner::new().with(
+            "xclip -selection clipboard -t image/png -i",
+            0,
+            "",
+            "",
+        ));
+        let clipboard = X11Clipboard::new(runner.clone());
+
+        assert!(clipboard.write(PNG, &png).await.unwrap());
+        assert_eq!(runner.input_for("xclip"), Some(png.to_vec()));
+    }
+
+    /// The channel speaks MIME; xclip speaks atoms, on the way in as well as
+    /// out. Written as `text/plain;charset=utf-8` the selection is one no X11
+    /// application asks for.
+    #[tokio::test]
+    async fn a_text_write_is_translated_into_the_x11_atom() {
+        let runner = Arc::new(FakeRunner::new().with(
+            "xclip -selection clipboard -t UTF8_STRING -i",
+            0,
+            "",
+            "",
+        ));
+        let clipboard = X11Clipboard::new(runner.clone());
+
+        assert!(clipboard.write(TEXT, b"hello").await.unwrap());
+        assert!(
+            runner.calls().iter().any(|c| c.contains("UTF8_STRING")),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// A write must never land on PRIMARY, which changes on every mouse drag.
+    #[tokio::test]
+    async fn a_write_names_the_clipboard_selection_explicitly() {
+        let runner = Arc::new(FakeRunner::new().with(
+            "xclip -selection clipboard -t UTF8_STRING -i",
+            0,
+            "",
+            "",
+        ));
+        let clipboard = X11Clipboard::new(runner.clone());
+        clipboard.write(TEXT, b"hi").await.unwrap();
+
+        let call = runner.calls().first().cloned().unwrap_or_default();
+        assert!(call.contains("-selection clipboard"), "{call}");
+    }
+
+    /// A type outside the table is refused before a subprocess runs, the same
+    /// way a read of one is.
+    #[tokio::test]
+    async fn a_write_of_an_uncarried_type_never_shells_out() {
+        let runner = Arc::new(FakeRunner::new());
+        let clipboard = X11Clipboard::new(runner.clone());
+        assert!(!clipboard.write("application/pdf", b"%PDF").await.unwrap());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// A write has no stderr to quote, so the exit status has to be in the
+    /// message or the failure is unattributable.
+    #[tokio::test]
+    async fn a_failed_write_names_its_exit_status() {
+        let runner =
+            arc(FakeRunner::new().with("xclip -selection clipboard -t UTF8_STRING -i", 1, "", ""));
+        let clipboard = X11Clipboard::new(runner);
+        let error = clipboard
+            .write(TEXT, b"hi")
+            .await
+            .expect_err("should be a fault");
+        assert!(error.to_string().contains("exit 1"), "{error}");
+    }
+
+    /// Writes go to wl-copy; only reads go to wl-paste.
+    #[tokio::test]
+    async fn wayland_writes_through_wl_copy() {
+        let runner = Arc::new(FakeRunner::new().with("wl-copy --type image/png", 0, "", ""));
+        let clipboard = WaylandClipboard::new(runner.clone());
+
+        assert!(clipboard.write(PNG, b"\x89PNG").await.unwrap());
+        assert_eq!(runner.input_for("wl-copy"), Some(b"\x89PNG".to_vec()));
     }
 
     #[tokio::test]

@@ -24,7 +24,18 @@ pub const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     ClipboardTargets,
-    ClipboardRead { mime: String },
+    ClipboardRead {
+        mime: String,
+    },
+    /// A header announcing `len` raw bytes to follow on the same stream — the
+    /// mirror of `Response::Payload`, in the other direction.
+    ///
+    /// The only operation that carries a body, and the only one that changes
+    /// the laptop rather than reporting on it.
+    ClipboardWrite {
+        mime: String,
+        len: usize,
+    },
     ChannelPing,
 }
 
@@ -35,6 +46,12 @@ pub enum Response {
     Payload {
         len: usize,
     },
+    /// A write reached the laptop's clipboard.
+    ///
+    /// Distinct from `Pong` on the wire rather than sharing the bare `ok`,
+    /// because these two are the only replies with no body and the channel log
+    /// is the only place a developer can see which one came back.
+    Written,
     Pong,
     Error {
         code: ErrorCode,
@@ -121,6 +138,9 @@ struct RequestLine {
     op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mime: Option<String>,
+    /// Present only on `clipboard.write`: how many raw bytes follow the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    len: Option<usize>,
 }
 
 pub fn encode_request(request: &Request) -> String {
@@ -129,16 +149,25 @@ pub fn encode_request(request: &Request) -> String {
             v: PROTOCOL_VERSION,
             op: "clipboard.targets".into(),
             mime: None,
+            len: None,
         },
         Request::ClipboardRead { mime } => RequestLine {
             v: PROTOCOL_VERSION,
             op: "clipboard.read".into(),
             mime: Some(mime.clone()),
+            len: None,
+        },
+        Request::ClipboardWrite { mime, len } => RequestLine {
+            v: PROTOCOL_VERSION,
+            op: "clipboard.write".into(),
+            mime: Some(mime.clone()),
+            len: Some(*len),
         },
         Request::ChannelPing => RequestLine {
             v: PROTOCOL_VERSION,
             op: "channel.ping".into(),
             mime: None,
+            len: None,
         },
     };
     // Serialising a struct of owned scalars cannot fail; the fallback keeps the
@@ -166,6 +195,17 @@ pub fn decode_request(line: &str) -> Result<Request, ProtocolError> {
             Some(mime) => Ok(Request::ClipboardRead { mime }),
             None => Err(ProtocolError::MissingField("mime")),
         },
+        "clipboard.write" => {
+            let mime = parsed.mime.ok_or(ProtocolError::MissingField("mime"))?;
+            let len = parsed.len.ok_or(ProtocolError::MissingField("len"))?;
+            // Refused here, before the reader allocates or reads by it. This is
+            // the only inbound length a peer chooses, so it is the only one that
+            // could make the laptop reserve 4 GB on request.
+            if len > MAX_PAYLOAD {
+                return Err(ProtocolError::TooLarge(len));
+            }
+            Ok(Request::ClipboardWrite { mime, len })
+        }
         other => Err(ProtocolError::UnknownOp(other.to_string())),
     }
 }
@@ -176,6 +216,8 @@ struct ResponseLine {
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     targets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     len: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +231,7 @@ pub fn encode_response(response: &Response) -> String {
         Response::Targets(targets) => ResponseLine {
             ok: true,
             targets: Some(targets.clone()),
+            written: None,
             len: None,
             code: None,
             message: None,
@@ -196,13 +239,23 @@ pub fn encode_response(response: &Response) -> String {
         Response::Payload { len } => ResponseLine {
             ok: true,
             targets: None,
+            written: None,
             len: Some(*len),
+            code: None,
+            message: None,
+        },
+        Response::Written => ResponseLine {
+            ok: true,
+            targets: None,
+            written: Some(true),
+            len: None,
             code: None,
             message: None,
         },
         Response::Pong => ResponseLine {
             ok: true,
             targets: None,
+            written: None,
             len: None,
             code: None,
             message: None,
@@ -210,6 +263,7 @@ pub fn encode_response(response: &Response) -> String {
         Response::Error { code, message } => ResponseLine {
             ok: false,
             targets: None,
+            written: None,
             len: None,
             code: Some(code.as_str().to_string()),
             message: Some(message.clone()),
@@ -234,6 +288,10 @@ pub fn decode_response(line: &str) -> Result<Response, ProtocolError> {
 
     if let Some(targets) = parsed.targets {
         return Ok(Response::Targets(targets));
+    }
+
+    if parsed.written == Some(true) {
+        return Ok(Response::Written);
     }
 
     match parsed.len {
@@ -284,11 +342,78 @@ mod tests {
     /// refused by name, not attempted.
     #[test]
     fn an_operation_outside_the_allowlist_is_refused() {
-        let line = r#"{"v":1,"op":"clipboard.write","data":"x"}"#;
+        let line = r#"{"v":1,"op":"clipboard.clear"}"#;
         assert!(matches!(
             decode_request(line),
-            Err(ProtocolError::UnknownOp(op)) if op == "clipboard.write"
+            Err(ProtocolError::UnknownOp(op)) if op == "clipboard.clear"
         ));
+    }
+
+    #[test]
+    fn a_write_request_carries_its_type_and_its_length() {
+        let request = Request::ClipboardWrite {
+            mime: "image/png".into(),
+            len: 4,
+        };
+        let line = encode_request(&request);
+        assert!(line.contains("\"op\":\"clipboard.write\""), "{line}");
+        assert!(line.contains("\"len\":4"), "{line}");
+        assert_eq!(decode_request(&line).unwrap(), request);
+    }
+
+    /// A write with no length cannot be framed: the reader would not know where
+    /// the body stops and the next request begins.
+    #[test]
+    fn a_write_without_a_length_is_a_missing_field() {
+        let line = r#"{"v":1,"op":"clipboard.write","mime":"text/plain;charset=utf-8"}"#;
+        assert!(matches!(
+            decode_request(line),
+            Err(ProtocolError::MissingField("len"))
+        ));
+    }
+
+    #[test]
+    fn a_write_without_a_type_is_a_missing_field() {
+        let line = r#"{"v":1,"op":"clipboard.write","len":4}"#;
+        assert!(matches!(
+            decode_request(line),
+            Err(ProtocolError::MissingField("mime"))
+        ));
+    }
+
+    /// The inbound direction is the only one where a peer chooses how much the
+    /// laptop allocates, so the cap is enforced before anything is read.
+    #[test]
+    fn an_oversized_write_is_refused_before_its_body_is_read() {
+        let line = format!(
+            r#"{{"v":1,"op":"clipboard.write","mime":"image/png","len":{}}}"#,
+            MAX_PAYLOAD + 1
+        );
+        assert!(matches!(
+            decode_request(&line),
+            Err(ProtocolError::TooLarge(_))
+        ));
+
+        // Exactly the cap is legal: the boundary belongs on the legal side.
+        let line =
+            format!(r#"{{"v":1,"op":"clipboard.write","mime":"image/png","len":{MAX_PAYLOAD}}}"#);
+        assert!(matches!(
+            decode_request(&line),
+            Ok(Request::ClipboardWrite { len, .. }) if len == MAX_PAYLOAD
+        ));
+    }
+
+    /// A write ack and a pong are the only two replies with no body, and the
+    /// channel log is the only place a developer sees which came back.
+    #[test]
+    fn a_write_acknowledgement_is_distinguishable_from_a_pong() {
+        let line = encode_response(&Response::Written);
+        assert_eq!(line, "{\"ok\":true,\"written\":true}\n");
+        assert_eq!(decode_response(&line).unwrap(), Response::Written);
+        assert_ne!(
+            decode_response(&encode_response(&Response::Pong)).unwrap(),
+            Response::Written
+        );
     }
 
     #[test]

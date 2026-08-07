@@ -56,8 +56,13 @@ pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// Fed to the child's stdin. Used to pipe brokered secrets without them ever
-    /// appearing in a process argument list, where `ps` would show them.
-    pub stdin: Option<String>,
+    /// appearing in a process argument list, where `ps` would show them, and to
+    /// hand a clipboard write to `xclip -i`.
+    ///
+    /// Bytes rather than a `String` for the same reason `run_bytes` exists: a
+    /// `String` cannot represent a PNG at all, so an image write would not be
+    /// merely lossy, it would be unconstructible.
+    pub stdin: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -80,6 +85,19 @@ pub trait CommandRunner: Send + Sync {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<BytesOutput>;
+
+    /// Feeds stdin to a command that forks a child to outlive it, and waits
+    /// only for the process actually started.
+    ///
+    /// `xclip -i` and `wl-copy` fork into the background to *serve* the
+    /// selection they were given, and that fork inherits whatever stdout it was
+    /// handed. `run` and `run_bytes` finish by reading stdout to EOF, which for
+    /// these two arrives only when the selection is replaced — so a clipboard
+    /// write through either would hang for as long as the copy stayed current.
+    ///
+    /// The cost is that stderr is unavailable: the fork holds that pipe too, so
+    /// the only diagnostic a write can carry is its exit status.
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32>;
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
@@ -138,7 +156,7 @@ impl CommandRunner for RealRunner {
         if let Some(input) = &options.stdin {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child.stdin.take().context("stdin was piped")?;
-            stdin.write_all(input.as_bytes()).await?;
+            stdin.write_all(input).await?;
             // Closing the pipe is what tells the child there is no more input.
             // The blocking version got this free when the `if let` block ended;
             // here the handle would otherwise live until the end of the
@@ -180,7 +198,7 @@ impl CommandRunner for RealRunner {
         if let Some(input) = &options.stdin {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child.stdin.take().context("stdin was piped")?;
-            stdin.write_all(input.as_bytes()).await?;
+            stdin.write_all(input).await?;
             drop(stdin);
         }
 
@@ -194,6 +212,39 @@ impl CommandRunner for RealRunner {
             stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+        let mut command = RealRunner::build(program, args, options);
+        // Null rather than piped: a pipe handed to the fork is exactly what
+        // would keep this call waiting for a selection nobody is going to
+        // replace.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command.stdin(if options.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("could not start `{program}`"))?;
+
+        if let Some(input) = &options.stdin {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().context("stdin was piped")?;
+            stdin.write_all(input).await?;
+            // The fork does not take ownership of the selection until it has
+            // read the content to EOF, so closing this is what completes the
+            // copy rather than merely tidying up.
+            drop(stdin);
+        }
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("`{program}` did not finish"))?;
+        Ok(status.code().unwrap_or(1))
     }
 
     async fn run_interactive(
@@ -241,6 +292,10 @@ pub struct FakeRunner {
     byte_responses: HashMap<String, Vec<u8>>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
+    /// What each call was given on stdin. A clipboard write is *only* its
+    /// stdin, so without this a test could assert the invocation and still not
+    /// know whether the bytes survived.
+    inputs: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 #[cfg(test)]
@@ -277,6 +332,33 @@ impl FakeRunner {
 
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The stdin every call was given, as `(invocation, bytes)`.
+    pub fn inputs(&self) -> Vec<(String, Vec<u8>)> {
+        self.inputs.lock().unwrap().clone()
+    }
+
+    /// The bytes piped into the first call whose invocation contains `needle`.
+    pub fn input_for(&self, needle: &str) -> Option<Vec<u8>> {
+        self.inputs()
+            .into_iter()
+            .find(|(invocation, _)| invocation.contains(needle))
+            .map(|(_, bytes)| bytes)
+    }
+
+    fn record(&self, program: &str, args: &[&str], options: &RunOptions) -> String {
+        let invocation = format!("{program} {}", args.join(" "))
+            .trim_end()
+            .to_string();
+        self.calls.lock().unwrap().push(invocation.clone());
+        if let Some(input) = &options.stdin {
+            self.inputs
+                .lock()
+                .unwrap()
+                .push((invocation.clone(), input.clone()));
+        }
+        invocation
     }
 
     /// The invocation a stub is matched against.
@@ -366,13 +448,9 @@ impl CommandRunner for FakeRunner {
         &self,
         program: &str,
         args: &[&str],
-        _options: &RunOptions,
+        options: &RunOptions,
     ) -> Result<CommandOutput> {
-        let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
+        self.record(program, args, options);
         Ok(self.lookup(program, args))
     }
 
@@ -380,13 +458,9 @@ impl CommandRunner for FakeRunner {
         &self,
         program: &str,
         args: &[&str],
-        _options: &RunOptions,
+        options: &RunOptions,
     ) -> Result<BytesOutput> {
-        let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
+        self.record(program, args, options);
 
         let text = self.lookup(program, args);
         // A test that only cares about the exit code can stub with `with` and
@@ -402,17 +476,18 @@ impl CommandRunner for FakeRunner {
         })
     }
 
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+        self.record(program, args, options);
+        Ok(self.lookup(program, args).code.unwrap_or(0))
+    }
+
     async fn run_interactive(
         &self,
         program: &str,
         args: &[&str],
-        _options: &RunOptions,
+        options: &RunOptions,
     ) -> Result<i32> {
-        let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
+        self.record(program, args, options);
         // A stub's exit code applies here too: interactive commands fail as
         // well — a developer who abandons a device-code prompt leaves `gh`
         // exiting non-zero — and a task that ignores that reports a sign-in

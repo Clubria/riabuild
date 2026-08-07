@@ -39,13 +39,69 @@ impl Agent {
         }
     }
 
-    /// Answers one request. The body is returned beside the header rather than
-    /// written, so every dispatch decision is testable without a socket.
-    pub async fn handle(&self, request: &Request, now: Instant) -> (Response, Option<Vec<u8>>) {
+    /// Answers one request. Bodies are passed and returned beside the header
+    /// rather than read and written, so every dispatch decision is testable
+    /// without a socket.
+    ///
+    /// `body` is the payload of an inbound write, already framed by `server`
+    /// against the length the header announced.
+    pub async fn handle(
+        &self,
+        request: &Request,
+        body: Option<Vec<u8>>,
+        now: Instant,
+    ) -> (Response, Option<Vec<u8>>) {
         match request {
             Request::ChannelPing => (Response::Pong, None),
             Request::ClipboardTargets => self.targets(now).await,
             Request::ClipboardRead { mime } => self.read(mime, now).await,
+            Request::ClipboardWrite { mime, len } => self.write(mime, body, *len).await,
+        }
+    }
+
+    /// The one operation that changes the laptop rather than reporting on it.
+    async fn write(
+        &self,
+        mime: &str,
+        body: Option<Vec<u8>>,
+        len: usize,
+    ) -> (Response, Option<Vec<u8>>) {
+        let bytes = body.unwrap_or_default();
+        if bytes.len() != len {
+            return (
+                Response::Error {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "the write announced {len} bytes and carried {}",
+                        bytes.len()
+                    ),
+                },
+                None,
+            );
+        }
+
+        // The snapshot describes a clipboard that is about to stop existing.
+        // Dropped before the write rather than after, so a write that fails
+        // half-way cannot leave a reader being served content the laptop no
+        // longer holds.
+        *self.snapshot.lock().await = None;
+
+        match self.clipboard.write(mime, &bytes).await {
+            Ok(true) => (Response::Written, None),
+            Ok(false) => (
+                Response::Error {
+                    code: ErrorCode::Unsupported,
+                    message: format!("the channel does not carry `{mime}`"),
+                },
+                None,
+            ),
+            Err(error) => (
+                Response::Error {
+                    code: ErrorCode::Internal,
+                    message: format!("could not write the laptop's clipboard: {error}"),
+                },
+                None,
+            ),
         }
     }
 
@@ -182,6 +238,19 @@ mod tests {
             }
             Ok(Some(self.bytes.lock().expect("lock").clone()))
         }
+        async fn write(&self, mime: &str, bytes: &[u8]) -> Result<bool> {
+            // Only the types a real backend has a name for. `refuses` stands in
+            // for anything outside the table.
+            if mime == "application/pdf" {
+                return Ok(false);
+            }
+            if mime == "explode" {
+                anyhow::bail!("the clipboard tool fell over");
+            }
+            *self.types.lock().expect("lock") = vec![mime.to_string()];
+            *self.bytes.lock().expect("lock") = bytes.to_vec();
+            Ok(true)
+        }
     }
 
     /// Lets one fake back both the trait object the agent owns and the handle
@@ -195,6 +264,9 @@ mod tests {
         }
         async fn read(&self, mime: &str) -> Result<Option<Vec<u8>>> {
             self.0.read(mime).await
+        }
+        async fn write(&self, mime: &str, bytes: &[u8]) -> Result<bool> {
+            self.0.write(mime, bytes).await
         }
     }
 
@@ -211,7 +283,9 @@ mod tests {
     #[tokio::test]
     async fn a_ping_is_answered_without_touching_the_clipboard() {
         let agent = agent(FakeClipboard::holding(&[], b""));
-        let (response, body) = agent.handle(&Request::ChannelPing, Instant::now()).await;
+        let (response, body) = agent
+            .handle(&Request::ChannelPing, None, Instant::now())
+            .await;
         assert_eq!(response, Response::Pong);
         assert!(body.is_none());
     }
@@ -220,7 +294,7 @@ mod tests {
     async fn targets_are_reported_from_the_clipboard() {
         let agent = agent(FakeClipboard::holding(&[PNG], b"\x89PNG"));
         let (response, _) = agent
-            .handle(&Request::ClipboardTargets, Instant::now())
+            .handle(&Request::ClipboardTargets, None, Instant::now())
             .await;
         assert_eq!(response, Response::Targets(vec![PNG.to_string()]));
     }
@@ -229,7 +303,7 @@ mod tests {
     async fn a_read_returns_a_length_header_and_the_bytes() {
         let agent = agent(FakeClipboard::holding(&[PNG], b"\x89PNG"));
         let request = Request::ClipboardRead { mime: PNG.into() };
-        let (response, body) = agent.handle(&request, Instant::now()).await;
+        let (response, body) = agent.handle(&request, None, Instant::now()).await;
         assert_eq!(response, Response::Payload { len: 4 });
         assert_eq!(body, Some(b"\x89PNG".to_vec()));
     }
@@ -244,13 +318,13 @@ mod tests {
         let now = Instant::now();
 
         // The advertisement, then the read that fetches and caches the bytes.
-        agent.handle(&Request::ClipboardTargets, now).await;
+        agent.handle(&Request::ClipboardTargets, None, now).await;
         let request = Request::ClipboardRead { mime: PNG.into() };
-        agent.handle(&request, now).await;
+        agent.handle(&request, None, now).await;
 
         clipboard.becomes_empty();
 
-        let (response, body) = agent.handle(&request, now).await;
+        let (response, body) = agent.handle(&request, None, now).await;
         assert_eq!(response, Response::Payload { len: 4 });
         assert_eq!(body, Some(b"\x89PNG".to_vec()));
     }
@@ -263,11 +337,11 @@ mod tests {
         let agent = agent(clipboard.clone());
         let now = Instant::now();
 
-        agent.handle(&Request::ClipboardTargets, now).await;
+        agent.handle(&Request::ClipboardTargets, None, now).await;
         clipboard.becomes_empty();
 
         let request = Request::ClipboardRead { mime: PNG.into() };
-        let (response, body) = agent.handle(&request, now).await;
+        let (response, body) = agent.handle(&request, None, now).await;
         let Response::Error { code, message } = response else {
             panic!("expected an error");
         };
@@ -284,14 +358,14 @@ mod tests {
         let agent = agent(clipboard.clone());
         let now = Instant::now();
 
-        agent.handle(&Request::ClipboardTargets, now).await;
+        agent.handle(&Request::ClipboardTargets, None, now).await;
         let request = Request::ClipboardRead { mime: PNG.into() };
-        agent.handle(&request, now).await;
+        agent.handle(&request, None, now).await;
 
         clipboard.becomes_empty();
 
         let later = now + SNAPSHOT_TTL + Duration::from_secs(1);
-        let (response, body) = agent.handle(&request, later).await;
+        let (response, body) = agent.handle(&request, None, later).await;
         assert!(matches!(response, Response::Error { .. }), "{response:?}");
         assert!(body.is_none());
     }
@@ -300,7 +374,7 @@ mod tests {
     async fn a_genuinely_empty_clipboard_is_unavailable_rather_than_a_fault() {
         let agent = agent(FakeClipboard::holding(&[], b""));
         let request = Request::ClipboardRead { mime: PNG.into() };
-        let (response, body) = agent.handle(&request, Instant::now()).await;
+        let (response, body) = agent.handle(&request, None, Instant::now()).await;
         assert!(
             matches!(&response, Response::Error { code, .. } if *code == ErrorCode::Unavailable),
             "{response:?}"
@@ -308,12 +382,156 @@ mod tests {
         assert!(body.is_none());
     }
 
+    fn write_of(mime: &str, bytes: &[u8]) -> Request {
+        Request::ClipboardWrite {
+            mime: mime.to_string(),
+            len: bytes.len(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_puts_the_bytes_on_the_clipboard() {
+        let clipboard = FakeClipboard::holding(&[], b"");
+        let agent = agent(clipboard.clone());
+
+        let (response, body) = agent
+            .handle(
+                &write_of(TEXT, b"copied on the server"),
+                Some(b"copied on the server".to_vec()),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(response, Response::Written);
+        assert!(body.is_none());
+        assert_eq!(
+            clipboard.read(TEXT).await.unwrap(),
+            Some(b"copied on the server".to_vec())
+        );
+    }
+
+    /// A write replaces the clipboard the snapshot describes. Left in place, the
+    /// next read would serve the content that was just overwritten — and would
+    /// look like a working paste while doing it.
+    #[tokio::test]
+    async fn a_write_invalidates_the_snapshot_taken_before_it() {
+        let clipboard = FakeClipboard::holding(&[TEXT], b"the old clipboard");
+        let agent = agent(clipboard.clone());
+        let now = Instant::now();
+
+        // Advertise, then read, so the snapshot holds cached content.
+        agent.handle(&Request::ClipboardTargets, None, now).await;
+        let read = Request::ClipboardRead { mime: TEXT.into() };
+        let (_, cached) = agent.handle(&read, None, now).await;
+        assert_eq!(cached, Some(b"the old clipboard".to_vec()));
+
+        agent
+            .handle(
+                &write_of(TEXT, b"the new one"),
+                Some(b"the new one".to_vec()),
+                now,
+            )
+            .await;
+
+        // Same instant, so nothing expired: only the write can have cleared it.
+        let (_, after) = agent.handle(&read, None, now).await;
+        assert_eq!(after, Some(b"the new one".to_vec()));
+    }
+
+    /// The length in the header is the framing. A body that does not match it
+    /// means the stream is out of step, and writing the fragment would put half
+    /// an image on the laptop.
+    #[tokio::test]
+    async fn a_body_that_does_not_match_its_announced_length_is_refused() {
+        let clipboard = FakeClipboard::holding(&[], b"");
+        let agent = agent(clipboard.clone());
+
+        let request = Request::ClipboardWrite {
+            mime: TEXT.into(),
+            len: 100,
+        };
+        let (response, _) = agent
+            .handle(&request, Some(b"short".to_vec()), Instant::now())
+            .await;
+
+        let Response::Error { code, message } = response else {
+            panic!("expected an error");
+        };
+        assert_eq!(code, ErrorCode::BadRequest);
+        assert!(message.contains("100"), "{message}");
+        // And nothing reached the clipboard.
+        assert!(clipboard.read(TEXT).await.unwrap().is_none());
+    }
+
+    /// A truncated body arrives as `None`, and must be refused rather than
+    /// written as an empty clipboard.
+    #[tokio::test]
+    async fn a_write_whose_body_never_arrived_is_refused() {
+        let agent = agent(FakeClipboard::holding(&[], b""));
+        let request = Request::ClipboardWrite {
+            mime: TEXT.into(),
+            len: 12,
+        };
+        let (response, _) = agent.handle(&request, None, Instant::now()).await;
+        assert!(
+            matches!(&response, Response::Error { code, .. } if *code == ErrorCode::BadRequest),
+            "{response:?}"
+        );
+    }
+
+    /// A type no backend has a name for is refused as unsupported rather than
+    /// reported as a broken laptop.
+    #[tokio::test]
+    async fn a_write_of_a_type_the_channel_does_not_carry_is_unsupported() {
+        let agent = agent(FakeClipboard::holding(&[], b""));
+        let (response, _) = agent
+            .handle(
+                &write_of("application/pdf", b"%PDF"),
+                Some(b"%PDF".to_vec()),
+                Instant::now(),
+            )
+            .await;
+        let Response::Error { code, message } = response else {
+            panic!("expected an error");
+        };
+        assert_eq!(code, ErrorCode::Unsupported);
+        assert!(message.contains("application/pdf"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_clipboard_tool_that_fails_a_write_is_reported_as_a_fault() {
+        let agent = agent(FakeClipboard::holding(&[], b""));
+        let (response, _) = agent
+            .handle(
+                &write_of("explode", b"x"),
+                Some(b"x".to_vec()),
+                Instant::now(),
+            )
+            .await;
+        let Response::Error { code, message } = response else {
+            panic!("expected an error");
+        };
+        assert_eq!(code, ErrorCode::Internal);
+        assert!(message.contains("fell over"), "{message}");
+    }
+
+    /// An empty clipboard is a legitimate thing to copy, and zero bytes is not
+    /// the same as a missing body.
+    #[tokio::test]
+    async fn an_empty_write_is_allowed() {
+        let agent = agent(FakeClipboard::holding(&[], b""));
+        let (response, _) = agent
+            .handle(&write_of(TEXT, b""), Some(Vec::new()), Instant::now())
+            .await;
+        assert_eq!(response, Response::Written);
+    }
+
     #[tokio::test]
     async fn a_payload_over_the_cap_is_refused_with_the_limit_named() {
         let huge = vec![0u8; MAX_PAYLOAD + 1];
         let agent = agent(FakeClipboard::holding(&[TEXT], &huge));
         let request = Request::ClipboardRead { mime: TEXT.into() };
-        let (response, body) = agent.handle(&request, Instant::now()).await;
+        let (response, body) = agent.handle(&request, None, Instant::now()).await;
         let Response::Error { code, message } = response else {
             panic!("expected an error");
         };

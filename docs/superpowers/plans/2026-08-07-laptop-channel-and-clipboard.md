@@ -20,6 +20,8 @@ Remote mode (`docs/superpowers/specs/2026-08-06-remote-mode-design.md`) is unmer
 - The `e2e/remote` container tests: the degradation test and the end-to-end paste test.
 - Writing the amendment paragraph into the remote-mode spec (that file is in a sibling worktree).
 
+Clipboard **writes** were added after these thirteen tasks landed; see *Task 14* at the end.
+
 ## Global Constraints
 
 Every task's requirements implicitly include these. The first five are from `riabuild-cli/CLAUDE.md` and are not style preferences.
@@ -4243,4 +4245,27 @@ Open these as a follow-up PR once `src/remote/` exists. Each is small; none chan
 - [ ] Refuse a pre-existing socket owned by another uid rather than unlinking it.
 - [ ] Write the amended-invariant paragraph into `2026-08-06-remote-mode-design.md`.
 - [ ] `e2e/remote` degradation test: kill the tunnel mid-session; setup re-runs, secrets re-pull, the shell works, and only clipboard fails.
-- [ ] `e2e/remote` end-to-end test: a PNG and a UTF-8 string paste through a real shim.
+- [ ] `e2e/remote` end-to-end test: a PNG and a UTF-8 string paste through a real shim, **and** a copy on the server that lands on the laptop's clipboard.
+
+---
+
+## Task 14: Clipboard writes (added after the first thirteen landed)
+
+Built as an increment on the finished channel, so this is a record of what changed rather than a script to follow. The design section is *What Claude Code actually does* in the spec.
+
+**Why it is not what it appears to be.** The request was "Claude Code can select and copy text, so add writes." Reading the shipped bundle showed Claude Code skips `xclip` entirely when `SSH_CONNECTION` is set and emits OSC 52 instead — and a real mosh 1.4.0 round trip relays OSC 52 verbatim. So Claude Code's own copy already worked, over both transports, and a write shim can never intercept it. The write path was built anyway, for the reason that survives: every *other* program on the server that copies (`gh`, `git`, `pass`, editors, `| xclip` scripts) writes into a clipboard nobody can paste from.
+
+**Two runner changes, both because the trait was text-shaped.**
+
+- `RunOptions.stdin` became `Vec<u8>`. A `String` cannot represent a PNG, so an image write was not lossy but unconstructible. One caller (`keychain.rs`) changed.
+- `CommandRunner::run_forking` was added. `xclip -i` and `wl-copy` fork a background child to serve the selection, and it inherits the captured stdout; `run` finishes by reading stdout to EOF, which arrives only when the selection is replaced. Measured at 3.01s against a 3-second forked child versus 0.00s with stdio nulled. `run_forking` nulls stdio and reaps only the direct child, at the cost of stderr — which is why a failed write reports its exit status instead.
+
+**What was added.**
+
+- [x] `Request::ClipboardWrite { mime, len }` and `Response::Written`. The only request with a body, framed exactly as a payload response is. The cap is enforced in `decode_request`, because this is the only length a peer chooses.
+- [x] `Clipboard::write` on all three backends: `xclip -t <atom> -i`, `wl-copy --type <mime>`, and on macOS `pbcopy` for text with an `«data …»` AppleScript literal on stdin for everything else — the exact inverse of the envelope `read` already decodes, which keeps writes off the filesystem and clear of `ARG_MAX`.
+- [x] `Agent::write`, which drops the snapshot **before** the write so a partial failure cannot leave a reader served content the laptop no longer holds.
+- [x] `client::request_with_body`, and body framing in `agent/server.rs`.
+- [x] A `wl-copy` shim beside `xclip` and `wl-paste`, with `CLIPBOARD_TOOLS` as the single list and a test that every shadowed name has a parser behind it.
+- [x] `Intent::Write`, including `wl-copy hello world` copying its arguments. PRIMARY writes, `--clear` and `-f`/`-filter` pass through.
+- [x] A failed write exits **non-zero**. Reads degrade into something indistinguishable from an empty clipboard on purpose; a write has no such twin, and a silent success loses what the developer copied.

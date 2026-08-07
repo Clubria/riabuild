@@ -75,6 +75,22 @@ fn decode_applescript_data(raw: &str, class: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// The bytes → `«data PNGf89504E47»`, the literal AppleScript reads back.
+///
+/// The exact inverse of `decode_applescript_data`, and it keeps writes off the
+/// filesystem: the alternative is a temp file for `read (POSIX file …)`, which
+/// would put a copy of every image the developer pastes into `/tmp`.
+fn encode_applescript_data(class: &str, bytes: &[u8]) -> String {
+    let mut literal = String::with_capacity(bytes.len() * 2 + class.len() + 8);
+    literal.push_str("«data ");
+    literal.push_str(class);
+    for byte in bytes {
+        literal.push_str(&format!("{byte:02X}"));
+    }
+    literal.push('»');
+    literal
+}
+
 #[async_trait]
 impl Clipboard for MacOsClipboard {
     async fn targets(&self) -> Result<Vec<String>> {
@@ -118,6 +134,61 @@ impl Clipboard for MacOsClipboard {
             return Ok(None);
         };
         Ok(decode_applescript_data(&raw, class))
+    }
+
+    async fn write(&self, mime_type: &str, bytes: &[u8]) -> Result<bool> {
+        // pbcopy is exact, and it is the only way to put text on the pasteboard
+        // without AppleScript's string handling rewriting line endings.
+        if mime_type.eq_ignore_ascii_case(mime::TEXT) {
+            let output = self
+                .runner
+                .run(
+                    "pbcopy",
+                    &[],
+                    &RunOptions {
+                        stdin: Some(bytes.to_vec()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .context("could not write the pasteboard with pbcopy")?;
+            if !output.ok() {
+                anyhow::bail!("`pbcopy` failed: {}", output.stderr.trim());
+            }
+            return Ok(true);
+        }
+
+        let Some(class) = class_for(mime_type) else {
+            return Ok(false);
+        };
+
+        // The script goes in on stdin rather than after `-e`. A 12 MB
+        // screenshot is 24 MB of hex, which is well past what an argument list
+        // can hold, and `osascript -` has no such limit.
+        let script = format!(
+            "set the clipboard to {}",
+            encode_applescript_data(class, bytes)
+        );
+        let output = self
+            .runner
+            .run(
+                "osascript",
+                &["-"],
+                &RunOptions {
+                    stdin: Some(script.into_bytes()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("could not write the pasteboard with osascript")?;
+
+        if !output.ok() {
+            anyhow::bail!(
+                "osascript could not set the pasteboard: {}",
+                output.stderr.trim()
+            );
+        }
+        Ok(true)
     }
 }
 
@@ -205,6 +276,57 @@ mod tests {
         for raw in ["", "missing value", "«data PNGf8950", "«data TIFF89504E47»"] {
             assert_eq!(decode_applescript_data(raw, "PNGf"), None, "{raw:?}");
         }
+    }
+
+    /// pbcopy is exact. AppleScript's string handling rewrites line endings and
+    /// mangles anything non-ASCII, which for a write means silently corrupting
+    /// what the developer copied.
+    #[tokio::test]
+    async fn macos_writes_text_through_pbcopy() {
+        let runner = Arc::new(FakeRunner::new().with("pbcopy", 0, "", ""));
+        let clipboard = MacOsClipboard::new(runner.clone());
+
+        assert!(clipboard.write(TEXT, "héllo".as_bytes()).await.unwrap());
+        assert_eq!(
+            runner.input_for("pbcopy"),
+            Some("héllo".as_bytes().to_vec())
+        );
+    }
+
+    /// The script goes in on stdin, not after `-e`: a screenshot's worth of hex
+    /// is far past what an argument list can hold.
+    #[tokio::test]
+    async fn macos_writes_an_image_as_a_data_literal_on_stdin() {
+        let runner = Arc::new(FakeRunner::new().with("osascript -", 0, "", ""));
+        let clipboard = MacOsClipboard::new(runner.clone());
+
+        assert!(
+            clipboard
+                .write(PNG, &[0x89, 0x50, 0x4E, 0x47])
+                .await
+                .unwrap()
+        );
+
+        let script = runner.input_for("osascript").expect("script on stdin");
+        let script = String::from_utf8(script).expect("utf-8 script");
+        assert_eq!(script, "set the clipboard to «data PNGf89504E47»");
+    }
+
+    #[tokio::test]
+    async fn a_macos_write_of_an_uncarried_type_never_shells_out() {
+        let runner = Arc::new(FakeRunner::new());
+        let clipboard = MacOsClipboard::new(runner.clone());
+        assert!(!clipboard.write("application/pdf", b"%PDF").await.unwrap());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// The envelope has to be the exact inverse of the one `read` decodes, or
+    /// a round trip through the channel corrupts what it carried.
+    #[test]
+    fn the_data_envelope_round_trips_through_its_own_decoder() {
+        let bytes = vec![0x00, 0x89, 0x50, 0xFF, 0x0A];
+        let literal = encode_applescript_data("PNGf", &bytes);
+        assert_eq!(decode_applescript_data(&literal, "PNGf"), Some(bytes));
     }
 
     #[test]

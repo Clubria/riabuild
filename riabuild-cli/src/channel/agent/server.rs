@@ -6,12 +6,12 @@
 //! a check on a socket that is merely still open.
 
 use super::Agent;
-use crate::channel::protocol::{ErrorCode, Response, decode_request, encode_response};
+use crate::channel::protocol::{ErrorCode, Request, Response, decode_request, encode_response};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 impl Agent {
@@ -50,7 +50,26 @@ impl Agent {
         reader.read_line(&mut line).await?;
 
         let (header, body) = match decode_request(&line) {
-            Ok(request) => self.handle(&request, Instant::now()).await,
+            Ok(request) => {
+                // A write is the only request with a body. Read exactly what
+                // the header announced — `decode_request` has already refused
+                // anything past the cap, so this cannot be told to allocate
+                // more than the channel carries.
+                let inbound = match &request {
+                    Request::ClipboardWrite { len, .. } => {
+                        let mut bytes = vec![0u8; *len];
+                        match reader.read_exact(&mut bytes).await {
+                            Ok(_) => Some(bytes),
+                            // A truncated body is a framing failure, not an
+                            // empty clipboard: answer rather than write half an
+                            // image onto the laptop.
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                self.handle(&request, inbound, Instant::now()).await
+            }
             // A line the allowlist refuses is answered, not dropped: the next
             // shell into the same server still needs this agent.
             Err(error) => (
@@ -156,6 +175,63 @@ mod tests {
         reader.read_line(&mut line).await.expect("read");
         assert_eq!(decode_response(&line).expect("decode"), Response::Pong);
 
+        serving.abort();
+    }
+
+    /// A write, body and all, over a real socket. The framing is the whole risk
+    /// here: the body is not newline-delimited, so a reader that guessed at its
+    /// length would corrupt every binary copy.
+    #[tokio::test]
+    async fn a_write_carries_its_body_over_a_real_unix_socket() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("channel.sock");
+        let serving = started(&socket).await;
+
+        // A body with an embedded newline and a non-UTF-8 byte: either one
+        // would be mangled by a reader that framed on lines or on strings.
+        let payload = b"first\nsecond\xFF".to_vec();
+        let request = Request::ClipboardWrite {
+            mime: TEXT.to_string(),
+            len: payload.len(),
+        };
+
+        let reply = crate::channel::client::request_with_body(&socket, &request, &payload)
+            .await
+            .expect("write");
+        assert_eq!(reply.response, Response::Written);
+
+        // The agent's clipboard now holds exactly those bytes.
+        let read = crate::channel::client::request(
+            &socket,
+            &Request::ClipboardRead {
+                mime: TEXT.to_string(),
+            },
+        )
+        .await
+        .expect("read back");
+        assert_eq!(read.body, payload);
+
+        serving.abort();
+    }
+
+    /// The connection stays usable after a write: the body must be consumed
+    /// exactly, or the next request would be read out of the leftovers.
+    #[tokio::test]
+    async fn a_write_leaves_the_agent_answering() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("channel.sock");
+        let serving = started(&socket).await;
+
+        let payload = b"content".to_vec();
+        let request = Request::ClipboardWrite {
+            mime: TEXT.to_string(),
+            len: payload.len(),
+        };
+        crate::channel::client::request_with_body(&socket, &request, &payload)
+            .await
+            .expect("write");
+
+        assert!(pings(&socket).await, "the agent stopped answering");
         serving.abort();
     }
 

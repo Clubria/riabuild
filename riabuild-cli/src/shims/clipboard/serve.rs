@@ -20,7 +20,19 @@ pub enum Output {
 fn vocabulary(tool: Tool) -> Vocabulary {
     match tool {
         Tool::Xclip => Vocabulary::X11,
-        Tool::WlPaste => Vocabulary::Wayland,
+        Tool::WlPaste | Tool::WlCopy => Vocabulary::Wayland,
+    }
+}
+
+/// What a tool puts on the clipboard when the caller named no type.
+///
+/// Both default to plain text, and getting this wrong is silent: the content
+/// arrives under a type nothing asks for, so the paste on the other side finds
+/// an empty clipboard.
+fn default_write_type(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Xclip => "UTF8_STRING",
+        Tool::WlPaste | Tool::WlCopy => "text/plain;charset=utf-8",
     }
 }
 
@@ -85,6 +97,9 @@ pub async fn run(
     let request = match &intent {
         Intent::PassThrough => return pass_through(tool, args, bin_dir, runner).await,
         Intent::Empty => return emit(tool, &Output::Nothing),
+        Intent::Write { target, literal } => {
+            return write(tool, target.as_deref(), literal.as_deref(), socket).await;
+        }
         Intent::Targets => Request::ClipboardTargets,
         Intent::Read(Some(target)) => match mime::to_mime(vocabulary(tool), target) {
             Some(mime) => Request::ClipboardRead { mime: mime.into() },
@@ -135,6 +150,63 @@ pub async fn run(
         (_, other) => {
             log(&describe(&other));
             emit(tool, &Output::Nothing)
+        }
+    }
+}
+
+/// Sends a copy up to the laptop.
+///
+/// Unlike a read, this cannot degrade quietly. A read that fails looks exactly
+/// like an empty clipboard, which is a state the caller already handles; a write
+/// that fails and reports success loses what the developer copied. So the exit
+/// status is non-zero whenever the content did not arrive — which is also what
+/// the real tool does on a server with no display.
+async fn write(
+    tool: Tool,
+    target: Option<&str>,
+    literal: Option<&str>,
+    socket: Option<PathBuf>,
+) -> i32 {
+    let native = target.unwrap_or_else(|| default_write_type(tool));
+    let Some(mime) = mime::to_mime(vocabulary(tool), native) else {
+        log(&format!("`{native}` is not a type the channel carries"));
+        return 1;
+    };
+
+    let bytes = match literal {
+        Some(text) => text.as_bytes().to_vec(),
+        None => {
+            use std::io::Read;
+            let mut buffer = Vec::new();
+            if let Err(error) = std::io::stdin().read_to_end(&mut buffer) {
+                log(&format!("could not read the content to copy: {error}"));
+                return 1;
+            }
+            buffer
+        }
+    };
+
+    let Some(socket) = socket else {
+        log("no clipboard channel is configured for this session");
+        return 1;
+    };
+
+    let request = Request::ClipboardWrite {
+        mime: mime.to_string(),
+        len: bytes.len(),
+    };
+
+    match client::request_with_body(&socket, &request, &bytes).await {
+        Ok(reply) => match reply.response {
+            Response::Written => 0,
+            other => {
+                log(&describe(&other));
+                1
+            }
+        },
+        Err(error) => {
+            log(&format!("{error:#}"));
+            1
         }
     }
 }
@@ -335,11 +407,36 @@ mod tests {
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
-    /// A write is handed to the real binary, with our own directory off PATH.
+    /// A PRIMARY write is handed to the real binary, with our own directory off
+    /// PATH.
     #[tokio::test]
-    async fn a_write_runs_the_real_tool() {
+    async fn a_primary_write_runs_the_real_tool() {
         use crate::runner::FakeRunner;
-        let fake = Arc::new(FakeRunner::new().with("xclip -selection clipboard -i", 0, "", ""));
+        let fake = Arc::new(FakeRunner::new().with("xclip -selection primary -i", 0, "", ""));
+        let runner: Arc<dyn CommandRunner> = fake.clone();
+        let args: Vec<String> = ["-selection", "primary", "-i"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+
+        let code = run(
+            Tool::Xclip,
+            &args,
+            None,
+            Path::new("/home/ada/.riabuild/bin"),
+            &runner,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(fake.calls(), vec!["xclip -selection primary -i"]);
+    }
+
+    /// A write that cannot reach the laptop must not report success: unlike a
+    /// read, there is no state the caller already handles that it resembles.
+    #[tokio::test]
+    async fn a_write_with_no_channel_fails_rather_than_pretending() {
+        use crate::runner::FakeRunner;
+        let fake = Arc::new(FakeRunner::new());
         let runner: Arc<dyn CommandRunner> = fake.clone();
         let args: Vec<String> = ["-selection", "clipboard", "-i"]
             .iter()
@@ -354,7 +451,24 @@ mod tests {
             &runner,
         )
         .await;
-        assert_eq!(code, 0);
-        assert_eq!(fake.calls(), vec!["xclip -selection clipboard -i"]);
+        assert_eq!(code, 1);
+        // And it did not quietly fall back to a tool that cannot reach the
+        // laptop either.
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    /// Both tools default to plain text, and under the name their own callers
+    /// use. A default of the wrong spelling is silent: the content lands under
+    /// a type nothing asks for.
+    #[test]
+    fn the_default_write_type_is_text_in_each_vocabulary() {
+        assert_eq!(
+            mime::to_mime(Vocabulary::X11, default_write_type(Tool::Xclip)),
+            Some(TEXT)
+        );
+        assert_eq!(
+            mime::to_mime(Vocabulary::Wayland, default_write_type(Tool::WlCopy)),
+            Some(TEXT)
+        );
     }
 }

@@ -29,6 +29,15 @@ pub trait Clipboard: Send + Sync {
 
     /// The bytes for one type, or `None` if the clipboard has no such content.
     async fn read(&self, mime: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Puts `bytes` on the laptop's clipboard under `mime`, replacing what was
+    /// there.
+    ///
+    /// `Ok(false)` when this laptop's clipboard has no name for that type — the
+    /// same clean refusal `read` makes with `Ok(None)`, rather than a fault.
+    /// `Err` is reserved for a tool that could not be run or would not take the
+    /// selection.
+    async fn write(&self, mime: &str, bytes: &[u8]) -> Result<bool>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

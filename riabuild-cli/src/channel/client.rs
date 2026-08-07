@@ -27,6 +27,14 @@ pub struct Reply {
 }
 
 pub async fn request(socket: &Path, request: &Request) -> Result<Reply> {
+    request_with_body(socket, request, &[]).await
+}
+
+/// A request that carries a payload — today only `clipboard.write`.
+///
+/// The body goes out on the same connection, straight after the header line,
+/// framed by the length the header announced.
+pub async fn request_with_body(socket: &Path, request: &Request, body: &[u8]) -> Result<Reply> {
     let connect = UnixStream::connect(socket);
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
@@ -43,16 +51,22 @@ pub async fn request(socket: &Path, request: &Request) -> Result<Reply> {
             )
         })?;
 
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange(stream, request))
+    tokio::time::timeout(REQUEST_TIMEOUT, exchange(stream, request, body))
         .await
         .context("the laptop channel did not answer in time")?
 }
 
-async fn exchange(mut stream: UnixStream, request: &Request) -> Result<Reply> {
+async fn exchange(mut stream: UnixStream, request: &Request, body: &[u8]) -> Result<Reply> {
     stream
         .write_all(encode_request(request).as_bytes())
         .await
         .context("could not send the request to the laptop channel")?;
+    if !body.is_empty() {
+        stream
+            .write_all(body)
+            .await
+            .context("could not send the payload to the laptop channel")?;
+    }
     stream.flush().await?;
 
     let mut reader = BufReader::new(stream);

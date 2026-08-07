@@ -23,6 +23,7 @@ pub use serve::run;
 pub enum Tool {
     Xclip,
     WlPaste,
+    WlCopy,
 }
 
 impl Tool {
@@ -34,6 +35,7 @@ impl Tool {
         match base.as_str() {
             "xclip" => Some(Tool::Xclip),
             "wl-paste" => Some(Tool::WlPaste),
+            "wl-copy" => Some(Tool::WlCopy),
             _ => None,
         }
     }
@@ -42,6 +44,7 @@ impl Tool {
         match self {
             Tool::Xclip => "xclip",
             Tool::WlPaste => "wl-paste",
+            Tool::WlCopy => "wl-copy",
         }
     }
 }
@@ -52,6 +55,15 @@ pub enum Intent {
     Targets,
     /// Read one type, or the preferred one when none was named.
     Read(Option<String>),
+    /// Put content on the laptop's clipboard.
+    ///
+    /// `literal` is `wl-copy`'s documented shorthand — `wl-copy hello` copies
+    /// its arguments rather than stdin — and is `None` for every piped write,
+    /// which is how programs actually call these tools.
+    Write {
+        target: Option<String>,
+        literal: Option<String>,
+    },
     /// A selection riabuild deliberately does not bridge. Behaves as an empty
     /// clipboard, which is what the real tool does when nothing is selected.
     Empty,
@@ -69,6 +81,7 @@ pub fn parse(tool: Tool, args: &[String]) -> Intent {
     match tool {
         Tool::Xclip => parse_xclip(args),
         Tool::WlPaste => parse_wl_paste(args),
+        Tool::WlCopy => parse_wl_copy(args),
     }
 }
 
@@ -81,6 +94,9 @@ fn parse_xclip(args: &[String]) -> Intent {
     while index < args.len() {
         match args[index].as_str() {
             "-o" | "-out" | "-output" => output = true,
+            // The explicit spelling of the default. It selects no behaviour on
+            // its own — the absence of -o is what makes this a write.
+            "-i" | "-in" => {}
             "-selection" | "-sel" => {
                 index += 1;
                 selection = args.get(index).cloned();
@@ -92,28 +108,71 @@ fn parse_xclip(args: &[String]) -> Intent {
             // Display and verbosity flags do not change what is read.
             "-d" | "-display" => index += 1,
             "-quiet" | "-silent" | "-verbose" | "-noutf8" | "-r" | "-rmlastnl" | "-l" => {}
-            // -i, -in, -f, -filter, -version, -h and anything unrecognised are
-            // not a clipboard read.
+            // -f/-filter copies *and* echoes stdin back out, -version and -h
+            // print. None of them is a plain clipboard transfer.
             _ => return Intent::PassThrough,
         }
         index += 1;
     }
 
+    // xclip's default selection is PRIMARY, not CLIPBOARD, in both directions.
+    let clipboard = selection.as_deref().is_some_and(is_clipboard_selection);
+
     if !output {
-        // No -o means xclip is copying, not pasting.
-        return Intent::PassThrough;
+        // No -o means xclip is copying rather than pasting.
+        return if clipboard {
+            Intent::Write {
+                target,
+                literal: None,
+            }
+        } else {
+            // A PRIMARY write is left to the real tool: it is the highlight
+            // buffer, it is not bridged in either direction, and a caller
+            // setting it locally should keep working.
+            Intent::PassThrough
+        };
     }
 
-    // xclip's default selection is PRIMARY, not CLIPBOARD.
-    match selection {
-        Some(value) if is_clipboard_selection(&value) => {}
-        _ => return Intent::Empty,
+    if !clipboard {
+        return Intent::Empty;
     }
 
     match target.as_deref() {
         Some("TARGETS") => Intent::Targets,
         Some(target) => Intent::Read(Some(target.to_string())),
         None => Intent::Read(None),
+    }
+}
+
+/// `wl-copy` is a writer only — there is no read form to tell apart.
+fn parse_wl_copy(args: &[String]) -> Intent {
+    let mut target: Option<String> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "-p" | "--primary" => return Intent::PassThrough,
+            // Clearing the laptop's clipboard from the server is a surprise
+            // rather than a transfer, so it stays local.
+            "-c" | "--clear" => return Intent::PassThrough,
+            "-t" | "--type" => {
+                index += 1;
+                target = args.get(index).cloned();
+            }
+            "-n" | "--trim-newline" | "-o" | "--paste-once" | "-f" | "--foreground" => {}
+            "-s" | "--seat" => index += 1,
+            // Everything that is not a flag is content: `wl-copy hello world`
+            // copies its arguments rather than stdin.
+            word if !word.starts_with('-') => words.push(word.to_string()),
+            _ => return Intent::PassThrough,
+        }
+        index += 1;
+    }
+
+    Intent::Write {
+        target,
+        literal: (!words.is_empty()).then(|| words.join(" ")),
     }
 }
 
@@ -240,17 +299,90 @@ mod tests {
         }
     }
 
-    /// Anything that writes is not ours. The channel is read-only, and a write
-    /// that silently did nothing would be worse than one that works locally.
+    /// A copy into the clipboard selection crosses to the laptop, whether the
+    /// caller spells the direction out or leaves it to the default.
     #[test]
-    fn writes_are_passed_through_to_the_real_binary() {
+    fn a_clipboard_write_is_bridged() {
+        let expected = Intent::Write {
+            target: None,
+            literal: None,
+        };
         assert_eq!(
             parse_argv(Tool::Xclip, &["-selection", "clipboard", "-i"]),
-            Intent::PassThrough
+            expected
         );
         // xclip with no -o at all reads stdin and copies.
         assert_eq!(
             parse_argv(Tool::Xclip, &["-selection", "clipboard"]),
+            expected
+        );
+        assert_eq!(parse_argv(Tool::WlCopy, &[]), expected);
+    }
+
+    #[test]
+    fn a_typed_write_carries_its_type() {
+        assert_eq!(
+            parse_argv(
+                Tool::Xclip,
+                &["-selection", "clipboard", "-t", "image/png", "-i"]
+            ),
+            Intent::Write {
+                target: Some("image/png".into()),
+                literal: None,
+            }
+        );
+        assert_eq!(
+            parse_argv(Tool::WlCopy, &["--type", "image/png"]),
+            Intent::Write {
+                target: Some("image/png".into()),
+                literal: None,
+            }
+        );
+    }
+
+    /// `wl-copy hello world` copies its arguments rather than stdin. Treated as
+    /// flags they would look unrecognised and the copy would pass through to a
+    /// tool that cannot reach the laptop.
+    #[test]
+    fn wl_copy_takes_its_content_from_the_argument_list_when_given_one() {
+        assert_eq!(
+            parse_argv(Tool::WlCopy, &["hello", "world"]),
+            Intent::Write {
+                target: None,
+                literal: Some("hello world".into()),
+            }
+        );
+    }
+
+    /// PRIMARY is the highlight buffer. It is not bridged in either direction,
+    /// and a caller setting it locally should keep working.
+    #[test]
+    fn a_primary_write_is_left_to_the_real_tool() {
+        assert_eq!(
+            parse_argv(Tool::Xclip, &["-selection", "primary", "-i"]),
+            Intent::PassThrough
+        );
+        // No -selection at all is PRIMARY too.
+        assert_eq!(parse_argv(Tool::Xclip, &["-i"]), Intent::PassThrough);
+        assert_eq!(
+            parse_argv(Tool::WlCopy, &["--primary"]),
+            Intent::PassThrough
+        );
+    }
+
+    /// Clearing the laptop's clipboard from the server is a surprise rather
+    /// than a transfer.
+    #[test]
+    fn clearing_stays_local() {
+        assert_eq!(parse_argv(Tool::WlCopy, &["--clear"]), Intent::PassThrough);
+    }
+
+    /// -f copies *and* echoes stdin back out. That is not a plain transfer, and
+    /// bridging it would drop the echo half.
+    #[test]
+    fn the_filter_form_is_passed_through() {
+        assert_eq!(
+            parse_argv(Tool::Xclip, &["-selection", "clipboard", "-f"]),
             Intent::PassThrough
         );
         assert_eq!(
@@ -277,13 +409,18 @@ mod tests {
         }
     }
 
+    /// One tool per direction per session type: xclip does both on X11, and
+    /// Wayland splits them across wl-paste and wl-copy.
     #[test]
-    fn only_the_two_shimmed_tools_are_recognised() {
+    fn only_the_shimmed_tools_are_recognised() {
         assert_eq!(Tool::from_name("xclip"), Some(Tool::Xclip));
         assert_eq!(Tool::from_name("wl-paste"), Some(Tool::WlPaste));
+        assert_eq!(Tool::from_name("wl-copy"), Some(Tool::WlCopy));
         assert_eq!(Tool::from_name("/usr/bin/xclip"), Some(Tool::Xclip));
+        // macOS as a *server* is out of scope, so its tools are not shimmed.
         assert_eq!(Tool::from_name("pbpaste"), None);
-        // wl-copy writes, and the channel is read-only.
-        assert_eq!(Tool::from_name("wl-copy"), None);
+        assert_eq!(Tool::from_name("pbcopy"), None);
+        // xsel is a third X11 spelling riabuild does not install or shadow.
+        assert_eq!(Tool::from_name("xsel"), None);
     }
 }
