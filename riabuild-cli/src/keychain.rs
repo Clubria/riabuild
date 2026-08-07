@@ -76,6 +76,16 @@ impl Keychain for SecurityCliKeychain {
     async fn set(&self, token: &str) -> Result<()> {
         // `-U` updates in place; without it a second login errors on a duplicate
         // item, which would make `apply()` unsafe to run twice.
+        //
+        // `-w` with no trailing value — never `-w <token>` — is what keeps the
+        // token out of argv: with nothing after it, `security` reads the
+        // password from stdin (it only falls back to an interactive prompt when
+        // stdin is a terminal, which it never is here), the same way
+        // `SecretToolKeychain::set` pipes its token to `secret-tool store`
+        // below. `-X` would take a hex-encoded password instead, but that is
+        // still an argv element and so not a fix. `ps` on this machine would
+        // show the full `security add-generic-password …` invocation to every
+        // other user, which is exactly what argv is: world-readable.
         let output = self
             .runner
             .run(
@@ -88,9 +98,11 @@ impl Keychain for SecurityCliKeychain {
                     "-a",
                     &self.account,
                     "-w",
-                    token,
                 ],
-                &RunOptions::default(),
+                &RunOptions {
+                    stdin: Some(token.as_bytes().to_vec()),
+                    ..Default::default()
+                },
             )
             .await?;
         if output.ok() {
@@ -574,6 +586,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_secret_never_appears_in_a_security_argument_list() {
+        // The macOS counterpart to `a_secret_never_appears_in_a_secret_tool_argument_list`
+        // below. `-w` carries no trailing value in argv — the token travels
+        // over stdin instead, exactly like `secret-tool store` already does —
+        // so it must not show up in any recorded call. `FakeRunner::calls`
+        // only ever sees `program` and `args`, never `RunOptions.stdin`, so
+        // this is a faithful stand-in for what `ps` would show a real
+        // co-tenant on the machine.
+        let runner = Arc::new(FakeRunner::new().with("security add-generic-password", 0, "", ""));
+        let keychain = SecurityCliKeychain::new(runner.clone());
+        keychain.set("super-secret").await.unwrap();
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("super-secret"))
+        );
+    }
+
+    #[tokio::test]
     async fn a_machine_with_no_keyring_gets_a_next_action_not_a_bug_report() {
         // A headless Linux box has no libsecret. That is an ordinary state, and
         // the message has to name both fixes.
@@ -815,5 +847,45 @@ mod tests {
     fn select_falls_back_to_the_platform_keyring_with_no_server_and_no_env() {
         assert_eq!(select(true, None, None), Choice::Macos);
         assert_eq!(select(false, None, None), Choice::Linux);
+    }
+
+    /// Round-trips a real token through `security(1)` against an actual
+    /// macOS login keychain: `set` then `get` must return exactly what was
+    /// stored, the same way `claude_config_dir_smoke` in `shims/mod.rs` pins
+    /// undocumented behaviour of a real external tool instead of guessing at
+    /// it.
+    ///
+    /// This confirms the thing a unit test cannot: that `-w` with no
+    /// trailing argv value genuinely reads the password from piped stdin,
+    /// rather than — for instance — silently storing an empty password, or
+    /// blocking forever on an interactive prompt that piped stdin can never
+    /// satisfy. That belief comes from `security`'s documented behaviour,
+    /// not from having run it: this repository's CI and every development
+    /// container it runs in are Linux, where `security` does not exist, so
+    /// nothing here has ever executed this path. Ignored for that reason —
+    /// a human with a real Mac must run it with `cargo test -- --ignored`.
+    ///
+    /// Uses a throwaway account distinct from `session-token` so running
+    /// this locally cannot clobber a developer's real riabuild sign-in, and
+    /// cleans up after itself.
+    #[tokio::test]
+    #[ignore = "requires the security(1) CLI and a real macOS login keychain"]
+    async fn security_cli_round_trips_a_token_through_a_real_keychain() {
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::runner::RealRunner);
+        if runner.which("security").is_none() {
+            panic!("security is not installed; this test needs to run on macOS");
+        }
+        let keychain = SecurityCliKeychain::for_account(runner, "riabuild-test-roundtrip");
+
+        keychain
+            .set("rb_test_roundtrip_token")
+            .await
+            .expect("write");
+        assert_eq!(
+            keychain.get().await.expect("read").as_deref(),
+            Some("rb_test_roundtrip_token")
+        );
+
+        keychain.delete().await.expect("cleanup");
     }
 }
