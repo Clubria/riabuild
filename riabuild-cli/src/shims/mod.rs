@@ -42,6 +42,14 @@ set -e
 CLAUDE_CONFIG_DIR="{config_dir}"
 export CLAUDE_CONFIG_DIR
 claude_binary="{claude}"
+case "$claude_binary" in
+  /*) ;;
+  # A non-absolute path (no Node pinned yet) can't be trusted with the -x
+  # test below: a same-named executable in the current directory would pass
+  # it, skip the PATH strip, and exec a bare name that PATH search resolves
+  # straight back to this script. Treat it as no path at all.
+  *) claude_binary="" ;;
+esac
 if [ ! -x "$claude_binary" ]; then
   # The recorded binary is gone: a `claude update` that migrated to a native
   # install, or a Node version change since the last run. Fall back to PATH
@@ -106,7 +114,7 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
 
     let claude = ctx.claude();
     let settings = ctx.paths.org_settings_file();
-    let ids = ctx.config.claude_accounts.clone();
+    let ids = &ctx.config.claude_accounts;
 
     for (index, id) in ids.iter().enumerate() {
         let script = launcher_script(&ctx.paths.claude_profile_dir(id), &claude, &settings, &bin);
@@ -116,7 +124,7 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
         }
     }
 
-    prune(&bin, ids.len()).await;
+    prune(&bin, ids.len()).await?;
     Ok(())
 }
 
@@ -128,16 +136,27 @@ async fn write_launcher(path: &Path, script: &str) -> Result<()> {
 
 /// Removes launchers that no longer name an account.
 ///
-/// Errors are ignored on purpose: every one of these is "it was not there",
-/// which is the state being asked for.
-async fn prune(bin: &Path, count: usize) {
+/// A file that was never there is the state being asked for, so
+/// `NotFound` is swallowed. Anything else — `EPERM`, a read-only mount — is
+/// a real failure: silently swallowing it would leave an orphan launcher
+/// behind unreported.
+async fn prune(bin: &Path, count: usize) -> Result<()> {
     // `c` is what riabuild called the launcher before accounts existed.
-    let _ = tokio::fs::remove_file(bin.join("c")).await;
+    remove_if_present(&bin.join("c")).await?;
     if count == 0 {
-        let _ = tokio::fs::remove_file(bin.join("claude")).await;
+        remove_if_present(&bin.join("claude")).await?;
     }
     for number in count + 1..=crate::accounts::MAX {
-        let _ = tokio::fs::remove_file(bin.join(format!("claude-{number}"))).await;
+        remove_if_present(&bin.join(format!("claude-{number}"))).await?;
+    }
+    Ok(())
+}
+
+async fn remove_if_present(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -181,6 +200,10 @@ mod tests {
         // them — and `claude-2 auth login`, which the account box tells the
         // developer to run, would do nothing at all.
         assert!(script.contains(r#""$@""#));
+        // A dropped `export` would leave every account sharing the default
+        // config directory — all nine collapsing into one — with the rest of
+        // this test still green.
+        assert!(script.contains("export CLAUDE_CONFIG_DIR"));
     }
 
     #[test]
@@ -219,6 +242,28 @@ mod tests {
     fn the_launcher_still_works_before_settings_have_been_fetched() {
         let script = script();
         assert!(script.contains(r#"if [ -f "/Users/ada/.riabuild/org-settings.json" ]"#));
+        // The unconditional exec after the `if` is what runs on every machine
+        // that has not fetched settings yet. Losing it would still satisfy
+        // `the_launcher_can_never_exec_itself` (which only checks the exec
+        // inside the `if`) while the launcher silently exited 0 doing nothing.
+        assert!(script.contains(r#"exec "$claude_binary" "$@""#), "{script}");
+    }
+
+    #[test]
+    fn a_bare_binary_name_cannot_be_used_to_exec_itself() {
+        // `Ctx::claude()` returns the bare name "claude" before a Node
+        // version is pinned. `[ ! -x "claude" ]` is a cwd-relative test — a
+        // same-named executable in an untrusted checkout would pass it, skip
+        // the PATH strip, and `exec "claude"` would search PATH straight back
+        // to this same script.
+        let script = launcher_script(
+            Path::new("/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"),
+            "claude",
+            Path::new("/Users/ada/.riabuild/org-settings.json"),
+            Path::new("/Users/ada/.riabuild/bin"),
+        );
+        assert!(script.contains(r#"case "$claude_binary" in"#), "{script}");
+        assert!(script.contains(r#"*) claude_binary="" ;;"#), "{script}");
     }
 
     #[tokio::test]
@@ -240,6 +285,19 @@ mod tests {
         }
         let primary = tokio::fs::read_to_string(bin.join("claude")).await.unwrap();
         assert!(primary.contains(ids[0].as_str()), "{primary}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(bin.join("claude"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode();
+            // A dropped `make_executable` reads as "permission denied" on a
+            // developer's laptop, not as a test failure in CI.
+            assert_eq!(mode & 0o111, 0o111, "mode was {mode:o}");
+        }
     }
 
     #[tokio::test]
@@ -267,6 +325,13 @@ mod tests {
         assert!(!tokio::fs::try_exists(bin.join("claude-2")).await.unwrap());
         assert!(!tokio::fs::try_exists(bin.join("claude-3")).await.unwrap());
         assert!(!tokio::fs::try_exists(bin.join("c")).await.unwrap());
+
+        // Deleting the last account must take the primary `claude` launcher
+        // with it — the `count == 0` branch of `prune`, otherwise untested.
+        ctx.config.claude_accounts.clear();
+        write_all(&ctx).await.unwrap();
+        assert!(!tokio::fs::try_exists(bin.join("claude")).await.unwrap());
+        assert!(!tokio::fs::try_exists(bin.join("claude-1")).await.unwrap());
     }
 
     #[tokio::test]
