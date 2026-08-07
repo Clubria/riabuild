@@ -19,6 +19,14 @@ pub struct Ui {
     /// Answers a test feeds to `ask` in place of a terminal.
     #[cfg(test)]
     answers: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Every question actually put to the developer.
+    ///
+    /// Recorded because the question text is the whole safety guarantee of a
+    /// destructive prompt, and it is the one part of it `info` cannot carry:
+    /// `info` is silent under `--quiet` and `ask` is not. Without this a
+    /// subcommand could name the account in lines nobody sees and still pass.
+    #[cfg(test)]
+    asked: std::sync::Mutex<Vec<String>>,
 }
 
 /// Spaces needed for `line` to cover a status line `previous` columns wide.
@@ -84,7 +92,15 @@ impl Ui {
             pending: AtomicUsize::new(0),
             #[cfg(test)]
             answers: Default::default(),
+            #[cfg(test)]
+            asked: Default::default(),
         }
+    }
+
+    /// Every question this `Ui` put, in order.
+    #[cfg(test)]
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
     }
 
     /// A `Ui` that answers its own questions, for tests.
@@ -233,7 +249,8 @@ impl Ui {
     }
 
     #[cfg(test)]
-    fn read_answer(&self, _question: &str) -> Option<String> {
+    fn read_answer(&self, question: &str) -> Option<String> {
+        self.asked.lock().unwrap().push(question.to_string());
         self.answers.lock().unwrap().pop_front()
     }
 
