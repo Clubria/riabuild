@@ -183,10 +183,14 @@ async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
             .into());
         }
         ctx.ui.info("");
+        // States what will happen; the question below asks. Saying "Delete
+        // account 2 — you@example.com?" here as well would put the same sentence
+        // on screen twice, and a prompt that repeats itself reads like a bug.
+        ctx.ui.info(&format!(
+            "  riabuild will remove account {number} from this machine."
+        ));
         ctx.ui
-            .info(&format!("  Delete account {number} — {named}?"));
-        ctx.ui
-            .info("  Its Claude Code sessions, history and login are removed.");
+            .info("  Its Claude Code sessions, history and login go with it.");
         // `Ui::confirm` defaults to yes, which is right for "shall I install
         // this" and wrong here: an empty answer must decline.
         let answer = ctx.ui.ask(&confirm_question(number, &named));
