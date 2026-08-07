@@ -105,9 +105,27 @@ pub async fn authorise(
     }
 
     let public_key_path = key_path(remote, paths).with_extension("pub");
-    let public_key = tokio::fs::read_to_string(&public_key_path)
-        .await
-        .unwrap_or_default();
+    let public_key = match tokio::fs::read_to_string(&public_key_path).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            // Distinct from every `paste()` branch below: those all have a
+            // key to show and just disagree about why the developer has to
+            // paste it by hand. This is the case where there is no key to
+            // paste at all — swallowing the read error here would produce
+            // "Add this line to ~/.ssh/authorized_keys…" followed by
+            // nothing, which reads as riabuild having quietly done
+            // something rather than having failed to find its own key.
+            return Err(Failure::new(
+                format!("authorising riabuild's key on {}", remote.host),
+                format!(
+                    "riabuild's public key is missing at {}. Run `riabuild remote` again to regenerate it.",
+                    public_key_path.display()
+                ),
+            )
+            .detail(error.to_string())
+            .into());
+        }
+    };
     let paste = || {
         Failure::new(
             format!("authorising riabuild's key on {}", remote.host),
@@ -216,6 +234,25 @@ mod tests {
         }
     }
 
+    /// Writes the `.pub` file `authorise` expects to find already generated
+    /// by `ensure_key` — every scenario past the "key already works" early
+    /// return needs this, now that a missing key is a distinct, actionable
+    /// failure rather than something `authorise` quietly reads as empty.
+    async fn write_public_key(paths: &RealPaths) {
+        tokio::fs::create_dir_all(paths.identity_dir())
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            paths
+                .identity_dir()
+                .join(remote().hash())
+                .with_extension("pub"),
+            "ssh-ed25519 AAAA riabuild",
+        )
+        .await
+        .expect("write pub");
+    }
+
     #[test]
     fn the_methods_a_server_offers_are_read_from_its_refusal() {
         assert_eq!(
@@ -316,6 +353,7 @@ mod tests {
     async fn ssh_copy_id_runs_when_the_server_will_take_a_password() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
         let fake = Arc::new(
             FakeRunner::new()
                 .with(
@@ -354,6 +392,7 @@ mod tests {
     async fn a_missing_ssh_copy_id_is_a_next_action_not_a_crash() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
         // FakeRunner::which only knows programs that have been stubbed.
         let fake = Arc::new(
             FakeRunner::new()
@@ -375,5 +414,95 @@ mod tests {
             .expect_err("no ssh-copy-id");
         let failure = error.downcast_ref::<Failure>().expect("a Failure");
         assert!(failure.detail.contains("ssh-copy-id"), "{}", failure.detail);
+    }
+
+    #[tokio::test]
+    async fn a_key_that_works_after_ssh_copy_id_is_reported_as_success() {
+        // The success branch (`ui.applied("Authorised"); Ok(())`) had no
+        // coverage: every other test's `BatchMode=yes` probe returns the
+        // same fixed response both times it's called, so the post-copy
+        // recheck could never see a different, successful answer. `.then()`
+        // queues a distinct response per call to the same key: the first
+        // probe (before `ssh-copy-id`) fails, the second (after) succeeds.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+        let fake = Arc::new(
+            FakeRunner::new()
+                .then(
+                    "ssh -o BatchMode=yes",
+                    255,
+                    "",
+                    "Permission denied (publickey,password).",
+                )
+                .then("ssh -o BatchMode=yes", 0, "", "")
+                .with(
+                    "ssh -o PreferredAuthentications=none",
+                    255,
+                    "",
+                    "Permission denied (publickey,password).",
+                )
+                .with("ssh-copy-id", 0, "", ""),
+        );
+
+        authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
+            .await
+            .expect("the key works after ssh-copy-id, so this must succeed");
+
+        let copy_call = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("ssh-copy-id"))
+            .expect("ssh-copy-id ran");
+        // The full argument vector, not just the program name: a regression
+        // dropping `UserKnownHostsFile` or `StrictHostKeyChecking=yes` would
+        // silently let `ssh-copy-id` trust afresh instead of routing through
+        // Task 15's pinned host key, and a `starts_with` check alone would
+        // not notice.
+        let expected_key = key_path(&remote(), &paths).with_extension("pub");
+        assert_eq!(
+            copy_call,
+            format!(
+                "ssh-copy-id -i {} -p 2222 -F /dev/null -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes ada@build-01.fly.dev",
+                expected_key.to_string_lossy(),
+                paths.known_hosts_file().to_string_lossy(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_public_key_fails_loudly_instead_of_pasting_nothing() {
+        // No `.pub` file written: stands in for a crash between key
+        // generation and authorisation, a manual deletion, or a permissions
+        // problem. Silently reading it as empty would produce "Add this
+        // line to ~/.ssh/authorized_keys…" followed by nothing.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = Arc::new(FakeRunner::new().with(
+            "ssh -o BatchMode=yes",
+            255,
+            "",
+            "Permission denied (publickey,password).",
+        ));
+
+        let error = authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
+            .await
+            .expect_err("a missing public key must not read as success");
+
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(
+            failure.action.contains("missing"),
+            "the developer must be told the key itself is missing, not shown \
+             an empty paste-this-line instruction: {}",
+            failure.action
+        );
+        assert!(
+            !fake.calls().iter().any(|call| {
+                call.starts_with("ssh-copy-id")
+                    || call.starts_with("ssh -o PreferredAuthentications")
+            }),
+            "a missing key must fail before probing the server or running ssh-copy-id: {:?}",
+            fake.calls()
+        );
     }
 }

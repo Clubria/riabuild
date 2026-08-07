@@ -54,7 +54,7 @@ pub fn key_path(remote: &Remote, paths: &dyn Paths) -> PathBuf {
 /// Idempotent: a second call against the same `remote` finds the file
 /// `ssh-keygen` left behind and returns immediately, without shelling out
 /// again — `apply()` has to be safe to run twice, and this is the same rule.
-#[allow(dead_code)] // consumed by Task 16
+#[allow(dead_code)] // consumed by Task 21, via authorise::authorise
 pub async fn ensure_key(
     remote: &Remote,
     paths: &dyn Paths,
@@ -118,7 +118,7 @@ pub async fn ensure_key(
     Ok(path)
 }
 
-#[allow(dead_code)] // consumed by Task 16, via ensure_key
+#[allow(dead_code)] // consumed by Task 21, via ensure_key
 fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()

@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 #[cfg(test)]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -177,6 +177,14 @@ pub struct FakeRunner {
     /// distinguishes one remote invocation from another is the tail, not the
     /// program name every one of them shares.
     contains: Vec<(String, CommandOutput)>,
+    /// Queued stubs: each call matching a key pops the next response queued
+    /// for it by `then()`, in order, before falling through to
+    /// `responses`/`contains` once that key's queue is empty. This is the
+    /// "first call fails, second succeeds" shape a single `with()` stub
+    /// cannot express, since every call to it returns the same fixed
+    /// response — needed for a probe that's run before and after some
+    /// action the test is asserting changed the server's state.
+    sequenced: std::sync::Mutex<HashMap<String, VecDeque<CommandOutput>>>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
     /// Invocation and the environment it was given, so a test can assert a task
@@ -211,6 +219,29 @@ impl FakeRunner {
         self.calls.lock().unwrap().clone()
     }
 
+    /// Queues a response after any already queued for this key, consumed in
+    /// call order and ahead of `with`/`containing`. Additive: once the queue
+    /// for a key empties, a later matching call falls through to those as
+    /// before, so existing stubs are unaffected by a test that never calls
+    /// this.
+    pub fn then(mut self, invocation: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.sequenced
+            .get_mut()
+            .unwrap()
+            .entry(invocation.to_string())
+            .or_default()
+            .push_back(CommandOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            });
+        let program = invocation.split_whitespace().next().unwrap_or_default();
+        if !program.is_empty() && !self.available.iter().any(|p| p == program) {
+            self.available.push(program.to_string());
+        }
+        self
+    }
+
     /// Stubs on a fragment appearing anywhere in the invocation, for commands
     /// whose distinguishing part is not at the front — `ssh … host uname -sm`.
     pub fn containing(mut self, fragment: &str, code: i32, stdout: &str, stderr: &str) -> Self {
@@ -240,7 +271,25 @@ impl FakeRunner {
             .unwrap_or_default()
     }
 
+    /// Pops the next response queued by `then()` for the longest matching
+    /// key (same prefix rule as `responses`), leaving an exhausted queue in
+    /// place so a later call matching the same key falls through to
+    /// `responses`/`contains` instead of finding nothing.
+    fn next_queued(&self, invocation: &str) -> Option<CommandOutput> {
+        let mut sequenced = self.sequenced.lock().unwrap();
+        let key = sequenced
+            .keys()
+            .filter(|key| invocation == key.as_str() || invocation.starts_with(&format!("{key} ")))
+            .max_by_key(|key| key.len())
+            .cloned()?;
+        sequenced.get_mut(&key).and_then(VecDeque::pop_front)
+    }
+
     fn stubbed(&self, invocation: &str) -> Option<CommandOutput> {
+        if let Some(output) = self.next_queued(invocation) {
+            return Some(output);
+        }
+
         let mut best: Option<(&String, &CommandOutput)> = None;
         for (key, value) in &self.responses {
             if invocation == key || invocation.starts_with(&format!("{key} ")) {
