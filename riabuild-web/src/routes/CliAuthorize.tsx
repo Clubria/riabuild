@@ -104,6 +104,7 @@ export function CliAuthorize() {
         <div className="mt-4">
           <Decision
             request={request}
+            now={data.now}
             busy={busy}
             onDecide={(decision) => {
               setBusy(true);
@@ -145,10 +146,20 @@ export function CliAuthorize() {
 
 function Decision({
   request,
+  now,
   busy,
   onDecide,
 }: {
   request: DeviceRequest;
+  /**
+   * The clock as a prop, never `Date.now()`.
+   *
+   * A component that reads the wall clock cannot be shown holding a fixed
+   * moment, so every screenshot of this panel would differ from the last and
+   * stop being evidence of anything. `data.now` is the ticking clock the
+   * provider owns, and fixtures freeze it.
+   */
+  now: number;
   busy: boolean;
   onDecide: (decision: "approve" | "deny") => void;
 }) {
@@ -166,7 +177,7 @@ function Decision({
         rows={[
           { label: "device", value: request.deviceLabel },
           { label: "riabuild", value: `v${request.cliVersion}` },
-          { label: "asked", value: formatAsked(request.requestedAt) },
+          { label: "asked", value: formatAsked(request.requestedAt, now) },
         ]}
       />
       <p className="mt-5 max-w-prose text-fg-dim">
@@ -233,8 +244,8 @@ function prefilledCode(): string {
   return group(normalise(raw));
 }
 
-function formatAsked(at: number): string {
-  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+function formatAsked(at: number, now: number): string {
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
   if (seconds < 60) return "just now";
   const minutes = Math.round(seconds / 60);
   return minutes === 1 ? "a minute ago" : `${minutes} minutes ago`;
