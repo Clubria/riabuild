@@ -143,4 +143,13 @@ mod tests {
         );
         assert!(file.starts_with(ctx.paths.root()), "{}", file.display());
     }
+
+    /// The label answers *which environment is this session in*, the job
+    /// `shell::PROMPT_LABEL` does for the prompt. A script edit that drops it
+    /// still parses, still renders, and still passes every other test here —
+    /// the line just quietly stops saying whose settings are in play.
+    #[test]
+    fn the_status_line_says_which_environment_it_belongs_to() {
+        assert!(SCRIPT.contains("(clubria)"), "{SCRIPT}");
+    }
 }
