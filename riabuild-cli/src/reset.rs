@@ -9,7 +9,9 @@
 //! What it removes is reconstructible by design — `check()` is authoritative,
 //! so `state.json` is a cache, and every toolchain is a download away. What it
 //! does *not* touch is the developer's checkout (it lives outside the tree) and
-//! their sign-in (the token is in the keychain, never here).
+//! their riabuild sign-in (that token is in the keychain, never here). Their
+//! Claude Code sign-ins do go: each account's login is scoped to the config
+//! directory being removed, so `warnings` counts them and says so.
 
 use crate::paths::{Paths, contract_tilde};
 use crate::ui::{Failure, Ui};
@@ -91,7 +93,7 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 
     let shown = contract_tilde(&plan.root, &home);
     ui.info(&format!("riabuild reset will remove {shown}"));
-    for line in warnings(&plan, &paths.claude_dir()) {
+    for line in warnings(&plan, &paths.claude_dir()).await {
         ui.note(&line);
     }
 
@@ -140,12 +142,18 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 
 /// What the developer is told before being asked.
 ///
-/// Pure, so the claims can be tested. The Claude Code history is the one item
-/// in the tree that is not reconstructible, so it is named — but only when the
-/// profile is actually there. Warning about history a developer does not have
-/// teaches them to skim the warning that matters. `claude_dir` is passed in
-/// rather than spelled out here, because the layout belongs to `paths.rs`.
-fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
+/// Takes the tree it describes as arguments, so every claim can be tested. The
+/// Claude Code history is the one item in the tree that is not reconstructible,
+/// so it is named — but only when there are accounts actually holding some.
+/// Warning about history a developer does not have teaches them to skim the
+/// warning that matters. `claude_dir` is passed in rather than spelled out here,
+/// because the layout belongs to `paths.rs`.
+///
+/// The accounts are *counted* rather than described as one profile: a developer
+/// with four of them is agreeing to lose four sign-ins and four session
+/// histories, and the singular understated that badly enough to read as a
+/// different, smaller operation.
+async fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
     if plan.entries.is_empty() {
         return vec!["it is empty".to_string()];
     }
@@ -155,11 +163,41 @@ fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
         .iter()
         .any(|entry| plan.root.join(entry) == claude_dir)
     {
-        lines
-            .push("this includes the Claude Code history kept in your Clubria profile".to_string());
+        // Counted on disk and not from `config.json`: a reset is for the machine
+        // whose state file already disagrees with reality, so the directories
+        // are the only account list worth believing here.
+        let found = account_count(claude_dir).await;
+        if found > 0 {
+            lines.push(format!(
+                "this includes the session history and sign-in of {}",
+                crate::ui::plural(found, "Claude Code account")
+            ));
+        }
     }
     lines.push("your checkout and your riabuild sign-in are not touched".to_string());
     lines
+}
+
+/// How many account directories `~/.riabuild/claude/` holds.
+///
+/// Only names `accounts::looks_like_id` accepts count. Anything else under there
+/// — a stray file, a directory a developer made by hand — is not an account, and
+/// counting it would put a number in the warning that no `riabuild claude list`
+/// agrees with.
+async fn account_count(claude_dir: &Path) -> u64 {
+    let Ok(mut cursor) = tokio::fs::read_dir(claude_dir).await else {
+        return 0;
+    };
+    let mut found = 0;
+    while let Ok(Some(entry)) = cursor.next_entry().await {
+        if !crate::accounts::looks_like_id(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        if entry.metadata().await.is_ok_and(|meta| meta.is_dir()) {
+            found += 1;
+        }
+    }
+    found
 }
 
 /// A last guard on a recursive delete driven by a trait a test can override.
@@ -446,12 +484,50 @@ mod tests {
         assert!(paths.root().exists(), "nothing is removed when refused");
     }
 
-    #[test]
-    fn the_claude_history_is_only_named_when_there_is_a_profile_to_lose() {
-        let paths = RealPaths::rooted_at("/Users/ada");
-        let claude = paths.claude_dir();
+    #[tokio::test]
+    async fn the_plan_counts_the_accounts_a_reset_would_sign_out() {
+        // Three accounts is three sign-ins and three session histories, and a
+        // warning that says "your Clubria profile" understates that by a factor
+        // of three. `provisioned` also leaves a non-UUID directory behind, which
+        // is never an account and must not be counted as one.
+        let (home, paths) = provisioned().await;
+        for _ in 0..3 {
+            let id = crate::accounts::new_id();
+            tokio::fs::create_dir_all(paths.claude_profile_dir(&id))
+                .await
+                .expect("an account directory");
+        }
 
-        let with_profile = Plan {
+        let plan = plan(&paths).await.expect("a provisioned tree");
+        let said = warnings(&plan, &paths.claude_dir()).await.join("\n");
+
+        assert!(said.contains("3 Claude Code accounts"), "{said}");
+        drop(home);
+    }
+
+    #[tokio::test]
+    async fn one_account_is_counted_in_the_singular() {
+        let (_home, paths) = provisioned().await;
+        tokio::fs::create_dir_all(paths.claude_profile_dir(&crate::accounts::new_id()))
+            .await
+            .expect("an account directory");
+
+        let plan = plan(&paths).await.expect("a provisioned tree");
+        let said = warnings(&plan, &paths.claude_dir()).await.join("\n");
+
+        assert!(said.contains("1 Claude Code account"), "{said}");
+        assert!(!said.contains("accounts"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn the_claude_history_is_only_named_when_there_is_an_account_to_lose() {
+        let (_home, paths) = provisioned().await;
+        let claude = paths.claude_dir();
+        tokio::fs::create_dir_all(paths.claude_profile_dir(&crate::accounts::new_id()))
+            .await
+            .expect("an account directory");
+
+        let with_accounts = Plan {
             root: paths.root(),
             entries: vec!["claude".into(), "state.json".into()],
         };
@@ -460,27 +536,27 @@ mod tests {
             entries: vec!["state.json".into()],
         };
 
-        let names_history = |plan: &Plan| {
-            warnings(plan, &claude)
-                .iter()
-                .any(|line| line.contains("Claude Code history"))
-        };
-        assert!(names_history(&with_profile));
-        assert!(
-            !names_history(&without),
-            "a tree with no profile in it has no history to warn about"
-        );
+        let named = warnings(&with_accounts, &claude).await.join("\n");
+        assert!(named.contains("Claude Code account"), "{named}");
+
+        // A tree with no `claude` entry has no history to warn about, however
+        // many directories the account root turns out to hold.
+        let silent = warnings(&without, &claude).await.join("\n");
+        assert!(!silent.contains("Claude Code account"), "{silent}");
     }
 
-    #[test]
-    fn an_empty_tree_says_so_and_claims_nothing_else() {
+    #[tokio::test]
+    async fn an_empty_tree_says_so_and_claims_nothing_else() {
         let paths = RealPaths::rooted_at("/Users/ada");
         let plan = Plan {
             root: paths.root(),
             entries: Vec::new(),
         };
 
-        assert_eq!(warnings(&plan, &paths.claude_dir()), vec!["it is empty"]);
+        assert_eq!(
+            warnings(&plan, &paths.claude_dir()).await,
+            vec!["it is empty"]
+        );
     }
 
     #[test]
