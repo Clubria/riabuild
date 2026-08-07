@@ -18,6 +18,8 @@ use crate::config::UserConfig;
 use crate::ui::{Failure, plural};
 use anyhow::Result;
 use rand::RngCore;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nine keeps every launcher name single-digit — `claude-1` … `claude-9` — and
 /// makes `riabuild claude delete 12` an obvious mistake rather than something
@@ -50,6 +52,58 @@ pub fn looks_like_id(name: &str) -> bool {
             .zip(&parts)
             .all(|(expected, part)| part.len() == *expected)
         && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Every account directory actually on disk, in the order adoption would number
+/// them: oldest first.
+///
+/// Here rather than beside the task that adopts them because "which directories
+/// under `~/.riabuild/claude/` are accounts, and in what order" is a property of
+/// the account model. `claude_accounts` asks it to adopt and to spot a directory
+/// nothing recorded; `reset` asks it to count what a delete would destroy. Two
+/// answers to that question would eventually disagree, and the one a developer
+/// would meet is a reset warning naming a number no `riabuild claude list`
+/// agrees with.
+///
+/// Ordered by creation time, falling back to modification time on a filesystem
+/// that does not record one, and broken by the directory name so the order is
+/// deterministic either way.
+///
+/// Creation time rather than mtime because Claude Code writes into
+/// `CLAUDE_CONFIG_DIR` on every session: the account the developer actually uses
+/// has the *newest* mtime, so sorting by that would hand `claude` to their least
+/// recently used login on the one machine where the order is observable — config
+/// lost, several directories on disk. Adoption is meant to keep their original
+/// account as account 1.
+pub async fn ids_on_disk(claude_dir: &Path) -> Vec<String> {
+    let Ok(mut entries) = tokio::fs::read_dir(claude_dir).await else {
+        return Vec::new();
+    };
+    let mut found: Vec<(SystemTime, String)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !looks_like_id(&name) {
+            continue;
+        }
+        // btime on APFS, statx on modern Linux. `or_else` and not `or`: both
+        // answers come out of the same already-populated stat struct, so neither
+        // is a syscall, but `or` would build the fallback for every entry
+        // including the ones `created()` answered. Lazy is the right default
+        // even where the cost is a `Result`.
+        let born = meta
+            .created()
+            .or_else(|_| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        found.push((born, name));
+    }
+    found.sort();
+    found.into_iter().map(|(_, name)| name).collect()
 }
 
 /// The account a developer's number refers to.
@@ -172,5 +226,78 @@ mod tests {
         assert!(!looks_like_id("settings"));
         assert!(!looks_like_id("not-a-uuid"));
         assert!(!looks_like_id(""));
+    }
+
+    #[tokio::test]
+    async fn only_directories_that_look_like_accounts_are_found() {
+        // What `reset` counts and what `claude_accounts` adopts. A stray file —
+        // or the `settings` directory an older riabuild left behind — is not an
+        // account, and counting it puts a number in the reset warning that no
+        // `riabuild claude list` agrees with.
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path();
+        let id = new_id();
+        tokio::fs::create_dir_all(dir.join(&id)).await.unwrap();
+        tokio::fs::create_dir_all(dir.join("settings"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("notes.txt"), "hi").await.unwrap();
+
+        assert_eq!(ids_on_disk(dir).await, vec![id]);
+        // A directory that is not there at all is no accounts, not an error.
+        assert!(ids_on_disk(&dir.join("nowhere")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_older_directory_is_numbered_first() {
+        // Account 1 is the one `claude` runs, so on the machine where adoption
+        // happens at all — config lost, several directories on disk — getting
+        // this backwards hands the developer's shell to the wrong login.
+        //
+        // This pins the ascending order and the tie-break. It does *not*
+        // distinguish creation time from modification time: both directories are
+        // made in sequence and never written to again, so the two orderings
+        // agree. `creation_time_is_preferred_over_modification_time` is the test
+        // that tells them apart, and it needs a filesystem that records a
+        // creation time.
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path();
+        let first = new_id();
+        let second = new_id();
+        tokio::fs::create_dir_all(dir.join(&first)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::create_dir_all(dir.join(&second)).await.unwrap();
+
+        assert_eq!(ids_on_disk(dir).await, vec![first, second]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a filesystem that records creation time (APFS birthtime, statx btime)"]
+    async fn creation_time_is_preferred_over_modification_time() {
+        // The discriminating case, and the reason mtime is the wrong key: Claude
+        // Code writes into CLAUDE_CONFIG_DIR on every session, so the account a
+        // developer actually uses has the newest mtime. Here the older
+        // directory is touched after the newer one exists, which is what a
+        // session does — under an mtime sort it would become account 2.
+        //
+        // Ignored by default because `Metadata::created()` is an `Err` on a
+        // filesystem without btime, where this legitimately falls back to mtime
+        // and the assertion below cannot hold. Same reason as
+        // `shims::claude_config_dir_smoke`: a real property, pinned where the
+        // platform can answer for it.
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path();
+        let older = new_id();
+        let newer = new_id();
+        tokio::fs::create_dir_all(dir.join(&older)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::create_dir_all(dir.join(&newer)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // A session in the older account: its mtime is now the newest of the two.
+        tokio::fs::write(dir.join(&older).join(".claude.json"), "{}")
+            .await
+            .unwrap();
+
+        assert_eq!(ids_on_disk(dir).await, vec![older, newer]);
     }
 }

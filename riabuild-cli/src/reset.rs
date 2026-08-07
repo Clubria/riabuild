@@ -180,24 +180,14 @@ async fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
 
 /// How many account directories `~/.riabuild/claude/` holds.
 ///
-/// Only names `accounts::looks_like_id` accepts count. Anything else under there
-/// — a stray file, a directory a developer made by hand — is not an account, and
-/// counting it would put a number in the warning that no `riabuild claude list`
-/// agrees with.
+/// Deferred to `accounts::ids_on_disk` rather than walked here, so there is one
+/// answer to "which directories under there are accounts". A second walk with
+/// its own filter would eventually disagree with the first, and the disagreement
+/// a developer would meet is a reset warning naming a number no `riabuild claude
+/// list` agrees with. Only names `accounts::looks_like_id` accepts count: a
+/// stray file, or a directory made by hand, is not an account.
 async fn account_count(claude_dir: &Path) -> u64 {
-    let Ok(mut cursor) = tokio::fs::read_dir(claude_dir).await else {
-        return 0;
-    };
-    let mut found = 0;
-    while let Ok(Some(entry)) = cursor.next_entry().await {
-        if !crate::accounts::looks_like_id(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        if entry.metadata().await.is_ok_and(|meta| meta.is_dir()) {
-            found += 1;
-        }
-    }
-    found
+    crate::accounts::ids_on_disk(claude_dir).await.len() as u64
 }
 
 /// A last guard on a recursive delete driven by a trait a test can override.

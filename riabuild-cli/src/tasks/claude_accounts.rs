@@ -18,7 +18,6 @@ use crate::version;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The version every behaviour this task depends on was verified against.
 ///
@@ -31,46 +30,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MIN_VERSION: &str = "2.1.223";
 
 pub struct ClaudeAccounts;
-
-/// Every account directory actually on disk, oldest first.
-///
-/// Ordered by creation time, falling back to modification time on a filesystem
-/// that does not record one, and broken by the directory name so the order is
-/// deterministic either way.
-///
-/// Creation time rather than mtime because Claude Code writes into
-/// `CLAUDE_CONFIG_DIR` on every session: the account the developer actually uses
-/// has the *newest* mtime, so sorting by that would hand `claude` to their least
-/// recently used login on the one machine where the order is observable — config
-/// lost, several directories on disk. Adoption is meant to keep their original
-/// account as account 1.
-async fn ids_on_disk(claude_dir: &Path) -> Vec<String> {
-    let Ok(mut entries) = tokio::fs::read_dir(claude_dir).await else {
-        return Vec::new();
-    };
-    let mut found: Vec<(SystemTime, String)> = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(meta) = entry.metadata().await else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !accounts::looks_like_id(&name) {
-            continue;
-        }
-        // btime on APFS, statx on modern Linux. `or_else` and not `or`: the
-        // fallback is a syscall, so it must not run when `created()` answered.
-        let born = meta
-            .created()
-            .or_else(|_| meta.modified())
-            .unwrap_or(UNIX_EPOCH);
-        found.push((born, name));
-    }
-    found.sort();
-    found.into_iter().map(|(_, name)| name).collect()
-}
 
 /// Whether riabuild has to install Claude Code before it can be used.
 ///
@@ -116,10 +75,13 @@ impl Task for ClaudeAccounts {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        // Existence before invocation — see `install_needed`. `ctx.claude()` is
-        // the bare name until `toolchain` pins a Node, and a bare name never
-        // exists as a relative path, so a machine with no toolchain reports
-        // exactly what is true: riabuild has not installed Claude Code.
+        // Existence before invocation — see `install_needed`. What makes this
+        // safe is the dependency edge and not the string: `depends_on
+        // (["toolchain"])` pins a Node first, so `ctx.claude()` is an absolute
+        // path under the tree riabuild owns by the time this runs. The bare
+        // name it falls back to before a Node is pinned would *not* be safe
+        // here — `try_exists("claude")` resolves against the current directory,
+        // so a checkout containing a file called `claude` satisfies it.
         let claude = ctx.claude();
         if !tokio::fs::try_exists(&claude).await.unwrap_or(false) {
             return Ok(Status::needs("Claude Code is not installed"));
@@ -158,7 +120,7 @@ impl Task for ClaudeAccounts {
         }
         // A directory nothing recorded is drift in the other direction: real
         // sessions and a real login that no riabuild command can reach.
-        for found in ids_on_disk(&ctx.paths.claude_dir()).await {
+        for found in accounts::ids_on_disk(&ctx.paths.claude_dir()).await {
             if !ids.contains(&found) {
                 return Ok(Status::needs(format!(
                     "the Claude Code account directory {found} is not registered"
@@ -202,7 +164,7 @@ impl Task for ClaudeAccounts {
         // engine would keep turning that into "it did not take effect", which
         // names nothing the developer can act on. So say what is wrong.
         let mut blocked = None;
-        for found in ids_on_disk(&claude_dir).await {
+        for found in accounts::ids_on_disk(&claude_dir).await {
             if kept.contains(&found) {
                 continue;
             }
@@ -634,67 +596,6 @@ mod tests {
 
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
         assert_eq!(ctx.config.claude_accounts, vec![orphan]);
-    }
-
-    #[tokio::test]
-    async fn adoption_numbers_the_older_directory_first() {
-        // Account 1 is the one `claude` runs, so on the machine where adoption
-        // happens at all — config lost, several directories on disk — getting
-        // this backwards hands the developer's shell to the wrong login.
-        //
-        // This pins the ascending order and the tie-break. It does *not*
-        // distinguish creation time from modification time: both directories are
-        // made in sequence and never written to again, so the two orderings
-        // agree. `adoption_prefers_creation_time_over_modification_time` is the
-        // test that tells them apart, and it needs a filesystem that records a
-        // creation time.
-        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
-        let first = accounts::new_id();
-        let second = accounts::new_id();
-        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&first))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&second))
-            .await
-            .unwrap();
-
-        ClaudeAccounts.apply(&mut ctx).await.unwrap();
-        assert_eq!(ctx.config.claude_accounts, vec![first, second]);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a filesystem that records creation time (APFS birthtime, statx btime)"]
-    async fn adoption_prefers_creation_time_over_modification_time() {
-        // The discriminating case, and the reason mtime is the wrong key: Claude
-        // Code writes into CLAUDE_CONFIG_DIR on every session, so the account a
-        // developer actually uses has the newest mtime. Here the older
-        // directory is touched after the newer one exists, which is what a
-        // session does — under an mtime sort it would become account 2.
-        //
-        // Ignored by default because `Metadata::created()` is an `Err` on a
-        // filesystem without btime, where this legitimately falls back to mtime
-        // and the assertion below cannot hold. Same reason as
-        // `shims::claude_config_dir_smoke`: a real property, pinned where the
-        // platform can answer for it.
-        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
-        let older = accounts::new_id();
-        let newer = accounts::new_id();
-        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&older))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&newer))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // A session in the older account: its mtime is now the newest of the two.
-        tokio::fs::write(ctx.paths.claude_config_file(&older), "{}")
-            .await
-            .unwrap();
-
-        ClaudeAccounts.apply(&mut ctx).await.unwrap();
-        assert_eq!(ctx.config.claude_accounts, vec![older, newer]);
     }
 
     #[tokio::test]
