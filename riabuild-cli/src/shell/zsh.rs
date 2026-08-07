@@ -75,7 +75,7 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx, prelude: &str) -> Result<super::ShellLaunch> {
     let dir = ctx.paths.shell_dir("zsh");
     tokio::fs::create_dir_all(&dir).await?;
 
@@ -89,7 +89,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         dir.join(".zshrc"),
         rcfile(
             &user_zdotdir,
-            &banner_command(&super::banner(colour)),
+            &banner_command(prelude),
             &prompt_command(colour),
         ),
     )
@@ -104,6 +104,34 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::status::{Account, Identity};
+    use crate::runner::FakeRunner;
+    use crate::testing::ctx_with;
+
+    #[tokio::test]
+    async fn prepare_writes_the_prelude_into_the_generated_rcfile() {
+        // A test that only exercises `rcfile` with a hand-picked literal, like
+        // the ones below, cannot catch `prepare` wiring the wrong thing into
+        // it. This one calls `prepare` itself and reads back the file it
+        // wrote.
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let accounts = vec![Account {
+            number: 1,
+            id: "id-1".into(),
+            identity: Identity::LoggedIn("clubria@proton.me".into()),
+        }];
+        let prelude = crate::shell::prelude(&accounts, false);
+
+        prepare(&ctx, &prelude).await.unwrap();
+
+        let written = tokio::fs::read_to_string(ctx.paths.shell_dir("zsh").join(".zshrc"))
+            .await
+            .unwrap();
+        // Distinctive to the box itself, not the banner — this fails if the
+        // box is dropped, truncated, or swapped for the banner alone.
+        assert!(written.contains("Your Claude Code accounts:"), "{written}");
+        assert!(written.contains("clubria@proton.me"), "{written}");
+    }
 
     #[test]
     fn sources_the_developers_own_config_before_anything_else() {

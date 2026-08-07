@@ -10,8 +10,8 @@
 //! the server sends the pointer, never the program.
 //!
 //! `node` resolves because `shell::path_with_riabuild` puts riabuild's own Node
-//! and `~/.riabuild/bin` on `PATH` together: the `c` launcher is reachable
-//! exactly when the interpreter it needs is.
+//! and `~/.riabuild/bin` on `PATH` together: the account launchers are reachable
+//! exactly when the interpreter they need is.
 
 use super::{Ctx, Status, Task, TaskId};
 use anyhow::Result;

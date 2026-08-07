@@ -15,7 +15,7 @@ const MANIFEST: [string, string][] = [
   ["toolchain", "riabuild-owned Node and pnpm"],
   ["project", "the repo, cloned where you asked"],
   ["repo_status", "report drift — never pull for you"],
-  ["claude_profiles", "a Claude Code profile of your own"],
+  ["claude_accounts", "Claude Code accounts of your own"],
   ["org_settings", "team policy, layered at launch"],
   ["env_local", "secrets, brokered fresh each time"],
 ];
@@ -88,7 +88,7 @@ export function Dashboard({ member }: { member: Member }) {
                 ●
               </span>
               {/* `ch` is exact in a monospace face: 16ch clears the longest id
-                  (`claude_profiles`) so every description starts on the same
+                  (`claude_accounts`) so every description starts on the same
                   column. Only from `sm` — at 380px that width would leave the
                   description nothing to wrap in. */}
               <span className="shrink-0 text-fg sm:min-w-[16ch]">{id}</span>

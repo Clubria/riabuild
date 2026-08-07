@@ -32,9 +32,10 @@ export const DEFAULT_STATUS_LINE = {
  * anything useful, and "set this up first" is a worse first run than sane
  * defaults a lead can correct.
  *
- * Every key here is settings data Claude Code reads from the file the `c`
- * launcher passes to `--settings` (source `flagSettings`, verified against
- * 2.1.223). Nothing here is written into anyone's own `settings.json`.
+ * Every key here is settings data Claude Code reads from the file each account
+ * launcher — `claude`, `claude-1` … `claude-N` — passes to `--settings` (source
+ * `flagSettings`, verified against 2.1.223). Nothing here is written into
+ * anyone's own `settings.json`.
  *
  * `statusLine` is the one key that names a program, and it still carries none:
  * the script it points at ships inside the riabuild binary. See

@@ -1,8 +1,9 @@
 //! Task 8 — cache the org's Claude Code settings.
 //!
-//! The file is handed to `claude --settings` by the `c` launcher, which layers
-//! it over the developer's own profile settings at launch. Nothing is merged
-//! into anyone's `settings.json`.
+//! The file is handed to `claude --settings` by every account launcher —
+//! `claude` and `claude-1` … `claude-N` — which layers it over that account's
+//! own settings at launch. One cached file serves all of them: org policy is
+//! org-wide by definition. Nothing is merged into anyone's `settings.json`.
 //!
 //! A recurring deep-merge cannot express removal, cannot tell org keys from
 //! developer keys after the first run, and silently clobbers edits. Layering at

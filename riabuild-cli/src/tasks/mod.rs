@@ -1,6 +1,6 @@
 //! The setup tasks and the context they run against.
 
-pub mod claude_profiles;
+pub mod claude_accounts;
 pub mod claude_statusline;
 pub mod claude_trust;
 pub mod engine;
@@ -145,6 +145,30 @@ impl Ctx {
         )
     }
 
+    /// The Claude Code riabuild installed, by absolute path.
+    ///
+    /// Same reasoning as `gh()`, with one addition: `which("claude")` reads the
+    /// ambient `PATH`, which during provisioning does not contain riabuild's
+    /// Node — so it finds whatever the developer happens to have installed, or
+    /// nothing at all in the moment just after riabuild installed one. Claude
+    /// Code is installed by riabuild's own npm, so its home is the pinned
+    /// Node's `bin`.
+    ///
+    /// Falls back to the bare name before a Node is pinned, which is the only
+    /// thing a machine with no toolchain yet could use.
+    pub fn claude(&self) -> String {
+        match &self.config.node_version {
+            Some(version) => self
+                .paths
+                .node_dir(version)
+                .join("bin")
+                .join("claude")
+                .to_string_lossy()
+                .into_owned(),
+            None => "claude".to_string(),
+        }
+    }
+
     fn owned_tool(&self, tool: &str, version: &str, member: &str) -> String {
         self.paths
             .tool_dir(tool, version)
@@ -164,10 +188,31 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(toolchain::Toolchain),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
-        Box::new(claude_profiles::ClaudeProfiles),
+        Box::new(claude_accounts::ClaudeAccounts),
         Box::new(org_settings::OrgSettings),
         Box::new(claude_trust::ClaudeTrust),
         Box::new(env_local::EnvLocal),
         Box::new(claude_statusline::ClaudeStatusline),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runner::FakeRunner;
+    use crate::testing::ctx_with;
+
+    #[tokio::test]
+    async fn claude_is_the_one_riabuilds_node_installed() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.node_version = Some("22.23.1".into());
+        let claude = ctx.claude();
+        assert!(claude.ends_with("/node/22.23.1/bin/claude"), "{claude}");
+        assert!(claude.starts_with(&ctx.paths.root().to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn without_a_pinned_node_the_bare_name_is_all_there_is() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        assert_eq!(ctx.claude(), "claude");
+    }
 }

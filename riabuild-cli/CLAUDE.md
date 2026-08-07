@@ -125,8 +125,10 @@ src/
   reset.rs     removes ~/.riabuild
   download.rs  fetching and digests    archive.rs   tar and zip extraction
   tools.rs     the gh and infisical releases riabuild owns
+  version.rs   parsing and comparison  testing.rs   test helpers
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
+  accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
 ```
 
 `download.rs` decides where bytes come from and whether they are the right bytes;
@@ -134,7 +136,25 @@ src/
 is what makes "verified before anything is written" a property of the code rather than a
 convention.
 
-One task per file. When a file passes roughly 300 lines, it is doing too much.
+One task per file. Roughly 300 lines of **production** code is the point at which
+a file is doing too much — `#[cfg(test)]` modules do not count towards it. The number
+is about how much behaviour one file owns, and a test module is not behaviour: a
+small implementation under a long test module is the shape this repo wants, and
+counting the tests would make writing more of them look like a problem.
+
+## Claude Code accounts
+
+A developer has an ordered list of up to nine Claude Code accounts, each a
+`~/.riabuild/claude/<uuid>/` config directory with its own sign-in, and each reached by its
+own generated launcher: `claude` runs the primary, `claude-1` … `claude-N` run a particular
+one. The launchers are the only thing that names a config directory — `CLAUDE_CONFIG_DIR` is
+deliberately **not** exported into the environment shell, so a `claude` started outside a
+launcher cannot land in an account by accident, and one exported value cannot quietly make
+all nine share a directory. `riabuild claude list|new|delete|primary` manages the list,
+every environment shell opens with the account box, and the org's Claude settings and the
+checkout's trust apply to every account, never just the first.
+
+Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
 
 ## Shell integration
 
