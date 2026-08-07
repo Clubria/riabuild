@@ -27,24 +27,40 @@ impl Remote {
     /// Hashed over the *login target* — user, host, and port — never the local
     /// `name`, so renaming a saved server never changes which key it uses.
     ///
-    /// Two normalisation decisions, made deliberately rather than left to
-    /// chance:
+    /// Four normalisation axes, each considered deliberately rather than left
+    /// to chance:
     ///
-    /// - The host is lowercased first. DNS names are case-insensitive, so
-    ///   `Build-01.fly.dev` and `build-01.fly.dev` are one server; hashing the
-    ///   host as typed would silently re-provision and re-authorise a server
-    ///   the developer already set up, the second time they typed it slightly
-    ///   differently.
-    /// - The port gets no equivalent treatment here, because it needs none:
-    ///   [`Remote::parse`] already fills in `22` whenever a spec omits a port,
-    ///   so by the time a `Remote` exists, `host:22` and a bare `host` have
-    ///   already become the same `u16`. A caller who builds a `Remote` by hand
-    ///   is expected to have resolved that the same way.
+    /// - **Case.** The host is lowercased first (ASCII-only —
+    ///   [`str::to_ascii_lowercase`], not [`str::to_lowercase`]: hostnames are
+    ///   ASCII or punycode, so there is no Unicode case-folding to get right or
+    ///   wrong here). DNS names are case-insensitive, so `Build-01.fly.dev` and
+    ///   `build-01.fly.dev` are one server; hashing the host as typed would
+    ///   silently re-provision and re-authorise a server the developer already
+    ///   set up, the second time they typed it slightly differently.
+    /// - **Trailing dot.** A single trailing `.` is stripped before lowercasing.
+    ///   `build-01.fly.dev.` is the fully-qualified spelling of
+    ///   `build-01.fly.dev` — DNS treats them as the identical name — and
+    ///   without this, typing (or a tool emitting) the FQDN form would fork one
+    ///   server into two SSH identities.
+    /// - **Port.** No equivalent treatment is needed here: [`Remote::parse`]
+    ///   already fills in `22` whenever a spec omits a port, so by the time a
+    ///   `Remote` exists, `host:22` and a bare `host` have already become the
+    ///   same `u16`. A caller who builds a `Remote` by hand is expected to have
+    ///   resolved that the same way.
+    /// - **IP vs. name.** Left un-normalised, on purpose. The hash is over the
+    ///   login target *as the developer typed it*, not over a resolved
+    ///   address — resolving `build-01.fly.dev` to an IP before hashing would
+    ///   mean the identity (and which SSH key gets used) depends on whatever
+    ///   DNS answers on a given day, which is exactly the kind of cleverness
+    ///   this design avoids. `10.0.0.5` and `build-01.fly.dev` are treated as
+    ///   two different servers even if they currently happen to be the same
+    ///   machine; that is a feature, not a gap — predictable beats resolved.
     /// - The user is left exactly as typed. Unix usernames are case-sensitive,
     ///   and `ada` and `Ada` are two different accounts, not one.
     #[allow(dead_code)] // consumed by Task 21
     pub fn hash(&self) -> String {
-        let key = format!("{}@{}:{}", self.user, self.host.to_lowercase(), self.port);
+        let host = self.host.strip_suffix('.').unwrap_or(&self.host);
+        let key = format!("{}@{}:{}", self.user, host.to_ascii_lowercase(), self.port);
         let digest = crate::download::sha256_hex(key.as_bytes());
         digest[..16].to_string()
     }
@@ -183,6 +199,25 @@ mod tests {
         };
         assert_eq!(lower.hash(), mixed_case.hash());
         assert_eq!(lower.hash(), upper.hash());
+    }
+
+    #[test]
+    fn a_trailing_dot_is_the_same_server() {
+        // The fully-qualified spelling of a DNS name ends in `.`; DNS treats
+        // `build-01.fly.dev` and `build-01.fly.dev.` as the identical name, and
+        // a hash that didn't would fork one server into two SSH identities the
+        // first time someone (or some tool) typed the FQDN form.
+        let bare = Remote {
+            name: "build-01".into(),
+            host: "build-01.fly.dev".into(),
+            port: 22,
+            user: "ada".into(),
+        };
+        let fqdn = Remote {
+            host: "build-01.fly.dev.".into(),
+            ..bare.clone()
+        };
+        assert_eq!(bare.hash(), fqdn.hash());
     }
 
     #[test]
