@@ -243,16 +243,40 @@ had copied when they pressed Ctrl+V.
 Bytes cross the wire as-is. PNG is already compressed, so `ssh -C` or a gzip layer buys
 almost nothing on the payload that dominates.
 
-The lever that would matter is **downscaling** — Claude's vision resizes above a long-edge
-cap (2576 px on current models) and discards the excess, so a 5K screenshot costs several
-times the tokens of a 2576 px one for no added information. It is deliberately not done:
-the most common laptop-origin paste is a dense error dialog or a UI with small text, and
-downscaling is precisely what makes that unreadable. A `maxLongEdge` knob exists in the
-agent's configuration, defaulted off, for developers on genuinely bad links.
+The lever that would matter is **downscaling**, and it is applied exactly once, at a
+constant compiled into the binary:
 
-If it is ever turned on by default, it belongs in the **agent**, not the shim — the shim
-runs after the bytes have already crossed the wire, so resizing there would save tokens but
-not transfer time.
+```rust
+/// The long-edge ceiling Claude's vision applies before it looks at an image.
+/// Resizing to this is information-neutral: the detail discarded here is the
+/// detail the model was going to discard anyway.
+const MAX_LONG_EDGE: u32 = 2576;
+```
+
+This is **not a setting**. There is no config key, no environment variable, and no
+dashboard field — riabuild does not ask a developer to pick a resolution any more than it
+asks them to pick a Node version. Changing the number is a release.
+
+The value is chosen so that the usual objection to downscaling does not apply. The most
+common laptop-origin paste is a dense error dialog or a UI with small text, and
+aggressive downscaling is what makes those unreadable — but Claude's vision already
+resizes anything above this ceiling and discards the excess. Sending a 5K screenshot
+uncompressed costs several times the transfer time of a 2576 px one and yields the model
+no additional pixels. Resizing *to the ceiling* loses nothing the model would have seen;
+resizing below it would, which is why the constant sits at the ceiling and not under it.
+
+Two consequences worth stating plainly, because both are real:
+
+- Images at or below 2576 px on the long edge are passed through **byte-for-byte** and
+  never decoded. The resize path is only entered by images that exceed the ceiling.
+- An oversized image is re-encoded, so a developer who runs `wl-paste > shot.png` on the
+  server to archive an original gets the resized copy, not the original bytes. This is the
+  one place the channel is deliberately not byte-transparent. It is accepted because the
+  channel exists to feed Claude Code, and a developer who needs original pixels has `scp`.
+
+Resizing belongs in the **agent**, not the shim. The shim runs after the bytes have
+already crossed the wire, so resizing there would save tokens but not transfer time —
+which is the whole point.
 
 ---
 
@@ -401,7 +425,8 @@ optional" is a sentence in a document rather than a property of the system.
 - **Writing to the laptop's clipboard.** `clipboard.write` inverts the trust direction —
   the server pushing data rather than answering a request — and weakens the property that
   makes the channel defensible. A separate change if it is ever wanted.
-- **Compression or downscaling by default.** The `maxLongEdge` knob ships off.
+- **Compression, and any downscaling below the model's ceiling.** Bytes cross as-is;
+  the sole transform is the compiled-in `MAX_LONG_EDGE` resize, and it is not a setting.
 - **Content inspection.** File *types* are filtered; text content is never scanned for
   paths or anything else.
 - **PRIMARY selection.** The X11 highlight buffer changes on every mouse drag; bridging it
