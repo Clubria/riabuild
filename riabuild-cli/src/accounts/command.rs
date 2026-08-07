@@ -271,6 +271,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_at_the_cap_leaves_no_directory_behind() {
+        // The order inside `new` is load-bearing: a directory created before
+        // the cap is checked is an account nothing can number, and the
+        // `claude_accounts` task can only report that state — never repair it —
+        // so every later `riabuild` run aborts there. Without this, moving
+        // `create_dir_all` one line up stays green everywhere.
+        let (mut ctx, _home, ids) = with_accounts(accounts::MAX).await;
+
+        let error = new(&mut ctx).await.unwrap_err().to_string();
+        // The action, not the attempt: an abandoned sign-in says "adding a
+        // Claude Code account" too, and this must be the cap refusal.
+        assert!(error.contains("riabuild claude delete"), "{error}");
+        assert_eq!(ctx.config.claude_accounts, ids);
+
+        let mut entries = tokio::fs::read_dir(ctx.paths.claude_dir()).await.unwrap();
+        let mut count = 0;
+        while let Ok(Some(_)) = entries.next_entry().await {
+            count += 1;
+        }
+        assert_eq!(count, accounts::MAX, "a tenth directory was created anyway");
+    }
+
+    #[tokio::test]
     async fn a_sign_in_that_did_not_take_adds_no_account() {
         // The browser was closed. Anything left behind would show as an
         // account permanently "(logged out)" that nobody chose to create.
