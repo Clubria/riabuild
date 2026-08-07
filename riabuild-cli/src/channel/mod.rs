@@ -14,3 +14,4 @@
 //! opens a shell. Only paste stops.
 
 pub mod mime;
+pub mod protocol;
