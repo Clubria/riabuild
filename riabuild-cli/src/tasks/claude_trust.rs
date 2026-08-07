@@ -11,10 +11,11 @@
 //! settings the org ships are held back as untrusted. That is the one dialog a
 //! provisioner cannot leave for the developer to meet on their own.
 //!
-//! Only the riabuild-owned profile is touched — `~/.riabuild/claude/<uuid>/` —
-//! never the developer's own `~/.claude.json`. The file is live state Claude
-//! Code rewrites constantly, so this is a read-modify-write that preserves every
-//! key it does not own, not a template.
+//! Every riabuild-owned account is touched — every `~/.riabuild/claude/<uuid>/`
+//! config directory in `claude_accounts` — never the developer's own
+//! `~/.claude.json`. Each account's file is live state Claude Code rewrites
+//! constantly, so each one is a read-modify-write that preserves every key it
+//! does not own, not a template.
 
 use super::{Ctx, Status, Task, TaskId};
 use crate::paths::contract_tilde;
@@ -88,37 +89,43 @@ impl Task for ClaudeTrust {
     }
 
     fn depends_on(&self) -> &[TaskId] {
-        // The profile supplies the config file to write into; the project
-        // supplies the path being trusted. A checkout moved by `project` has to
-        // be re-trusted at its new path, which is what this edge buys.
+        // The accounts task supplies the config files to write into, one per
+        // account; the project task supplies the path being trusted. A checkout
+        // moved by `project` has to be re-trusted at its new path, which is what
+        // this edge buys.
         &["claude_accounts", "project"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        let Some(profile) = ctx.config.primary_account().map(str::to_string) else {
-            return Ok(Status::needs("no Claude Code profile yet"));
-        };
+        if ctx.config.claude_accounts.is_empty() {
+            return Ok(Status::needs("no Claude Code account yet"));
+        }
         let Some(dir) = ctx.project_dir() else {
             return Ok(Status::needs("no project directory yet"));
         };
+        let keys = trust_keys(&dir).await;
+        let shown = contract_tilde(&dir, &ctx.paths.home());
 
-        let file = config_file(ctx, &profile);
-        let Ok(text) = tokio::fs::read_to_string(&file).await else {
-            return Ok(Status::needs("the Claude Code profile has no config yet"));
-        };
-        let Ok(root) = serde_json::from_str::<Value>(&text) else {
-            // Claude Code cannot start against this, so the machine is broken
-            // whatever the trust key says.
-            return Ok(Status::needs(
-                "the Claude Code profile config is not valid JSON",
-            ));
-        };
-
-        for key in trust_keys(&dir).await {
-            if !is_trusted(&root, &key) {
+        for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
+            let file = config_file(ctx, id);
+            let Ok(text) = tokio::fs::read_to_string(&file).await else {
                 return Ok(Status::needs(format!(
-                    "{} is not trusted by Claude Code yet",
-                    contract_tilde(&dir, &ctx.paths.home())
+                    "account {} has no Claude Code config yet",
+                    index + 1
+                )));
+            };
+            let Ok(root) = serde_json::from_str::<Value>(&text) else {
+                // Claude Code cannot start against this, so the machine is
+                // broken whatever the trust key says.
+                return Ok(Status::needs(format!(
+                    "the Claude Code config for account {} is not valid JSON",
+                    index + 1
+                )));
+            };
+            if !keys.iter().all(|key| is_trusted(&root, key)) {
+                return Ok(Status::needs(format!(
+                    "{shown} is not trusted by account {} yet",
+                    index + 1
                 )));
             }
         }
@@ -127,13 +134,13 @@ impl Task for ClaudeTrust {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let Some(profile) = ctx.config.primary_account().map(str::to_string) else {
+        if ctx.config.claude_accounts.is_empty() {
             return Err(Failure::new(
                 "trusting the checkout",
-                "Run `riabuild` again — the Claude Code profile has to exist first.",
+                "Run `riabuild` again — a Claude Code account has to exist first.",
             )
             .into());
-        };
+        }
         let Some(dir) = ctx.project_dir() else {
             return Err(Failure::new(
                 "trusting the checkout",
@@ -141,38 +148,47 @@ impl Task for ClaudeTrust {
             )
             .into());
         };
+        let keys = trust_keys(&dir).await;
 
-        let file = config_file(ctx, &profile);
-        if let Some(parent) = file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        for id in ctx.config.claude_accounts.clone() {
+            trust_one(ctx, &id, &keys).await?;
         }
-
-        let mut root = load_or_reset(ctx, &file).await?;
-        let mut projects = match root.remove("projects") {
-            Some(Value::Object(map)) => map,
-            _ => Map::new(),
-        };
-
-        for key in trust_keys(&dir).await {
-            match projects.get_mut(&key) {
-                Some(Value::Object(entry)) => {
-                    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
-                }
-                _ => {
-                    projects.insert(key, new_project_entry());
-                }
-            }
-        }
-        root.insert("projects".into(), Value::Object(projects));
-
-        // Claude Code may be running against this file right now, so the new
-        // content lands whole or not at all.
-        let text = serde_json::to_string_pretty(&Value::Object(root))?;
-        let staged = file.with_extension("json.riabuild-tmp");
-        tokio::fs::write(&staged, text).await?;
-        tokio::fs::rename(&staged, &file).await?;
         Ok(())
     }
+}
+
+/// Writes the trust key into one account's config, preserving every key it does
+/// not own. Claude Code may be running against this file right now, so the new
+/// content lands whole or not at all.
+async fn trust_one(ctx: &mut Ctx, id: &str, keys: &[String]) -> Result<()> {
+    let file = config_file(ctx, id);
+    if let Some(parent) = file.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut root = load_or_reset(ctx, &file).await?;
+    let mut projects = match root.remove("projects") {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+
+    for key in keys {
+        match projects.get_mut(key) {
+            Some(Value::Object(entry)) => {
+                entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+            }
+            _ => {
+                projects.insert(key.clone(), new_project_entry());
+            }
+        }
+    }
+    root.insert("projects".into(), Value::Object(projects));
+
+    let text = serde_json::to_string_pretty(&Value::Object(root))?;
+    let staged = file.with_extension("json.riabuild-tmp");
+    tokio::fs::write(&staged, text).await?;
+    tokio::fs::rename(&staged, &file).await?;
+    Ok(())
 }
 
 /// The existing config, or a fresh one if there is nothing usable there.
@@ -206,19 +222,23 @@ mod tests {
     use crate::testing::{ctx_with, write_file};
     use std::path::PathBuf;
 
-    /// A ctx with a profile and a real checkout directory on disk.
-    async fn ready() -> (Ctx, tempfile::TempDir, String, PathBuf) {
+    /// A ctx with two accounts and a real checkout directory on disk.
+    async fn ready() -> (Ctx, tempfile::TempDir, Vec<String>, PathBuf) {
         let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
-        let profile = new_id();
-        tokio::fs::create_dir_all(ctx.paths.claude_dir().join(&profile))
-            .await
-            .expect("profile dir");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = new_id();
+            tokio::fs::create_dir_all(ctx.paths.claude_dir().join(&id))
+                .await
+                .expect("account dir");
+            ids.push(id);
+        }
         let dir = home.path().join("code/hub");
         tokio::fs::create_dir_all(&dir).await.expect("checkout");
 
-        ctx.config.claude_accounts = vec![profile.clone()];
+        ctx.config.claude_accounts = ids.clone();
         ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
-        (ctx, home, profile, dir)
+        (ctx, home, ids, dir)
     }
 
     #[tokio::test]
@@ -232,8 +252,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_untrusted_checkout_is_detected() {
-        let (ctx, _home, profile, _dir) = ready().await;
-        write_file(&config_file(&ctx, &profile), r#"{"numStartups": 3}"#).await;
+        let (ctx, _home, ids, _dir) = ready().await;
+        write_file(&config_file(&ctx, &ids[0]), r#"{"numStartups": 3}"#).await;
 
         let status = ClaudeTrust.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("not trusted"), "{status:?}");
@@ -241,9 +261,9 @@ mod tests {
 
     #[tokio::test]
     async fn trust_recorded_for_another_checkout_does_not_count() {
-        let (ctx, _home, profile, _dir) = ready().await;
+        let (ctx, _home, ids, _dir) = ready().await;
         write_file(
-            &config_file(&ctx, &profile),
+            &config_file(&ctx, &ids[0]),
             r#"{"projects":{"/somewhere/else":{"hasTrustDialogAccepted":true}}}"#,
         )
         .await;
@@ -253,24 +273,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applying_trusts_the_checkout() {
-        let (mut ctx, _home, _profile, _dir) = ready().await;
+    async fn one_trusted_account_is_not_enough() {
+        // claude-2 would open the trust modal on first launch and hold the
+        // org's settings back as untrusted — the exact dialog this task exists
+        // to prevent, just one account over.
+        let (mut ctx, _home, ids, _dir) = ready().await;
+        write_file(&config_file(&ctx, &ids[0]), r#"{"numStartups":1}"#).await;
         ClaudeTrust.apply(&mut ctx).await.unwrap();
+
+        // Now break only the second account's trust.
+        write_file(&config_file(&ctx, &ids[1]), r#"{"numStartups":1}"#).await;
+        let status = ClaudeTrust.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("not trusted"), "{status:?}");
+        assert!(format!("{status:?}").contains('2'), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn applying_trusts_every_account() {
+        let (mut ctx, _home, ids, dir) = ready().await;
+        ClaudeTrust.apply(&mut ctx).await.unwrap();
+
+        let key = dir.to_string_lossy().into_owned();
+        for id in &ids {
+            let text = tokio::fs::read_to_string(config_file(&ctx, id))
+                .await
+                .unwrap();
+            let root: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                root["projects"][&key]["hasTrustDialogAccepted"],
+                json!(true),
+                "{id}"
+            );
+        }
         assert_eq!(ClaudeTrust.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
     async fn applying_keeps_everything_else_in_the_config() {
-        let (mut ctx, _home, profile, _dir) = ready().await;
+        let (mut ctx, _home, ids, _dir) = ready().await;
         write_file(
-            &config_file(&ctx, &profile),
+            &config_file(&ctx, &ids[0]),
             r#"{"numStartups":7,"projects":{"/other":{"hasTrustDialogAccepted":true,"allowedTools":["Bash"]}}}"#,
         )
         .await;
 
         ClaudeTrust.apply(&mut ctx).await.unwrap();
 
-        let text = tokio::fs::read_to_string(config_file(&ctx, &profile))
+        let text = tokio::fs::read_to_string(config_file(&ctx, &ids[0]))
             .await
             .unwrap();
         let root: Value = serde_json::from_str(&text).unwrap();
@@ -282,10 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_existing_entry_is_edited_rather_than_replaced() {
-        let (mut ctx, _home, profile, dir) = ready().await;
+        let (mut ctx, _home, ids, dir) = ready().await;
         let key = dir.to_string_lossy().into_owned();
         write_file(
-            &config_file(&ctx, &profile),
+            &config_file(&ctx, &ids[0]),
             &format!(
                 r#"{{"projects":{{"{key}":{{"hasTrustDialogAccepted":false,"allowedTools":["Read"]}}}}}}"#
             ),
@@ -294,7 +343,7 @@ mod tests {
 
         ClaudeTrust.apply(&mut ctx).await.unwrap();
 
-        let text = tokio::fs::read_to_string(config_file(&ctx, &profile))
+        let text = tokio::fs::read_to_string(config_file(&ctx, &ids[0]))
             .await
             .unwrap();
         let root: Value = serde_json::from_str(&text).unwrap();
@@ -304,13 +353,13 @@ mod tests {
 
     #[tokio::test]
     async fn applying_twice_is_safe() {
-        let (mut ctx, _home, profile, _dir) = ready().await;
+        let (mut ctx, _home, ids, _dir) = ready().await;
         ClaudeTrust.apply(&mut ctx).await.unwrap();
-        let first = tokio::fs::read_to_string(config_file(&ctx, &profile))
+        let first = tokio::fs::read_to_string(config_file(&ctx, &ids[0]))
             .await
             .unwrap();
         ClaudeTrust.apply(&mut ctx).await.unwrap();
-        let second = tokio::fs::read_to_string(config_file(&ctx, &profile))
+        let second = tokio::fs::read_to_string(config_file(&ctx, &ids[0]))
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -318,8 +367,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_config_is_moved_aside_rather_than_overwritten() {
-        let (mut ctx, _home, profile, _dir) = ready().await;
-        let file = config_file(&ctx, &profile);
+        let (mut ctx, _home, ids, _dir) = ready().await;
+        let file = config_file(&ctx, &ids[0]);
         write_file(&file, "{ not json").await;
 
         assert!(matches!(

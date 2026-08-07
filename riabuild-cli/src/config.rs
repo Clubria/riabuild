@@ -123,6 +123,13 @@ impl UserConfig {
     }
 
     /// The account `claude` runs.
+    ///
+    /// Task 10 folded `claude_trust` into a loop over every account, which was
+    /// this method's last caller — `shims` already indexed `claude_accounts`
+    /// directly rather than going through it. Left in place and allowed rather
+    /// than deleted: removing a Task 1 interface is a call for whoever owns
+    /// this plan, not a side effect of this task.
+    #[allow(dead_code)]
     pub fn primary_account(&self) -> Option<&str> {
         self.claude_accounts.first().map(String::as_str)
     }
