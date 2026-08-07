@@ -198,22 +198,37 @@ jobs:
           workspaces: riabuild-cli
           key: ${{ matrix.target }}
 
-      - name: Install the musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       # `ring` builds C, and cc-rs looks for `<arch>-linux-musl-gcc` — a name
       # Ubuntu's musl-tools does not provide; it ships `musl-gcc`. Without this
       # the build fails outright with `failed to find tool`, which is at least
       # loud. Pointing it at the host's glibc `cc` instead would be the quiet
       # version of the same mistake.
+      #
+      # Written to $GITHUB_ENV once rather than exported in each step that
+      # builds. Two reasons, and the second is why the first release failed:
+      #
+      #   * cc-rs and Cargo want different spellings of the same target, and
+      #     repeating both transformations is how they drift apart.
+      #   * cc-rs accepts `CC_<target>` with hyphens, but that is not a valid
+      #     shell identifier, so `export CC_x86_64-unknown-linux-musl=…` is a
+      #     hard error before a single crate compiles. $GITHUB_ENV takes
+      #     `NAME=value` literally and never had that restriction; the
+      #     underscore spelling below is the one cc-rs also accepts.
+      - name: Install the musl toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+          target_cc=$(printf '%s' "${{ matrix.target }}" | tr '-' '_')
+          target_env=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          echo "CC_${target_cc}=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         env:
           RIABUILD_VERSION: ${{ env.VERSION }}
         run: |
           set -euo pipefail
-          target_env=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
-          export "CC_${{ matrix.target }}"=musl-gcc
-          export "CARGO_TARGET_${target_env}_LINKER"=musl-gcc
           cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Verify the binary is static and runs
@@ -251,9 +266,6 @@ jobs:
           RIABUILD_VERSION: ${{ env.VERSION }}
         run: |
           set -euo pipefail
-          target_env=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
-          export "CC_${{ matrix.target }}"=musl-gcc
-          export "CARGO_TARGET_${target_env}_LINKER"=musl-gcc
           cargo test --release --locked --target ${{ matrix.target }} \
             tls_and_dns_work_on_this_build -- --ignored --exact \
             download::tests::tls_and_dns_work_on_this_build
