@@ -167,6 +167,11 @@ export function Gallery() {
         <Row label="no dashes">
           <Copyable value="nodashesatall" label="value" />
         </Row>
+        <Row label="long, no dashes">
+          {/* The hostile case: no dash to truncate at, and long enough that
+              an unbounded prefix would overflow the row. */}
+          <Copyable value={"unbrokentoken".repeat(6)} label="long value" />
+        </Row>
         <Row label="empty">
           <Copyable value="" label="empty value" />
         </Row>

@@ -35,4 +35,45 @@ describe("Copyable", () => {
     render(<Copyable value="" label="member id" />);
     expect(screen.getByRole("button", { name: /copy member id/i })).toBeVisible();
   });
+
+  test("bounds the displayed length of a long dash-less value instead of rendering it whole", () => {
+    vi.stubGlobal("navigator", {});
+    const LONG = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    render(<Copyable value={LONG} label="token" />);
+    // Truncated to the same 8-character cap a UUID's first segment gets —
+    // never the whole 64-character string, which would overflow its row.
+    expect(screen.getByText("abcdefgh…")).toBeVisible();
+    expect(screen.queryByText(LONG, { selector: "[aria-hidden]" })).not.toBeInTheDocument();
+    expect(screen.getByText(LONG)).toBeInTheDocument(); // still the sr-only / copy source
+  });
+
+  test("does not append an ellipsis when the value already fits", () => {
+    vi.stubGlobal("navigator", {});
+    render(<Copyable value="short" label="value" />);
+    // Both the visible (aria-hidden) prefix and the sr-only full value read
+    // "short" when nothing was cut — disambiguate by picking the visible one.
+    expect(screen.getByText("short", { selector: "[aria-hidden]" })).toBeVisible();
+    expect(screen.queryByText("short…")).not.toBeInTheDocument();
+  });
+
+  test("announces the copy result to a screen reader without changing the button's own label", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    render(<Copyable value={UUID} label="member id" />);
+    // aria-label overrides the accessible name outright, so the button's own
+    // name must not carry the state — a separate live region does.
+    expect(screen.getByRole("button", { name: "Copy member id" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Copy member id" }));
+    expect(await screen.findByText(/member id copied/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy member id" })).toBeInTheDocument();
+  });
+
+  test("announces a failed copy to a screen reader", async () => {
+    vi.stubGlobal("navigator", {});
+    render(<Copyable value={UUID} label="member id" />);
+    await userEvent.click(screen.getByRole("button", { name: /copy member id/i }));
+    expect(await screen.findByText(/copy failed.*member id/i)).toBeInTheDocument();
+  });
 });
