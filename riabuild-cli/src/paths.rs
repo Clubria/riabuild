@@ -162,8 +162,10 @@ pub fn remote_namespace(home: &Path, member_id: &str) -> PathBuf {
     home.join(".riabuild-remote").join(member_id)
 }
 
-/// The folder Clubria checkouts are grouped under on macOS.
-const MACOS_ORG_DIR: &str = "Clubria";
+/// The folder Clubria checkouts are grouped under — under `Documents` on
+/// macOS, and under a developer's own directory on a server (see
+/// [`remote_project_dir`]). No longer macOS-only, hence the name.
+const ORG_DIR: &str = "Clubria";
 
 /// Where a repository is checked out when the developer has not chosen a place.
 ///
@@ -184,9 +186,24 @@ pub fn default_project_dir(home: &Path, repo_name: &str) -> PathBuf {
 /// `cfg!` would compile one of these branches out of the test binary entirely.
 fn default_project_dir_on(os: &str, home: &Path, repo_name: &str) -> PathBuf {
     match os {
-        "macos" => home.join("Documents").join(MACOS_ORG_DIR).join(repo_name),
+        "macos" => home.join("Documents").join(ORG_DIR).join(repo_name),
         _ => home.join("code").join(repo_name),
     }
+}
+
+/// Where a checkout lands on a server.
+///
+/// Grouped by GitHub login because a developer `cd`s into this every day and a
+/// UUID is not a path anyone can read. Nothing durable rests on the name: the
+/// absolute path is recorded in the namespace's `config.json` the first time it
+/// is chosen, so a later GitHub rename changes nothing.
+///
+/// Never `~/Documents`, on any platform: macOS protects it from SSH sessions,
+/// returning "Operation not permitted" unless sshd has Full Disk Access, and
+/// one answer on every platform is one less branch to be wrong in.
+#[allow(dead_code)] // consumed by Task 7b
+pub fn remote_project_dir(home: &Path, login: &str, repo_name: &str) -> PathBuf {
+    home.join(ORG_DIR).join(login).join(repo_name)
 }
 
 /// Expands a leading `~` the way a developer typing a path expects.
@@ -234,6 +251,33 @@ mod tests {
             default_project_dir_on("macos", Path::new("/Users/ada"), "ai-builders-hub"),
             PathBuf::from("/Users/ada/Documents/Clubria/ai-builders-hub")
         );
+    }
+
+    #[test]
+    fn a_server_checkout_is_grouped_by_developer_and_avoids_documents() {
+        // Not ~/Documents even on macOS: over SSH that directory is TCC-protected
+        // and returns "Operation not permitted" unless sshd has Full Disk Access.
+        // One answer on every platform is also one less branch to be wrong in.
+        assert_eq!(
+            remote_project_dir(Path::new("/home/dev"), "ada", "ai-builders-hub"),
+            PathBuf::from("/home/dev/Clubria/ada/ai-builders-hub")
+        );
+        assert_eq!(
+            remote_project_dir(Path::new("/Users/dev"), "bob", "ai-builders-hub"),
+            PathBuf::from("/Users/dev/Clubria/bob/ai-builders-hub")
+        );
+    }
+
+    #[test]
+    fn two_developers_sharing_a_server_get_different_checkouts() {
+        // Same home, different GitHub logins — isolates login as the variable
+        // that must produce different paths, which is the whole point of
+        // grouping by developer: two co-tenants must never resolve to one
+        // checkout.
+        let home = Path::new("/home/dev");
+        let ada = remote_project_dir(home, "ada", "ai-builders-hub");
+        let bob = remote_project_dir(home, "bob", "ai-builders-hub");
+        assert_ne!(ada, bob);
     }
 
     #[test]
