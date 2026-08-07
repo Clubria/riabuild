@@ -1,13 +1,13 @@
 //! Task 10 — the checkout, trusted, so Claude Code starts working immediately.
 //!
 //! Everything else riabuild tells Claude Code is settings data layered at launch
-//! by the `c` shim. Trust cannot be: `hasTrustDialogAccepted` is per-project
+//! by the account launchers. Trust cannot be: `hasTrustDialogAccepted` is per-project
 //! state in `.claude.json`, keyed by absolute path, and no settings file can
 //! express it. Claude Code says as much in its own diagnostic — *"Run Claude
 //! Code interactively here once and accept the trust dialog, or set
 //! projects[<path>].hasTrustDialogAccepted: true"*.
 //!
-//! Until it is set, the first `c` in a fresh checkout opens a modal, and the
+//! Until it is set, the first `claude` in a fresh checkout opens a modal, and the
 //! settings the org ships are held back as untrusted. That is the one dialog a
 //! provisioner cannot leave for the developer to meet on their own.
 //!

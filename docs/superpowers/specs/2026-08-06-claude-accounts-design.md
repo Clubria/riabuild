@@ -342,17 +342,32 @@ Replaces `tasks/claude_profiles.rs`. Task id becomes `claude_accounts`; `depends
 | Condition | Reason shown |
 |---|---|
 | Claude Code is not installed | `Claude Code is not installed` |
-| `claude --version` < 2.0.0 | `Claude Code is older than 2.0.0` |
+| `claude --version` < `MIN_VERSION` | `Claude Code <found> is older than 2.1.223` |
 | no accounts registered | `no Claude Code account yet` |
-| a registered directory is missing | `a Claude Code account directory is missing` |
-| an unregistered UUID directory exists | `a Claude Code account is not registered` |
+| a registered directory is missing | `Claude Code account <n>'s directory is missing (<id>)` |
+| an unregistered UUID directory exists | `the Claude Code account directory <id> is not registered` |
 | account 1 is signed out | `account 1 is not signed in` |
+| account 1's status will not parse | `riabuild could not tell whether account 1 is signed in: <why>` |
+
+`MIN_VERSION` is `2.1.223` and must not be lowered: the three behaviours above were only
+ever verified against that build, a 2.0.x machine passed the original `2.0.0` floor while
+possibly lacking `auth status --json` altogether, and the floor costs nothing to hold —
+`install_claude` runs `npm install -g @anthropic-ai/claude-code` unpinned, so anyone below
+it is upgraded to latest rather than blocked. The reason names the version *found*, because
+"older than 2.1.223" without it leaves a developer unable to tell whether the upgrade
+worked.
+
+The last row is why `Identity` has three states: a status riabuild could not read is
+reported as unreadable, never as signed out. Claiming a developer is signed out when the
+network was down would send them to a browser to fix nothing.
 
 `apply()`:
 
 1. Install Claude Code with riabuild's npm if missing (unchanged).
 2. Drop registered accounts whose directories are gone.
-3. **Adopt** unregistered UUID directories, oldest `mtime` first.
+3. **Adopt** unregistered UUID directories, oldest first — by creation time (APFS
+   `birthtime`, `statx` `btime`), falling back to `mtime` where the filesystem has none.
+   `mtime` alone would let a recently used account adopt as account 1.
 4. Create account 1 if the list is empty.
 5. Run `claude auth login` interactively for account 1 if it is signed out, and hard-error
    if that is abandoned.

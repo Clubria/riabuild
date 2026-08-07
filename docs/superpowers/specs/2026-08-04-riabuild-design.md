@@ -203,8 +203,8 @@ instability costs us time.
   config.json             project path and chosen defaults
   org-settings.json       cached org Claude Code settings
   node/22.23.1/bin/       riabuild-owned Node
-  bin/  pnpm  c           standalone pnpm, profile launcher
-  claude/<uuid>/          CLAUDE_CONFIG_DIR profiles
+  bin/  pnpm  claude  claude-1…N   standalone pnpm, one launcher per account
+  claude/<uuid>/          CLAUDE_CONFIG_DIR account directories
   shell/zsh/.zshrc        generated rcfiles
   logs/riabuild.log
 ```
@@ -230,6 +230,7 @@ riabuild-cli/src/
   tasks/               mod (trait + registry + DAG runner) + one file per task
   shell/               mod, zsh, bash, fish
   shims/               generation of ~/.riabuild/bin entries
+  accounts/            Claude Code accounts: registry, status, box, `riabuild claude`
 ```
 
 ### The task engine
@@ -287,11 +288,18 @@ names a registered task.
 | 4 | `toolchain` | — | `~/.riabuild/node/<pinned>/bin/node -v` matches the repo's `.nvmrc`; `~/.riabuild/bin/pnpm -v` matches the repo's `packageManager` field. |
 | 5 | `project` | 2 | configured directory exists, is a git repo, `origin` is `Clubria/ai-builders-hub`. |
 | 6 | `repo_status` | 5 | **Reports only.** Ahead/behind counts and dirty-tree state. Never pulls. |
-| 7 | `claude_profiles` | — | at least one UUID-named profile directory exists; `claude --version` ≥ floor. |
+| 7 | `claude_accounts` | 4 | at least one account directory exists, account 1 is signed in, `claude --version` ≥ floor. |
 | 8 | `org_settings` | 1 | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
 | 9 | `env_local` | 1, 3, 5 | `.env.local` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. |
-| 10 | `claude_trust` | 5, 7 | the profile's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
+| 10 | `claude_trust` | 5, 7 | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
 | 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
+
+> **Superseded for Claude Code.** This document's single-profile model — one
+> `~/.riabuild/claude/<uuid>/` reached by a `c` launcher — was replaced by an ordered list
+> of up to nine accounts, each with its own launcher. Where the two disagree about Claude
+> Code, `2026-08-06-claude-accounts-design.md` is the design; everything else here still
+> holds. The paragraphs below are kept as the reasoning that produced the layering approach,
+> which the accounts model inherits unchanged.
 
 Notes on specific tasks:
 
@@ -310,16 +318,17 @@ works-in-my-shell failures.
 HEAD, and conflicts. Startup is the worst possible moment for that. riabuild reports
 drift and lets the developer decide.
 
-**7 and 8 — Claude Code profiles.** Task 7 creates `~/.riabuild/claude/<uuid>/` if no
-profile exists. Task 8 caches the org settings JSON. **Neither merges anything into a
-developer's `settings.json`.** Instead, the `c` launcher injects org policy at launch:
+**7 and 8 — Claude Code accounts.** Task 7 creates `~/.riabuild/claude/<uuid>/` if no
+account exists. Task 8 caches the org settings JSON. **Neither merges anything into a
+developer's `settings.json`.** Instead, each account's launcher injects org policy at
+launch:
 
 ```sh
 CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> \
   claude --settings ~/.riabuild/org-settings.json
 ```
 
-`--settings` layers over the profile's own settings. Org policy is always current,
+`--settings` layers over the account's own settings. Org policy is always current,
 removals take effect, developer edits survive, and there is no merge code to write. A
 recurring deep-merge into `settings.json` cannot express removal, cannot distinguish org
 keys from developer keys after the first run, and silently clobbers developer edits.
@@ -343,9 +352,9 @@ user and policy settings and unlike repo-controllable project settings.
 
 **10 — `claude_trust`.** The one piece of Claude Code state riabuild cannot express as
 settings data. Trust is `projects[<absolute path>].hasTrustDialogAccepted` in
-`.claude.json`, and until it is set, the first `c` in a fresh checkout opens a modal and
-holds the org's settings back as untrusted. The task read-modify-writes only the
-riabuild-owned profile's `.claude.json` — never `~/.claude.json` — preserving every key
+`.claude.json`, and until it is set, the first `claude` in a fresh checkout opens a modal
+and holds the org's settings back as untrusted. The task read-modify-writes only the
+riabuild-owned accounts' `.claude.json` — never `~/.claude.json` — preserving every key
 it does not own, and swaps the file in atomically because Claude Code may be running
 against it. It writes the key under both the literal and the resolved checkout path,
 since a symlinked checkout makes those different strings and trust under one is invisible
@@ -358,7 +367,7 @@ deliberately split across the trust boundary: the server sends the *pointer*, an
 Serving the script body instead would be a one-key remote code execution channel — the
 task manifest this design already rejected, wearing a different name. `node` resolves
 because `path_with_riabuild` puts riabuild's Node and `~/.riabuild/bin` on `PATH`
-together, so the interpreter is present wherever the `c` launcher is.
+together, so the interpreter is present wherever the account launchers are.
 
 ### Startup update check
 
@@ -381,7 +390,7 @@ and a banner:
 ```
 
 PATH becomes `~/.riabuild/bin:~/.riabuild/node/<version>/bin:$PATH`, which supplies
-`node`, `pnpm`, and `c`.
+`node`, `pnpm`, and one `claude` launcher per account.
 
 Per-shell handling is explicit work, not an implementation detail:
 

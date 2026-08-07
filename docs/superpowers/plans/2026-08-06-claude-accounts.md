@@ -22,7 +22,9 @@ Every task's requirements implicitly include all of these. They come from `riabu
 - **`apply()` must be safe to run twice**, and is always followed by a re-run of `check()`.
 - **`check()` is authoritative**; `version()` is only for drift a check genuinely cannot observe.
 - **One task per file; roughly 300 lines is the ceiling** for any file.
-- **Claude Code version floor is `2.0.0`** (`MIN_VERSION`).
+- **Claude Code version floor is `2.1.223`** (`MIN_VERSION`). Raised from `2.0.0` during
+  execution: the three behaviours this feature rests on were only ever verified against
+  that build, and `install_claude` is unpinned, so the floor upgrades rather than blocks.
 - **The account cap is 9** (`accounts::MAX`).
 - **Prompts belong in `apply()` or a subcommand, never in `check()`**, and every prompt has a default — `Ui::ask` returns `None` when there is no terminal.
 - After every task: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
@@ -978,8 +980,12 @@ async fn ask(runner: &dyn CommandRunner, claude: &str, dir: &Path) -> Identity {
     let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
         return Identity::Unknown("Claude Code did not answer in JSON".to_string());
     };
-    if value.get("loggedIn") != Some(&Value::Bool(true)) {
-        return Identity::LoggedOut;
+    match value.get("loggedIn") {
+        Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => return Identity::LoggedOut,
+        // Absent, or not a bool: riabuild does not know, and must not spend
+        // that ignorance as a claim that the account is signed out.
+        _ => return Identity::Unknown("Claude Code reported no sign-in state".to_string()),
     }
     match value.get("email").and_then(Value::as_str) {
         Some(email) => Identity::LoggedIn(email.to_string()),
@@ -1806,7 +1812,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIN_VERSION: &str = "2.0.0";
+const MIN_VERSION: &str = "2.1.223";
 
 pub struct ClaudeAccounts;
 
@@ -2727,3 +2733,50 @@ The task is not finished while checks are queued, running, or failing. If CI fai
 **Type consistency.** `Account`/`Identity` are defined in Task 5 and used unchanged in 6, 8, 9 and 11. `accounts::remove` returns `Result<String>` and every caller discards the id except `promote`. `launcher_script` takes four arguments in Task 7 and is called with four in the same task; nothing else calls it. `prepare` gains a `&str` in Task 8 for all three shells and `spawn` is the only caller.
 
 **Ordering.** Tasks 3 and 4 are prerequisites of 5; 5 and 6 of 8 and 11; 2 of 7, 9 and 11; 1 of everything. The tree compiles and the suite passes at the end of every task, which is what makes each one reviewable on its own.
+
+---
+
+## Corrections during execution
+
+The provenance record: where the shipped code deliberately differs from this plan, and why.
+Written for whoever reads the plan later and finds the tree disagreeing with it. The full
+ledger is `.superpowers/sdd/2026-08-06-claude-accounts/progress.md`.
+
+- **A missing-binary guard in `claude_accounts`'s `check()` and `apply()`.** The plan ran
+  `ctx.claude()` unguarded. `RealRunner::run` returns `Err` for a binary that is not there,
+  the engine reports `NeverRun` without calling `check()`, so `apply()` ran first and `?`
+  propagated the spawn error — `install_claude` was never reached and a fresh laptop could
+  not be provisioned at all. `github_cli` and `toolchain` both `try_exists` first; the plan
+  dropped that when it moved from `which("claude")` to an absolute path. Invisible to the
+  suite, because `FakeRunner` answers where `RealRunner` errors.
+- **Adoption orders by creation time, not `mtime`.** Claude Code writes into a config
+  directory every session, so `mtime` ranks the *least used* account first — the inverse of
+  the intent. Now `created()` (APFS `birthtime`, `statx` `btime`) with an `mtime` fallback.
+- **The cap is a `Failure`, not a silent no-op.** An unregistered directory on a machine
+  already at nine accounts made `apply()` do nothing, which the engine reports as "did not
+  take effect" — wedging every later run with nothing actionable. It now names the directory
+  and says what to do.
+- **`Unknown` is not signed out in `apply()`.** The plan collapsed an unreadable status into
+  signed-out, which opened a browser on every run of a machine whose `claude auth status`
+  could not be read.
+- **`loggedIn` is a three-way match.** `!= Some(Bool(true))` made
+  `{"error":"could not reach the server"}` mean "signed out" — the one claim this feature
+  promises never to invent. Absent or non-boolean is now `Unknown`.
+- **`MIN_VERSION` raised from `2.0.0` to `2.1.223`.** The three Claude Code behaviours this
+  rests on were only ever verified against that build, and `install_claude` is unpinned, so
+  the floor upgrades a developer rather than blocking one.
+- **`--check` is honoured by `new`, `delete` and `primary`.** It was already plumbed to
+  `ctx.dry_run`, and `riabuild --check claude delete 3` really deleted account 3.
+- **The generated launcher neutralises a non-absolute `claude`.** `Ctx::claude()` can return
+  the bare name, and `[ ! -x "claude" ]` then tests a path relative to the *current
+  directory* — a checkout holding an executable called `claude` made the launcher `exec`
+  itself forever. A `case` guard now runs before the `-x` test.
+- **Two tasks the plan lacked.** *9b*: drop the retired `claude_profiles` record from
+  `state.json`, which the spec required and no brief implemented. *11b*: teach `e2e/run.sh`
+  about accounts — it asserted the `claude_profiles` state key, the retired `claude_profile`
+  config field, an executable `bin/c`, and a `CLAUDE_CONFIG_DIR` export this plan removes.
+  `.github/workflows/e2e.yml` runs `on: pull_request`, so without it the PR gate was
+  permanently red for no real defect.
+- **The `c` shim is deleted, not merely unwritten.** `prune` removes `bin/c` on every
+  `write_all`, so a machine provisioned before this branch does not keep a launcher that
+  points at a model of the world that no longer exists.

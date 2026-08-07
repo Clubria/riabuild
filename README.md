@@ -74,7 +74,7 @@ distribution or glibc requirement beyond what the packages declare.
 
 ## What `riabuild` does to a machine
 
-Nine setup tasks, compiled into the binary, run in dependency order. Each one checks
+Eleven setup tasks, compiled into the binary, run in dependency order. Each one checks
 whether the machine is *currently* correct, repairs it if not, and then re-checks —
 a task never records a success it has not verified.
 
@@ -86,11 +86,30 @@ a task never records a success it has not verified.
 | 4 | `toolchain` | riabuild-owned Node and pnpm at the versions the repo pins |
 | 5 | `project` | the checkout exists and `origin` really is our repo |
 | 6 | `repo_status` | reports ahead/behind and dirty state — **never pulls** |
-| 7 | `claude_profiles` | Claude Code installed, with a profile of your own |
+| 7 | `claude_accounts` | Claude Code installed, and at least one account of your own, signed in |
 | 8 | `org_settings` | the team's Claude settings, cached and current |
-| 9 | `env_local` | `.env.local`, freshly brokered, parseable, and git-ignored |
+| 9 | `claude_trust` | every account trusts the checkout, so no modal on first launch |
+| 10 | `env_local` | `.env.local`, freshly brokered, parseable, and git-ignored |
+| 11 | `claude_statusline` | the status line script the org settings name |
 
-Then it drops you into your own shell with the environment applied.
+Then it drops you into your own shell with the environment applied, opening with a box
+listing your Claude Code accounts and who is signed into each.
+
+## Claude Code accounts
+
+You can have up to nine, each with its own sign-in, its own sessions, and its own history.
+In the environment shell, `claude` starts Claude Code on your primary account and
+`claude-1` … `claude-9` start a particular one. All of them get the org's Claude settings
+and trust the checkout.
+
+| Command | What |
+|---|---|
+| `riabuild claude list` | your accounts and who is signed into each |
+| `riabuild claude new` | adds an account and signs it in |
+| `riabuild claude delete <n>` | signs it out and removes it; later accounts move up a number |
+| `riabuild claude primary <n>` | makes account `<n>` the one `claude` runs |
+
+`riabuild claude` on its own is `list`.
 
 ## Two rules that shape everything
 
@@ -107,7 +126,7 @@ identity and mints short-lived tokens on demand; the CLI pipes them straight int
 ```sh
 cd riabuild-web  && pnpm dev            # convex + vite
 cd riabuild-web  && pnpm ui:check       # Playwright: every UI state × 3 viewports
-cd riabuild-cli  && cargo test          # 112 unit tests, no machine state needed
+cd riabuild-cli  && cargo test          # unit tests only, no machine state needed
 ```
 
 Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.

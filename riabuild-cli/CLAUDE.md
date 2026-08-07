@@ -125,9 +125,24 @@ src/
   reset.rs     removes ~/.riabuild
   download.rs  fetching and digests    archive.rs   tar and zip extraction
   tools.rs     the gh and infisical releases riabuild owns
+  version.rs   version floors          testing.rs   test helpers
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
+  accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
 ```
+
+## Claude Code accounts
+
+A developer has an ordered list of up to nine Claude Code accounts, each a
+`~/.riabuild/claude/<uuid>/` config directory with its own sign-in, and each reached by its
+own generated launcher: `claude` runs the primary, `claude-1` … `claude-N` run a named one.
+The launchers are the only thing that names a config directory — `CLAUDE_CONFIG_DIR` is
+deliberately **not** exported into the environment shell, so a `claude` started outside a
+launcher cannot land in an account by accident. `riabuild claude list|new|delete|primary`
+manages the list, every environment shell opens with the account box, and the org's Claude
+settings and the checkout's trust apply to every account, never just the first.
+
+Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
 
 `download.rs` decides where bytes come from and whether they are the right bytes;
 `archive.rs` only ever sees a buffer that already matched a digest. Keep that split — it
