@@ -231,6 +231,28 @@ arguably more in riabuild's spirit, but re-execing from inside a task is a contr
 change that belongs to the update mechanism rather than to this one. First contact with
 riabuild is an install command anyway, so the developer is already at a package manager.
 
+## Rollout
+
+This is a breaking change with no compatibility path, so the order matters:
+
+1. **Merge and deploy riabuild-web.** `/api/v1/cli/device` has to exist before any binary
+   asks for it, and the old `{ code, verifier }` body stops working the moment this
+   deploys — a CLI mid-login when it lands gets a 400 and has to run `riabuild login`
+   again. That is the whole cost of the cutover.
+2. **Cut a release** (`docs/releasing.md`).
+3. **A lead raises `minCliVersion`** to that release in the dashboard's lead panel.
+
+Step 3 is not automatic and must not be: `docs/releasing.md` is explicit that raising the
+floor interrupts whatever everyone is doing the moment they next launch riabuild, so it is
+a decision rather than a consequence of shipping. Until it happens, an already-signed-in
+developer on an older binary keeps working from their existing session and only breaks
+when that session expires; a developer who is *not* signed in gets a 400 from
+`/api/v1/cli/token` with no useful explanation.
+
+That gap is the argument for doing step 3 promptly rather than for skipping it. Once the
+floor is raised, `/api/v1/cli/device` answers an old binary with a 409 naming the upgrade
+command — the version floor's first reach onto an unsigned machine.
+
 ## Testing
 
 - `convex/api.test.ts`: full device flow; polling before approval; denial; approval by a
