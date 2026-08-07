@@ -29,13 +29,38 @@ impl CommandOutput {
     }
 }
 
+/// Subprocess output whose stdout is not assumed to be text.
+///
+/// `CommandOutput` exists for the `--version` and status checks that make up
+/// most of riabuild, and its lossy `String` conversion is right for those. The
+/// clipboard channel moves PNGs, where a single replacement character is a
+/// corrupt image, so it reads through here instead. stderr stays a `String`:
+/// it is diagnostics, it is always text, and every caller puts it in a message.
+#[derive(Debug, Clone)]
+pub struct BytesOutput {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+impl BytesOutput {
+    pub fn ok(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// Fed to the child's stdin. Used to pipe brokered secrets without them ever
-    /// appearing in a process argument list, where `ps` would show them.
-    pub stdin: Option<String>,
+    /// appearing in a process argument list, where `ps` would show them, and to
+    /// hand a clipboard write to `xclip -i`.
+    ///
+    /// Bytes rather than a `String` for the same reason `run_bytes` exists: a
+    /// `String` cannot represent a PNG at all, so an image write would not be
+    /// merely lossy, it would be unconstructible.
+    pub stdin: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -46,6 +71,31 @@ pub trait CommandRunner: Send + Sync {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<CommandOutput>;
+
+    /// Like `run`, but stdout is returned as raw bytes.
+    ///
+    /// Used by the clipboard channel, where stdout is a PNG rather than a
+    /// version string, and `from_utf8_lossy` would replace every byte that is
+    /// not valid UTF-8 with U+FFFD.
+    async fn run_bytes(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<BytesOutput>;
+
+    /// Feeds stdin to a command that forks a child to outlive it, and waits
+    /// only for the process actually started.
+    ///
+    /// `xclip -i` and `wl-copy` fork into the background to *serve* the
+    /// selection they were given, and that fork inherits whatever stdout it was
+    /// handed. `run` and `run_bytes` finish by reading stdout to EOF, which for
+    /// these two arrives only when the selection is replaced — so a clipboard
+    /// write through either would hang for as long as the copy stayed current.
+    ///
+    /// The cost is that stderr is unavailable: the fork holds that pipe too, so
+    /// the only diagnostic a write can carry is its exit status.
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32>;
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
@@ -104,7 +154,7 @@ impl CommandRunner for RealRunner {
         if let Some(input) = &options.stdin {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child.stdin.take().context("stdin was piped")?;
-            stdin.write_all(input.as_bytes()).await?;
+            stdin.write_all(input).await?;
             // Closing the pipe is what tells the child there is no more input.
             // The blocking version got this free when the `if let` block ended;
             // here the handle would otherwise live until the end of the
@@ -123,6 +173,76 @@ impl CommandRunner for RealRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    async fn run_bytes(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<BytesOutput> {
+        let mut command = RealRunner::build(program, args, options);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.stdin(if options.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("could not start `{program}`"))?;
+
+        if let Some(input) = &options.stdin {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().context("stdin was piped")?;
+            stdin.write_all(input).await?;
+            drop(stdin);
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .with_context(|| format!("`{program}` did not finish"))?;
+
+        Ok(BytesOutput {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+        let mut command = RealRunner::build(program, args, options);
+        // Null rather than piped: a pipe handed to the fork is exactly what
+        // would keep this call waiting for a selection nobody is going to
+        // replace.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command.stdin(if options.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("could not start `{program}`"))?;
+
+        if let Some(input) = &options.stdin {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().context("stdin was piped")?;
+            stdin.write_all(input).await?;
+            // The fork does not take ownership of the selection until it has
+            // read the content to EOF, so closing this is what completes the
+            // copy rather than merely tidying up.
+            drop(stdin);
+        }
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("`{program}` did not finish"))?;
+        Ok(status.code().unwrap_or(1))
     }
 
     async fn run_interactive(
@@ -167,6 +287,10 @@ struct Stub {
     /// Empty means "any environment", which is what `with` produces.
     env: Vec<(String, String)>,
     output: CommandOutput,
+    /// Raw stdout, for a command whose output is not text. `None` falls back to
+    /// `output.stdout`, so a test that only cares about the exit code can stub
+    /// with `with` and still be read through `run_bytes`.
+    bytes: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -185,6 +309,10 @@ pub struct FakeRunner {
     responses: Vec<Stub>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
+    /// What each call was given on stdin. A clipboard write is *only* its
+    /// stdin, so without this a test could assert the invocation and still not
+    /// know whether the bytes survived.
+    inputs: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 #[cfg(test)]
@@ -217,6 +345,7 @@ impl FakeRunner {
                 stdout: stdout.to_string(),
                 stderr: stderr.to_string(),
             },
+            bytes: None,
         });
         let program = invocation.split_whitespace().next().unwrap_or_default();
         if !self.available.iter().any(|p| p == program) {
@@ -225,8 +354,48 @@ impl FakeRunner {
         self
     }
 
+    /// Scripts a command whose stdout is binary.
+    ///
+    /// One stub, like every other, so `which`, the exit code and the env
+    /// matching all resolve through exactly the same path as `with` — only
+    /// stdout differs.
+    pub fn with_bytes(mut self, invocation: &str, code: i32, stdout: &[u8], stderr: &str) -> Self {
+        self = self.with(invocation, code, "", stderr);
+        if let Some(stub) = self.responses.last_mut() {
+            stub.bytes = Some(stdout.to_vec());
+        }
+        self
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The stdin every call was given, as `(invocation, bytes)`.
+    pub fn inputs(&self) -> Vec<(String, Vec<u8>)> {
+        self.inputs.lock().unwrap().clone()
+    }
+
+    /// The bytes piped into the first call whose invocation contains `needle`.
+    pub fn input_for(&self, needle: &str) -> Option<Vec<u8>> {
+        self.inputs()
+            .into_iter()
+            .find(|(invocation, _)| invocation.contains(needle))
+            .map(|(_, bytes)| bytes)
+    }
+
+    fn record(&self, program: &str, args: &[&str], options: &RunOptions) -> String {
+        let invocation = format!("{program} {}", args.join(" "))
+            .trim_end()
+            .to_string();
+        self.calls.lock().unwrap().push(invocation.clone());
+        if let Some(input) = &options.stdin {
+            self.inputs
+                .lock()
+                .unwrap()
+                .push((invocation.clone(), input.clone()));
+        }
+        invocation
     }
 
     /// The invocation a stub is matched against.
@@ -262,6 +431,15 @@ impl FakeRunner {
     }
 
     fn stubbed(&self, invocation: &str, options: &RunOptions) -> Option<CommandOutput> {
+        self.matching(invocation, options)
+            .map(|stub| stub.output.clone())
+    }
+
+    /// The stub an invocation selects, if any.
+    ///
+    /// Shared by the text and byte lookups so a binary stub can never be
+    /// selected by different rules from the text one beside it.
+    fn matching(&self, invocation: &str, options: &RunOptions) -> Option<&Stub> {
         self.responses
             .iter()
             .filter(|stub| {
@@ -287,7 +465,17 @@ impl FakeRunner {
             // specificity only breaks ties between stubs that already match on
             // the same invocation length.
             .max_by_key(|stub| (stub.invocation.len(), stub.env.len()))
-            .map(|stub| stub.output.clone())
+    }
+
+    /// The byte-stub twin of `resolve`, matched by exactly the same rules so a
+    /// binary stub cannot be selected differently from a text one.
+    fn resolve_bytes(&self, program: &str, args: &[&str], options: &RunOptions) -> Option<Vec<u8>> {
+        let full = format!("{program} {}", args.join(" "))
+            .trim_end()
+            .to_string();
+        self.matching(&full, options)
+            .or_else(|| self.matching(&FakeRunner::stub_key(program, args), options))
+            .and_then(|stub| stub.bytes.clone())
     }
 
     fn lookup(&self, program: &str, args: &[&str], options: &RunOptions) -> CommandOutput {
@@ -312,12 +500,35 @@ impl CommandRunner for FakeRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<CommandOutput> {
-        let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
+        self.record(program, args, options);
         Ok(self.lookup(program, args, options))
+    }
+
+    async fn run_bytes(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<BytesOutput> {
+        self.record(program, args, options);
+
+        let text = self.lookup(program, args, options);
+        // A test that only cares about the exit code can stub with `with` and
+        // still be read through `run_bytes`.
+        let stdout = self
+            .resolve_bytes(program, args, options)
+            .unwrap_or_else(|| text.stdout.into_bytes());
+
+        Ok(BytesOutput {
+            code: text.code,
+            stdout,
+            stderr: text.stderr,
+        })
+    }
+
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+        self.record(program, args, options);
+        Ok(self.lookup(program, args, options).code.unwrap_or(0))
     }
 
     async fn run_interactive(
@@ -326,11 +537,7 @@ impl CommandRunner for FakeRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<i32> {
-        let invocation = format!("{program} {}", args.join(" "));
-        self.calls
-            .lock()
-            .unwrap()
-            .push(invocation.trim_end().to_string());
+        self.record(program, args, options);
         // A stub's exit code applies here too: interactive commands fail as
         // well — a developer who abandons a device-code prompt leaves `gh`
         // exiting non-zero — and a task that ignores that reports a sign-in
@@ -347,6 +554,91 @@ impl CommandRunner for FakeRunner {
             .iter()
             .any(|p| p == program)
             .then(|| PathBuf::from(format!("/usr/bin/{program}")))
+    }
+}
+
+#[cfg(test)]
+mod bytes_tests {
+    use super::*;
+
+    /// A PNG is not valid UTF-8. Read through `run`, its bytes come back
+    /// mangled into replacement characters; `run_bytes` is what makes the
+    /// clipboard channel possible at all.
+    #[tokio::test]
+    async fn binary_stdout_survives_the_runner() {
+        // PNG magic, then a byte that is illegal as UTF-8 on its own.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF];
+        let runner = FakeRunner::new().with_bytes("xclip -o", 0, &png, "");
+
+        let out = runner
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .unwrap();
+
+        assert!(out.ok());
+        assert_eq!(out.stdout, png);
+    }
+
+    /// The bug this whole method exists to avoid, pinned against the real
+    /// runner so nobody "simplifies" the clipboard backends back onto `run`.
+    #[tokio::test]
+    async fn the_same_bytes_through_run_would_have_been_corrupted() {
+        let png = [0x89u8, b'P', b'N', b'G', 0xFF];
+        let emit = ["-c", r"printf '\211PNG\377'"];
+
+        let lossy = RealRunner
+            .run("sh", &emit, &RunOptions::default())
+            .await
+            .unwrap();
+        let raw = RealRunner
+            .run_bytes("sh", &emit, &RunOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(raw.stdout, png);
+        assert_ne!(lossy.stdout.as_bytes(), png);
+        assert!(
+            lossy.stdout.contains('\u{FFFD}'),
+            "expected replacement characters, got {:?}",
+            lossy.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstubbed_command_fails_the_same_way_as_run() {
+        let runner = FakeRunner::new();
+        let out = runner
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(out.code, Some(127));
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.contains("no stub"), "{}", out.stderr);
+    }
+
+    #[tokio::test]
+    async fn bytes_calls_are_recorded_like_every_other_call() {
+        let runner = FakeRunner::new().with_bytes("xclip -o", 0, b"hi", "");
+        runner
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(runner.calls(), vec!["xclip -o".to_string()]);
+    }
+
+    /// The real runner is exercised through a shell builtin every supported
+    /// platform has, so this stays a unit test rather than a fixture.
+    #[tokio::test]
+    async fn the_real_runner_returns_raw_bytes() {
+        let out = RealRunner
+            .run_bytes(
+                "sh",
+                &["-c", r"printf '\211PNG\377'"],
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, [0x89u8, b'P', b'N', b'G', 0xFF]);
     }
 }
 
@@ -489,5 +781,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.trimmed(), "2.1.223 (Claude Code)");
+    }
+
+    /// A binary stub is selected by exactly the same rules as a text one, so
+    /// the byte lookup cannot quietly diverge from the command that ran.
+    #[tokio::test]
+    async fn a_byte_stub_can_be_scoped_to_an_environment_variable_too() {
+        let runner = FakeRunner::new()
+            .with_bytes("xclip -o", 0, b"\x89PNG\xFF", "")
+            .with_env("xclip -o", &[("DISPLAY", ":1")], 1, "", "no display");
+
+        let scoped = runner
+            .run_bytes("xclip", &["-o"], &in_env("DISPLAY", ":1"))
+            .await
+            .unwrap();
+        assert_eq!(scoped.code, Some(1), "the env-scoped stub should win");
+
+        let plain = runner
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(plain.stdout, b"\x89PNG\xFF");
+    }
+
+    fn in_env(key: &str, value: &str) -> RunOptions {
+        RunOptions {
+            env: vec![(key.to_string(), value.to_string())],
+            ..Default::default()
+        }
     }
 }

@@ -12,6 +12,7 @@
 mod accounts;
 mod api;
 mod archive;
+mod channel;
 mod cli;
 mod config;
 mod download;
@@ -76,6 +77,12 @@ async fn main() {
 async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
+
+    // Dispatched before the setup flow: the shim runs on every Ctrl+V, so it
+    // must not check the machine, talk to the API, or print a banner.
+    if let Some(Command::Channel { action }) = &cli.command {
+        return channel::dispatch(action, cli.quiet).await;
+    }
 
     // Dispatched before anything creates or reads the tree. riabuild must not
     // recreate the directory it is about to remove, and a reset must not depend
@@ -142,6 +149,9 @@ async fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
+        Some(Command::Channel { .. }) => {
+            unreachable!("the channel returns before the setup flow starts")
+        }
         Some(Command::Status) | None => {}
     }
 

@@ -370,6 +370,24 @@ mod tests {
             Err(anyhow::anyhow!("could not start `{program}`"))
         }
 
+        async fn run_bytes(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<crate::runner::BytesOutput> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+
+        async fn run_forking(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+
         async fn run_interactive(
             &self,
             program: &str,
