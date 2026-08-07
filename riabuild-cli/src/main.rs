@@ -13,6 +13,7 @@ mod api;
 mod cli;
 mod config;
 mod download;
+mod gh_session;
 mod keychain;
 mod paths;
 mod remote;
