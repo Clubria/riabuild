@@ -156,9 +156,6 @@ impl Ctx {
     ///
     /// Falls back to the bare name before a Node is pinned, which is the only
     /// thing a machine with no toolchain yet could use.
-    // Task 5 wires this in — remove this once it does. `dead_code` finding a
-    // real gap again is the point of not leaving it broader than needed.
-    #[allow(dead_code)]
     pub fn claude(&self) -> String {
         match &self.config.node_version {
             Some(version) => self

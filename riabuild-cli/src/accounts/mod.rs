@@ -16,6 +16,8 @@
 // finding a real gap again is the point of not leaving it broader than needed.
 #![allow(dead_code)]
 
+pub mod status;
+
 use crate::config::UserConfig;
 use crate::ui::{Failure, plural};
 use anyhow::Result;
