@@ -16,3 +16,4 @@
 pub mod clipboard;
 pub mod mime;
 pub mod protocol;
+pub mod resize;
