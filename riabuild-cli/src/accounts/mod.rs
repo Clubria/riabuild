@@ -16,6 +16,7 @@
 // finding a real gap again is the point of not leaving it broader than needed.
 #![allow(dead_code)]
 
+pub mod render;
 pub mod status;
 
 use crate::config::UserConfig;
