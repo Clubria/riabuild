@@ -131,19 +131,35 @@ fn digest_command(path: &str) -> String {
     shell_command(&digest_probe(path))
 }
 
+/// What `verify_or_remove_command` prints, in place of a digest, when `rm -f`
+/// was issued but the file is still there afterwards — permission denied, a
+/// read-only home, a quota, an immutable bit. Distinctive on purpose: it must
+/// never be mistaken for a real sha256 digest (64 lowercase hex characters)
+/// by whatever compares against `expected`.
+const REMOVE_FAILED_MARKER: &str = "RIABUILD_REMOVE_FAILED";
+
 /// Computes the on-disk digest of `path` and, if it does not match
-/// `expected`, removes `path` — in the *same* SSH round trip as the check.
-/// Without this, a corrupted transfer would leave a `chmod 755`'d file
-/// sitting at a well-known, shared path between the failed check and
-/// whatever retries, and anything that invokes `remote_binary_path` directly
-/// in that window executes unverified bytes — the exact thing digest
-/// verification exists to prevent, one step late.
+/// `expected`, removes `path` — in the *same* SSH round trip as the check,
+/// and checks the file's actual absence afterwards rather than trusting
+/// `rm -f`'s exit status. `rm -f` succeeding is not the same as the file
+/// being gone (it swallows its own failures, and a corrupted transfer plus a
+/// permission problem is exactly the kind of unlucky day this exists for):
+/// without the `[ -e … ]` check, `rm -f` could fail silently, `write_binary`
+/// would report "removed" while the corrupted, `chmod 755`'d binary is still
+/// sitting at a well-known, shared, executable path — a false reassurance
+/// that is worse than no message at all, because it stops anyone looking.
 fn verify_or_remove_command(path: &str, expected: &str) -> String {
     shell_command(&format!(
-        "digest=$({probe}); if [ \"$digest\" != {expected} ]; then rm -f {path}; fi; printf %s \"$digest\"",
+        "digest=$({probe}); \
+         if [ \"$digest\" != {expected} ]; then \
+         rm -f {path}; \
+         if [ -e {path} ]; then printf {marker}; exit 1; fi; \
+         fi; \
+         printf %s \"$digest\"",
         probe = digest_probe(path),
         expected = shell_quote(expected),
         path = shell_quote(path),
+        marker = shell_quote(REMOVE_FAILED_MARKER),
     ))
 }
 
@@ -301,6 +317,24 @@ async fn write_binary(
     // transfer must never be left behind at this well-known, shared path,
     // and must never be reported as a successful install.
     let confirmed = ctx.ssh(&verify_or_remove_command(&path, expected)).await?;
+
+    // Checked before the generic `!confirmed.ok()` branch below: a failed
+    // removal also exits non-zero, and this is the one case that must never
+    // be mistaken for an ordinary "try again" failure — the corrupted binary
+    // is still sitting at a well-known, shared, executable path, and nobody
+    // must be told otherwise.
+    if confirmed.trimmed() == REMOVE_FAILED_MARKER {
+        return Err(Failure::new(
+            format!("removing a corrupted riabuild from {}", ctx.remote.host),
+            format!(
+                "riabuild could not remove it. SSH to that server yourself and delete {path} \
+                 by hand before running `riabuild remote` again — do not run anything at that \
+                 path in the meantime."
+            ),
+        )
+        .detail("rm -f was issued but the file is still there afterwards")
+        .into());
+    }
     if !confirmed.ok() {
         return Err(Failure::new(
             format!("verifying riabuild on {}", ctx.remote.host),
@@ -612,11 +646,11 @@ mod tests {
         let fake = Arc::new(
             FakeRunner::new()
                 .then(&prefix, 0, "", "") // the write
-                .then(&prefix, 0, "deadbeef\n", "") // post-write reverify: mismatch
-                // This test's own follow-up probe, standing in for "whatever
-                // runs next" — proving the mismatched file is actually gone,
-                // not merely that a removal command was composed.
-                .then(&prefix, 1, "", "No such file or directory"),
+                // Post-write reverify: mismatch, `rm -f` ran and the file's
+                // `[ -e … ]` check afterwards came back false, so the script
+                // falls through to `printf %s "$digest"` with the *old*
+                // digest — the shape a successful cleanup actually produces.
+                .then(&prefix, 0, "deadbeef\n", ""),
         );
         let ctx = SshCtx {
             remote: &remote,
@@ -640,8 +674,13 @@ mod tests {
             .expect("must be the actionable Failure");
         assert!(failure.detail.contains("deadbeef"), "{}", failure.detail);
 
-        // The removal must be issued in the very same round trip as the
-        // mismatch check — not a second command a retry might never reach.
+        // The removal, and a check that it actually worked, must both be in
+        // the very same round trip as the mismatch check — not a second
+        // command a retry might never reach, and not trusting `rm -f`'s exit
+        // status, which is discarded here on purpose (see
+        // `verify_or_remove_command`'s doc comment): it can fail silently,
+        // and a "removed" message while the file is still there is a false
+        // reassurance that stops anyone from looking.
         let issued = fake.calls();
         let reverify = issued
             .iter()
@@ -650,11 +689,62 @@ mod tests {
             .expect("a reverify call was made");
         assert!(reverify.contains("rm -f"), "{reverify}");
         assert!(reverify.contains(&path), "{reverify}");
+        assert!(
+            reverify.contains("-e ") && reverify.contains(REMOVE_FAILED_MARKER),
+            "must check the file's absence after rm -f, not just issue it: {reverify}"
+        );
+    }
 
-        // And a follow-up probe against the same path finds nothing there.
-        let probe = ssh_once(&remote, &paths, fake, &digest_command(&path))
-            .await
-            .expect("probe runs");
-        assert!(!probe.ok(), "the file must be gone: {probe:?}");
+    #[tokio::test]
+    async fn a_removal_that_fails_is_reported_as_a_dangerous_leftover_not_a_generic_retry() {
+        // `rm -f` was issued but the file is still there afterwards —
+        // permission denied, a read-only home, a quota. This must never be
+        // confused with an ordinary "try again" failure or, worse, reported
+        // as a successful cleanup: a corrupted, `chmod 755`'d binary is still
+        // sitting at a well-known, shared, executable path.
+        let laptop = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(laptop.path());
+        let remote = remote();
+        let path = remote_binary_path("/home/dev", "2026.08.06");
+
+        let prefix = ssh_prefix(&remote, &paths);
+        let fake = Arc::new(
+            FakeRunner::new()
+                .then(&prefix, 0, "", "") // the write
+                .then(&prefix, 1, REMOVE_FAILED_MARKER, ""), // rm -f ran, file survived
+        );
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake,
+            ui: &Ui::new(true),
+        };
+
+        let error = write_binary(
+            &ctx,
+            "/home/dev",
+            "2026.08.06",
+            EXPECTED,
+            b"fake riabuild binary".to_vec(),
+        )
+        .await
+        .expect_err("a surviving corrupted file must be reported");
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("must be the actionable Failure");
+        // Distinct from the ordinary "try again" wording elsewhere in this
+        // file: this is the one case that must read as dangerous, not routine.
+        assert!(
+            failure.action.contains("by hand"),
+            "must not read as an ordinary retry: {}",
+            failure.action
+        );
+        assert!(failure.action.contains(&path), "{}", failure.action);
+        assert!(
+            !failure.detail.contains("removed"),
+            "must not claim a removal that did not happen: {}",
+            failure.detail
+        );
     }
 }
