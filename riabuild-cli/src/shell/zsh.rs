@@ -89,7 +89,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         dir.join(".zshrc"),
         rcfile(
             &user_zdotdir,
-            &banner_command(&super::banner(colour)),
+            &banner_command(&super::banner(colour, ctx.server.as_deref())),
             &prompt_command(colour),
         ),
     )

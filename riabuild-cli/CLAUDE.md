@@ -61,6 +61,12 @@ around a check that does not detect a real state, fix the check.
 `keychain.rs`. Infisical tokens are short-lived, brokered per use, and piped straight into
 `infisical export` — never written down.
 
+A riabuild-managed **server** is the one exception: it may hold its own session
+token at `<namespace>/session.token`, mode 0600. It has no keyring, the token is
+minted for that server alone, it is labelled and listed in the dashboard, and
+`riabuild remote forget` revokes it. Laptops are unchanged, and the Infisical
+credential is still brokered per use and never written down.
+
 **Paths and keychain stay behind traits.** v1 targets macOS, but `paths.rs` and
 `keychain.rs` are the only files that may know that. Linux support should be an addition,
 not a rewrite.

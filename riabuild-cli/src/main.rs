@@ -16,6 +16,7 @@ mod download;
 mod keychain;
 mod paths;
 mod runner;
+mod scope;
 mod shell;
 mod shims;
 mod tasks;
@@ -69,35 +70,27 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
+    let scope = scope::Scope::detect();
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
-    // `None` here: Task 10 supplies a server's session token path when riabuild
-    // is running on a server rather than a developer's laptop.
+    // A server has no keyring an SSH session can unlock, so its own session
+    // lives in a file in its namespace instead — see `scope.rs`.
+    let session_token_file = scope.is_remote().then(|| paths.session_token_file());
     let keychain: Arc<dyn keychain::Keychain> =
-        Arc::from(keychain::for_platform(runner.clone(), None));
+        Arc::from(keychain::for_platform(runner.clone(), session_token_file));
 
     tokio::fs::create_dir_all(paths.root()).await?;
 
-    let mut ctx = Ctx {
-        paths: paths.clone(),
-        runner: runner.clone(),
-        keychain: keychain.clone(),
-        api: api::ApiClient::new(cli::VERSION),
+    let mut ctx = build_ctx(
+        &scope,
+        paths.clone(),
+        runner.clone(),
+        keychain.clone(),
         ui,
-        config: UserConfig::load(paths.as_ref()).await,
-        state: State::load(paths.as_ref()).await,
-        org: None,
-        member: None,
-        // No `Scope` yet to read this from — `riabuild remote` (Task 10) is the
-        // task that turns this into `Some(name)` when riabuild is running on a
-        // server rather than a developer's laptop.
-        server: None,
-        cli_version: cli::VERSION.to_string(),
-        web_url: api::web_url(),
-        env: Vec::new(),
-        notes: Vec::new(),
-        dry_run: cli.check || matches!(cli.command, Some(Command::Status)),
-    };
+        UserConfig::load(paths.as_ref()).await,
+        State::load(paths.as_ref()).await,
+        cli.check || matches!(cli.command, Some(Command::Status)),
+    );
 
     if let Some(project) = &cli.project {
         let expanded = expand_tilde(project, &paths.home());
@@ -120,6 +113,48 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 
     provision(&mut ctx, &cli).await
+}
+
+/// Assembles the `Ctx` a run works against.
+///
+/// Split out of `run` so the one field that comes from `Scope` — `server` —
+/// is testable without standing up `RealPaths::new()`, a real `ApiClient`, or
+/// a platform keychain. `run` is the only caller. `Ctx.server` is the only
+/// remote-mode fact a task is allowed to branch on (see `tasks::Ctx::server`),
+/// and this is the one place it is set from the environment riabuild actually
+/// found itself in — hardcoding `None` here is the regression that leaves
+/// per-developer checkout namespacing (`paths::remote_project_dir`,
+/// `Ctx::default_checkout`) dead on every server despite compiling and
+/// passing every other test. See ruling R11 in
+/// `.superpowers/sdd/2026-08-06-remote-mode/decisions.md`.
+#[allow(clippy::too_many_arguments)]
+fn build_ctx(
+    scope: &scope::Scope,
+    paths: Arc<dyn Paths>,
+    runner: Arc<dyn CommandRunner>,
+    keychain: Arc<dyn keychain::Keychain>,
+    ui: Ui,
+    config: UserConfig,
+    state: State,
+    dry_run: bool,
+) -> Ctx {
+    Ctx {
+        paths,
+        runner,
+        keychain,
+        api: api::ApiClient::new(cli::VERSION),
+        ui,
+        config,
+        state,
+        org: None,
+        member: None,
+        server: scope.server.clone(),
+        cli_version: cli::VERSION.to_string(),
+        web_url: api::web_url(),
+        env: Vec::new(),
+        notes: Vec::new(),
+        dry_run,
+    }
 }
 
 /// Asks riabuild-web who this machine belongs to, before any task runs.
@@ -154,7 +189,11 @@ async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     connect(ctx).await?;
     describe_session(ctx);
 
-    if let Some(org) = &ctx.org {
+    // A managed server has no package manager watching this binary, so it must
+    // never try to replace itself — see `scope.rs` and `tasks::Ctx::server`.
+    if let Some(org) = &ctx.org
+        && ctx.server.is_none()
+    {
         match update::decide(
             &ctx.cli_version,
             &org.min_cli_version,
@@ -291,4 +330,47 @@ fn print_env(ctx: &Ctx) -> Result<i32> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keychain::MemoryKeychain;
+    use crate::runner::FakeRunner;
+    use tempfile::TempDir;
+
+    fn ctx_for(scope: &scope::Scope) -> Ctx {
+        let home = TempDir::new().expect("tempdir");
+        let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
+        let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
+        let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
+        build_ctx(
+            scope,
+            paths,
+            runner,
+            keychain,
+            Ui::new(true),
+            UserConfig::default(),
+            State::default(),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_remote_scope_reaches_ctx_server() {
+        // This is the assertion R11 exists for: a `Ctx` built from a remote
+        // `Scope` must carry the server's name, not the `server: None` this
+        // wiring used to hardcode. Revert `build_ctx`'s `server:` line to
+        // `None` and this fails.
+        let scope = scope::Scope::read(Some("build-01"));
+        let ctx = ctx_for(&scope);
+        assert_eq!(ctx.server.as_deref(), Some("build-01"));
+    }
+
+    #[test]
+    fn a_laptop_scope_leaves_ctx_server_empty() {
+        let scope = scope::Scope::read(None);
+        let ctx = ctx_for(&scope);
+        assert_eq!(ctx.server, None);
+    }
 }

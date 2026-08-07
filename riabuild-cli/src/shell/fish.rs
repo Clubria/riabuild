@@ -93,7 +93,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         fish_dir.join("config.fish"),
         config(
             &user_config_dir,
-            &banner_command(&super::banner(colour)),
+            &banner_command(&super::banner(colour, ctx.server.as_deref())),
             &prompt_command(colour),
         ),
     )

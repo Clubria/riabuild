@@ -79,7 +79,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         &rc,
         rcfile(
             &ctx.paths.home(),
-            &banner_command(&super::banner(colour)),
+            &banner_command(&super::banner(colour, ctx.server.as_deref())),
             &prompt_command(colour),
         ),
     )

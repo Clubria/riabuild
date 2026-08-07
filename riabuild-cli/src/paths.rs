@@ -33,7 +33,6 @@ pub trait Paths: Send + Sync {
     }
     /// A server's own riabuild session. Never used on a laptop, where the
     /// platform keychain holds it instead.
-    #[allow(dead_code)] // consumed by Task 10 (Task 9 only threads it through as an Option<PathBuf>)
     fn session_token_file(&self) -> PathBuf {
         self.root().join("session.token")
     }
