@@ -48,7 +48,11 @@ async function seedMember(
 async function issueSession(
   t: ReturnType<typeof setup>,
   memberId: Id<"members">,
-  options: { expiresAt?: number; revoked?: boolean } = {},
+  options: {
+    expiresAt?: number;
+    revoked?: boolean;
+    deviceLabel?: string;
+  } = {},
 ) {
   const token = randomToken(32);
   const tokenHash = await sha256Hex(token);
@@ -56,7 +60,7 @@ async function issueSession(
     await ctx.db.insert("cliSessions", {
       memberId,
       tokenHash,
-      deviceLabel: "ada-mbp",
+      deviceLabel: options.deviceLabel ?? "ada-mbp",
       cliVersion: "0.1.0",
       lastUsedAt: 0,
       expiresAt: options.expiresAt ?? Date.now() + 60_000,
@@ -726,5 +730,208 @@ describe("member administration", () => {
     const { rowId } = await seedMember(t);
     const member = await t.query(internal.members.byId, { memberId: rowId });
     expect(member?.githubLogin).toBe("ada");
+  });
+});
+
+describe("revoking a session", () => {
+  const realFetch = globalThis.fetch;
+
+  // This endpoint re-verifies GitHub org membership same as /secrets/token —
+  // revocation changes access, so the Convex row is never the sole gate here
+  // either. Stub GitHub as reachable and membership as current.
+  beforeEach(() => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.includes("api.github.com")) return new Response(null, { status: 204 });
+      throw new Error(`unexpected fetch to ${url}`);
+    };
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  test("a member can revoke their own session", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const victim = await issueSession(t, rowId, {
+      deviceLabel: "build-01.fly.dev",
+    });
+    const victimId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      const found = rows.find((row) => row.deviceLabel === "build-01.fly.dev");
+      return found?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${victimId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ revoked: true });
+
+    const revoked = await t.run(async (ctx) => await ctx.db.get("cliSessions", victimId!));
+    expect(revoked?.revokedAt).toBeTruthy();
+
+    // The revoked token is dead everywhere, not just on the laptop that held it.
+    const after = await t.fetch("/api/v1/me", { headers: bearer(victim) });
+    expect(after.status).toBe(401);
+
+    const actions = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).map((row) => row.action),
+    );
+    expect(actions).toContain("session.revoked");
+  });
+
+  // A session id that belongs to somebody else must read identically to one
+  // that never existed at all — see the next test. If revoking somebody
+  // else's session returned a distinct status (e.g. 403), a caller could
+  // enumerate live session ids one guess at a time by watching which ones
+  // come back "forbidden" instead of "not found". So this is 404, not 403,
+  // and the two tests below assert the response bodies are indistinguishable.
+  test("a developer cannot revoke somebody else's session, and it looks the same as not existing", async () => {
+    const t = setup();
+    const { rowId: mine } = await seedMember(t);
+    const { rowId: theirs } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, mine);
+    const other = await issueSession(t, theirs);
+    const otherId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === theirs)?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${otherId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("session_unknown");
+    expect(
+      await t.run(async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt),
+    ).toBeFalsy();
+
+    // The victim's session survives untouched — the failed attempt didn't
+    // revoke it, and it still authenticates.
+    const stillLive = await t.fetch("/api/v1/me", { headers: bearer(other) });
+    expect(stillLive.status).toBe(200);
+  });
+
+  test("an unknown session id gets the identical 404 as somebody else's session", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/cli/sessions/not-a-real-id", {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "session_unknown",
+        message: "That session no longer exists.",
+        action: "Run `riabuild remote list` to see what is left.",
+      },
+    });
+  });
+
+  test("an org lead can revoke somebody else's session", async () => {
+    const t = setup();
+    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: devRow } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, leadRow);
+    const victim = await issueSession(t, devRow);
+    const victimId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === devRow)?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${victimId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(200);
+
+    const after = await t.fetch("/api/v1/me", { headers: bearer(victim) });
+    expect(after.status).toBe(401);
+
+    const revocation = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).find(
+        (row) => row.action === "session.revoked",
+      ),
+    );
+    expect(revocation?.actorId).toBe(leadRow);
+    expect(revocation?.subjectId).toBe(devRow);
+  });
+
+  test("revoking your own currently-authenticating session is not an error, and kills it for real", async () => {
+    // `apply()` runs twice; so does `forget` after a half-finished one.
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const target = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows[0]?._id;
+    });
+
+    const once = await t.fetch(`/api/v1/cli/sessions/${target}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(once.status).toBe(200);
+
+    // The caller just revoked the session it is calling with, so a second
+    // attempt authenticates as nobody — 401, not a 500. It never reaches the
+    // idempotency check inside the mutation, because it never reaches the
+    // mutation at all.
+    const twice = await t.fetch(`/api/v1/cli/sessions/${target}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(twice.status).toBe(401);
+  });
+
+  test("revoking an already-revoked session through a live caller is a no-op, not an error", async () => {
+    // Exercises the mutation's own idempotency, using a caller (a lead) whose
+    // token survives the first call — unlike the self-revoke case above,
+    // where the second call never reaches the mutation.
+    const t = setup();
+    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: devRow } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, leadRow);
+    await issueSession(t, devRow);
+    const targetId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === devRow)?._id;
+    });
+
+    const once = await t.fetch(`/api/v1/cli/sessions/${targetId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(once.status).toBe(200);
+    const revokedAtFirst = await t.run(
+      async (ctx) => (await ctx.db.get("cliSessions", targetId!))?.revokedAt,
+    );
+
+    const twice = await t.fetch(`/api/v1/cli/sessions/${targetId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(twice.status).toBe(200);
+    const revokedAtSecond = await t.run(
+      async (ctx) => (await ctx.db.get("cliSessions", targetId!))?.revokedAt,
+    );
+    // Not re-stamped with a later timestamp — a no-op, not a second write.
+    expect(revokedAtSecond).toBe(revokedAtFirst);
+
+    const revocations = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).filter(
+        (row) => row.action === "session.revoked",
+      ),
+    );
+    expect(revocations).toHaveLength(1);
   });
 });

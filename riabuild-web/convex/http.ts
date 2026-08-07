@@ -351,4 +351,42 @@ http.route({
   ),
 });
 
+/* -------------------------------------------------------------------------- */
+/* DELETE /api/v1/cli/sessions/<id> — revoke a session                        */
+/* -------------------------------------------------------------------------- */
+
+http.route({
+  pathPrefix: "/api/v1/cli/sessions/",
+  method: "DELETE",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const { member } = await authenticate(ctx, req);
+      // The non-negotiable one, same as /secrets/token: a Convex row cannot
+      // outvote GitHub. Revocation changes access, so it re-verifies too.
+      await requireOrgMembership(member.githubLogin);
+
+      const id = new URL(req.url).pathname.split("/").pop() ?? "";
+      const result = await ctx.runMutation(internal.sessions.revokeById, {
+        sessionId: id,
+        actorId: member._id,
+        isLead: member.role === "lead",
+      });
+
+      // "not_found" and "forbidden" collapse into the identical response: a
+      // session id that belongs to somebody else must be indistinguishable
+      // from one that never existed, or this endpoint becomes a way to probe
+      // for live session ids one guess at a time.
+      if (result === "not_found" || result === "forbidden") {
+        fail(
+          404,
+          "session_unknown",
+          "That session no longer exists.",
+          "Run `riabuild remote list` to see what is left.",
+        );
+      }
+      return jsonResponse({ revoked: true });
+    }),
+  ),
+});
+
 export default http;
