@@ -5,6 +5,7 @@
 //! concrete next action, and whether re-running is safe. A provisioner that
 //! fails vaguely is worse than one that does not run.
 
+use anyhow::Result;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -55,6 +56,22 @@ pub fn duration_words(minutes: u64) -> String {
         .map(|(count, unit)| plural(*count, unit))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// What a typed answer means, given a default. Pure, so the rules are testable
+/// without a terminal.
+pub fn answer_or_default(input: &str, default: Option<&str>) -> Option<String> {
+    let typed = input.trim();
+    if !typed.is_empty() {
+        return Some(typed.to_string());
+    }
+    default.map(str::to_string)
+}
+
+/// Only an explicit yes is a yes. Pressing return through a prompt nobody read
+/// must not trust a host key.
+pub fn is_yes(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 impl Default for Ui {
@@ -208,6 +225,64 @@ impl Ui {
         );
         eprintln!();
     }
+
+    /// Asks for one value, showing the default in brackets.
+    ///
+    /// Blocking stdio like the rest of this file (the documented exception to
+    /// the async-IO rule). Refuses outright when stdin is not a terminal
+    /// rather than attempting a read: an open pipe with nothing written yet
+    /// blocks on read rather than returning EOF, so `IsTerminal` — "is a
+    /// human plausibly there" — is checked before any read is attempted.
+    #[allow(dead_code)] // consumed by Task 21
+    pub fn ask(&self, label: &str, default: Option<&str>) -> Result<String> {
+        if !std::io::stdin().is_terminal() {
+            return Err(Failure::new(
+                format!("asking you for {label}"),
+                "Pass the server as `riabuild remote <user>@<host>:<port>` — \
+                 there is no terminal here to ask in.",
+            )
+            .into());
+        }
+        loop {
+            match default {
+                Some(value) => print!("  {label} [{value}] "),
+                None => print!("  {label} "),
+            }
+            std::io::stdout().flush()?;
+
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line)? == 0 {
+                // stdin closed mid-prompt.
+                return Err(Failure::new(
+                    format!("asking you for {label}"),
+                    "Run `riabuild remote` again from a terminal.",
+                )
+                .into());
+            }
+            if let Some(answer) = answer_or_default(&line, default) {
+                return Ok(answer);
+            }
+        }
+    }
+
+    /// Asks a yes/no question. Defaults to no: an empty answer, or no
+    /// terminal at all, must never read as consent — the caller this exists
+    /// for is trusting a host key nobody has looked at yet.
+    #[allow(dead_code)] // consumed by Task 15
+    pub fn confirm(&self, question: &str) -> Result<bool> {
+        if !std::io::stdin().is_terminal() {
+            return Err(Failure::new(
+                format!("asking you to confirm: {question}"),
+                "Run `riabuild remote` from a terminal, where you can answer this.",
+            )
+            .into());
+        }
+        print!("  {question} [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(is_yes(&line))
+    }
 }
 
 /// A failure a developer can act on.
@@ -311,6 +386,70 @@ mod tests {
     #[test]
     fn an_expired_credential_does_not_read_as_zero_minutes() {
         assert_eq!(duration_words(0), "less than a minute");
+    }
+
+    #[test]
+    fn an_empty_answer_takes_the_default_and_a_typed_one_wins() {
+        assert_eq!(answer_or_default("", Some("22")), Some("22".into()));
+        assert_eq!(answer_or_default("  \n", Some("22")), Some("22".into()));
+        assert_eq!(answer_or_default("2222\n", Some("22")), Some("2222".into()));
+        assert_eq!(answer_or_default("  ada  ", None), Some("ada".into()));
+        // No default and no answer is not an answer.
+        assert_eq!(answer_or_default("", None), None);
+    }
+
+    #[test]
+    fn confirmation_defaults_to_no() {
+        // The fingerprint prompt is the one this exists for. Anything other than an
+        // explicit yes has to mean no, or a developer pressing return through a
+        // prompt they did not read trusts a host key they have never seen.
+        assert!(is_yes("y"));
+        assert!(is_yes("Y\n"));
+        assert!(is_yes("yes"));
+        assert!(!is_yes(""));
+        assert!(!is_yes("\n"));
+        assert!(!is_yes("n"));
+        assert!(!is_yes("sure"));
+    }
+
+    // Proves the guard against `std::io::stdin()` itself, not just the pure
+    // helpers above: redirects the process's real fd 0 to `/dev/null` so the
+    // assertion holds everywhere, not only when the test binary happens to
+    // be launched non-interactively (true in CI, not guaranteed at a
+    // developer's terminal) — that ambient dependence is exactly what could
+    // hide a hang.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_stdin_returns_an_error_instead_of_blocking() {
+        use std::os::fd::AsRawFd;
+
+        unsafe extern "C" {
+            fn dup(fd: i32) -> i32;
+            fn dup2(oldfd: i32, newfd: i32) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+
+        // SAFETY: POSIX calls over raw fds this process owns; stdin is
+        // restored before the test returns, on every path.
+        let saved_stdin = unsafe { dup(0) };
+        assert!(saved_stdin >= 0, "failed to save the real stdin fd");
+        let redirected = unsafe { dup2(devnull.as_raw_fd(), 0) };
+        assert_eq!(redirected, 0, "failed to point stdin at /dev/null");
+
+        let ask_result = Ui::new(true).ask("host", None);
+        let confirm_result = Ui::new(true).confirm("proceed?");
+
+        unsafe {
+            dup2(saved_stdin, 0);
+            close(saved_stdin);
+        }
+
+        let ask_err = ask_result.expect_err("ask must refuse a non-terminal stdin");
+        assert!(ask_err.to_string().contains("host"));
+        let confirm_err = confirm_result.expect_err("confirm must refuse a non-terminal stdin");
+        assert!(confirm_err.to_string().contains("proceed?"));
     }
 
     #[test]
