@@ -198,33 +198,42 @@ impl ApiClient {
 
     /// `GET /api/v1/me`
     ///
-    /// Fetches the envelope untyped and decodes `Member` out of it separately
-    /// from `interpret`'s error path. `interpret` already distinguishes an
-    /// `ApiError` (the server explaining a 4xx/5xx) from a transport failure;
-    /// decoding `Member` here, rather than as the type parameter of
-    /// `get_json`, keeps a *decode* failure — a dashboard older than this
-    /// binary, sending no `memberId` — from ever being confused with an
-    /// `ApiError`. Conflating the two would mean an ordinary expired session
-    /// (`?` on a 401 propagating an `ApiError`) could get caught by the same
-    /// `map_err` that turns a decode failure into "deploy the dashboard",
-    /// which would stop `main::connect`'s `needs_login()` check from ever
-    /// seeing it and send the developer to fix infrastructure instead of
-    /// signing in again.
+    /// Fetches the envelope untyped through `interpret`, then hands the
+    /// `member` field to `decode_member` as a separate step. `interpret`
+    /// already distinguishes an `ApiError` (the server explaining a 4xx/5xx)
+    /// from a transport failure; keeping the `Member` decode out of that same
+    /// `?` — and out of a `map_err` that would also catch the `ApiError`
+    /// `interpret` can return — is what keeps a *decode* failure (a
+    /// dashboard older than this binary, sending no `memberId`) from ever
+    /// being confused with an ordinary expired session. Conflating the two
+    /// would stop `main::connect`'s `needs_login()` check from ever seeing a
+    /// 401 and send the developer to fix infrastructure instead of signing
+    /// in again.
     pub async fn me(&self) -> Result<Member> {
         let envelope: serde_json::Value = self.get_json("/api/v1/me").await?;
-        let member = envelope
-            .get("member")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        serde_json::from_value::<Member>(member).map_err(|error| {
-            Failure::new(
-                "reading your riabuild profile",
-                "Ask your team lead to deploy the dashboard — this riabuild is newer than it.",
-            )
-            .detail(error.to_string())
-            .into()
-        })
+        decode_member(envelope)
     }
+}
+
+/// Pulls `Member` out of the `{ "member": { ... } }` envelope `/api/v1/me`
+/// returns, reporting a decode failure as "the dashboard is stale" rather
+/// than the raw serde error `main.rs` would otherwise print as an unnamed
+/// bug. Kept as a standalone function — rather than inlined into `me()` —
+/// specifically so a test can call the exact code `me()` runs instead of a
+/// hand-copied stand-in that would silently stop matching it.
+fn decode_member(envelope: serde_json::Value) -> Result<Member> {
+    let member = envelope
+        .get("member")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::from_value::<Member>(member).map_err(|error| {
+        Failure::new(
+            "reading your riabuild profile",
+            "Ask your team lead to deploy the dashboard — this riabuild is newer than it.",
+        )
+        .detail(error.to_string())
+        .into()
+    })
 }
 
 /// Turns a reqwest result into either the decoded body or an `ApiError`.
@@ -352,6 +361,8 @@ mod tests {
             "../../etc",
             "not-a-uuid",
             "550E8400-E29B-41D4-A716-446655440000",
+            " 550e8400-e29b-41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-446655440000 ",
         ] {
             let json = format!(
                 r#"{{"githubLogin":"ada","githubId":"1","memberId":"{bad}","firstName":"A",
@@ -364,33 +375,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_expired_session_still_asks_for_a_login_rather_than_a_deploy() {
-        // The regression this test exists to prevent: an ApiError must survive
-        // as an ApiError through `?`, or `main::connect` stops instead of
-        // re-running `login`.
-        let error = ApiError {
-            status: 401,
-            code: "session_expired".into(),
-            message: "This machine's session has expired.".into(),
-            action: "Run `riabuild login`.".into(),
-        };
-        let wrapped: anyhow::Error = error.into();
-        assert!(
-            wrapped
-                .downcast_ref::<ApiError>()
-                .is_some_and(ApiError::needs_login)
-        );
-    }
+    // The auth half of the decode-vs-auth split (an ApiError surviving as an
+    // ApiError through `?`) is exercised end to end by
+    // `a_403_is_never_treated_as_a_login_problem` above — this file has no
+    // HTTP stub, so there is no `ApiClient::me()` call to drive through a
+    // real 401/403 without inventing that scaffolding. A prior version of
+    // this test constructed an `ApiError` by hand and asserted a
+    // downcast/`needs_login` property that belongs to `anyhow` and
+    // `ApiError`, not to anything in this file's control flow, and never
+    // called `me()` — so it was deleted rather than kept as padding.
 
     #[test]
-    fn a_missing_member_id_is_reported_as_a_stale_dashboard_not_a_bug() {
-        // Pins the distinction the brief calls out: a decode failure (this
-        // test) must never be confused with an `ApiError` (the test above).
-        // If `me()`'s error mapping regresses to catching everything `?`
-        // could produce, this would start reporting as an auth problem
-        // instead, and the one above would start reporting as "deploy the
-        // dashboard" — either swap is the bug this pair pins.
+    fn decode_member_reports_a_missing_member_id_as_a_stale_dashboard_not_a_bug() {
+        // Calls the exact function `me()` calls — not a hand-copied
+        // stand-in — so this test tracks `me()`'s real behavior. If `me()`
+        // regressed to wrapping its whole body (including the propagated
+        // `ApiError` from `interpret`) in one `map_err`, that regression
+        // would not touch this function's signature or this test's call
+        // site, which is exactly why the split into `decode_member` matters:
+        // a test on `me()` itself would need an HTTP stub this file does not
+        // have, but `decode_member` is where the actual risk (a decode
+        // failure) lives, and it is plain data in, `Result` out.
         let envelope = serde_json::json!({
             "member": {
                 "githubLogin": "ada",
@@ -401,18 +406,28 @@ mod tests {
                 "status": "active",
             }
         });
-        let member = envelope
-            .get("member")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let decoded = serde_json::from_value::<Member>(member).map_err(|error| {
-            Failure::new(
-                "reading your riabuild profile",
-                "Ask your team lead to deploy the dashboard — this riabuild is newer than it.",
-            )
-            .detail(error.to_string())
+        let error =
+            decode_member(envelope).expect_err("a payload with no memberId must not decode");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("a decode failure must surface as a Failure, not an opaque error");
+        assert!(failure.action.contains("deploy the dashboard"));
+    }
+
+    #[test]
+    fn decode_member_reads_a_well_formed_envelope() {
+        let envelope = serde_json::json!({
+            "member": {
+                "githubLogin": "ada",
+                "memberId": "550e8400-e29b-41d4-a716-446655440000",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "email": "ada@clubria.dev",
+                "role": "developer",
+                "status": "active",
+            }
         });
-        let error = decoded.expect_err("a payload with no memberId must not decode");
-        assert!(error.action.contains("deploy the dashboard"));
+        let member = decode_member(envelope).expect("a well-formed envelope should decode");
+        assert_eq!(member.member_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 }
