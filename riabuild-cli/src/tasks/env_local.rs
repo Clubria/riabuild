@@ -244,8 +244,14 @@ async fn write_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+// `async`, matching the `unix` arm above. This body used to be a synchronous
+// `std::fs::write`, for which a plain `fn` was right; the sweep that moved
+// riabuild's IO onto tokio rewrote it to an `.await` and left the signature
+// alone. Nothing caught it because no CI job compiles a non-unix target, so
+// this arm is never built — `#[cfg]`-gated code is invisible to every check
+// that runs, which is exactly how a whole-file sweep skips it.
 #[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+async fn write_private(path: &Path, contents: &str) -> Result<()> {
     tokio::fs::write(path, contents).await?;
     Ok(())
 }

@@ -4,9 +4,10 @@
 //! writes the riabuild session itself, a distinct concern from handing over a
 //! *GitHub* credential, and growing `session.rs` past this file's own weight
 //! would have pushed it over the ~300-line production budget every file in
-//! this crate is held to (see `riabuild-cli/CLAUDE.md`'s "one task per file";
-//! `keychain.rs` and `install.rs` are the cautionary examples of not doing
-//! this).
+//! this crate is held to (see `riabuild-cli/CLAUDE.md`'s "one task per file").
+//! `keychain.rs` and `install.rs` were the cautionary examples when this was
+//! written; both have since been split for the same reason, which is the
+//! argument for doing it up front rather than after a file has grown.
 
 use super::{Remote, identity};
 use crate::paths::Paths;
@@ -87,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_piped_and_never_put_in_an_argument_list() {
         // Arguments are world-readable through `ps`. This is the same assertion
-        // keychain.rs already makes about `secret-tool`.
+        // `keychain/platform.rs` already makes about `secret-tool`.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
         let fake = Arc::new(

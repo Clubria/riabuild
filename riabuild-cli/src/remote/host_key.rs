@@ -267,7 +267,7 @@ async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
 
 /// Opens `path` for append (creating it if needed) and writes `bytes`,
 /// flushed before returning — `write_all` alone only queues the bytes for a
-/// blocking-pool task to actually write, the same gap `keychain.rs`'s
+/// blocking-pool task to actually write, the same gap `keychain/file.rs`'s
 /// `write_private_token` was fixed for.
 async fn append(path: &Path, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;

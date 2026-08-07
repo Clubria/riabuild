@@ -90,15 +90,19 @@ dependency edges you must declare.
 
 ```
 src/
-  main.rs      top-level flow          cli.rs       clap definitions
+  main.rs      entry point, dispatch   cli.rs       clap definitions
+  provision.rs the default flow        internal.rs  `riabuild internal …` handlers
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
-  keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
+  keychain/    secret storage: trait,  runner.rs    CommandRunner — all subprocesses
+               the two platform CLIs,
+               the server's file store
   update.rs    version check, re-exec  ui.rs        output and prompts
-  scope.rs     laptop vs. server, from gh_session.rs  server-only GitHub config dir,
-               RIABUILD_REMOTE, and the               lives only as long as a session
-               namespace it implies: member
-               id, server session token file
+  scope.rs     laptop vs. server, from gh_session/  where the GitHub config dir
+               RIABUILD_REMOTE, and the             goes, how it is created safely
+               namespace it implies: member         against a co-tenant, and how
+               id, server session token file        long it lives
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
+  download/    fetching and verifying a release, and landing an unpacked tree atomically
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
   remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
                trust, authorising a key, installing the server's own binary, minting its

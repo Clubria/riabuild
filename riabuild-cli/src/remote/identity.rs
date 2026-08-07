@@ -90,7 +90,7 @@ pub async fn ensure_key(
 ) -> Result<PathBuf> {
     let path = key_path(remote, paths);
     // Repaired unconditionally, before the existence check — same order as
-    // `keychain.rs`'s `ensure_private_dir`, so a world-readable directory
+    // `keychain/file.rs`'s `ensure_private_dir`, so a world-readable directory
     // doesn't stay that way just because riabuild finds it already there.
     tokio::fs::create_dir_all(paths.identity_dir()).await?;
     set_private_dir(&paths.identity_dir()).await?;
@@ -174,7 +174,7 @@ pub(super) async fn set_private_dir(_path: &std::path::Path) -> Result<()> {
 
 /// Pins a private key file at `0600` regardless of its prior mode — the same
 /// "set explicitly, don't trust creation-time permissions" rule
-/// `keychain.rs`'s `write_private_token` documents.
+/// `keychain/file.rs`'s `write_private_token` documents.
 #[cfg(unix)]
 async fn set_private_file(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

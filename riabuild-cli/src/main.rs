@@ -1,6 +1,13 @@
 //! riabuild — from "accepted a GitHub org invite" to "running Claude Code
 //! against the Clubria codebase with working secrets", without the developer
 //! making a single environment decision.
+//!
+//! This file is the wiring only: parse argv, assemble the `Ctx` a run works
+//! against — including the GitHub-session envelope a remote scope executes
+//! inside — and dispatch to whichever module implements the command. The
+//! default flow lives in `provision.rs`, the hidden `internal` subcommands in
+//! `internal.rs`, and `riabuild remote` in `remote/`. Only `logout`, `env`,
+//! and `connect` are small enough to have stayed here.
 
 // `unwrap_used` is denied for the shipped binary in `Cargo.toml`. In tests a
 // panic *is* the reporting mechanism for a failed precondition, so unwrapping a
@@ -14,8 +21,10 @@ mod cli;
 mod config;
 mod download;
 mod gh_session;
+mod internal;
 mod keychain;
 mod paths;
+mod provision;
 mod remote;
 mod runner;
 mod scope;
@@ -33,9 +42,10 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::{State, UserConfig};
 use paths::{Paths, RealPaths, expand_tilde};
-use runner::{CommandRunner, RealRunner, RunOptions};
+use provision::{open_shell, provision};
+use runner::{CommandRunner, RealRunner};
 use std::sync::Arc;
-use tasks::{Ctx, engine};
+use tasks::Ctx;
 use ui::{Failure, Ui};
 
 #[tokio::main(flavor = "current_thread")]
@@ -91,7 +101,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // `holds_gh_session_marker`): if either claimed a marker the same way
     // the shell does, its own exit would find no other marker yet and wipe
     // the GitHub credential moments after `internal seed-github` wrote it —
-    // the exact "earlier draft got it backwards" bug `gh_session.rs`'s module
+    // the exact "earlier draft got it backwards" bug `gh_session`'s module
     // doc warns about. Those two only `attach`, which never claims or
     // releases anything.
     let gh_dir: Option<std::path::PathBuf>;
@@ -177,7 +187,7 @@ async fn run(cli: Cli) -> Result<i32> {
 /// way — granting a marker to a `--no-shell` run — is what would make the
 /// setup run's own exit sweep away a credential `seed_github` had just
 /// written on an earlier hop, before the shell ever sees it.
-fn opens_shell(cli: &Cli) -> bool {
+pub(crate) fn opens_shell(cli: &Cli) -> bool {
     match &cli.command {
         Some(Command::Shell) => true,
         Some(
@@ -196,7 +206,7 @@ fn opens_shell(cli: &Cli) -> bool {
 /// GitHub-session marker `gh_session::open`/`close` guard.
 ///
 /// Only the invocation that goes on to hold the interactive environment
-/// shell open should ever do that — see `gh_session.rs`'s module doc. Every
+/// shell open should ever do that — see `gh_session`'s module doc. Every
 /// other invocation — the hidden `internal` subcommands (`gh-sweep`,
 /// `seed-github`), and just as importantly the *setup* run, which is an
 /// ordinary default-flow invocation with `--no-shell` set — calls `attach`
@@ -228,65 +238,14 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         }
         Some(Command::Internal {
             action: cli::InternalAction::GhSweep,
-        }) => {
-            // Run by the laptop before seeding, so a dead session's leftovers
-            // go before the new credential arrives rather than after.
-            let runtime = gh_session::choose_runtime_dir(
-                std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-                std::env::var("TMPDIR").ok().as_deref(),
-            )
-            .await?;
-            let dir = gh_session::GhSession::attach(
-                &runtime,
-                &scope::member_id_from_root(ctx.paths.as_ref())?,
-            )
-            .await?;
-            gh_session::sweep(&dir, ctx.runner.clone(), config::now_secs()).await?;
-            return Ok(0);
-        }
+        }) => return internal::gh_sweep(ctx).await,
         Some(Command::Internal {
             action: cli::InternalAction::SeedGithub,
-        }) => {
-            // `tokio::io`, not `std::io`: a blocking read on the current-thread
-            // runtime stalls every other future on it, which is the invariant in
-            // riabuild-cli/CLAUDE.md.
-            use tokio::io::AsyncReadExt;
-            let mut token = String::new();
-            tokio::io::stdin().read_to_string(&mut token).await?;
-            return accept_github_token(ctx, &token).await;
-        }
+        }) => return internal::seed_github(ctx).await,
         Some(Command::Status) | None => {}
     }
 
     provision(ctx, cli).await
-}
-
-/// The server half of `remote::seed::seed_github`: hands the GitHub token the
-/// laptop piped over SSH on to `gh`, again on stdin.
-///
-/// The token reaches `gh` only on stdin — never in argv, because `ps` is
-/// world-readable and on a shared server it shows every other developer's
-/// command lines — and is never logged. `gh` writes its own `hosts.yml`, with
-/// its own permissions, into the `GH_CONFIG_DIR` the scoped runner supplies;
-/// riabuild never hand-writes that file.
-///
-/// Taking the token as an argument rather than reading stdin itself is what
-/// makes that guarantee assertable: the caller above reads the *process's*
-/// stdin, which under `cargo test` is the terminal, so a test driving the
-/// subcommand end to end would block on EOF instead of asserting anything.
-async fn accept_github_token(ctx: &Ctx, token: &str) -> Result<i32> {
-    let output = ctx
-        .runner
-        .run(
-            "gh",
-            &["auth", "login", "--with-token"],
-            &RunOptions {
-                stdin: Some(token.trim().as_bytes().to_vec()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    Ok(if output.ok() { 0 } else { 1 })
 }
 
 /// Remembers `--project`, unless the path names a directory on a *server*.
@@ -323,7 +282,7 @@ async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
 /// passing every other test. See ruling R11 in
 /// `.superpowers/sdd/2026-08-06-remote-mode/decisions.md`.
 #[allow(clippy::too_many_arguments)]
-fn build_ctx(
+pub(crate) fn build_ctx(
     scope: &scope::Scope,
     paths: Arc<dyn Paths>,
     runner: Arc<dyn CommandRunner>,
@@ -379,137 +338,6 @@ pub(crate) async fn connect(ctx: &mut Ctx) -> Result<()> {
     }
 }
 
-async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
-    ctx.ui.banner("Clubria");
-    connect(ctx).await?;
-    describe_session(ctx);
-
-    // A managed server has no package manager watching this binary, so it must
-    // never try to replace itself — see `scope.rs` and `tasks::Ctx::server`.
-    if let Some(org) = &ctx.org
-        && ctx.server.is_none()
-    {
-        match update::decide(
-            &ctx.cli_version,
-            &org.min_cli_version,
-            &org.latest_cli_version,
-            update::already_updated(),
-        ) {
-            update::Action::Continue => {}
-            update::Action::Upgrade { to, mandatory } => {
-                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory).await?;
-            }
-        }
-    }
-
-    ctx.ui.heading("Checking this machine");
-    let registry = tasks::registry();
-    let outcome = engine::run_all(&registry, ctx).await?;
-
-    shims::write_all(ctx).await?;
-
-    let notes = std::mem::take(&mut ctx.notes);
-    if !notes.is_empty() {
-        ctx.ui.heading("Worth knowing");
-        for note in notes {
-            ctx.ui.note(&note);
-        }
-    }
-
-    log_run(ctx, &outcome).await;
-
-    if ctx.dry_run {
-        ctx.ui.info("");
-        // "9 item(s) already correct, 0 would be set up." made a fine machine
-        // read like a to-do list. The all-clear deserves to say so plainly.
-        ctx.ui.info(&if outcome.applied.is_empty() {
-            "Everything on this machine is already set up.".to_string()
-        } else {
-            format!(
-                "{} already correct, {} still to set up.",
-                ui::plural(outcome.satisfied.len() as u64, "item"),
-                outcome.applied.len(),
-            )
-        });
-        return Ok(0);
-    }
-
-    if !opens_shell(cli) {
-        return Ok(0);
-    }
-    open_shell(ctx).await
-}
-
-/// Who riabuild thinks this machine belongs to, and where the token lives.
-///
-/// Printed on every run because "riabuild is using the wrong account" is
-/// otherwise invisible until something fails for a confusing reason.
-fn describe_session(ctx: &Ctx) {
-    let Some(member) = &ctx.member else {
-        ctx.ui
-            .note("not signed in yet — riabuild will open your browser");
-        return;
-    };
-    ctx.ui.note(&format!(
-        "signed in as {} <{}> · {} · token in your {}",
-        member.display_name(),
-        member.email,
-        member.role,
-        ctx.keychain.describe(),
-    ));
-}
-
-/// One line per run in `~/.riabuild/logs/riabuild.log`.
-///
-/// Deliberately never fatal: failing to write a log must not fail a setup that
-/// otherwise worked. It exists so "send me your riabuild log" is a useful thing
-/// for a team lead to ask.
-async fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
-    use tokio::io::AsyncWriteExt;
-    let path = ctx.paths.log_file();
-    let Some(parent) = path.parent() else { return };
-    if tokio::fs::create_dir_all(parent).await.is_err() {
-        return;
-    }
-    let line = format!(
-        "{} riabuild {} satisfied={} applied=[{}]\n",
-        config::now_secs(),
-        ctx.cli_version,
-        outcome.satisfied.len(),
-        outcome.applied.join(","),
-    );
-    if let Ok(mut file) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
-        // write_all reporting success only means the bytes reached
-        // tokio::fs::File's internal buffer, not that the background
-        // write() syscall ran — flush is what waits for that.
-        let _ = async {
-            file.write_all(line.as_bytes()).await?;
-            file.flush().await
-        }
-        .await;
-    }
-}
-
-async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
-    if shell::already_inside() {
-        // Nesting would stack PATH entries and leave the developer two `exit`s
-        // away from their own terminal.
-        ctx.ui
-            .info("You are already in the Clubria environment. Type `exit` to leave it.");
-        return Ok(0);
-    }
-    // The banner itself comes from the generated rcfile, inside the new shell —
-    // printing it here too is what made every developer see it twice. This blank
-    // line is only separation from the task list above.
-    ctx.ui.info("");
-    shell::spawn(ctx).await
-}
-
 async fn logout(ctx: &mut Ctx) -> Result<i32> {
     ctx.keychain.delete().await?;
     ctx.config.session_expires_at = None;
@@ -545,15 +373,9 @@ mod tests {
     /// `Ctx`'s `Paths` point at, so a test that writes anything (`config.save`)
     /// needs it alive for the duration.
     fn ctx_for(scope: &scope::Scope) -> (Ctx, TempDir) {
-        ctx_with_runner(scope, Arc::new(FakeRunner::new()))
-    }
-
-    /// `ctx_for` with the caller keeping its own handle on the `FakeRunner`,
-    /// for tests that assert on what was run rather than only on the result.
-    fn ctx_with_runner(scope: &scope::Scope, fake: Arc<FakeRunner>) -> (Ctx, TempDir) {
         let home = TempDir::new().expect("tempdir");
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
-        let runner: Arc<dyn CommandRunner> = fake;
+        let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
         let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
         let ctx = build_ctx(
             scope,
@@ -637,56 +459,6 @@ mod tests {
         assert!(ctx.paths.config_file().exists());
     }
 
-    #[tokio::test]
-    async fn the_github_token_reaches_gh_on_stdin_and_never_in_argv() {
-        // On a shared server `ps` shows every developer's command lines, so a
-        // token in argv is a token handed to everyone logged in. Both halves
-        // are asserted deliberately: dropping `stdin:` from the call site
-        // leaves argv clean, so an argv-only test stays green while `gh` is
-        // handed an empty pipe; passing the token as an extra argument as well
-        // would leave stdin correct, so a stdin-only test stays green while
-        // `ps` leaks it.
-        let fake = Arc::new(FakeRunner::new().with("gh auth login --with-token", 0, "", ""));
-        let (ctx, _home) = ctx_with_runner(&scope::Scope::read(Some("build-01")), fake.clone());
-
-        let token = "gho_averysecretgithubtoken";
-        assert_eq!(
-            accept_github_token(&ctx, &format!("{token}\n"))
-                .await
-                .expect("gh runs"),
-            0
-        );
-
-        assert_eq!(
-            fake.stdin_text_of("gh auth login").as_deref(),
-            Some(token),
-            "the token must arrive on stdin, trailing newline trimmed"
-        );
-        for call in fake.calls() {
-            assert!(
-                !call.contains(token),
-                "the token must not appear in any argument list: {call}"
-            );
-        }
-        assert_eq!(fake.calls(), vec!["gh auth login --with-token".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn a_gh_that_rejects_the_token_is_a_nonzero_exit() {
-        // The failure has to travel back over SSH as an exit code — a seeding
-        // run that reported success while `gh` refused the token would leave
-        // the shell hop to discover it, with no credential and no explanation.
-        let fake =
-            Arc::new(FakeRunner::new().with("gh auth login --with-token", 1, "", "bad token"));
-        let (ctx, _home) = ctx_with_runner(&scope::Scope::read(Some("build-01")), fake);
-        assert_eq!(
-            accept_github_token(&ctx, "gho_expired")
-                .await
-                .expect("gh runs"),
-            1
-        );
-    }
-
     /// A `Cli` with every field but `command`/`no_shell`/`check` at its
     /// ordinary default, for the marker-predicate tests below — those three
     /// are the only fields `opens_shell` reads.
@@ -702,7 +474,7 @@ mod tests {
 
     #[test]
     fn internal_plumbing_never_claims_the_gh_session_marker() {
-        // This is the fix for the bug described in `gh_session.rs`'s module
+        // This is the fix for the bug described in `gh_session`'s module
         // doc: if `internal seed-github` claimed a marker the same way the
         // interactive shell does, its own exit would wipe the credential it
         // had just written. Reverting `holds_gh_session_marker` to always
