@@ -291,6 +291,22 @@ async fn sign_in(ctx: &mut Ctx) -> Result<()> {
 /// riabuild convinced it had signed the developer in, and the only symptom was
 /// a later check failing for a reason that did not mention the sign-in.
 async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> Result<()> {
+    // Both commands that reach here open a device-code flow and wait for a
+    // person. With no terminal that wait never ends: `gh` does not time out,
+    // so riabuild hangs with no output until something outside kills it. An
+    // unattended run has to be told what to do instead, and there is a real
+    // answer — `GH_TOKEN` needs no browser.
+    if !ctx.ui.can_prompt() {
+        return Err(Failure::new(
+            attempting,
+            "Set GH_TOKEN to a GitHub token with the `read:org` permission, \
+             or run `gh auth login` yourself at a terminal first.",
+        )
+        .command(format!("gh {}", args.join(" ")))
+        .detail("this needs a browser sign-in and there is no terminal to prompt on")
+        .into());
+    }
+
     let code = ctx
         .runner
         .run_interactive("gh", args, &RunOptions::default())
@@ -338,6 +354,7 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_and_runner, ctx_with};
+    use crate::ui::Ui;
 
     const MEMBERSHIP: &str = "gh api /user/memberships/orgs/Clubria";
 
@@ -483,6 +500,38 @@ mod tests {
         let (mut ctx, _home) = ctx_with(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("signing you in"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_never_waits_on_a_browser_sign_in() {
+        // The bug this covers hung `riabuild remote` forever. `gh auth login
+        // --web` prints a device code and waits for a person; handed no
+        // terminal it waits with no output and no timeout, so the container
+        // test sat there until something outside killed it. Failing with the
+        // remedy is the only useful thing riabuild can do here.
+        let runner = healthy()
+            .with("gh auth status", 1, "", "You are not logged into any hosts")
+            .with("gh auth login", 0, "", "");
+        let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(false);
+
+        let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
+        assert!(error.contains("GH_TOKEN"), "{error}");
+        assert!(
+            !calls.calls().iter().any(|call| call.contains("auth login")),
+            "gh must never be started at all: reaching it is the hang. {:?}",
+            calls.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_already_works_needs_no_terminal() {
+        // The guard must not turn every unattended run into a failure. A
+        // GH_TOKEN that already answers the membership question never reaches
+        // a prompt, so it must still succeed with no terminal at all.
+        let (mut ctx, _home) = ctx_with(healthy()).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(false);
+        GithubCli.apply(&mut ctx).await.unwrap();
     }
 
     #[tokio::test]

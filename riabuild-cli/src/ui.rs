@@ -17,6 +17,14 @@ mod prompt;
 pub struct Ui {
     colour: bool,
     quiet: bool,
+    /// Whether there is a terminal a person could answer a prompt on.
+    ///
+    /// riabuild's own prompts are not the only ones that matter. `gh auth
+    /// login --web` runs a device-code flow: it prints a code and waits for a
+    /// human to finish in a browser. Handed no terminal it does not fail — it
+    /// waits, silently, forever. Every command riabuild hands the terminal to
+    /// has to know whether that terminal exists.
+    can_prompt: bool,
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
     pending: AtomicUsize,
@@ -75,8 +83,31 @@ impl Ui {
         Self {
             colour,
             quiet,
+            can_prompt: std::io::stdin().is_terminal(),
             pending: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether a command that prompts can be handed the terminal.
+    ///
+    /// Read it before delegating to anything that waits on a person. A `false`
+    /// here is not a reason to prompt more quietly — it means the answer can
+    /// never arrive, so the only honest move is to say so and stop.
+    pub fn can_prompt(&self) -> bool {
+        self.can_prompt
+    }
+
+    /// Overrides terminal detection.
+    ///
+    /// Tests model a developer sitting at a terminal, but `cargo test` hands
+    /// them no tty, so without this every test would silently take the
+    /// unattended path and stop covering the interactive one. Test-only on
+    /// purpose: production must read the real terminal, never be told.
+    #[cfg(test)]
+    #[must_use]
+    pub fn assume_prompts_work(mut self, yes: bool) -> Self {
+        self.can_prompt = yes;
+        self
     }
 
     /// Claims the pending status line, so it is only covered once.

@@ -65,7 +65,10 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         runner,
         keychain,
         api: ApiClient::new("0.1.0"),
-        ui: Ui::new(true),
+        // A test Ctx models a developer sitting at a terminal. `cargo test`
+        // gives the process no tty, so without this every test would take the
+        // unattended path and stop covering the interactive one.
+        ui: Ui::new(true).assume_prompts_work(true),
         config: UserConfig::default(),
         state: State::default(),
         org: Some(org_config()),
