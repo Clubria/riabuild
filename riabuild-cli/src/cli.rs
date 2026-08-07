@@ -72,6 +72,11 @@ pub enum Command {
     },
     /// Print the environment riabuild would apply, as `export` lines.
     Env,
+    /// The laptop channel: what makes paste work over a remote session.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
     /// Remove `~/.riabuild` so the next run sets this machine up from scratch.
     ///
     /// Runs no setup tasks: the point of a reset is the machine no check can
@@ -82,6 +87,32 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelAction {
+    /// Serve this laptop's clipboard to a remote session.
+    ///
+    /// Hidden: started by the remote flow, not by a developer.
+    #[command(hide = true)]
+    Agent {
+        /// Where to listen. Defaults to the session's runtime directory.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+    /// Stand in for `xclip` or `wl-paste` on the server.
+    ///
+    /// Hidden: invoked by the generated shims in `~/.riabuild/bin`.
+    #[command(hide = true)]
+    Shim {
+        /// The tool being shadowed.
+        tool: String,
+        /// That tool's own arguments, passed through untouched.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Report whether the clipboard channel is up.
+    Status,
 }
 
 #[cfg(test)]
@@ -147,6 +178,68 @@ mod tests {
     fn reset_can_be_told_not_to_ask() {
         let cli = Cli::parse_from(["riabuild", "reset", "--yes"]);
         assert!(matches!(cli.command, Some(Command::Reset { yes: true })));
+    }
+
+    #[test]
+    fn the_shim_passes_its_arguments_through_verbatim() {
+        // The generated ~/.riabuild/bin/xclip runs exactly this. Flags that
+        // look like riabuild's own must reach the parser as the tool's.
+        let cli = Cli::parse_from([
+            "riabuild",
+            "channel",
+            "shim",
+            "xclip",
+            "-selection",
+            "clipboard",
+            "-t",
+            "TARGETS",
+            "-o",
+        ]);
+        let Some(Command::Channel {
+            action: ChannelAction::Shim { tool, args },
+        }) = cli.command
+        else {
+            panic!("expected a shim invocation");
+        };
+        assert_eq!(tool, "xclip");
+        assert_eq!(args, ["-selection", "clipboard", "-t", "TARGETS", "-o"]);
+    }
+
+    /// `--quiet` is a riabuild flag, and the shim must not eat it out of the
+    /// tool's own argument list.
+    #[test]
+    fn a_tool_flag_that_collides_with_riabuilds_own_still_reaches_the_tool() {
+        let cli = Cli::parse_from(["riabuild", "channel", "shim", "xclip", "-quiet", "-o"]);
+        let Some(Command::Channel {
+            action: ChannelAction::Shim { args, .. },
+        }) = cli.command
+        else {
+            panic!("expected a shim invocation");
+        };
+        assert_eq!(args, ["-quiet", "-o"]);
+    }
+
+    #[test]
+    fn the_agent_can_be_told_where_to_listen() {
+        let cli = Cli::parse_from(["riabuild", "channel", "agent", "--socket", "/tmp/a.sock"]);
+        let Some(Command::Channel {
+            action: ChannelAction::Agent { socket },
+        }) = cli.command
+        else {
+            panic!("expected the agent");
+        };
+        assert_eq!(socket.as_deref(), Some("/tmp/a.sock"));
+    }
+
+    #[test]
+    fn channel_status_is_a_plain_subcommand() {
+        let cli = Cli::parse_from(["riabuild", "channel", "status"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Channel {
+                action: ChannelAction::Status
+            })
+        ));
     }
 
     #[test]

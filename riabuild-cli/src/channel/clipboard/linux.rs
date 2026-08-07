@@ -3,9 +3,24 @@
 use super::Clipboard;
 use crate::channel::mime::{self, Vocabulary};
 use crate::runner::{CommandRunner, RunOptions};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// The shell's code for "no such command".
+///
+/// This is the one exit status that is a genuine fault rather than an empty
+/// clipboard: the tool riabuild was told to use is not installed, and every
+/// read will fail the same way until someone installs it. Reported with the
+/// tool's own stderr, because "paste does not work" is not actionable.
+const NOT_FOUND: i32 = 127;
+
+fn fault(tool: &str, stderr: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`{tool}` is not installed on this laptop: {}",
+        stderr.trim()
+    )
+}
 
 pub struct X11Clipboard {
     runner: Arc<dyn CommandRunner>,
@@ -30,7 +45,10 @@ impl Clipboard for X11Clipboard {
             .await
             .context("could not ask xclip what is on the clipboard")?;
 
-        // xclip exits non-zero on an empty clipboard. That is not a fault.
+        if output.code == Some(NOT_FOUND) {
+            bail!(fault("xclip", &output.stderr));
+        }
+        // Any other non-zero exit is an empty clipboard. That is not a fault.
         if !output.ok() {
             return Ok(Vec::new());
         }
@@ -54,6 +72,9 @@ impl Clipboard for X11Clipboard {
             .await
             .context("could not read the clipboard with xclip")?;
 
+        if output.code == Some(NOT_FOUND) {
+            bail!(fault("xclip", &output.stderr));
+        }
         if !output.ok() || output.stdout.is_empty() {
             return Ok(None);
         }
@@ -80,6 +101,9 @@ impl Clipboard for WaylandClipboard {
             .await
             .context("could not ask wl-paste what is on the clipboard")?;
 
+        if output.code == Some(NOT_FOUND) {
+            bail!(fault("wl-paste", &output.stderr));
+        }
         if !output.ok() {
             return Ok(Vec::new());
         }
@@ -102,6 +126,9 @@ impl Clipboard for WaylandClipboard {
             .await
             .context("could not read the clipboard with wl-paste")?;
 
+        if output.code == Some(NOT_FOUND) {
+            bail!(fault("wl-paste", &output.stderr));
+        }
         if !output.ok() || output.stdout.is_empty() {
             return Ok(None);
         }
@@ -178,6 +205,23 @@ mod tests {
         ));
         let clipboard = X11Clipboard::new(runner);
         assert_eq!(clipboard.read(PNG).await.unwrap(), None);
+    }
+
+    /// The one exit status that is a genuine fault. Left as an empty clipboard,
+    /// a laptop with no xclip installed reports "nothing copied" forever and
+    /// nobody ever finds out why paste does not work.
+    #[tokio::test]
+    async fn a_missing_tool_is_a_fault_rather_than_an_empty_clipboard() {
+        let runner = arc(FakeRunner::new().with(
+            "xclip -selection clipboard -t TARGETS -o",
+            127,
+            "",
+            "xclip: command not found",
+        ));
+        let clipboard = X11Clipboard::new(runner);
+        let error = clipboard.targets().await.expect_err("should be a fault");
+        assert!(error.to_string().contains("not installed"), "{error}");
+        assert!(error.to_string().contains("command not found"), "{error}");
     }
 
     #[tokio::test]
