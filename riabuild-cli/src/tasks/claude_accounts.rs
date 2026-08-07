@@ -20,14 +20,30 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIN_VERSION: &str = "2.0.0";
+/// The version every behaviour this task depends on was verified against.
+///
+/// Not an arbitrary bump: `claude auth status --json`, `claude auth login`, and
+/// the per-`CLAUDE_CONFIG_DIR` keychain scoping that makes two accounts two
+/// independent sign-ins were only ever confirmed on 2.1.223. A developer on
+/// 2.0.x may not have `auth status --json` at all, which this task now treats as
+/// a hard failure rather than a misread. Raising the floor costs nothing —
+/// `install_claude` installs whatever npm calls latest.
+const MIN_VERSION: &str = "2.1.223";
 
 pub struct ClaudeAccounts;
 
 /// Every account directory actually on disk, oldest first.
 ///
-/// Oldest first so that adoption keeps a developer's original account as
-/// account 1, which is the one their editor and their muscle memory point at.
+/// Ordered by creation time, falling back to modification time on a filesystem
+/// that does not record one, and broken by the directory name so the order is
+/// deterministic either way.
+///
+/// Creation time rather than mtime because Claude Code writes into
+/// `CLAUDE_CONFIG_DIR` on every session: the account the developer actually uses
+/// has the *newest* mtime, so sorting by that would hand `claude` to their least
+/// recently used login on the one machine where the order is observable — config
+/// lost, several directories on disk. Adoption is meant to keep their original
+/// account as account 1.
 async fn ids_on_disk(claude_dir: &Path) -> Vec<String> {
     let Ok(mut entries) = tokio::fs::read_dir(claude_dir).await else {
         return Vec::new();
@@ -44,10 +60,39 @@ async fn ids_on_disk(claude_dir: &Path) -> Vec<String> {
         if !accounts::looks_like_id(&name) {
             continue;
         }
-        found.push((meta.modified().unwrap_or(UNIX_EPOCH), name));
+        // btime on APFS, statx on modern Linux. `or_else` and not `or`: the
+        // fallback is a syscall, so it must not run when `created()` answered.
+        let born = meta
+            .created()
+            .or_else(|_| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        found.push((born, name));
     }
     found.sort();
     found.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Whether riabuild has to install Claude Code before it can be used.
+///
+/// The existence test comes first and is not optional. `RealRunner::run` returns
+/// `Err` when the program is not there — a spawn failure, not an exit code — so
+/// asking `--version` first makes the missing-binary case propagate an `anyhow`
+/// chain instead of reaching `install_claude`. The task whose job is installing
+/// Claude Code would abort before it could. `github_cli` and `toolchain` gate on
+/// `try_exists` for the same reason.
+///
+/// An installed copy below the floor routes here too: `install_claude` is the
+/// upgrade path as well as the install path.
+async fn install_needed(ctx: &Ctx) -> Result<bool> {
+    let claude = ctx.claude();
+    if !tokio::fs::try_exists(&claude).await.unwrap_or(false) {
+        return Ok(true);
+    }
+    let reported = ctx
+        .runner
+        .run(&claude, &["--version"], &RunOptions::default())
+        .await?;
+    Ok(!reported.ok() || !version::at_least(reported.trimmed(), MIN_VERSION))
 }
 
 #[async_trait]
@@ -71,7 +116,14 @@ impl Task for ClaudeAccounts {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
+        // Existence before invocation — see `install_needed`. `ctx.claude()` is
+        // the bare name until `toolchain` pins a Node, and a bare name never
+        // exists as a relative path, so a machine with no toolchain reports
+        // exactly what is true: riabuild has not installed Claude Code.
         let claude = ctx.claude();
+        if !tokio::fs::try_exists(&claude).await.unwrap_or(false) {
+            return Ok(Status::needs("Claude Code is not installed"));
+        }
         let reported = ctx
             .runner
             .run(&claude, &["--version"], &RunOptions::default())
@@ -81,7 +133,8 @@ impl Task for ClaudeAccounts {
         }
         if !version::at_least(reported.trimmed(), MIN_VERSION) {
             return Ok(Status::needs(format!(
-                "Claude Code is older than {MIN_VERSION}"
+                "Claude Code {} is older than {MIN_VERSION}",
+                reported.trimmed()
             )));
         }
 
@@ -89,17 +142,27 @@ impl Task for ClaudeAccounts {
         let Some(primary) = ids.first() else {
             return Ok(Status::needs("no Claude Code account yet"));
         };
-        for id in ids {
-            let dir = ctx.paths.claude_profile_dir(id);
-            if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
-                return Ok(Status::needs("a Claude Code account directory is missing"));
+        // Both of these name the account they are about: each is a condition a
+        // developer has to act on by hand, and "an account is not registered"
+        // does not say which of nine directories to deal with.
+        for (index, id) in ids.iter().enumerate() {
+            if !tokio::fs::try_exists(ctx.paths.claude_profile_dir(id))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(Status::needs(format!(
+                    "Claude Code account {}'s directory is missing ({id})",
+                    index + 1
+                )));
             }
         }
         // A directory nothing recorded is drift in the other direction: real
         // sessions and a real login that no riabuild command can reach.
         for found in ids_on_disk(&ctx.paths.claude_dir()).await {
             if !ids.contains(&found) {
-                return Ok(Status::needs("a Claude Code account is not registered"));
+                return Ok(Status::needs(format!(
+                    "the Claude Code account directory {found} is not registered"
+                )));
             }
         }
 
@@ -113,51 +176,87 @@ impl Task for ClaudeAccounts {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let claude = ctx.claude();
-        if !ctx
-            .runner
-            .run(&claude, &["--version"], &RunOptions::default())
-            .await?
-            .ok()
-        {
+        if install_needed(ctx).await? {
             install_claude(ctx).await?;
         }
 
         let claude_dir = ctx.paths.claude_dir();
         tokio::fs::create_dir_all(&claude_dir).await?;
 
+        // Both existence tests go through `claude_profile_dir` so they cannot
+        // drift apart from `check()`'s.
         let mut kept = Vec::new();
         for id in ctx.config.claude_accounts.clone() {
-            if tokio::fs::try_exists(claude_dir.join(&id))
+            if tokio::fs::try_exists(ctx.paths.claude_profile_dir(&id))
                 .await
                 .unwrap_or(false)
             {
                 kept.push(id);
             }
         }
+        // At the cap there is no number left to give an orphan, and no choice
+        // riabuild may make on the developer's behalf: one of these directories
+        // is a login and a year of sessions. Adopting silently is impossible and
+        // skipping silently wedges every future run — `check()` would keep
+        // reporting the orphan, `apply()` would keep changing nothing, and the
+        // engine would keep turning that into "it did not take effect", which
+        // names nothing the developer can act on. So say what is wrong.
+        let mut blocked = None;
         for found in ids_on_disk(&claude_dir).await {
-            if !kept.contains(&found) && kept.len() < accounts::MAX {
-                kept.push(found);
+            if kept.contains(&found) {
+                continue;
             }
+            if kept.len() >= accounts::MAX {
+                blocked = Some(found);
+                break;
+            }
+            kept.push(found);
         }
         if kept.is_empty() {
             let id = accounts::new_id();
-            tokio::fs::create_dir_all(claude_dir.join(&id)).await?;
+            tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&id)).await?;
             kept.push(id);
         }
         ctx.config.claude_accounts = kept;
+        // Saved before the orphan is reported: dropping accounts whose
+        // directories vanished is real progress, and losing it would make the
+        // next run repeat the same work to reach the same error.
         ctx.config.save(ctx.paths.as_ref()).await?;
+
+        if let Some(found) = blocked {
+            let dir = ctx.paths.claude_profile_dir(&found);
+            return Err(Failure::new(
+                "numbering a Claude Code account directory riabuild found on disk",
+                format!(
+                    "Delete {} if you do not want it, or free a number with `riabuild claude delete <number>`, then run `riabuild` again.",
+                    dir.display()
+                ),
+            )
+            .detail(format!(
+                "riabuild numbers at most {} accounts and you already have that many, so {found} cannot be one of them",
+                accounts::MAX
+            ))
+            .into());
+        }
 
         let Some(primary) = ctx.config.claude_accounts.first().cloned() else {
             return Ok(());
         };
-        if !matches!(
-            accounts::status::read(ctx, &primary).await,
-            Identity::LoggedIn(_)
-        ) {
-            sign_in(ctx, &primary).await?;
+        // `LoggedOut` and `Unknown` are not the same thing, and collapsing them
+        // here would spend riabuild's ignorance as a browser sign-in on every
+        // single run of a machine whose sign-in state simply cannot be read.
+        // `accounts::status` goes to real lengths to keep them apart.
+        match accounts::status::read(ctx, &primary).await {
+            Identity::LoggedIn(_) => Ok(()),
+            Identity::LoggedOut => sign_in(ctx, &primary).await,
+            Identity::Unknown(why) => Err(Failure::new(
+                "reading whether your Claude Code account is signed in",
+                "Run `riabuild` again. If it keeps failing, run that command yourself and send its output to your team lead.",
+            )
+            .command("claude auth status --json")
+            .detail(why)
+            .into()),
         }
-        Ok(())
     }
 }
 
@@ -239,11 +338,12 @@ mod tests {
     use super::*;
     use crate::accounts;
     use crate::runner::FakeRunner;
-    use crate::testing::ctx_with;
+    use crate::testing::{ctx_with, write_file};
     use std::sync::Arc;
 
     const VERSION: &str = "claude --version";
     const STATUS: &str = "claude auth status --json";
+    const NODE: &str = "22.23.1";
 
     fn installed() -> FakeRunner {
         FakeRunner::new().with(VERSION, 0, "2.1.223 (Claude Code)", "")
@@ -258,15 +358,27 @@ mod tests {
         )
     }
 
+    /// A ctx whose Claude Code binary is where `ctx.claude()` says it is.
+    ///
+    /// The file's contents are irrelevant — every invocation goes through
+    /// `FakeRunner` — but it has to exist, because its existence is what tells a
+    /// provisioned machine from a bare one. Tests that want the bare case use
+    /// `ctx_with` and assert the task asks to install.
+    async fn ctx_with_claude(runner: FakeRunner) -> (Ctx, tempfile::TempDir) {
+        let (mut ctx, home) = ctx_with(runner).await;
+        ctx.config.node_version = Some(NODE.into());
+        write_file(Path::new(&ctx.claude()), "#!/bin/sh\n").await;
+        (ctx, home)
+    }
+
     /// A ctx with one account on disk and Claude Code installed and signed in.
     async fn ready() -> (Ctx, tempfile::TempDir, String) {
-        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let (mut ctx, home) = ctx_with_claude(signed_in()).await;
         let id = accounts::new_id();
         tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&id))
             .await
             .unwrap();
         ctx.config.claude_accounts = vec![id.clone()];
-        ctx.runner = Arc::new(signed_in());
         (ctx, home, id)
     }
 
@@ -281,16 +393,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claude_riabuild_has_not_installed_is_never_run() {
+        // `RealRunner::run` answers a missing binary with `Err` — a spawn
+        // failure, not an exit code — so a check that asked `--version` before
+        // testing for the file would propagate an anyhow chain with no next
+        // action, and `apply` would abort before reaching `install_claude`.
+        // `FakeRunner` cannot reproduce a spawn error: it answers an unstubbed
+        // command with exit 127 inside an `Ok`. So this pins the observable
+        // half instead — a runner that would gladly answer is never asked.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let runner = Arc::new(signed_in());
+        ctx.runner = runner.clone();
+        ctx.config.node_version = Some(NODE.into());
+
+        let status = ClaudeAccounts.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("not installed"),
+            "{status:?}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[tokio::test]
+    async fn applying_installs_claude_code_before_running_it() {
+        // The other half of the same bug: the task whose job is installing
+        // Claude Code must reach `install_claude`. There is no npm on this
+        // machine, so that is as far as it gets — which is the point.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let runner = Arc::new(signed_in());
+        ctx.runner = runner.clone();
+        ctx.config.node_version = Some(NODE.into());
+
+        let error = ClaudeAccounts
+            .apply(&mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("installing Claude Code"), "{error}");
+        assert!(
+            !runner.calls().iter().any(|call| call.contains(VERSION)),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    #[tokio::test]
     async fn an_old_claude_is_detected() {
-        let runner = FakeRunner::new().with(VERSION, 0, "1.9.0 (Claude Code)", "");
-        let (ctx, _home) = ctx_with(runner).await;
+        let (ctx, _home) =
+            ctx_with_claude(FakeRunner::new().with(VERSION, 0, "1.9.0 (Claude Code)", "")).await;
         let status = ClaudeAccounts.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("older than"), "{status:?}");
     }
 
     #[tokio::test]
+    async fn an_old_claude_is_upgraded_rather_than_left_alone() {
+        // `install_claude` is the upgrade path as well as the install path, so
+        // a copy below the floor has to route to it — reaching the npm check is
+        // how that shows here.
+        let (mut ctx, _home) =
+            ctx_with_claude(FakeRunner::new().with(VERSION, 0, "2.0.5 (Claude Code)", "")).await;
+        let error = ClaudeAccounts
+            .apply(&mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("installing Claude Code"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_machine_with_no_account_is_detected() {
-        let (ctx, _home) = ctx_with(installed()).await;
+        let (ctx, _home) = ctx_with_claude(installed()).await;
         let status = ClaudeAccounts.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("no Claude Code account"),
@@ -300,22 +472,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_deleted_account_directory_is_noticed() {
-        let (mut ctx, _home) = ctx_with(installed()).await;
+        let (mut ctx, _home) = ctx_with_claude(installed()).await;
         tokio::fs::create_dir_all(ctx.paths.claude_dir())
             .await
             .unwrap();
-        ctx.config.claude_accounts = vec![accounts::new_id()];
+        let id = accounts::new_id();
+        ctx.config.claude_accounts = vec![id.clone()];
         let status = ClaudeAccounts.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("directory is missing"),
             "{status:?}"
         );
+        // Named, because repairing this by hand means knowing which one.
+        assert!(format!("{status:?}").contains(&id), "{status:?}");
     }
 
     #[tokio::test]
     async fn a_directory_nothing_recorded_is_noticed() {
         let (ctx, _home, _id) = ready().await;
-        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&accounts::new_id()))
+        let orphan = accounts::new_id();
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&orphan))
             .await
             .unwrap();
         let status = ClaudeAccounts.check(&ctx).await.unwrap();
@@ -323,6 +499,20 @@ mod tests {
             format!("{status:?}").contains("not registered"),
             "{status:?}"
         );
+        assert!(format!("{status:?}").contains(&orphan), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_state_riabuild_cannot_read_is_not_called_signed_out() {
+        // No stub for `auth status --json`, so the answer will not parse.
+        // `Unknown` is a distinct reason on purpose: reporting it as signed out
+        // would assert something about the account that nothing established.
+        let (mut ctx, _home, _id) = ready().await;
+        ctx.runner = Arc::new(installed());
+        let status = ClaudeAccounts.check(&ctx).await.unwrap();
+        let described = format!("{status:?}");
+        assert!(described.contains("could not tell"), "{described}");
+        assert!(!described.contains("is not signed in"), "{described}");
     }
 
     #[tokio::test]
@@ -344,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn applying_creates_the_first_account() {
-        let (mut ctx, _home) = ctx_with(signed_in()).await;
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
         assert_eq!(ctx.config.claude_accounts.len(), 1);
         assert_eq!(ClaudeAccounts.check(&ctx).await.unwrap(), Status::Satisfied);
@@ -354,7 +544,7 @@ mod tests {
     async fn a_directory_nothing_recorded_is_adopted_rather_than_abandoned() {
         // The rescue this exists for: config.json lost, but the login and a
         // year of session history are still sitting in the directory.
-        let (mut ctx, _home) = ctx_with(signed_in()).await;
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
         let orphan = accounts::new_id();
         tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&orphan))
             .await
@@ -362,6 +552,97 @@ mod tests {
 
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
         assert_eq!(ctx.config.claude_accounts, vec![orphan]);
+    }
+
+    #[tokio::test]
+    async fn adoption_numbers_the_older_directory_first() {
+        // Account 1 is the one `claude` runs, so on the machine where adoption
+        // happens at all — config lost, several directories on disk — getting
+        // this backwards hands the developer's shell to the wrong login.
+        //
+        // This pins the ascending order and the tie-break. It does *not*
+        // distinguish creation time from modification time: both directories are
+        // made in sequence and never written to again, so the two orderings
+        // agree. `adoption_prefers_creation_time_over_modification_time` is the
+        // test that tells them apart, and it needs a filesystem that records a
+        // creation time.
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
+        let first = accounts::new_id();
+        let second = accounts::new_id();
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&first))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&second))
+            .await
+            .unwrap();
+
+        ClaudeAccounts.apply(&mut ctx).await.unwrap();
+        assert_eq!(ctx.config.claude_accounts, vec![first, second]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a filesystem that records creation time (APFS birthtime, statx btime)"]
+    async fn adoption_prefers_creation_time_over_modification_time() {
+        // The discriminating case, and the reason mtime is the wrong key: Claude
+        // Code writes into CLAUDE_CONFIG_DIR on every session, so the account a
+        // developer actually uses has the newest mtime. Here the older
+        // directory is touched after the newer one exists, which is what a
+        // session does — under an mtime sort it would become account 2.
+        //
+        // Ignored by default because `Metadata::created()` is an `Err` on a
+        // filesystem without btime, where this legitimately falls back to mtime
+        // and the assertion below cannot hold. Same reason as
+        // `shims::claude_config_dir_smoke`: a real property, pinned where the
+        // platform can answer for it.
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
+        let older = accounts::new_id();
+        let newer = accounts::new_id();
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&older))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&newer))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // A session in the older account: its mtime is now the newest of the two.
+        tokio::fs::write(ctx.paths.claude_config_file(&older), "{}")
+            .await
+            .unwrap();
+
+        ClaudeAccounts.apply(&mut ctx).await.unwrap();
+        assert_eq!(ctx.config.claude_accounts, vec![older, newer]);
+    }
+
+    #[tokio::test]
+    async fn an_orphan_that_cannot_be_numbered_is_reported_rather_than_ignored() {
+        // The cap deadlock: `check()` reports the orphan, `apply()` can do
+        // nothing about it, and the engine turns the still-failing re-check into
+        // "it did not take effect" — so every later run aborts here, at a task
+        // that has stopped explaining itself. The developer has to choose, so
+        // apply() says so and names the directory.
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
+        for _ in 0..accounts::MAX {
+            let id = accounts::new_id();
+            tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&id))
+                .await
+                .unwrap();
+            ctx.config.claude_accounts.push(id);
+        }
+        let orphan = accounts::new_id();
+        tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&orphan))
+            .await
+            .unwrap();
+
+        let error = ClaudeAccounts
+            .apply(&mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&orphan), "{error}");
+        assert!(error.contains("riabuild claude delete"), "{error}");
+        assert_eq!(ctx.config.claude_accounts.len(), accounts::MAX);
     }
 
     #[tokio::test]
@@ -376,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn applying_twice_is_safe() {
-        let (mut ctx, _home) = ctx_with(signed_in()).await;
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
         let first = ctx.config.claude_accounts.clone();
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
@@ -387,7 +668,7 @@ mod tests {
     async fn an_abandoned_sign_in_is_not_treated_as_success() {
         // Claude Code exits non-zero when the browser is closed. A task that
         // ignored that would report a machine that is ready and is not.
-        let (mut ctx, _home) = ctx_with(
+        let (mut ctx, _home) = ctx_with_claude(
             installed()
                 .with(STATUS, 1, r#"{"loggedIn":false}"#, "")
                 .with("claude auth login", 1, "", ""),
@@ -402,8 +683,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sign_in_state_riabuild_cannot_read_does_not_open_a_browser() {
+        // `installed()` alone leaves `auth status --json` unstubbed, so the
+        // answer will not parse. Treating that as a sign-out would open a
+        // browser on every single run of a machine riabuild cannot read.
+        let (mut ctx, _home) = ctx_with_claude(FakeRunner::new()).await;
+        let runner = Arc::new(installed());
+        ctx.runner = runner.clone();
+
+        let error = ClaudeAccounts
+            .apply(&mut ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reading whether your Claude Code account is signed in"),
+            "{error}"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("auth login")),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    #[tokio::test]
     async fn a_signed_in_account_is_never_sent_through_a_browser() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let (mut ctx, _home) = ctx_with_claude(FakeRunner::new()).await;
         let runner = Arc::new(signed_in());
         ctx.runner = runner.clone();
         ClaudeAccounts.apply(&mut ctx).await.unwrap();
