@@ -95,7 +95,9 @@ src/
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
   scope.rs     laptop vs. server, from gh_session.rs  server-only GitHub config dir,
-               RIABUILD_REMOTE                        lives only as long as a session
+               RIABUILD_REMOTE, and the               lives only as long as a session
+               namespace it implies: member
+               id, server session token file
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
   remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key

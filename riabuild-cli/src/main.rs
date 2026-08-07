@@ -77,7 +77,7 @@ async fn run(cli: Cli) -> Result<i32> {
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     // A server has no keyring an SSH session can unlock, so its own session
     // lives in a file in its namespace instead — see `scope.rs`.
-    let session_token_file = server_session_token_file(&scope, paths.as_ref())?;
+    let session_token_file = scope.server_session_token_file(paths.as_ref())?;
     let keychain: Arc<dyn keychain::Keychain> =
         Arc::from(keychain::for_platform(runner.clone(), session_token_file));
 
@@ -102,7 +102,7 @@ async fn run(cli: Cli) -> Result<i32> {
             std::env::var("TMPDIR").ok().as_deref(),
         )
         .await?;
-        let member_id = member_id_from_root(paths.as_ref())?;
+        let member_id = scope::member_id_from_root(paths.as_ref())?;
         if holds_gh_session_marker(&cli) {
             let session =
                 gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?;
@@ -162,72 +162,6 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 
     code
-}
-
-/// The member id this root is namespaced under — and, by being `Ok` at all,
-/// the single source of truth for "this riabuild is running inside a server
-/// namespace", read off the path that *is* the namespace rather than off a
-/// separate variable that would have to agree with it (R14's lesson).
-///
-/// Only the `<home>/.riabuild-remote/<member-id>` shape `remote::env_prefix`
-/// sets `RIABUILD_ROOT` to qualifies, and never with an empty id:
-/// `gh_session::open`/`attach` join the id verbatim onto `riabuild-gh-`, so an
-/// empty one would collide every developer on a shared server onto one runtime
-/// directory — and onto each other's GitHub credential.
-fn member_id_from_root(paths: &dyn Paths) -> Result<String> {
-    let root = paths.root();
-    root.parent()
-        .and_then(std::path::Path::file_name)
-        .filter(|parent| *parent == ".riabuild-remote")
-        .and_then(|_| root.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            Failure::new(
-                "working out which developer this server session belongs to",
-                "This is a bug in riabuild — send your team lead the value of RIABUILD_ROOT on that server.",
-            )
-            .into()
-        })
-}
-
-/// Where a *server* keeps its own riabuild session; `None` on a laptop, where
-/// the platform keychain holds it.
-///
-/// The two facts that make a riabuild "a server" — `RIABUILD_REMOTE` naming
-/// one, and `RIABUILD_ROOT` pointing into `.riabuild-remote/<member-id>` — are
-/// set together by `remote::env_prefix` and mean nothing apart. Choosing off
-/// the variable alone is what let `RIABUILD_REMOTE=x riabuild login` on a
-/// laptop write a bearer token in cleartext to `~/.riabuild/session.token` —
-/// the exact path `riabuild-cli/CLAUDE.md`'s invariant forbids — while
-/// `describe()` called it "this server's riabuild namespace". So the
-/// file-backed store is derived from the namespace, the fact that is actually
-/// load-bearing, and a scope contradicting it is refused rather than quietly
-/// resolved either way.
-fn server_session_token_file(
-    scope: &scope::Scope,
-    paths: &dyn Paths,
-) -> Result<Option<std::path::PathBuf>> {
-    match (member_id_from_root(paths).is_ok(), scope.is_remote()) {
-        (true, true) => Ok(Some(paths.session_token_file())),
-        (false, false) => Ok(None),
-        (namespaced, _) => Err(Failure::new(
-            "working out whether this riabuild is running on a managed server",
-            "Run `riabuild remote <server>` from your laptop again — it sets RIABUILD_ROOT and \
-             RIABUILD_REMOTE together, and only one of them arrived here.",
-        )
-        .detail(format!(
-            "RIABUILD_ROOT={:?} {} a server namespace, but RIABUILD_REMOTE {}",
-            paths.root(),
-            if namespaced { "is" } else { "is not" },
-            if namespaced {
-                "is not set"
-            } else {
-                "names one"
-            },
-        ))
-        .into()),
-    }
 }
 
 /// Whether this invocation goes on to hold the interactive environment shell
@@ -302,9 +236,11 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
                 std::env::var("TMPDIR").ok().as_deref(),
             )
             .await?;
-            let dir =
-                gh_session::GhSession::attach(&runtime, &member_id_from_root(ctx.paths.as_ref())?)
-                    .await?;
+            let dir = gh_session::GhSession::attach(
+                &runtime,
+                &scope::member_id_from_root(ctx.paths.as_ref())?,
+            )
+            .await?;
             gh_session::sweep(&dir, ctx.runner.clone(), config::now_secs()).await?;
             return Ok(0);
         }
@@ -317,27 +253,40 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             use tokio::io::AsyncReadExt;
             let mut token = String::new();
             tokio::io::stdin().read_to_string(&mut token).await?;
-            // `gh` writes its own `hosts.yml`, with its own permissions, into
-            // the `GH_CONFIG_DIR` the scoped runner supplies — riabuild never
-            // hand-writes that file. The token reaches `gh` only on stdin,
-            // never in argv (`ps` is world-readable) and never logged.
-            let output = ctx
-                .runner
-                .run(
-                    "gh",
-                    &["auth", "login", "--with-token"],
-                    &RunOptions {
-                        stdin: Some(token.trim().as_bytes().to_vec()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            return Ok(if output.ok() { 0 } else { 1 });
+            return accept_github_token(ctx, &token).await;
         }
         Some(Command::Status) | None => {}
     }
 
     provision(ctx, cli).await
+}
+
+/// The server half of `remote::seed::seed_github`: hands the GitHub token the
+/// laptop piped over SSH on to `gh`, again on stdin.
+///
+/// The token reaches `gh` only on stdin — never in argv, because `ps` is
+/// world-readable and on a shared server it shows every other developer's
+/// command lines — and is never logged. `gh` writes its own `hosts.yml`, with
+/// its own permissions, into the `GH_CONFIG_DIR` the scoped runner supplies;
+/// riabuild never hand-writes that file.
+///
+/// Taking the token as an argument rather than reading stdin itself is what
+/// makes that guarantee assertable: the caller above reads the *process's*
+/// stdin, which under `cargo test` is the terminal, so a test driving the
+/// subcommand end to end would block on EOF instead of asserting anything.
+async fn accept_github_token(ctx: &Ctx, token: &str) -> Result<i32> {
+    let output = ctx
+        .runner
+        .run(
+            "gh",
+            &["auth", "login", "--with-token"],
+            &RunOptions {
+                stdin: Some(token.trim().as_bytes().to_vec()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(if output.ok() { 0 } else { 1 })
 }
 
 /// Remembers `--project`, unless the path names a directory on a *server*.
@@ -596,9 +545,15 @@ mod tests {
     /// `Ctx`'s `Paths` point at, so a test that writes anything (`config.save`)
     /// needs it alive for the duration.
     fn ctx_for(scope: &scope::Scope) -> (Ctx, TempDir) {
+        ctx_with_runner(scope, Arc::new(FakeRunner::new()))
+    }
+
+    /// `ctx_for` with the caller keeping its own handle on the `FakeRunner`,
+    /// for tests that assert on what was run rather than only on the result.
+    fn ctx_with_runner(scope: &scope::Scope, fake: Arc<FakeRunner>) -> (Ctx, TempDir) {
         let home = TempDir::new().expect("tempdir");
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
-        let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
+        let runner: Arc<dyn CommandRunner> = fake;
         let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
         let ctx = build_ctx(
             scope,
@@ -682,71 +637,53 @@ mod tests {
         assert!(ctx.paths.config_file().exists());
     }
 
-    #[test]
-    fn member_id_comes_from_the_roots_last_component() {
-        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
-        assert_eq!(member_id_from_root(&paths).expect("id"), "550e8400");
-    }
+    #[tokio::test]
+    async fn the_github_token_reaches_gh_on_stdin_and_never_in_argv() {
+        // On a shared server `ps` shows every developer's command lines, so a
+        // token in argv is a token handed to everyone logged in. Both halves
+        // are asserted deliberately: dropping `stdin:` from the call site
+        // leaves argv clean, so an argv-only test stays green while `gh` is
+        // handed an empty pipe; passing the token as an extra argument as well
+        // would leave stdin correct, so a stdin-only test stays green while
+        // `ps` leaks it.
+        let fake = Arc::new(FakeRunner::new().with("gh auth login --with-token", 0, "", ""));
+        let (ctx, _home) = ctx_with_runner(&scope::Scope::read(Some("build-01")), fake.clone());
 
-    #[test]
-    fn a_server_writes_its_session_to_a_file_only_inside_a_real_namespace() {
-        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
+        let token = "gho_averysecretgithubtoken";
         assert_eq!(
-            server_session_token_file(&scope::Scope::read(Some("build-01")), &paths)
-                .expect("the sanctioned combination"),
-            Some(paths.session_token_file())
+            accept_github_token(&ctx, &format!("{token}\n"))
+                .await
+                .expect("gh runs"),
+            0
         );
-    }
 
-    #[test]
-    fn a_laptop_never_reaches_the_file_backed_keychain() {
-        let paths = RealPaths::rooted_at("/Users/ada");
         assert_eq!(
-            server_session_token_file(&scope::Scope::read(None), &paths).expect("a laptop"),
-            None
+            fake.stdin_text_of("gh auth login").as_deref(),
+            Some(token),
+            "the token must arrive on stdin, trailing newline trimmed"
         );
+        for call in fake.calls() {
+            assert!(
+                !call.contains(token),
+                "the token must not appear in any argument list: {call}"
+            );
+        }
+        assert_eq!(fake.calls(), vec!["gh auth login --with-token".to_string()]);
     }
 
-    #[test]
-    fn a_remote_scope_over_a_laptop_root_is_refused_not_written_to() {
-        // The whole of S2: `RIABUILD_REMOTE=x riabuild login` with no
-        // `RIABUILD_ROOT` used to write the session token in cleartext to
-        // `~/.riabuild/session.token` — the path CLAUDE.md's invariant
-        // forbids — because "server" was one environment variable rather
-        // than a namespace. Any process running as the developer could flip
-        // keychain-backed storage into a plaintext file read.
-        let paths = RealPaths::rooted_at("/Users/ada");
-        let error = server_session_token_file(&scope::Scope::read(Some("build-01")), &paths)
-            .expect_err("a laptop root is not a server namespace");
-        let failure = error
-            .downcast_ref::<Failure>()
-            .expect("must be the actionable Failure: {error}");
-        assert!(
-            failure.detail.contains("RIABUILD_ROOT"),
-            "{}",
-            failure.detail
-        );
-    }
-
-    #[test]
-    fn a_namespaced_root_without_a_remote_scope_is_refused_too() {
-        // The mirror image, refused for the same reason: the two facts are
-        // set together by `remote::env_prefix`, so one without the other is a
-        // machine riabuild cannot describe honestly either way.
-        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
-        assert!(server_session_token_file(&scope::Scope::read(None), &paths).is_err());
-    }
-
-    #[test]
-    fn a_root_with_no_final_component_is_a_failure_not_an_empty_id() {
-        // An empty member id is what would make every developer on a shared
-        // server collide onto one runtime directory (and each other's
-        // GitHub credential) — this must hard-error, never fall back.
-        let paths = RealPaths::with_root("/", "/");
-        let error = member_id_from_root(&paths).expect_err("no component to read");
-        assert!(
-            error.downcast_ref::<Failure>().is_some(),
-            "must be the actionable Failure, not a generic error: {error}"
+    #[tokio::test]
+    async fn a_gh_that_rejects_the_token_is_a_nonzero_exit() {
+        // The failure has to travel back over SSH as an exit code — a seeding
+        // run that reported success while `gh` refused the token would leave
+        // the shell hop to discover it, with no credential and no explanation.
+        let fake =
+            Arc::new(FakeRunner::new().with("gh auth login --with-token", 1, "", "bad token"));
+        let (ctx, _home) = ctx_with_runner(&scope::Scope::read(Some("build-01")), fake);
+        assert_eq!(
+            accept_github_token(&ctx, "gho_expired")
+                .await
+                .expect("gh runs"),
+            1
         );
     }
 

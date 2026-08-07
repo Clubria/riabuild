@@ -6,10 +6,17 @@
 //! (`~/.riabuild/ssh-identities/<hash>`). The `store` submodule persists what
 //! has already been set up, in `remotes.json`. Later tasks add provisioning
 //! and the shell handoff on top of this.
+//!
+//! The two key questions are two submodules on purpose, and neither reaches
+//! into the other's answer: `identity` owns the key that proves who *we* are
+//! to a server, `host_key` owns the key that proves who the *server* is to
+//! us. Confusing the second for the first is how a developer gets phished by
+//! a box that isn't theirs.
 
 pub mod authorise;
 pub mod flow;
 pub mod forget;
+pub mod host_key;
 pub mod identity;
 pub mod install;
 pub mod seed;
@@ -182,14 +189,25 @@ pub async fn ssh_once(
     runner.run("ssh", &refs, &RunOptions::default()).await
 }
 
-/// The server's own home directory, asked for once and kept in
-/// `remotes.json` from then on.
+/// The server's own home directory, asked for once and cached on the store
+/// entry from then on.
 ///
 /// Everything downstream of this uses the absolute string it returns,
 /// never `~`: a `~` is only a home directory to a shell willing to expand
 /// it, mosh runs commands with no shell at all, and an unexpanded `~` that
 /// reached `paths::root_for` would be refused outright rather than
 /// silently collapsing every developer on the box into one namespace.
+///
+/// **Caches in memory; never writes `remotes.json` itself.** This is the one
+/// step `riabuild remote --check` runs that reaches the server, and a
+/// `store.save` here made a read-only probe persist a full record — name,
+/// host, port, user — for a machine the developer had only asked riabuild to
+/// look at, which then read back from `riabuild remote list` as a server they
+/// had set up. Persisting is left to the callers that mean it:
+/// `session::ensure` when it mints a session, and `store::remember` when a
+/// connect succeeds. The cost is that a run dying between here and either of
+/// those re-asks `$HOME` next time — one `printf` over an SSH connection that
+/// is being opened anyway.
 pub async fn resolve_home(
     remote: &Remote,
     paths: &dyn Paths,
@@ -216,7 +234,6 @@ pub async fn resolve_home(
     if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
         record.home = home.clone();
     }
-    store.save(paths).await?;
     Ok(home)
 }
 
@@ -483,7 +500,15 @@ mod tests {
                 .filter(|call| call.contains("printf"))
                 .count(),
             1,
-            "the second call must come from remotes.json"
+            "the second call must come from the record, not the server"
+        );
+        // Cached on the record, not written out: this is the only step
+        // `riabuild remote --check` runs that reaches the server, and a save
+        // here persisted a full record for a machine that had only been
+        // probed. `session::ensure` and `store::remember` are what mean it.
+        assert!(
+            !paths.remotes_file().exists(),
+            "resolving a home must not write remotes.json"
         );
     }
 

@@ -28,7 +28,7 @@
 #    builds macOS only). Until one ships, the run cannot get past the
 #    install step.
 #
-# Because of (2) the six isolation assertions at the bottom DO NOT RUN yet.
+# Because of (2) the five isolation assertions at the bottom DO NOT RUN yet.
 # This script does not paper over that: it asserts positively, against the
 # container and this laptop's own filesystem, that the stages it claims to
 # cover actually happened — a key pair on the laptop, a host key pinned, a
@@ -39,7 +39,7 @@
 # hang as a success.
 #
 # WHAT A LINUX/MUSL CHECKSUM ALONE WILL NOT UNBLOCK. An earlier version of
-# this comment claimed the six assertions would start running the moment
+# this comment claimed the five assertions would start running the moment
 # that asset shipped, with no edit needed here. That is false, and saying so
 # is the point of this paragraph — the next step after the install is
 # `session::ensure`, and it needs three things this setup does not have:
@@ -174,7 +174,7 @@ if [ -z "$ready" ]; then
 fi
 
 # The fingerprint answers `--accept-host-key`'s prompt without weakening it:
-# a mismatch still fails identity::trust_host outright.
+# a mismatch still fails host_key::trust_host outright.
 fingerprint="$(ssh-keyscan -p "$CONTAINER_PORT" -t ed25519 localhost 2>/dev/null \
   | ssh-keygen -lf - | awk '{print $2}')"
 if [ -z "$fingerprint" ]; then
@@ -304,7 +304,7 @@ assert_reached_the_server() {
   # `<root>` is `$HOME/.riabuild`, because `run_as` sets no RIABUILD_ROOT.
   ls "$work/laptop-ada/.riabuild/ssh-identities/"*.pub >/dev/null 2>&1 \
     || failed="$failed\n  - no SSH key pair was generated on the laptop"
-  # The container's host key, pinned (identity::trust_host) — in riabuild's
+  # The container's host key, pinned (host_key::trust_host) — in riabuild's
   # own known_hosts, never the developer's `~/.ssh/known_hosts`. That is
   # deliberate (`ssh_options` passes `-F /dev/null` and points
   # `UserKnownHostsFile` at `<root>/ssh/known_hosts`) and identity.rs has a
@@ -337,7 +337,7 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "# the container's host key was pinned, and riabuild's key was"
   echo "# authorised on the container. Those stages ran for real."
   echo "#"
-  echo "# The six isolation assertions this test names were NOT run:"
+  echo "# The five isolation assertions this test names were NOT run:"
   echo "# they need an installed server binary, which does not exist"
   echo "# yet. This is expected until a Linux/musl release ships."
   echo "############################################################"
@@ -365,9 +365,30 @@ in_container "grep -q 'bob@' ~/.riabuild-remote/$MEMBER_B/gitconfig"
 test "$(in_container 'ls ~/.riabuild/node | wc -l')" -eq 1
 # 4. checkouts grouped by developer, not shared
 in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
-# 5. gh configuration is isolated while a session is live…
-in_container "test -d \"\${XDG_RUNTIME_DIR:-/tmp}/riabuild-gh-$MEMBER_A\"" || true
-# 6. …and nothing is left once both sessions have ended
+# 5. no gh configuration outlives the sessions that created it
+#
+# There were six assertions here. The missing one claimed to check that gh
+# config is isolated *while a session is live*, by testing that
+# `$XDG_RUNTIME_DIR/riabuild-gh-$MEMBER_A` exists — and it ended in
+# `|| true`, so it could not fail.
+#
+# The `|| true` was not laziness, and deleting it alone would have been
+# wrong: that assertion directly contradicts this one. Both run here, after
+# both `run_as` calls have returned, so after every session is already dead.
+# One demanded the directory be present; the next demands it be gone. On a
+# correct implementation the pair cannot both hold, so the only way to keep
+# them together was to disarm one of them — which quietly turned "six
+# assertions" into five and a decoration, printed under a banner that says
+# they all passed.
+#
+# Live-session isolation is not observable from out here at all: riabuild
+# creates the runtime directory and reaps it before the process this script
+# waits on exits, so there is no moment in between for a shell to look. It
+# is covered where it can be, by tests that hold a `GhSession` open and
+# assert against it directly:
+# `gh_session.rs::opening_a_session_makes_a_private_directory_and_a_marker`
+# and `::two_sessions_share_one_sign_in_and_the_last_one_out_wipes_it`.
+# This file asserts the half a black box really can see: nothing survives.
 test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
 
-echo "remote mode e2e: all assertions passed"
+echo "remote mode e2e: all five isolation assertions passed"

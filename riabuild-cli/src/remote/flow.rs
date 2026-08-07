@@ -7,7 +7,7 @@
 //! further along in `forget.rs`, split out of this file for the same reason
 //! and by the same precedent.
 
-use super::{Remote, forget, shell, ssh_once, store};
+use super::{Remote, forget, host_key, shell, ssh_once, store};
 use super::{authorise, env_command, env_prefix, identity, install, resolve_home, seed, session};
 use crate::cli::{Cli, Command, RemoteAction};
 use crate::paths::Paths;
@@ -117,7 +117,7 @@ async fn connect_and_setup(
     // every test that does not check for it, and silently reduces
     // `trust_host` to the interactive prompt, which errors out with no TTY
     // to show one on (an unattended CI or container run, in particular).
-    identity::trust_host(
+    host_key::trust_host(
         &remote,
         ctx.paths.as_ref(),
         ctx.runner.clone(),
@@ -478,7 +478,7 @@ mod tests {
         );
         let failure = error
             .downcast_ref::<Failure>()
-            .expect("must be the actionable Failure identity::trust_host raises");
+            .expect("must be the actionable Failure host_key::trust_host raises");
         assert!(
             failure.detail.contains("expected") && failure.detail.contains("offered"),
             "{}",
@@ -512,7 +512,7 @@ mod tests {
                 .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""),
         );
 
-        identity::trust_host(
+        host_key::trust_host(
             &remote(),
             &paths,
             fake,
@@ -675,8 +675,7 @@ mod tests {
             !calls.iter().any(|call| call.starts_with("ssh-copy-id")),
             "--check must never write into the server's authorized_keys: {calls:?}"
         );
-        // …and it stopped before asking the server anything at all, so
-        // `resolve_home`'s `store.save` never wrote `remotes.json` either.
+        // …and it stopped before asking the server anything at all.
         assert!(
             !calls.iter().any(|call| call.contains("printf %s")),
             "nothing should have been run on the server: {calls:?}"
@@ -688,6 +687,80 @@ mod tests {
         assert_eq!(
             result.expect("not being authorised yet is a check result, not an error"),
             0
+        );
+    }
+
+    /// The other half of "`--check` writes nothing": the server riabuild's
+    /// key *already* works on, which is the one `--check` path that runs past
+    /// the `can_sign_in` probe and reaches `resolve_home`.
+    ///
+    /// `check_against_a_new_server_never_runs_ssh_copy_id` asserts an empty
+    /// `remotes.json` too, but it gets there for free — that run stops at the
+    /// probe, before any command reaches the server. This one does not stop:
+    /// it asks the server for `$HOME`, and `resolve_home` used to follow that
+    /// answer with a `store.save`, persisting a record — name, host, port,
+    /// user — for a machine the developer had only asked riabuild to *look*
+    /// at. It then showed up in `riabuild remote list` as a server they had
+    /// set up, and `remote forget` was the only way to take it back out.
+    #[tokio::test]
+    async fn check_never_persists_a_server_it_only_probed() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // riabuild's key already works here, so `--check` runs on past
+            // the probe instead of stopping at it.
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "")
+            .containing("printf %s", 0, "/home/dev", "");
+        let (mut ctx, _home, fake) = crate::testing::ctx_and_runner(fake).await;
+        ctx.member = Some(member());
+        // Empty, unlike every other fixture here: a server named as a spec
+        // rather than a saved label is what `store::choose` adds a record
+        // for, and an added record is what there is to wrongly persist.
+        let mut store = store::Store::default();
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "--check",
+            "remote",
+            "ada@build-01.fly.dev",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        // `uname -sm` answers nothing a Rust target can be derived from, so
+        // this ends inside `install::ensure_riabuild` — well past
+        // `resolve_home`, which is the step under test.
+        let _ = connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("ada@build-01.fly.dev".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await;
+
+        // The round trip really happened — otherwise this passes for the same
+        // free reason the probe-stopped test does, and would keep passing if
+        // the save came back.
+        assert!(
+            fake.calls().iter().any(|call| call.contains("printf %s")),
+            "this test is only meaningful if the run got as far as asking the \
+             server anything: {:?}",
+            fake.calls()
+        );
+        assert!(
+            !ctx.paths.remotes_file().exists(),
+            "--check must leave no record of a server it only probed"
         );
     }
 

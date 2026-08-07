@@ -103,7 +103,7 @@ pub enum InternalAction {
     GhSweep,
 }
 
-/// `identity::fingerprint_of` (Task 15) only ever extracts a token starting
+/// `host_key::fingerprint_of` (Task 15) only ever extracts a token starting
 /// with `SHA256:` out of `ssh-keygen -lf` output, so a value lacking that
 /// prefix can never match one — rejecting it here loses nothing that would
 /// otherwise have succeeded. Letting it through instead would surface as
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn accept_host_key_feeds_the_flag_verbatim() {
         // Beyond the `SHA256:` prefix, no further shape validation:
-        // `identity::trust_host` (Task 15) does an exact string comparison
+        // `host_key::trust_host` (Task 15) does an exact string comparison
         // against what `ssh-keyscan` offers, so the CLI layer's job is only
         // to carry the developer's text through unmodified from there.
         let cli = Cli::parse_from([

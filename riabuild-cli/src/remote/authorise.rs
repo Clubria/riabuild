@@ -40,7 +40,8 @@
 //! to paste by hand instead.
 
 use super::Remote;
-use super::identity::{entry_host, key_path, ssh_options};
+use super::host_key::entry_host;
+use super::identity::{key_path, ssh_options};
 use crate::paths::Paths;
 use crate::runner::{CommandRunner, RunOptions};
 use crate::ui::{Failure, Ui};
