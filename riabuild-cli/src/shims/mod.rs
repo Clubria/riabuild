@@ -15,8 +15,10 @@
 //!
 //! `CLAUDE_CONFIG_DIR` is present in the Claude Code binary (verified against
 //! 2.1.221) but is **not** in the public settings documentation. Undocumented
-//! means unpromised, so `claude_config_dir_smoke` below pins the behaviour: an
-//! upstream change should surface as a test failure, not as broken laptops.
+//! means unpromised, so the four `#[ignore]`d smoke tests at the end of this
+//! file pin it and the three behaviours built on it: an upstream change should
+//! surface as a test failure, not as broken laptops. They need a real Claude Code
+//! install, so run them with `cargo test -- --ignored` before every version bump.
 
 use crate::archive::make_executable;
 use crate::tasks::Ctx;
@@ -401,5 +403,115 @@ mod tests {
             profile.read_dir().unwrap().next().is_some() || profile.exists(),
             "CLAUDE_CONFIG_DIR was ignored"
         );
+    }
+
+    /// Pins the behaviour every account depends on: `CLAUDE_CONFIG_DIR` scopes
+    /// the *login*, not just the settings. If this stops holding, two accounts
+    /// share one sign-in and the whole feature is a lie.
+    ///
+    /// Deliberately `#[ignore]`d rather than deleted: it is a record of an
+    /// undocumented upstream property, and it needs a real Claude Code install
+    /// to say anything at all. Run it by hand before every version bump.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code install; records the per-config-directory login scoping this feature rests on"]
+    async fn auth_status_is_scoped_to_the_config_dir() {
+        use crate::runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let fresh = home.path().join("fresh");
+        tokio::fs::create_dir_all(&fresh).await.unwrap();
+
+        let output = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions {
+                    env: vec![(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        fresh.to_string_lossy().into_owned(),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("claude auth status");
+
+        assert!(
+            output.stdout.contains(r#""loggedIn": false"#)
+                || output.stdout.contains(r#""loggedIn":false"#),
+            "a fresh config dir reported a sign-in: {output:?}"
+        );
+    }
+
+    /// Pins the JSON key the account box reads. `status::ask` takes the email out
+    /// of `auth status --json`, and a rename upstream would turn every signed-in
+    /// account into `Unknown` — a box that says riabuild cannot tell, on a machine
+    /// where nothing is wrong.
+    ///
+    /// Deliberately `#[ignore]`d: it asserts against the developer's own sign-in,
+    /// which only a real machine has.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code install and a signed-in developer; records the `email` key the account box reads"]
+    async fn auth_status_reports_an_email_field() {
+        use crate::runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let mine = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude auth status");
+
+        assert!(
+            mine.stdout.contains("email"),
+            "the developer's own sign-in reported no email field: {mine:?}"
+        );
+    }
+
+    /// Every launcher passes `--settings` unconditionally, so `claude-2 auth
+    /// login` — which the account box tells developers to run — depends on a
+    /// global flag being accepted ahead of a subcommand.
+    ///
+    /// Deliberately `#[ignore]`d: only a real `claude` can say whether its
+    /// argument parser still allows this, and the shims are generated on the
+    /// assumption that it does.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code install; records that --settings is accepted ahead of a subcommand, which every launcher assumes"]
+    async fn settings_flag_survives_a_subcommand() {
+        use crate::runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        tokio::fs::write(&settings, "{}").await.unwrap();
+
+        let output = runner
+            .run(
+                "claude",
+                &[
+                    "--settings",
+                    &settings.to_string_lossy(),
+                    "auth",
+                    "status",
+                    "--json",
+                ],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude --settings auth status");
+        assert!(output.stdout.contains("loggedIn"), "{output:?}");
     }
 }
