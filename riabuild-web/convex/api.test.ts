@@ -89,71 +89,27 @@ describe("member ids", () => {
     expect(member?.memberId).toMatch(UUID);
   });
 
-  // These two go away in Task 2, when the field becomes required — see the
-  // note there. They cover the one production deploy the mutation exists for.
-  test("the backfill fills only the rows that are missing one", async () => {
+  // The backfill's own idempotency tests (which inserted a member row with no
+  // `memberId`) were deleted in Task 2, when the schema field became
+  // required: `convex-test` now rejects that fixture outright, and a row
+  // without the field was its entire subject. `backfillMemberIds` is covered
+  // by its one production deploy's returned count instead — see the comment
+  // on the mutation in members.ts.
+});
+
+describe("member payloads", () => {
+  test("every member payload carries the member id", async () => {
     const t = setup();
-    const withId = await seedMember(t);
-    const withoutId = await t.run(async (ctx) => {
-      const userId = await ctx.db.insert("users", { name: "Bob", email: "bob@clubria.dev" });
-      return await ctx.db.insert("members", {
-        userId,
-        githubLogin: "bob",
-        githubId: "5678",
-        firstName: "Bob",
-        lastName: "Stone",
-        email: "bob@clubria.dev",
-        role: "developer" as const,
-        status: "active" as const,
-      });
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
+
+    const response = await t.fetch("/api/v1/me", {
+      headers: bearer(token),
     });
+    const body = await response.json();
 
-    const before = await t.run(async (ctx) => (await ctx.db.get("members", withId.rowId))?.memberId);
-    const filled = await t.mutation(internal.members.backfillMemberIds, {});
-
-    expect(filled).toBe(1);
-    const after = await t.run(async (ctx) => ({
-      untouched: (await ctx.db.get("members", withId.rowId))?.memberId,
-      filled: (await ctx.db.get("members", withoutId))?.memberId,
-    }));
-    expect(after.untouched).toBe(before);
-    expect(after.filled).toBeTruthy();
-  });
-
-  test("running the backfill twice changes nothing the second time", async () => {
-    const t = setup();
-    // A row missing a memberId, same shape as the sibling test above — a
-    // table with nothing to fill would return 0 on both runs for a reason
-    // that has nothing to do with idempotency.
-    const withoutId = await t.run(async (ctx) => {
-      const userId = await ctx.db.insert("users", { name: "Bob", email: "bob@clubria.dev" });
-      return await ctx.db.insert("members", {
-        userId,
-        githubLogin: "bob",
-        githubId: "5678",
-        firstName: "Bob",
-        lastName: "Stone",
-        email: "bob@clubria.dev",
-        role: "developer" as const,
-        status: "active" as const,
-      });
-    });
-
-    const firstRun = await t.mutation(internal.members.backfillMemberIds, {});
-    expect(firstRun).toBe(1);
-    const mintedId = await t.run(
-      async (ctx) => (await ctx.db.get("members", withoutId))?.memberId,
-    );
-    expect(mintedId).toBeTruthy();
-
-    const secondRun = await t.mutation(internal.members.backfillMemberIds, {});
-    expect(secondRun).toBe(0);
-    // The part that actually catches double-minting: not just that the
-    // count was 0 the second time, but that the id itself never moved.
-    const idAfterSecondRun = await t.run(
-      async (ctx) => (await ctx.db.get("members", withoutId))?.memberId,
-    );
-    expect(idAfterSecondRun).toBe(mintedId);
+    expect(response.status).toBe(200);
+    expect(body.member.memberId).toMatch(UUID);
   });
 });
 

@@ -6,7 +6,7 @@ import {
 } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
-import { memberView, viewerMember, writeAudit } from "./members";
+import { memberView, toView, viewerMember, writeAudit } from "./members";
 import { createSession } from "./sessions";
 import { randomToken, sha256Hex } from "./lib/crypto";
 
@@ -18,18 +18,7 @@ export const viewerForAuthorize = internalQuery({
   returns: v.union(memberView, v.null()),
   handler: async (ctx) => {
     const member = await viewerMember(ctx);
-    if (member === null) return null;
-    return {
-      _id: member._id,
-      githubLogin: member.githubLogin,
-      githubId: member.githubId,
-      firstName: member.firstName,
-      lastName: member.lastName,
-      email: member.email,
-      role: member.role,
-      status: member.status,
-      joinedAt: member._creationTime,
-    };
+    return member === null ? null : toView(member);
   },
 });
 
@@ -174,17 +163,7 @@ export const redeem = internalMutation({
       status: "ok" as const,
       sessionId,
       expiresAt: session?.expiresAt ?? args.now,
-      member: {
-        _id: member._id,
-        githubLogin: member.githubLogin,
-        githubId: member.githubId,
-        firstName: member.firstName,
-        lastName: member.lastName,
-        email: member.email,
-        role: member.role,
-        status: member.status,
-        joinedAt: member._creationTime,
-      },
+      member: toView(member),
     };
   },
 });

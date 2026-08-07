@@ -15,6 +15,7 @@ auth.addHttpRoutes(http);
 
 type MemberView = {
   _id: Id<"members">;
+  memberId: string;
   githubLogin: string;
   githubId: string;
   firstName: string;
@@ -149,6 +150,7 @@ async function requireOrgMembership(login: string): Promise<void> {
 
 function memberPayload(member: MemberView) {
   return {
+    memberId: member.memberId,
     githubLogin: member.githubLogin,
     githubId: member.githubId,
     firstName: member.firstName,

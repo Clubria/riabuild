@@ -6,7 +6,7 @@ import {
   MutationCtx,
 } from "./_generated/server";
 import { Doc, Id } from "./_generated/dataModel";
-import { memberView, viewerMember, writeAudit } from "./members";
+import { memberView, toView, viewerMember, writeAudit } from "./members";
 
 export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -117,17 +117,7 @@ export const authenticate = internalMutation({
     return {
       status: "ok" as const,
       sessionId: session._id,
-      member: {
-        _id: member._id,
-        githubLogin: member.githubLogin,
-        githubId: member.githubId,
-        firstName: member.firstName,
-        lastName: member.lastName,
-        email: member.email,
-        role: member.role,
-        status: member.status,
-        joinedAt: member._creationTime,
-      },
+      member: toView(member),
     };
   },
 });
