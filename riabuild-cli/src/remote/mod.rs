@@ -7,6 +7,7 @@
 //! has already been set up, in `remotes.json`. Later tasks add provisioning
 //! and the shell handoff on top of this.
 
+pub mod authorise;
 pub mod identity;
 pub mod store;
 
