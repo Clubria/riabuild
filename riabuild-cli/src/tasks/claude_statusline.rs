@@ -143,4 +143,18 @@ mod tests {
         );
         assert!(file.starts_with(ctx.paths.root()), "{}", file.display());
     }
+
+    /// The status line and the prompt answer the same question — *which
+    /// environment is this?* — from a JavaScript asset and a Rust constant that
+    /// nothing but this test connects. Renaming one and not the other leaves a
+    /// developer with two markers for one environment, and every other test
+    /// here still passes.
+    #[test]
+    fn the_status_line_carries_the_same_label_as_the_prompt() {
+        assert!(
+            SCRIPT.contains(crate::shell::PROMPT_LABEL),
+            "the status line has to say `{}`, like the prompt does",
+            crate::shell::PROMPT_LABEL
+        );
+    }
 }
