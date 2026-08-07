@@ -176,9 +176,8 @@ async function decide(
 /**
  * Approve a pending request.
  *
- * A mutation rather than the action the loopback flow needed: with the codes
- * now minted in the HTTP action, nothing on this path wants the action
- * runtime's `crypto`.
+ * A mutation rather than an action: both codes are minted in the HTTP action,
+ * so nothing on this path needs the action runtime's `crypto`.
  */
 export const approve = mutation({
   args: { userCode: v.string() },
@@ -318,10 +317,10 @@ export const redeem = internalMutation({
 /**
  * Deletes dead requests. Scheduled hourly by `crons.ts`.
  *
- * Under the loopback flow, walking away from a login wrote nothing at all — a
- * row appeared only once someone clicked approve. Now every `riabuild login`
- * leaves one whether or not a human ever looks at it, so abandoned rows are the
- * common case rather than the exception.
+ * Every `riabuild login` leaves a row whether or not a human ever looks at it,
+ * so abandoned requests are the common case here rather than the exception —
+ * the endpoint that writes them is unauthenticated and needs no approval to
+ * have been given.
  */
 export const reapExpired = internalMutation({
   args: {},

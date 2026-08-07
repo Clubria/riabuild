@@ -16,8 +16,8 @@ export function route(pathname: string): Route {
   const path = normalise(pathname);
 
   if (path === "/") return { kind: "dashboard" };
-  // `/cli`, not `/cli/authorize`: the old path carried the loopback flow in its
-  // query string, and a developer now types this one off a terminal by hand.
+  // Short because a developer types it by hand, off a terminal that may be on
+  // another machine entirely.
   if (path === "/cli") return { kind: "authorize" };
   if (path === "/__ui" && import.meta.env.DEV) return { kind: "gallery" };
 
