@@ -107,7 +107,37 @@ pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
         ("RIABUILD_SHELL".to_string(), "1".to_string()),
     ];
     env.extend(ctx.env.iter().cloned());
+    if let Some(browser) = browser_for(ctx, &env) {
+        env.push(("BROWSER".to_string(), browser));
+    }
     env
+}
+
+/// `$BROWSER`, but only for a session that has a laptop to open links on.
+///
+/// Claude Code checks `BROWSER` before it checks anything else, and on a
+/// headless server that check is the only thing standing between a login URL
+/// and a terminal browser rendering over the session. Pointing it at the shim
+/// is what makes remote links open on the laptop.
+///
+/// Conditional because the shim has nowhere to send a link without a channel.
+/// A local session opens browsers perfectly well on its own, and exporting this
+/// there would turn a working sign-in into an exit 1 — so the variable appears
+/// exactly where the channel it depends on does.
+fn browser_for(ctx: &Ctx, env: &[(String, String)]) -> Option<String> {
+    let configured = env
+        .iter()
+        .any(|(name, value)| name == crate::channel::SOCKET_ENV && !value.is_empty());
+    if !configured {
+        return None;
+    }
+    Some(
+        ctx.paths
+            .bin_dir()
+            .join(crate::shims::BROWSER_TOOL)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Everything printed when the environment shell starts: the account box, then
@@ -170,6 +200,52 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
+
+    /// A local session opens browsers on its own. Exporting BROWSER there would
+    /// point Claude Code at a shim with nowhere to send the link, turning a
+    /// working sign-in into an exit 1.
+    #[tokio::test]
+    async fn a_session_with_no_channel_gets_no_browser_variable() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let env = environment(&ctx);
+        assert!(!env.iter().any(|(name, _)| name == "BROWSER"), "{env:?}");
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_channel_points_browser_at_the_shim() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.env.push((
+            crate::channel::SOCKET_ENV.to_string(),
+            "/run/user/1000/riabuild/channel.sock".to_string(),
+        ));
+
+        let env = environment(&ctx);
+        let browser = env
+            .iter()
+            .find(|(name, _)| name == "BROWSER")
+            .map(|(_, value)| value.clone())
+            .expect("BROWSER should be set when the channel is");
+
+        assert_eq!(
+            browser,
+            ctx.paths
+                .bin_dir()
+                .join(crate::shims::BROWSER_TOOL)
+                .to_string_lossy()
+        );
+    }
+
+    /// An empty socket variable is not a channel. Treating it as one would set
+    /// BROWSER on a session that cannot open anything.
+    #[tokio::test]
+    async fn an_empty_socket_variable_does_not_count_as_a_channel() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.env
+            .push((crate::channel::SOCKET_ENV.to_string(), String::new()));
+
+        let env = environment(&ctx);
+        assert!(!env.iter().any(|(name, _)| name == "BROWSER"), "{env:?}");
+    }
 
     #[test]
     fn recognises_the_common_shells() {

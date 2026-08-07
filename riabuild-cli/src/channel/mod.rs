@@ -17,6 +17,7 @@ pub mod agent;
 pub mod client;
 pub mod clipboard;
 pub mod mime;
+pub mod opener;
 pub mod protocol;
 pub mod resize;
 pub mod supervisor;
@@ -106,9 +107,17 @@ pub async fn dispatch(action: &ChannelAction, quiet: bool) -> Result<i32> {
                 .into());
             };
 
-            let agent = Arc::new(agent::Agent::new(clipboard::backend(runner, session)));
+            let bin = RealPaths::new()?.bin_dir();
+            let agent = Arc::new(agent::Agent::new(
+                clipboard::backend(runner.clone(), session),
+                Box::new(opener::SystemOpener::new(runner, os, &bin)),
+            ));
             agent.serve(&socket).await?;
             Ok(0)
+        }
+
+        ChannelAction::Open { args } => {
+            Ok(crate::shims::browser::run(args, Some(socket_path())).await)
         }
 
         ChannelAction::Status => {

@@ -36,7 +36,49 @@ pub enum Request {
         mime: String,
         len: usize,
     },
+    /// Open a URL in the laptop's own browser.
+    ///
+    /// The second operation that changes the laptop rather than reporting on
+    /// it, and the first that reaches past the laptop into whatever application
+    /// claims the scheme. `is_openable` is why that is defensible: this variant
+    /// cannot be constructed by `decode_request` for anything but http and
+    /// https.
+    OpenUrl {
+        url: String,
+    },
     ChannelPing,
+}
+
+/// The scheme rule, and the whole security boundary of `browser.open`.
+///
+/// `open(1)` on macOS dispatches by scheme to whichever application registered
+/// it, so `file://`, `vscode://` and `slack://` are not links — they are calls
+/// into a local application with a payload the server chose. The URL that
+/// reaches this operation was picked by a model reading a repository, so
+/// "the server would not send that" is not an assumption available to us.
+///
+/// Checked on the laptop, before the request becomes a `Request` at all. The
+/// server checks too, but only so a mistake produces a local message instead of
+/// a round trip; this copy is the one that decides.
+pub fn is_openable(url: &str) -> bool {
+    let lowered = url.to_ascii_lowercase();
+    let rest = match () {
+        _ if lowered.starts_with("https://") => &url["https://".len()..],
+        _ if lowered.starts_with("http://") => &url["http://".len()..],
+        // Anything else, `javascript:` and `file:` included, is not a link this
+        // channel carries.
+        _ => return false,
+    };
+
+    // A scheme with nothing after it is not a URL, and `xdg-open ""` is an
+    // error rather than a no-op.
+    if rest.is_empty() {
+        return false;
+    }
+
+    // Whitespace and control characters would either break the newline framing
+    // this protocol is built on or arrive at the opener as a second argument.
+    !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +94,12 @@ pub enum Response {
     /// because these two are the only replies with no body and the channel log
     /// is the only place a developer can see which one came back.
     Written,
+    /// A URL reached the laptop's browser.
+    ///
+    /// Carries its own `opened` discriminator on the wire rather than sharing
+    /// the bare `ok`, because `decode_response` reads a header with no other
+    /// field as `Pong` — without it, "opened" would come back as a ping answer.
+    Opened,
     Pong,
     Error {
         code: ErrorCode,
@@ -100,6 +148,7 @@ pub enum ProtocolError {
     UnsupportedVersion(u8),
     MissingField(&'static str),
     TooLarge(usize),
+    UnsupportedScheme(String),
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -124,6 +173,10 @@ impl std::fmt::Display for ProtocolError {
                 f,
                 "the payload is {len} bytes, over the {MAX_PAYLOAD} byte channel limit"
             ),
+            ProtocolError::UnsupportedScheme(url) => write!(
+                f,
+                "the channel opens http and https links only, and `{url}` is neither"
+            ),
         }
     }
 }
@@ -141,6 +194,9 @@ struct RequestLine {
     /// Present only on `clipboard.write`: how many raw bytes follow the line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     len: Option<usize>,
+    /// Present only on `browser.open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 pub fn encode_request(request: &Request) -> String {
@@ -150,24 +206,35 @@ pub fn encode_request(request: &Request) -> String {
             op: "clipboard.targets".into(),
             mime: None,
             len: None,
+            url: None,
         },
         Request::ClipboardRead { mime } => RequestLine {
             v: PROTOCOL_VERSION,
             op: "clipboard.read".into(),
             mime: Some(mime.clone()),
             len: None,
+            url: None,
         },
         Request::ClipboardWrite { mime, len } => RequestLine {
             v: PROTOCOL_VERSION,
             op: "clipboard.write".into(),
             mime: Some(mime.clone()),
             len: Some(*len),
+            url: None,
+        },
+        Request::OpenUrl { url } => RequestLine {
+            v: PROTOCOL_VERSION,
+            op: "browser.open".into(),
+            mime: None,
+            len: None,
+            url: Some(url.clone()),
         },
         Request::ChannelPing => RequestLine {
             v: PROTOCOL_VERSION,
             op: "channel.ping".into(),
             mime: None,
             len: None,
+            url: None,
         },
     };
     // Serialising a struct of owned scalars cannot fail; the fallback keeps the
@@ -206,6 +273,16 @@ pub fn decode_request(line: &str) -> Result<Request, ProtocolError> {
             }
             Ok(Request::ClipboardWrite { mime, len })
         }
+        "browser.open" => {
+            let url = parsed.url.ok_or(ProtocolError::MissingField("url"))?;
+            // Refused here, so no caller downstream is ever handed a `OpenUrl`
+            // holding a scheme the laptop should not dispatch. The check is not
+            // repeated in the agent because it cannot be reached without one.
+            if !is_openable(&url) {
+                return Err(ProtocolError::UnsupportedScheme(url));
+            }
+            Ok(Request::OpenUrl { url })
+        }
         other => Err(ProtocolError::UnknownOp(other.to_string())),
     }
 }
@@ -218,6 +295,8 @@ struct ResponseLine {
     targets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     written: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opened: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     len: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +311,7 @@ pub fn encode_response(response: &Response) -> String {
             ok: true,
             targets: Some(targets.clone()),
             written: None,
+            opened: None,
             len: None,
             code: None,
             message: None,
@@ -240,6 +320,7 @@ pub fn encode_response(response: &Response) -> String {
             ok: true,
             targets: None,
             written: None,
+            opened: None,
             len: Some(*len),
             code: None,
             message: None,
@@ -248,6 +329,16 @@ pub fn encode_response(response: &Response) -> String {
             ok: true,
             targets: None,
             written: Some(true),
+            opened: None,
+            len: None,
+            code: None,
+            message: None,
+        },
+        Response::Opened => ResponseLine {
+            ok: true,
+            targets: None,
+            written: None,
+            opened: Some(true),
             len: None,
             code: None,
             message: None,
@@ -256,6 +347,7 @@ pub fn encode_response(response: &Response) -> String {
             ok: true,
             targets: None,
             written: None,
+            opened: None,
             len: None,
             code: None,
             message: None,
@@ -264,6 +356,7 @@ pub fn encode_response(response: &Response) -> String {
             ok: false,
             targets: None,
             written: None,
+            opened: None,
             len: None,
             code: Some(code.as_str().to_string()),
             message: Some(message.clone()),
@@ -294,6 +387,13 @@ pub fn decode_response(line: &str) -> Result<Response, ProtocolError> {
         return Ok(Response::Written);
     }
 
+    // Before the `len` match below, whose `None` arm is `Pong`: an `Opened`
+    // that fell through to it would come back as a ping answer, and the shim
+    // would report a link opened on a laptop that never saw it.
+    if parsed.opened == Some(true) {
+        return Ok(Response::Opened);
+    }
+
     match parsed.len {
         // Checked here so the cap is enforced before a reader allocates by it.
         Some(len) if len > MAX_PAYLOAD => Err(ProtocolError::TooLarge(len)),
@@ -322,6 +422,91 @@ mod tests {
         assert!(line.contains("\"op\":\"clipboard.read\""), "{line}");
         assert!(line.contains("\"mime\":\"image/png\""), "{line}");
         assert_eq!(decode_request(&line).unwrap(), request);
+    }
+
+    #[test]
+    fn an_open_request_round_trips_its_url() {
+        let request = Request::OpenUrl {
+            url: "https://github.com/login/device".into(),
+        };
+        let line = encode_request(&request);
+        assert!(line.contains("\"op\":\"browser.open\""), "{line}");
+        assert_eq!(decode_request(&line).unwrap(), request);
+    }
+
+    /// The security boundary. `open(1)` dispatches by scheme to whatever
+    /// application claims it, so these are not links — they are calls into a
+    /// local application with a payload the server chose.
+    #[test]
+    fn only_http_and_https_survive_decoding() {
+        for url in [
+            "file:///etc/passwd",
+            "vscode://ms-vscode.remote/x",
+            "javascript:alert(1)",
+            "slack://open?team=T1",
+            "HtTpS:/evil",
+            "ftp://example.com",
+            // A scheme with nothing after it.
+            "https://",
+            // Whitespace would arrive at the opener as a second argument.
+            "https://example.com/a b",
+        ] {
+            assert!(!is_openable(url), "{url} should not be openable");
+
+            let line = format!(
+                "{{\"v\":1,\"op\":\"browser.open\",\"url\":{}}}\n",
+                serde_json::to_string(url).unwrap()
+            );
+            assert!(
+                matches!(
+                    decode_request(&line),
+                    Err(ProtocolError::UnsupportedScheme(_))
+                ),
+                "{url} decoded into a request"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_links_are_openable_whatever_the_case_of_the_scheme() {
+        for url in [
+            "http://example.com",
+            "https://example.com",
+            "HTTPS://EXAMPLE.COM/Path?q=1#frag",
+            "https://localhost:3000/callback?code=abc",
+        ] {
+            assert!(is_openable(url), "{url} should be openable");
+        }
+    }
+
+    /// A control character would break the newline framing the whole protocol
+    /// rests on.
+    #[test]
+    fn a_url_carrying_a_newline_is_refused() {
+        assert!(!is_openable("https://example.com/\nclipboard.read"));
+        assert!(!is_openable("https://example.com/\u{7}"));
+    }
+
+    #[test]
+    fn an_open_request_without_a_url_names_the_missing_field() {
+        let line = "{\"v\":1,\"op\":\"browser.open\"}\n";
+        assert!(matches!(
+            decode_request(line),
+            Err(ProtocolError::MissingField("url"))
+        ));
+    }
+
+    /// `Opened` and `Pong` are both bodiless successes. Without its own
+    /// discriminator `Opened` decodes as `Pong`, and the shim reports a link
+    /// opened on a laptop that never saw it.
+    #[test]
+    fn opened_does_not_come_back_as_a_ping_answer() {
+        let line = encode_response(&Response::Opened);
+        assert_eq!(decode_response(&line).unwrap(), Response::Opened);
+        assert_eq!(
+            decode_response(&encode_response(&Response::Pong)).unwrap(),
+            Response::Pong
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 mod server;
 
 use crate::channel::clipboard::Clipboard;
+use crate::channel::opener::Opener;
 use crate::channel::protocol::{ErrorCode, MAX_PAYLOAD, Request, Response};
 use crate::channel::resize;
 use std::time::{Duration, Instant};
@@ -28,13 +29,15 @@ struct Snapshot {
 
 pub struct Agent {
     clipboard: Box<dyn Clipboard>,
+    opener: Box<dyn Opener>,
     snapshot: Mutex<Option<Snapshot>>,
 }
 
 impl Agent {
-    pub fn new(clipboard: Box<dyn Clipboard>) -> Self {
+    pub fn new(clipboard: Box<dyn Clipboard>, opener: Box<dyn Opener>) -> Self {
         Self {
             clipboard,
+            opener,
             snapshot: Mutex::new(None),
         }
     }
@@ -56,6 +59,34 @@ impl Agent {
             Request::ClipboardTargets => self.targets(now).await,
             Request::ClipboardRead { mime } => self.read(mime, now).await,
             Request::ClipboardWrite { mime, len } => self.write(mime, body, *len).await,
+            Request::OpenUrl { url } => self.open(url).await,
+        }
+    }
+
+    /// Opens a link on the laptop.
+    ///
+    /// No prompt, by decision: `clipboard.read` already hands the server the
+    /// contents of this laptop's clipboard without asking, and a confirmation
+    /// per URL turns a device-code login into a two-machine dance. The log line
+    /// is the audit trail, and it is written *before* the opener runs so a URL
+    /// that hangs a browser is still recorded.
+    ///
+    /// The scheme was settled in `decode_request`; by here the URL is http or
+    /// https and nothing else.
+    async fn open(&self, url: &str) -> (Response, Option<Vec<u8>>) {
+        note(&format!("opening {url}"));
+        match self.opener.open(url).await {
+            Ok(()) => (Response::Opened, None),
+            Err(error) => {
+                note(&format!("could not open {url}: {error:#}"));
+                (
+                    Response::Error {
+                        code: ErrorCode::Unavailable,
+                        message: format!("this laptop could not open the link: {error}"),
+                    },
+                    None,
+                )
+            }
         }
     }
 
@@ -173,6 +204,27 @@ impl Agent {
     }
 }
 
+/// The laptop's record of what the server asked it to do.
+///
+/// Only `browser.open` writes here. Clipboard traffic is high-volume and its
+/// content is the developer's own, so logging it would be both noisy and a
+/// place secrets accumulate; opening a link is rare, consequential, and the
+/// operation the developer agreed to have happen without a prompt. That trade
+/// is the reason there is no confirmation.
+fn note(message: &str) {
+    if let Ok(path) = std::env::var(crate::channel::LOG_ENV) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "agent: {message}");
+        }
+    }
+    eprintln!("riabuild: {message}");
+}
+
 fn internal(error: anyhow::Error) -> Response {
     Response::Error {
         code: ErrorCode::Internal,
@@ -270,14 +322,83 @@ mod tests {
         }
     }
 
+    /// Records what it was asked to open, and fails for one sentinel URL so the
+    /// error path has something to exercise.
+    #[derive(Default)]
+    pub(super) struct FakeOpener {
+        opened: StdMutex<Vec<String>>,
+    }
+
+    impl FakeOpener {
+        fn opened(&self) -> Vec<String> {
+            self.opened.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Opener for Arc<FakeOpener> {
+        async fn open(&self, url: &str) -> Result<()> {
+            if url.contains("unreachable") {
+                anyhow::bail!("no browser answered");
+            }
+            self.opened.lock().expect("lock").push(url.to_string());
+            Ok(())
+        }
+    }
+
     fn agent(clipboard: Arc<FakeClipboard>) -> Agent {
-        Agent::new(Box::new(Handle(clipboard)))
+        agent_with(clipboard, Arc::new(FakeOpener::default()))
+    }
+
+    fn agent_with(clipboard: Arc<FakeClipboard>, opener: Arc<FakeOpener>) -> Agent {
+        Agent::new(Box::new(Handle(clipboard)), Box::new(opener))
     }
 
     /// An agent over a fixed clipboard, for the socket tests in `server`, which
     /// only need something that answers.
     pub(super) fn agent_holding(types: &[&str], bytes: &[u8]) -> Agent {
         agent(FakeClipboard::holding(types, bytes))
+    }
+
+    #[tokio::test]
+    async fn an_open_request_reaches_the_laptops_opener() {
+        let opener = Arc::new(FakeOpener::default());
+        let agent = agent_with(FakeClipboard::holding(&[], b""), opener.clone());
+
+        let request = Request::OpenUrl {
+            url: "https://github.com/login/device".into(),
+        };
+        let (response, body) = agent.handle(&request, None, Instant::now()).await;
+
+        assert_eq!(response, Response::Opened);
+        assert!(body.is_none());
+        assert_eq!(opener.opened(), vec!["https://github.com/login/device"]);
+    }
+
+    /// A laptop that cannot open the link says so rather than reporting
+    /// success: the server's shim exits non-zero off the back of this, which is
+    /// what makes Claude Code print the URL instead of pretending it opened.
+    #[tokio::test]
+    async fn a_laptop_that_cannot_open_the_link_reports_it() {
+        let opener = Arc::new(FakeOpener::default());
+        let agent = agent_with(FakeClipboard::holding(&[], b""), opener.clone());
+
+        let request = Request::OpenUrl {
+            url: "https://unreachable.example.com".into(),
+        };
+        let (response, _) = agent.handle(&request, None, Instant::now()).await;
+
+        assert!(
+            matches!(
+                response,
+                Response::Error {
+                    code: ErrorCode::Unavailable,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        assert!(opener.opened().is_empty());
     }
 
     #[tokio::test]
