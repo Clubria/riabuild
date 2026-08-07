@@ -353,4 +353,52 @@ mod tests {
             assert!(bytes.is_some(), "{target} was advertised but read nothing");
         }
     }
+
+    /// Pins the write half against a real pasteboard.
+    ///
+    /// Ignored by default, and separate from the read smoke test because it is
+    /// destructive: it replaces the pasteboard, so it restores the text that was
+    /// there before rather than leaving a developer's copy consumed by a test.
+    ///
+    /// This is the one path in the backend that cannot be proved by a scripted
+    /// runner. `«data …»` on `osascript -`'s stdin either sets the pasteboard or
+    /// it does not, and only a Mac can say which.
+    #[tokio::test]
+    #[ignore = "requires macOS; replaces and then restores the pasteboard"]
+    async fn macos_pasteboard_write_smoke() {
+        use crate::runner::RealRunner;
+        let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
+        let clipboard = MacOsClipboard::new(runner);
+
+        let restore = clipboard.read(TEXT).await.expect("read the current text");
+
+        clipboard
+            .write(TEXT, "riabuild write smoke".as_bytes())
+            .await
+            .expect("write text");
+        assert_eq!(
+            clipboard.read(TEXT).await.expect("read back"),
+            Some("riabuild write smoke".as_bytes().to_vec())
+        );
+
+        // A one-pixel PNG, to exercise the data-literal path rather than pbcopy.
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        clipboard.write(PNG, &png).await.expect("write png");
+        let read_back = clipboard.read(PNG).await.expect("read the png back");
+        assert_eq!(
+            read_back,
+            Some(png),
+            "the pasteboard did not return the bytes it was given"
+        );
+
+        if let Some(text) = restore {
+            clipboard.write(TEXT, &text).await.expect("restore");
+        }
+    }
 }
