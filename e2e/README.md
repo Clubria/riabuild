@@ -27,6 +27,7 @@ So this covers the seams no unit test reaches:
 | drift | deleting `~/.riabuild/bin/pnpm` repairs the toolchain and nothing else |
 | the shell handoff | real `zsh` and `bash` resolving `node`, `pnpm` and `claude` |
 | `CLAUDE_CONFIG_DIR` | still redirecting Claude Code, which is undocumented and therefore only true while something tests it |
+| Claude Code accounts | `riabuild claude list` on a real machine, and account 1's sign-in state as *real* Claude Code reports it |
 | the Keychain | `security(1)`, on macOS, storing and deleting the session token |
 
 ## What is faked
@@ -44,6 +45,45 @@ The stub returns a loud `501` for any path it does not implement, so an Infisica
 CLI change surfaces as *"the stub does not implement GET /api/v5/…"* rather than
 as an empty `.env.local` and a passing run. It moved from `/api/v3/secrets/raw`
 to `/api/v4/secrets` once already.
+
+## The one step CI cannot finish
+
+`claude auth login` opens a browser and waits for a round trip somebody has to
+complete. A runner has nobody, and the spec makes a signed-in account 1 a
+*blocking* provisioning requirement — so on CI `riabuild` stops there on purpose,
+in a sentence rather than a hang:
+
+```
+riabuild stopped: signing you in to Claude Code
+  ran claude auth login
+  riabuild has no terminal to hand the sign-in to, and will not wait for one
+```
+
+The suite expects that and asserts it precisely: the refusal has to name the step
+and name one action a person can take, and **any other** provisioning failure is
+still fatal. It then asserts everything the run did reach, plus everything the
+sign-in does not gate — `riabuild claude list`, `riabuild env`, the shell handoff,
+`CLAUDE_CONFIG_DIR`, and that account 1 reads as *logged out* rather than *cannot
+tell*. That last one is worth its place: unit tests pin riabuild's parse against
+canned JSON, and only a real machine pins the JSON.
+
+Two things genuinely go uncovered, because a run that stops at the last task never
+reaches the step after it: the generated launchers in `~/.riabuild/bin`, and the
+per-account trust keys. That is the task engine's ordinary fail-fast contract
+rather than anything about accounts — a failed `project` task costs the shell too.
+
+A third, the `applied=[]` idempotency invariant, is substituted rather than lost.
+Its run log is written after the tasks, so an aborted run produces none; `--check`
+completes where a real run cannot and writes the same line, and it must report
+exactly `claude_accounts,claude_trust` outstanding and nothing else. Their reason
+there is *first run*, not *account 1 is not signed in* — `status_for` answers a
+task with no state record without calling `check()` at all — which is why the
+assertion is on the set of task ids and not on the sentence.
+
+None of this is remembered anywhere. Seed a signed-in Claude Code config directory
+under `~/.riabuild/claude/` before the run — `claude_accounts` adopts a directory
+it finds on disk — and provisioning succeeds, `SIGN_IN` becomes `done`, and every
+gated assertion runs in place of its substitute.
 
 ## Test auth
 

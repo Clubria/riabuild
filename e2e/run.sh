@@ -503,12 +503,43 @@ check "the dry run cloned nothing" test ! -d "$DEFAULT_CHECKOUT"
 
 step "riabuild, for real"
 
+# Exactly one provisioning failure is tolerated, and only when it is this one:
+# `claude auth login` opens a browser somebody has to finish, and a CI runner has
+# nobody to finish it. riabuild refusing there is riabuild working — the spec
+# makes a signed-in account 1 a blocking requirement — so what this asserts is
+# that the refusal is *that* refusal, arriving in a sentence rather than as a
+# thirty-minute hang, which is what it used to be.
+#
+# A branch, not a lowered bar, and it re-arms itself: seed a signed-in Claude Code
+# config directory under ~/.riabuild/claude before the run — `claude_accounts`
+# adopts a directory it finds on disk — and provisioning succeeds, SIGN_IN stays
+# `done`, and every gated assertion below runs in place of its substitute with
+# nothing to remember to put back. Each gate says what it is standing in for; the
+# whole arrangement is written up in e2e/README.md.
+SIGN_IN=done
 if ! PROVISION_OUT="$(riabuild --no-shell 2>&1)"; then
-  printf '%s\n' "$PROVISION_OUT" | sed 's/^/         | /' >&2
-  die "riabuild failed to provision the machine."
+  case "$PROVISION_OUT" in
+    *'no terminal to hand the sign-in to'*) SIGN_IN=refused ;;
+    *)
+      printf '%s\n' "$PROVISION_OUT" | sed 's/^/         | /' >&2
+      die "riabuild failed to provision the machine."
+      ;;
+  esac
 fi
 printf '%s\n' "$PROVISION_OUT" | sed 's/^/         | /'
-pass "provisioned"
+
+if [ "$SIGN_IN" = done ]; then
+  pass "provisioned"
+else
+  pass "provisioned as far as a machine with nobody at the keyboard goes"
+  # The refusal has to name the step, and name one thing a person can do. A
+  # provisioner that stops without either is indistinguishable from a crash.
+  check_contains "it stopped at the Claude Code sign-in and named it" \
+    "$PROVISION_OUT" "signing you in to Claude Code"
+  check_contains "and named the one action that finishes it" \
+    "$PROVISION_OUT" 'Run `riabuild` yourself from a terminal'
+  info "no Anthropic credential here, so the sign-in and its dependants are asserted short of done"
+fi
 
 # ---------------------------------------------------------------------------
 # 11. What it did to the machine
@@ -518,8 +549,26 @@ step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
 for task in login github_cli infisical_cli toolchain project repo_status \
-            claude_accounts org_settings claude_trust env_local claude_statusline; do
+            org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
+done
+
+# The two tasks the sign-in gates. `claude_accounts` is only recorded once
+# account 1 is actually signed in, and `claude_trust` depends on it and so never
+# runs at all.
+#
+# Short of the sign-in this asserts their *absence*, which is the more valuable
+# half of the pair: "never record a success we have not verified" is the invariant
+# the whole task engine rests on, and a run that got nine tasks done and stopped
+# at the tenth is precisely the situation in which a provisioner is tempted to
+# round up. A recorded claude_accounts here would mean the next run skipped the
+# sign-in and left the developer with an account they cannot use.
+for task in claude_accounts claude_trust; do
+  if [ "$SIGN_IN" = done ]; then
+    check_contains "task recorded: $task" "$STATE" "\"$task\""
+  else
+    check_missing "not recorded, because the sign-in did not finish: $task" "$STATE" "\"$task\""
+  fi
 done
 
 CONFIG="$(cat "$RIA_HOME/config.json" 2>/dev/null || echo '{}')"
@@ -539,9 +588,19 @@ check_contains "riabuild's Node is the version it pinned" \
   "$("$RIA_HOME/node/$NODE_VERSION/bin/node" -v 2>&1)" "v$NODE_VERSION"
 check_contains "riabuild's pnpm is the version it pinned" \
   "$("$RIA_HOME/bin/pnpm" --version 2>&1)" "$PNPM_VERSION"
-check "the claude launcher is executable" test -x "$RIA_HOME/bin/claude"
-check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude-1"
+# True on every path, and worth asking on every path: nothing in riabuild may
+# create `c` any more, including the code that writes the launchers it replaced.
 check "the retired c launcher is gone" test ! -e "$RIA_HOME/bin/c"
+# Written after the task engine finishes, so a run that stops at the sign-in
+# writes none of them. That is the engine's ordinary fail-fast contract rather
+# than anything specific to accounts — a failed `project` task costs the shell
+# too — so there is nothing here to assert short of a completed run.
+if [ "$SIGN_IN" = done ]; then
+  check "the claude launcher is executable" test -x "$RIA_HOME/bin/claude"
+  check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude-1"
+else
+  info "launchers not checked: the run stopped before the step that writes them"
+fi
 
 check "the checkout is a git repository" test -d "$PROJECT_DIR/.git"
 check_contains "the checkout's origin is the repo the server named" \
@@ -585,24 +644,82 @@ check_missing "the stand-in was never asked for anything it does not implement" 
 
 step "A second run changes nothing"
 
-riabuild --no-shell >/dev/null 2>&1 || fail "the second run did not exit 0"
-SECOND="$(last_run_log)"
-info "$SECOND"
-check_contains "nothing was applied the second time" "$SECOND" "applied=[]"
+# The `applied=[...]` field of the run log, which names task ids rather than the
+# human-facing titles. `--check` writes this log too, and that is what makes it a
+# usable stand-in below: the same field, from a command that completes on a
+# machine where a real run cannot.
+applied_ids() {
+  printf '%s' "$1" | sed -n 's/.*applied=\[\(.*\)\]$/\1/p'
+}
+
+if [ "$SIGN_IN" = done ]; then
+  riabuild --no-shell >/dev/null 2>&1 || fail "the second run did not exit 0"
+  SECOND="$(last_run_log)"
+  info "$SECOND"
+  check_contains "nothing was applied the second time" "$SECOND" "applied=[]"
+else
+  # Same invariant, asked in the one way an unattended machine can answer it.
+  # A real second run stops at the sign-in again and never reaches the code that
+  # writes the run log, so there is no `applied=[]` to read. `--check` runs every
+  # task's status and applies nothing, so it completes — and what it must report
+  # is the two tasks the sign-in blocks and *nothing else*. That is the same
+  # claim `applied=[]` makes, minus the one item this environment cannot supply.
+  #
+  # Their reason is "first run", not "account 1 is not signed in": `status_for`
+  # answers a task with no state record without calling `check()` at all. Which
+  # is why this asserts the set of task ids and not the sentence.
+  if CHECK_AFTER="$(riabuild --check --no-shell 2>&1)"; then
+    pass "a --check after the aborted run still exits 0"
+  else
+    fail "a --check after the aborted run did not exit 0"
+    printf '%s\n' "$CHECK_AFTER" | sed 's/^/         | /' >&2
+  fi
+  AFTER="$(last_run_log)"
+  info "$AFTER"
+  OUTSTANDING="$(applied_ids "$AFTER")"
+  if [ "$OUTSTANDING" = "claude_accounts,claude_trust" ]; then
+    pass "the sign-in and the trust that depends on it are all that is outstanding"
+  else
+    fail "expected only claude_accounts,claude_trust outstanding — got [$OUTSTANDING]"
+  fi
+fi
 
 step "Drift is detected and repaired"
 
 rm -f "$RIA_HOME/bin/pnpm"
-riabuild --no-shell >/dev/null 2>&1 || fail "the repair run did not exit 0"
-REPAIR="$(last_run_log)"
-info "$REPAIR"
-check "pnpm is back" test -x "$RIA_HOME/bin/pnpm"
-check_contains "the toolchain was repaired" "$REPAIR" "toolchain"
-# claude_accounts depends on toolchain, so it re-running is the dependency
-# cascade working. login, github_cli and project depend on nothing that moved.
-for untouched in login github_cli project; do
-  check_missing "$untouched was left alone" "$REPAIR" "$untouched"
-done
+if [ "$SIGN_IN" = done ]; then
+  riabuild --no-shell >/dev/null 2>&1 || fail "the repair run did not exit 0"
+  REPAIR="$(last_run_log)"
+  info "$REPAIR"
+  check "pnpm is back" test -x "$RIA_HOME/bin/pnpm"
+  check_contains "the toolchain was repaired" "$REPAIR" "toolchain"
+  # claude_accounts depends on toolchain, so it re-running is the dependency
+  # cascade working. login, github_cli and project depend on nothing that moved.
+  for untouched in login github_cli project; do
+    check_missing "$untouched was left alone" "$REPAIR" "$untouched"
+  done
+else
+  # The repair itself is unaffected: `toolchain` runs long before the sign-in, so
+  # a run that dies at the sign-in still puts pnpm back. What is unavailable is
+  # the run log, so the two halves are asserted separately — the repair on the
+  # machine, where it actually matters, and "nothing else moved" through the
+  # `--check` that follows it.
+  DRIFT="$(riabuild --check --no-shell 2>&1)" || true
+  check_contains "the drift is seen" "$DRIFT" "Node and pnpm would run"
+  riabuild --no-shell >/dev/null 2>&1 || true
+  check "pnpm is back" test -x "$RIA_HOME/bin/pnpm"
+  REPAIRED="$(riabuild --check --no-shell 2>&1)" || fail "a --check after the repair did not exit 0"
+  REMAINING="$(applied_ids "$(last_run_log)")"
+  # Back to exactly the two the sign-in blocks: the toolchain was repaired, and
+  # nothing that depends on it was left needing a re-run. login, github_cli and
+  # project depend on nothing that moved and must not appear either.
+  if [ "$REMAINING" = "claude_accounts,claude_trust" ]; then
+    pass "the toolchain is correct again and nothing else was disturbed"
+  else
+    fail "after the repair, expected only claude_accounts,claude_trust — got [$REMAINING]"
+    printf '%s\n' "$REPAIRED" | sed 's/^/         | /' >&2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 13. The environment a developer actually lands in
@@ -633,9 +750,18 @@ for sh in zsh bash; do
     # the tarball directory riabuild owns. Both are on the PATH it hands over.
     check_contains "$sh: node resolves inside the environment" "$SHELL_OUT" \
       "$RIA_HOME/node/$NODE_VERSION/bin/node"
-    for tool in pnpm claude; do
-      check_contains "$sh: $tool resolves inside the environment" "$SHELL_OUT" "$RIA_HOME/bin/$tool"
-    done
+    check_contains "$sh: pnpm resolves inside the environment" "$SHELL_OUT" "$RIA_HOME/bin/pnpm"
+    # Whichever path this run took, `claude` must come out of the tree riabuild
+    # owns and nowhere else — a developer's `claude` resolving to something on the
+    # machine's own PATH is the failure worth catching. The two answers are
+    # different files, so the assertion names the one this run should produce
+    # rather than a prefix both would satisfy.
+    if [ "$SIGN_IN" = done ]; then
+      check_contains "$sh: claude resolves to its launcher" "$SHELL_OUT" "$RIA_HOME/bin/claude"
+    else
+      check_contains "$sh: claude resolves inside riabuild's Node" "$SHELL_OUT" \
+        "$RIA_HOME/node/$NODE_VERSION/bin/claude"
+    fi
   fi
 done
 
@@ -663,6 +789,24 @@ printf '%s\n' "$LIST_OUT" | sed 's/^/         | /'
 check_contains "the account box has its heading" "$LIST_OUT" "Your Claude Code accounts:"
 check_contains "account 1 is listed" "$LIST_OUT" "1."
 check_contains "account 1 names both its launchers" "$LIST_OUT" "claude-1 / claude"
+
+if [ "$SIGN_IN" = done ]; then
+  check_missing "account 1 is not reported as logged out" "$LIST_OUT" "(logged out)"
+else
+  # The one thing about the three-state read that only a real machine can prove.
+  # Asked about a real, freshly created, never-signed-in config directory, real
+  # Claude Code answers `loggedIn: false` and riabuild must report *logged out* —
+  # not "cannot tell", which is reserved for an answer it genuinely could not
+  # read. Collapsing those two is the bug the plan shipped with and the spec
+  # forbids: it spends riabuild's ignorance as a browser sign-in on every run of a
+  # machine whose state simply cannot be read. Unit tests pin the parse against
+  # canned JSON; this pins the JSON.
+  check_contains "account 1 is reported as logged out" "$LIST_OUT" "(logged out)"
+  check_missing "and not as unreadable" "$LIST_OUT" "cannot tell"
+  # Hints are only printed when they would work, so this one appearing is also
+  # the assertion that riabuild knows which account needs a login.
+  check_contains "the box offers the command that fixes it" "$LIST_OUT" "claude-1 auth login"
+fi
 
 # ---------------------------------------------------------------------------
 # 15. CLAUDE_CONFIG_DIR — undocumented, therefore only true while tested
@@ -732,7 +876,15 @@ fi
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
-  printf '\033[32mriabuild works end to end.\033[0m\n'
+  # Said differently on the two paths. A green run that never signed anybody in
+  # has not been end to end, and reporting that it has is how a known gap becomes
+  # a forgotten one.
+  if [ "$SIGN_IN" = done ]; then
+    printf '\033[32mriabuild works end to end.\033[0m\n'
+  else
+    printf '\033[32mriabuild works end to end, up to the Claude Code sign-in nobody here can finish.\033[0m\n'
+    printf '\033[2msee "The one step CI cannot finish" in e2e/README.md\033[0m\n'
+  fi
   exit 0
 fi
 printf '\033[31m%d assertion(s) failed.\033[0m\n' "$FAILURES"
