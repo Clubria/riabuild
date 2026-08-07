@@ -15,6 +15,7 @@ mod config;
 mod download;
 mod keychain;
 mod paths;
+mod remote;
 mod runner;
 mod scope;
 mod shell;
