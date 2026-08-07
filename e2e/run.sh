@@ -518,25 +518,30 @@ step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
 for task in login github_cli infisical_cli toolchain project repo_status \
-            claude_profiles org_settings claude_trust env_local claude_statusline; do
+            claude_accounts org_settings claude_trust env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
 
 CONFIG="$(cat "$RIA_HOME/config.json" 2>/dev/null || echo '{}')"
 read_config() { printf '%s' "$CONFIG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('$1') or '')"; }
+read_config_list_first() {
+  printf '%s' "$CONFIG" | python3 -c "import json,sys; v=json.load(sys.stdin).get('$1') or []; print(v[0] if v else '')"
+}
 
 NODE_VERSION="$(read_config node_version)"
 PNPM_VERSION="$(read_config pnpm_version)"
 PROJECT_DIR="$(read_config project_path)"
-CLAUDE_PROFILE="$(read_config claude_profile)"
-info "node=$NODE_VERSION pnpm=$PNPM_VERSION profile=$CLAUDE_PROFILE"
+CLAUDE_ACCOUNT="$(read_config_list_first claude_accounts)"
+info "node=$NODE_VERSION pnpm=$PNPM_VERSION account=$CLAUDE_ACCOUNT"
 info "checkout=$PROJECT_DIR"
 
 check_contains "riabuild's Node is the version it pinned" \
   "$("$RIA_HOME/node/$NODE_VERSION/bin/node" -v 2>&1)" "v$NODE_VERSION"
 check_contains "riabuild's pnpm is the version it pinned" \
   "$("$RIA_HOME/bin/pnpm" --version 2>&1)" "$PNPM_VERSION"
-check "the c launcher is executable" test -x "$RIA_HOME/bin/c"
+check "the claude launcher is executable" test -x "$RIA_HOME/bin/claude"
+check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude-1"
+check "the retired c launcher is gone" test ! -e "$RIA_HOME/bin/c"
 
 check "the checkout is a git repository" test -d "$PROJECT_DIR/.git"
 check_contains "the checkout's origin is the repo the server named" \
@@ -547,7 +552,7 @@ check "org-settings.json is valid JSON" \
 check_contains "org-settings.json is what this deployment served" \
   "$(cat "$RIA_HOME/org-settings.json" 2>/dev/null)" "CLUBRIA_E2E"
 
-check "a Claude Code profile exists" test -d "$RIA_HOME/claude/$CLAUDE_PROFILE"
+check "the first account's config directory exists" test -d "$RIA_HOME/claude/$CLAUDE_ACCOUNT"
 
 # The org settings *name* this script; the binary carries it. That split is what
 # keeps a dashboard field from being a way to run code on a laptop, so the file
@@ -593,7 +598,7 @@ REPAIR="$(last_run_log)"
 info "$REPAIR"
 check "pnpm is back" test -x "$RIA_HOME/bin/pnpm"
 check_contains "the toolchain was repaired" "$REPAIR" "toolchain"
-# claude_profiles depends on toolchain, so it re-running is the dependency
+# claude_accounts depends on toolchain, so it re-running is the dependency
 # cascade working. login, github_cli and project depend on nothing that moved.
 for untouched in login github_cli project; do
   check_missing "$untouched was left alone" "$REPAIR" "$untouched"
@@ -609,7 +614,11 @@ ENV_OUT="$(riabuild env 2>&1)"
 check_contains "PATH gets riabuild's bin directory" "$ENV_OUT" "$RIA_HOME/bin"
 check_contains "PATH gets riabuild's Node" "$ENV_OUT" "$RIA_HOME/node/$NODE_VERSION/bin"
 check_contains "the shell is marked as riabuild's" "$ENV_OUT" "RIABUILD_SHELL='1'"
-check_contains "Claude Code is pointed at the profile" "$ENV_OUT" "CLAUDE_CONFIG_DIR"
+# Deliberately absent. The launchers in ~/.riabuild/bin each set their own
+# account's CLAUDE_CONFIG_DIR; an exported one would override every launcher at
+# once and quietly make all nine accounts share a config directory. One
+# mechanism, not two.
+check_missing "the environment pins no single account" "$ENV_OUT" "CLAUDE_CONFIG_DIR"
 
 # `riabuild shell` spawns the developer's real shell. Feeding it a command on
 # stdin runs the actual handoff — rcfile generation, ZDOTDIR, PATH — rather than
@@ -618,13 +627,13 @@ for sh in zsh bash; do
   if command -v "$sh" >/dev/null 2>&1; then
     # A `VAR=value func` prefix, not `env` — `riabuild` here is a shell function
     # that redirects HOME, and `env` can only run a real executable.
-    SHELL_OUT="$(printf 'command -v node pnpm c\nexit\n' \
+    SHELL_OUT="$(printf 'command -v node pnpm claude\nexit\n' \
       | SHELL="$(command -v "$sh")" riabuild shell 2>&1 || true)"
-    # pnpm and c are shims in ~/.riabuild/bin; node comes straight out of the
-    # tarball directory riabuild owns. Both are on the PATH it hands over.
+    # pnpm and claude are shims in ~/.riabuild/bin; node comes straight out of
+    # the tarball directory riabuild owns. Both are on the PATH it hands over.
     check_contains "$sh: node resolves inside the environment" "$SHELL_OUT" \
       "$RIA_HOME/node/$NODE_VERSION/bin/node"
-    for tool in pnpm c; do
+    for tool in pnpm claude; do
       check_contains "$sh: $tool resolves inside the environment" "$SHELL_OUT" "$RIA_HOME/bin/$tool"
     done
   fi
@@ -638,7 +647,25 @@ if [ -f "$RIA_HOME/shell/zsh/.zshrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 14. CLAUDE_CONFIG_DIR — undocumented, therefore only true while tested
+# 14. The accounts a developer can see and manage
+# ---------------------------------------------------------------------------
+
+step "Claude Code accounts"
+
+# `riabuild claude list` is local: no session, no network, no provisioning. It
+# is also the only way a developer learns which number to type at the other
+# subcommands, so it has to work on a machine that has just been provisioned.
+if ! LIST_OUT="$(riabuild claude list 2>&1)"; then
+  printf '%s\n' "$LIST_OUT" | sed 's/^/         | /' >&2
+  die "riabuild claude list failed."
+fi
+printf '%s\n' "$LIST_OUT" | sed 's/^/         | /'
+check_contains "the account box has its heading" "$LIST_OUT" "Your Claude Code accounts:"
+check_contains "account 1 is listed" "$LIST_OUT" "1."
+check_contains "account 1 names both its launchers" "$LIST_OUT" "claude-1 / claude"
+
+# ---------------------------------------------------------------------------
+# 15. CLAUDE_CONFIG_DIR — undocumented, therefore only true while tested
 # ---------------------------------------------------------------------------
 
 step "CLAUDE_CONFIG_DIR still redirects Claude Code"
@@ -665,17 +692,17 @@ if [ -n "$CLAUDE_BIN" ] && [ -x "$CLAUDE_BIN" ]; then
   else
     # Not a failure of riabuild — a change in Claude Code. Said plainly so
     # whoever reads this knows which repository to go and look at.
-    # A failure, not a note. CLAUDE_CONFIG_DIR is undocumented, the `c` launcher
-    # depends on it entirely, and an upstream change has to surface here rather
-    # than as every developer's profiles quietly merging into one.
-    fail "Claude Code did not keep its configuration in CLAUDE_CONFIG_DIR — the c launcher's isolation is gone"
+    # A failure, not a note. CLAUDE_CONFIG_DIR is undocumented, every per-account
+    # launcher depends on it entirely, and an upstream change has to surface
+    # here rather than as every developer's accounts quietly merging into one.
+    fail "Claude Code did not keep its configuration in CLAUDE_CONFIG_DIR — the per-account launchers' isolation is gone"
   fi
 else
-  fail "no claude on the PATH riabuild provides — the c launcher would not work"
+  fail "no claude on the PATH riabuild provides — the per-account launchers would not work"
 fi
 
 # ---------------------------------------------------------------------------
-# 15. Signing out
+# 16. Signing out
 # ---------------------------------------------------------------------------
 
 if [ "$PLATFORM" = macos ]; then

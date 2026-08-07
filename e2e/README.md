@@ -25,7 +25,7 @@ So this covers the seams no unit test reaches:
 | the `/api/v1` contract | the Rust client parsing what Convex actually serves |
 | idempotency | a second run applies nothing, on a machine rather than in a tempdir |
 | drift | deleting `~/.riabuild/bin/pnpm` repairs the toolchain and nothing else |
-| the shell handoff | real `zsh` and `bash` resolving `node`, `pnpm` and `c` |
+| the shell handoff | real `zsh` and `bash` resolving `node`, `pnpm` and `claude` |
 | `CLAUDE_CONFIG_DIR` | still redirecting Claude Code, which is undocumented and therefore only true while something tests it |
 | the Keychain | `security(1)`, on macOS, storing and deleting the session token |
 
