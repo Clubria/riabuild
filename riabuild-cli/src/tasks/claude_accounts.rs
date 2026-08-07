@@ -229,6 +229,23 @@ impl Task for ClaudeAccounts {
 /// ready, with the only symptom a later failure that says nothing about a
 /// sign-in.
 async fn sign_in(ctx: &mut Ctx, id: &str) -> Result<()> {
+    // Checked before the terminal is handed over, and the one thing this
+    // function must do before anything else. `claude auth login` waits for a
+    // browser round trip somebody has to finish, so on a machine with nobody on
+    // the other end it does not fail — it waits. On CI it opened a browser and
+    // sat there until the job's own timeout killed it, half an hour later, with
+    // nothing on stdout to say why. An unattended run has to be refused in a
+    // sentence rather than hung.
+    if !ctx.ui.interactive() {
+        return Err(Failure::new(
+            "signing you in to Claude Code",
+            "Run `riabuild` yourself from a terminal — the sign-in opens a browser and someone has to finish it.",
+        )
+        .command("claude auth login")
+        .detail("riabuild has no terminal to hand the sign-in to, and will not wait for one")
+        .into());
+    }
+
     ctx.ui
         .note("Opening your browser to sign in to Claude Code…");
     let claude = ctx.claude();
@@ -648,6 +665,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sign_in_with_nobody_to_finish_it_refuses_rather_than_waiting() {
+        // `claude auth login` opens a browser and waits for a round trip to
+        // complete. With no terminal there is nobody to complete it, and the
+        // command does not fail — it sits there. On CI that was a job killed by
+        // its own 30-minute timeout with nothing on stdout to explain it.
+        let (mut ctx, _home) = ctx_with_claude(FakeRunner::new()).await;
+        let runner = Arc::new(installed().with(STATUS, 1, r#"{"loggedIn":false}"#, ""));
+        ctx.runner = runner.clone();
+        // What `ctx_with` builds, and what a CI job has.
+        assert!(!ctx.ui.interactive());
+
+        let error = ClaudeAccounts.apply(&mut ctx).await.unwrap_err();
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("a machine with no terminal is not a riabuild bug");
+        assert!(failure.action.contains("from a terminal"), "{failure:?}");
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("auth login")),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    #[tokio::test]
     async fn an_abandoned_sign_in_is_not_treated_as_success() {
         // Claude Code exits non-zero when the browser is closed. A task that
         // ignored that would report a machine that is ready and is not.
@@ -657,6 +702,9 @@ mod tests {
                 .with("claude auth login", 1, "", ""),
         )
         .await;
+        // A terminal, so this reaches the sign-in at all: `sign_in` refuses
+        // outright without one, which is a different test above.
+        ctx.ui = crate::ui::Ui::scripted([]);
         let error = ClaudeAccounts
             .apply(&mut ctx)
             .await
