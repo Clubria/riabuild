@@ -13,6 +13,7 @@
 use crate::runner::{CommandRunner, RunOptions};
 use crate::tasks::Ctx;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::task::JoinSet;
 
@@ -37,28 +38,44 @@ pub struct Account {
 
 /// Every account, asked at the same time.
 pub async fn read_all(ctx: &Ctx) -> Vec<Account> {
+    let claude = ctx.claude();
     let mut asking = JoinSet::new();
+    // A panicked lookup's `JoinError` carries no payload, so the number and id
+    // it would have reported are kept here, keyed by the task that owns them —
+    // that is the only way to still list the account rather than lose it.
+    let mut pending: HashMap<tokio::task::Id, (usize, String)> = HashMap::new();
     for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
         let runner = ctx.runner.clone();
-        let claude = ctx.claude();
+        let claude = claude.clone();
         let dir = ctx.paths.claude_profile_dir(id);
-        let id = id.clone();
-        asking.spawn(async move {
+        let number = index + 1;
+        let id_for_task = id.clone();
+        let handle = asking.spawn(async move {
             let identity = ask(runner.as_ref(), &claude, &dir).await;
             Account {
-                number: index + 1,
-                id,
+                number,
+                id: id_for_task,
                 identity,
             }
         });
+        pending.insert(handle.id(), (number, id.clone()));
     }
 
     let mut found = Vec::new();
-    while let Some(joined) = asking.join_next().await {
+    while let Some(joined) = asking.join_next_with_id().await {
         match joined {
-            Ok(account) => found.push(account),
-            // A panicked lookup must not take the whole box with it.
-            Err(_) => continue,
+            Ok((_, account)) => found.push(account),
+            // A panicked lookup must not take the account with it — the
+            // number and id are still known even though the identity is not.
+            Err(error) => {
+                if let Some((number, id)) = pending.remove(&error.id()) {
+                    found.push(Account {
+                        number,
+                        id,
+                        identity: Identity::Unknown("the lookup did not finish".to_string()),
+                    });
+                }
+            }
         }
     }
     // Tasks finish in whatever order the children do; the developer numbers
@@ -102,8 +119,12 @@ async fn ask(runner: &dyn CommandRunner, claude: &str, dir: &Path) -> Identity {
     let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
         return Identity::Unknown("Claude Code did not answer in JSON".to_string());
     };
-    if value.get("loggedIn") != Some(&Value::Bool(true)) {
-        return Identity::LoggedOut;
+    match value.get("loggedIn") {
+        Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => return Identity::LoggedOut,
+        // Absent, or not a bool: riabuild does not know, and must not spend
+        // that ignorance as a claim that the account is signed out.
+        _ => return Identity::Unknown("Claude Code reported no sign-in state".to_string()),
     }
     match value.get("email").and_then(Value::as_str) {
         Some(email) => Identity::LoggedIn(email.to_string()),
@@ -168,12 +189,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_that_will_not_parse_is_not_reported_as_signed_out() {
-        // The distinction that matters: riabuild not knowing must never render
-        // as "(logged out)", which is a claim about the account.
+        // No stub is registered, so the fake runner answers with an empty,
+        // unparseable stdout rather than a spawn failure — this exercises the
+        // JSON-parse branch of `ask`, not the `runner.run` error branch. The
+        // distinction that matters is the same either way: riabuild not
+        // knowing must never render as "(logged out)", which is a claim about
+        // the account.
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.claude_accounts = vec![accounts::new_id()];
 
         let found = read_all(&ctx).await;
+        assert_eq!(found.len(), 1);
         assert!(
             matches!(found[0].identity, Identity::Unknown(_)),
             "{:?}",
@@ -197,7 +223,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_accounts_means_no_subprocesses() {
+    async fn an_answer_with_no_sign_in_state_is_not_a_sign_out() {
+        // A future "could not reach the server" signal arrives as JSON with no
+        // `loggedIn` field at all. That must not be mistaken for a sign-out —
+        // this is exactly what `ask`'s doc comment says the exit code is
+        // ignored to avoid, and the JSON path must hold to the same rule.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let id = accounts::new_id();
+        ctx.config.claude_accounts = vec![id.clone()];
+        ctx.runner = Arc::new(FakeRunner::new().with(
+            "claude auth status --json",
+            1,
+            r#"{"error":"network unreachable"}"#,
+            "",
+        ));
+
+        assert!(matches!(read(&ctx, &id).await, Identity::Unknown(_)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_account_list_yields_an_empty_result() {
         let (ctx, _home) = ctx_with(FakeRunner::new()).await;
         assert!(read_all(&ctx).await.is_empty());
     }
