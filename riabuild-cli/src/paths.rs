@@ -53,7 +53,6 @@ pub trait Paths: Send + Sync {
     fn pnpm_dir(&self, version: &str) -> PathBuf {
         self.tools_root().join("pnpm").join(version)
     }
-    #[allow(dead_code)] // consumed by Task 17
     fn riabuild_dir(&self, version: &str) -> PathBuf {
         self.tools_root().join("riabuild").join(version)
     }
@@ -107,7 +106,6 @@ impl RealPaths {
     /// Also how a layout method (`riabuild_dir`, `owner_file`, ...) gets evaluated
     /// against a *remote* home from the laptop side: root it here rather than
     /// formatting that layout a second time.
-    #[allow(dead_code)] // consumed by Task 17, deriving remote_binary_path from riabuild_dir()
     pub fn with_root(home: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
         Self {
             home: home.as_ref().to_path_buf(),

@@ -24,7 +24,6 @@ const RELEASES: &str = "https://github.com/Clubria/riabuild/releases/download";
 /// than the laptop driving it, so — unlike `node_platform` above — this takes
 /// the platform as an argument rather than reading `std::env::consts` for the
 /// host riabuild happens to be running on.
-#[allow(dead_code)] // consumed by Task 17
 pub fn rust_target(uname_s: &str, uname_m: &str) -> Result<String> {
     let arch = match uname_m.trim() {
         "x86_64" | "amd64" => "x86_64",
@@ -44,17 +43,14 @@ pub fn rust_target(uname_s: &str, uname_m: &str) -> Result<String> {
 /// The release asset name for a given version and target triple, e.g.
 /// `riabuild-2026.08.06-aarch64-apple-darwin.tar.gz`. Matches the tarball
 /// name `.github/workflows/release.yml`'s Package step produces.
-#[allow(dead_code)] // consumed by Task 17
 pub fn riabuild_asset(version: &str, target: &str) -> String {
     format!("riabuild-{version}-{target}.tar.gz")
 }
 
-#[allow(dead_code)] // consumed by Task 17
 pub fn riabuild_asset_url(version: &str, target: &str) -> String {
     format!("{RELEASES}/v{version}/{}", riabuild_asset(version, target))
 }
 
-#[allow(dead_code)] // consumed by Task 17
 pub fn riabuild_checksums_url(version: &str) -> String {
     format!("{RELEASES}/v{version}/riabuild-{version}-checksums.txt")
 }
@@ -232,6 +228,26 @@ fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Resu
     Ok(())
 }
 
+/// One named member of a gzipped tarball, in memory.
+///
+/// The release tarball holds `riabuild` at its root. The bytes are wanted rather
+/// than a path, because they go straight down an SSH pipe to a server.
+pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        let matches = path.file_name().is_some_and(|found| found == name);
+        if matches {
+            let mut buffer = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buffer)?;
+            return Ok(buffer);
+        }
+    }
+    anyhow::bail!("{name} is not in that archive")
+}
+
 #[cfg(unix)]
 pub async fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -406,6 +422,31 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert!(rust_target("Linux", "armv7l").is_err());
         assert!(rust_target("FreeBSD", "x86_64").is_err());
         assert!(rust_target("Darwin", "ppc").is_err());
+    }
+
+    #[test]
+    fn a_single_member_is_lifted_out_of_a_tarball() {
+        // Built in memory, so the test needs no fixture file and no network.
+        let mut archive = tar::Builder::new(Vec::new());
+        let payload = b"\x7fELF fake binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "riabuild", &payload[..])
+            .expect("append");
+        let tar_bytes = archive.into_inner().expect("finish");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
+        let gz = encoder.finish().expect("gzip");
+
+        assert_eq!(
+            extract_single_file(&gz, "riabuild").expect("extract"),
+            payload
+        );
+        assert!(extract_single_file(&gz, "not-there").is_err());
     }
 
     #[test]

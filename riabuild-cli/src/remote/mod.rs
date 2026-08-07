@@ -9,6 +9,7 @@
 
 pub mod authorise;
 pub mod identity;
+pub mod install;
 pub mod store;
 
 use crate::paths::Paths;
