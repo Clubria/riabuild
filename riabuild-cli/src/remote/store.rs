@@ -8,7 +8,6 @@
 use crate::paths::Paths;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // consumed by Task 21
@@ -52,7 +51,7 @@ impl Store {
     /// `Store` a caller built deliberately, never a silent wipe.
     #[allow(dead_code)] // consumed by Task 21
     pub async fn load(paths: &dyn Paths) -> Store {
-        let Ok(text) = tokio::fs::read_to_string(remotes_file(paths)).await else {
+        let Ok(text) = tokio::fs::read_to_string(paths.remotes_file()).await else {
             return Store::default();
         };
         serde_json::from_str(&text).unwrap_or_default()
@@ -60,7 +59,7 @@ impl Store {
 
     #[allow(dead_code)] // consumed by Task 21
     pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
-        crate::config::write_json(&remotes_file(paths), self).await
+        crate::config::write_json(&paths.remotes_file(), self).await
     }
 
     #[allow(dead_code)] // consumed by Task 21
@@ -72,19 +71,6 @@ impl Store {
     pub fn names(&self) -> Vec<String> {
         self.remotes.iter().map(|r| r.name.clone()).collect()
     }
-}
-
-/// `<root>/remotes.json`.
-///
-/// A free function here rather than `Paths::remotes_file()`: `paths.rs` is
-/// being edited by another task concurrently with this one, so this task
-/// computes the path itself instead of racing that edit. Whoever next touches
-/// `paths.rs` should promote this to a trait method matching the task-13
-/// interface (`Paths::remotes_file`) — Task 15 needs the equivalent
-/// `identity_dir`/`ssh_dir` there anyway, and one definition of the layout
-/// beats two.
-fn remotes_file(paths: &dyn Paths) -> PathBuf {
-    paths.root().join("remotes.json")
 }
 
 /// A short local label, from the first label of the hostname.
@@ -167,7 +153,7 @@ mod tests {
         tokio::fs::create_dir_all(paths.root())
             .await
             .expect("mkdir");
-        tokio::fs::write(remotes_file(&paths), "{{{ not json")
+        tokio::fs::write(paths.remotes_file(), "{{{ not json")
             .await
             .expect("write");
 
@@ -191,7 +177,7 @@ mod tests {
         tokio::fs::create_dir_all(paths.root())
             .await
             .expect("mkdir");
-        tokio::fs::write(remotes_file(&paths), "")
+        tokio::fs::write(paths.remotes_file(), "")
             .await
             .expect("write");
 

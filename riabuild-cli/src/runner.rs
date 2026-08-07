@@ -546,6 +546,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_child_receives_bytes_that_are_not_valid_utf8() {
+        // A gzip header is not valid UTF-8, and Task 17 streams a whole binary
+        // through here. Asserting a field returns what was just assigned to
+        // it would prove nothing about the code that could get
+        // bytes-versus-UTF-8 wrong; this runs a real child instead.
+        //
+        // The check goes through `wc -c` rather than `cat` + a byte-length
+        // comparison on `stdout`: `CommandOutput::stdout` is a lossy-decoded
+        // `String` (`String::from_utf8_lossy`), and every invalid byte in
+        // these six becomes a 3-byte U+FFFD replacement on the way back out
+        // — echoing the input and measuring the echo would be measuring the
+        // lossy decoder, not what the child actually received on stdin.
+        // `wc -c` reports the byte count as plain ASCII digits, which round-
+        // trips through that same lossy decoding unchanged, so it proves the
+        // six raw bytes reached the child intact without depending on stdout
+        // being representable as UTF-8 at all.
+        let bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe];
+        let output = RealRunner
+            .run(
+                "wc",
+                &["-c"],
+                &RunOptions {
+                    stdin: Some(bytes.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("wc runs");
+        assert_eq!(output.trimmed(), bytes.len().to_string());
+    }
+
+    #[tokio::test]
     async fn a_fragment_stub_can_answer_for_the_end_of_a_command() {
         let fake = FakeRunner::new()
             .with("ssh", 1, "", "unmatched")

@@ -66,6 +66,25 @@ pub trait Paths: Send + Sync {
     fn log_file(&self) -> PathBuf {
         self.root().join("logs").join("riabuild.log")
     }
+    /// The servers this laptop knows about — see `remote::store`.
+    fn remotes_file(&self) -> PathBuf {
+        self.root().join("remotes.json")
+    }
+    /// The private key riabuild makes for each server, one file per
+    /// `Remote::hash()`. Never shared with anything else riabuild writes;
+    /// see `remote::identity`.
+    fn identity_dir(&self) -> PathBuf {
+        self.root().join("ssh-identities")
+    }
+    /// Where riabuild's own `known_hosts` lives — never the developer's
+    /// `~/.ssh/known_hosts`. See `remote::identity::ssh_options`'s `-F
+    /// /dev/null`, which is what makes that true.
+    fn ssh_dir(&self) -> PathBuf {
+        self.root().join("ssh")
+    }
+    fn known_hosts_file(&self) -> PathBuf {
+        self.ssh_dir().join("known_hosts")
+    }
 }
 
 pub struct RealPaths {

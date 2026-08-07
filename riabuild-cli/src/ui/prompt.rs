@@ -24,6 +24,7 @@ pub fn answer_or_default(input: &str, default: Option<&str>) -> Option<String> {
 
 /// Only an explicit yes is a yes. Pressing return through a prompt nobody read
 /// must not trust a host key.
+#[allow(dead_code)] // consumed by Task 21, via Ui::confirm
 pub fn is_yes(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
@@ -71,7 +72,7 @@ impl Ui {
     /// Asks a yes/no question. Defaults to no: an empty answer, or no
     /// terminal at all, must never read as consent — the caller this exists
     /// for is trusting a host key nobody has looked at yet.
-    #[allow(dead_code)] // consumed by Task 15
+    #[allow(dead_code)] // consumed by Task 21, via identity::trust_host
     pub fn confirm(&self, question: &str) -> Result<bool> {
         if !std::io::stdin().is_terminal() {
             return Err(Failure::new(
