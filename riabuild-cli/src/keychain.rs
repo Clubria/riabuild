@@ -163,7 +163,7 @@ impl Keychain for SecretToolKeychain {
                     ACCOUNT,
                 ],
                 &RunOptions {
-                    stdin: Some(token.to_string()),
+                    stdin: Some(token.as_bytes().to_vec()),
                     ..Default::default()
                 },
             )
