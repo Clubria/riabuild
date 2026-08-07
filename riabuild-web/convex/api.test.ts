@@ -75,10 +75,14 @@ function bearer(token: string, version?: string): HeadersInit {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe("member ids", () => {
-  test("a member created through sign-in gets a member id", async () => {
-    // Exercises the insert in auth.ts. Reaching this through the backfill
-    // instead would pass with auth.ts unchanged, which is the whole bug this
-    // test is here to catch.
+  test("a freshly inserted member row has a UUID-shaped member id", async () => {
+    // NOTE: this goes through the `seedMember` fixture, not `auth.ts`'s
+    // `upsertMember` — it does not exercise the `memberId: crypto.randomUUID()`
+    // line in auth.ts at all. Deleting that line would not fail this test,
+    // because `seedMember` mints its own id independently. Covering the real
+    // auth.ts minting path means driving a sign-in through convex-test —
+    // stubbing GitHub's token/user endpoints the way `stubUpstreams` does
+    // below for Infisical — which is out of scope here.
     const t = setup();
     const { rowId } = await seedMember(t);
     const member = await t.run(async (ctx) => await ctx.db.get("members", rowId));
@@ -118,9 +122,38 @@ describe("member ids", () => {
 
   test("running the backfill twice changes nothing the second time", async () => {
     const t = setup();
-    await seedMember(t);
-    await t.mutation(internal.members.backfillMemberIds, {});
-    expect(await t.mutation(internal.members.backfillMemberIds, {})).toBe(0);
+    // A row missing a memberId, same shape as the sibling test above — a
+    // table with nothing to fill would return 0 on both runs for a reason
+    // that has nothing to do with idempotency.
+    const withoutId = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { name: "Bob", email: "bob@clubria.dev" });
+      return await ctx.db.insert("members", {
+        userId,
+        githubLogin: "bob",
+        githubId: "5678",
+        firstName: "Bob",
+        lastName: "Stone",
+        email: "bob@clubria.dev",
+        role: "developer" as const,
+        status: "active" as const,
+      });
+    });
+
+    const firstRun = await t.mutation(internal.members.backfillMemberIds, {});
+    expect(firstRun).toBe(1);
+    const mintedId = await t.run(
+      async (ctx) => (await ctx.db.get("members", withoutId))?.memberId,
+    );
+    expect(mintedId).toBeTruthy();
+
+    const secondRun = await t.mutation(internal.members.backfillMemberIds, {});
+    expect(secondRun).toBe(0);
+    // The part that actually catches double-minting: not just that the
+    // count was 0 the second time, but that the id itself never moved.
+    const idAfterSecondRun = await t.run(
+      async (ctx) => (await ctx.db.get("members", withoutId))?.memberId,
+    );
+    expect(idAfterSecondRun).toBe(mintedId);
   });
 });
 
