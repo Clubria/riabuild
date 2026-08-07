@@ -19,6 +19,13 @@
 //! file pin it and the three behaviours built on it: an upstream change should
 //! surface as a test failure, not as broken laptops. They need a real Claude Code
 //! install, so run them with `cargo test -- --ignored` before every version bump.
+//!
+//! The launchers also clear `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`, which
+//! is what makes the clipboard shims below reachable — see the comment in
+//! `launcher_script`. That is undocumented behaviour too, read out of the 2.1.224
+//! binary rather than promised anywhere, but it cannot be pinned by a smoke test:
+//! Claude Code exposes no non-interactive clipboard command to assert against.
+//! Re-read it by hand when the pinned Claude Code version moves.
 
 pub mod clipboard;
 
@@ -43,6 +50,22 @@ pub fn launcher_script(
 # which is how org policy stays current without riabuild ever editing
 # settings.json.
 set -e
+# Claude Code treats "am I over SSH?" as "my clipboard is not the user's
+# clipboard", and answers it from these three variables alone. Over SSH it skips
+# the native copy and returns "" from every paste *without running anything* — so
+# the xclip/wl-paste shims in this same bin/ are never reached, and the channel
+# they front is dead code. Clearing the three makes Claude Code probe for a
+# clipboard tool, find riabuild's shim first on PATH, and reach the laptop.
+#
+# Verified against Claude Code 2.1.224: only SSH_CONNECTION reaches the clipboard
+# path, but all three feed the terminal-type probe, so a session that cleared one
+# and kept the others would still report itself as "ssh-session". They are also
+# on Claude Code's own environment allowlist, so a relaunched or child session
+# inherits whatever this script leaves — clearing them here covers the whole tree.
+#
+# SSH_AUTH_SOCK is deliberately NOT cleared: it is agent forwarding, not session
+# detection, and dropping it breaks `git push` over SSH.
+unset SSH_CONNECTION SSH_CLIENT SSH_TTY
 CLAUDE_CONFIG_DIR="{config_dir}"
 export CLAUDE_CONFIG_DIR
 claude_binary="{claude}"
@@ -251,6 +274,35 @@ mod tests {
         // config directory — all nine collapsing into one — with the rest of
         // this test still green.
         assert!(script.contains("export CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn the_launcher_clears_the_ssh_detection_variables() {
+        let script = script();
+        // Assert on the `unset` lines themselves, not on the script text: the
+        // comment above them names SSH_AUTH_SOCK to explain why it is spared,
+        // so a substring search over the whole script proves nothing.
+        let unsets: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("unset "))
+            .collect();
+        // Claude Code answers "am I over SSH?" from these three and nothing
+        // else. Leave any of them set and every paste returns "" without a
+        // subprocess, so the xclip/wl-paste shims beside this launcher are
+        // never invoked and the channel behind them is unreachable.
+        //
+        // Agent forwarding is not session detection: a fourth name here, or
+        // SSH_AUTH_SOCK joining this line, breaks `git push` over SSH.
+        assert_eq!(
+            unsets,
+            ["unset SSH_CONNECTION SSH_CLIENT SSH_TTY"],
+            "{script}"
+        );
+        // A clear that lands after the exec never runs.
+        let unset = script.find("unset SSH_CONNECTION").unwrap();
+        let exec = script.find("exec ").unwrap();
+        assert!(unset < exec, "unset must precede every exec:\n{script}");
     }
 
     #[test]
