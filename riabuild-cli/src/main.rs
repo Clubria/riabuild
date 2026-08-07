@@ -116,7 +116,6 @@ async fn run(cli: Cli) -> Result<i32> {
         org: None,
         member: None,
         cli_version: cli::VERSION.to_string(),
-        web_url: api::web_url(),
         env: Vec::new(),
         notes: Vec::new(),
         dry_run: cli.check || matches!(cli.command, Some(Command::Status)),
@@ -269,7 +268,7 @@ async fn write_launchers(ctx: &Ctx) -> Result<()> {
 fn describe_session(ctx: &Ctx) {
     let Some(member) = &ctx.member else {
         ctx.ui
-            .note("not signed in yet — riabuild will open your browser");
+            .note("not signed in yet — riabuild will give you a code to approve");
         return;
     };
     ctx.ui.note(&format!(

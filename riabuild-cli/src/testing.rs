@@ -89,7 +89,6 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         org: Some(org_config()),
         member: None,
         cli_version: "0.1.0".into(),
-        web_url: "https://riabuild.clubria.com".into(),
         env: Vec::new(),
         notes: Vec::new(),
         dry_run: false,

@@ -31,7 +31,8 @@ export function offlineData(message: string): Data {
     updateOrg: reject,
     signIn: reject,
     signOut: reject,
-    authorizeCli: reject,
-    handOffToCli: () => {},
+    lookupDeviceCode: reject,
+    approveDeviceCode: reject,
+    denyDeviceCode: reject,
   };
 }

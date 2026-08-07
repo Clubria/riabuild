@@ -1,6 +1,14 @@
 import { describe, expect, test } from "vitest";
 import { compareVersions, meetsMinimum, parseVersion } from "./version";
-import { base64url, pkceChallenge, randomToken, sha256Hex } from "./crypto";
+import {
+  base64url,
+  formatUserCode,
+  normaliseUserCode,
+  randomToken,
+  randomUserCode,
+  sha256Hex,
+  USER_CODE_ALPHABET,
+} from "./crypto";
 
 describe("version comparison", () => {
   test("orders by numeric component, not lexically", () => {
@@ -57,10 +65,47 @@ describe("token minting", () => {
     expect(await sha256Hex("hellp")).not.toBe(hash);
   });
 
-  test("PKCE challenge matches the S256 definition", async () => {
-    // The canonical example from RFC 7636 appendix B.
-    expect(
-      await pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-    ).toBe("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+});
+
+describe("user codes", () => {
+  test("the alphabet cannot spell a word or hide a typo", () => {
+    // RFC 8628 §6.1: no vowels, so no code ever reads as a word by accident.
+    expect(USER_CODE_ALPHABET).not.toMatch(/[AEIOU]/);
+    // The characters a developer would mistype copying off a terminal.
+    expect(USER_CODE_ALPHABET).not.toMatch(/[O0I1L]/);
+    // Duplicates would quietly bias the distribution.
+    expect(new Set(USER_CODE_ALPHABET).size).toBe(USER_CODE_ALPHABET.length);
+  });
+
+  test("a fresh code is eight characters from that alphabet", () => {
+    const code = randomUserCode();
+    expect(code).toHaveLength(8);
+    for (const character of code) {
+      expect(USER_CODE_ALPHABET).toContain(character);
+    }
+  });
+
+  test("codes do not repeat", () => {
+    const codes = new Set(Array.from({ length: 64 }, () => randomUserCode()));
+    expect(codes.size).toBe(64);
+  });
+
+  test("display groups the code into halves", () => {
+    expect(formatUserCode("WXZBCDFG")).toBe("WXZB-CDFG");
+  });
+
+  test("typing it back accepts whatever shape the developer used", () => {
+    // Lowercase off a phone, the dash they read on screen, a stray space from a
+    // paste: all the same code. Refusing any of them would be a support ticket.
+    expect(normaliseUserCode("wxzb-cdfg")).toBe("WXZBCDFG");
+    expect(normaliseUserCode("WXZBCDFG")).toBe("WXZBCDFG");
+    expect(normaliseUserCode("  wxzb cdfg  ")).toBe("WXZBCDFG");
+    expect(normaliseUserCode("WXZB–CDFG")).toBe("WXZBCDFG");
+  });
+
+  test("normalising leaves nothing that could widen a lookup", () => {
+    // The result is used as an index key, so anything that is not alphabet is
+    // dropped rather than passed through.
+    expect(normaliseUserCode("WX*ZB/CD?FG")).toBe("WXZBCDFG");
   });
 });

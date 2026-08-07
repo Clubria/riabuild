@@ -49,20 +49,38 @@ export default defineSchema({
     .index("by_memberId", ["memberId"]),
 
   /**
-   * One-time codes minted by the /cli/authorize screen and redeemed once by
-   * POST /api/v1/cli/token. Separate from `cliSessions` on purpose: an
-   * abandoned login must never look like a live session.
+   * Pending device-authorisation requests: one row per `riabuild login`, minted
+   * by POST /api/v1/cli/device and redeemed once by POST /api/v1/cli/token.
+   * Separate from `cliSessions` on purpose — an abandoned login must never look
+   * like a live session.
+   *
+   * A row is created *before* anyone is known, which is the inversion that
+   * matters when reading this table: `memberId`, `approvedAt` and `deniedAt`
+   * stay empty until a human acts on the request, and most rows never fill them
+   * in. `by_expiresAt` exists for the hourly sweep in `crons.ts` that keeps
+   * abandoned logins from accumulating forever.
    */
-  cliAuthCodes: defineTable({
-    codeHash: v.string(),
-    /** PKCE S256 challenge, base64url. The CLI proves it holds the verifier. */
-    challenge: v.string(),
-    memberId: v.id("members"),
+  cliDeviceCodes: defineTable({
+    /** SHA-256 of the secret the CLI polls with. The raw value is never stored. */
+    deviceCodeHash: v.string(),
+    /**
+     * The short code the developer reads off their terminal, normalised to
+     * uppercase without its dash. Plaintext on purpose: it identifies a request
+     * but cannot be exchanged for anything, so hashing it would only stop the
+     * dashboard from looking it up.
+     */
+    userCode: v.string(),
     deviceLabel: v.string(),
     cliVersion: v.string(),
     expiresAt: v.number(),
+    memberId: v.optional(v.id("members")),
+    approvedAt: v.optional(v.number()),
+    deniedAt: v.optional(v.number()),
     consumedAt: v.optional(v.number()),
-  }).index("by_codeHash", ["codeHash"]),
+  })
+    .index("by_deviceCodeHash", ["deviceCodeHash"])
+    .index("by_userCode", ["userCode"])
+    .index("by_expiresAt", ["expiresAt"]),
 
   /** Single row. Edited by leads in the dashboard, read by every CLI launch. */
   orgConfig: defineTable({

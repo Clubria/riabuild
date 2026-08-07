@@ -1,5 +1,6 @@
 import {
   useAction,
+  useConvex,
   useConvexAuth,
   useMutation,
   useQuery,
@@ -46,7 +47,13 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
   const setStatus = useMutation(api.members.setStatus);
   const revoke = useMutation(api.sessions.revoke);
   const updateOrg = useMutation(api.org.update);
-  const authorize = useAction(api.cliAuth.authorize);
+  const approveDevice = useMutation(api.cliAuth.approve);
+  const denyDevice = useMutation(api.cliAuth.deny);
+  /**
+   * Imperative rather than `useQuery`: the code comes from a text box, so there
+   * is nothing to subscribe to until a developer has finished typing one.
+   */
+  const convex = useConvex();
 
   const membership = useMembership(isAuthenticated);
 
@@ -86,10 +93,10 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     signOut: async () => {
       await signOut();
     },
-    authorizeCli: async (p) => await authorize(p),
-    handOffToCli: (url) => {
-      window.location.href = url;
-    },
+    lookupDeviceCode: async (p) =>
+      await convex.query(api.cliAuth.deviceRequest, p),
+    approveDeviceCode: async (p) => await approveDevice(p),
+    denyDeviceCode: async (p) => await denyDevice(p),
   };
 
   return <DataContext.Provider value={data}>{children}</DataContext.Provider>;
