@@ -2771,6 +2771,13 @@ ledger is `.superpowers/sdd/2026-08-06-claude-accounts/progress.md`.
   the bare name, and `[ ! -x "claude" ]` then tests a path relative to the *current
   directory* — a checkout holding an executable called `claude` made the launcher `exec`
   itself forever. A `case` guard now runs before the `-x` test.
+- **`install_claude` names its prefix.** `npm install -g` puts a binary where the Node that
+  *interprets* npm lives, and `bin/npm` is a `#!/usr/bin/env node` script — so on a machine
+  with any system Node, Claude Code installed beside that one and `Ctx::claude()` never found
+  it. A `prefix` line in a developer's `~/.npmrc` would have done the same. Now `--prefix`
+  names riabuild's Node tree on the command line and `PATH` is prefixed with riabuild's own
+  `bin` for that call. The retired `claude_profiles` hid this by resolving the binary with
+  `which("claude")`; the first `e2e/run.sh` run on the pull request found it.
 - **Two tasks the plan lacked.** *9b*: drop the retired `claude_profiles` record from
   `state.json`, which the spec required and no brief implemented. *11b*: teach `e2e/run.sh`
   about accounts — it asserted the `claude_profiles` state key, the retired `claude_profile`
