@@ -7,16 +7,100 @@
 use super::{Remote, identity, shell_command, shell_quote, ssh_once};
 use crate::download;
 use crate::paths::{Paths, RealPaths};
-use crate::runner::{CommandRunner, RunOptions};
+use crate::runner::{CommandOutput, CommandRunner, RunOptions};
 use crate::ui::{Failure, Ui};
 use anyhow::Result;
+use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The fixed `(remote, paths, runner, ui)` quad every step below needs —
+/// bundled so threading it through a private call chain does not turn into a
+/// wall of repeated parameters (and the `#[allow(clippy::too_many_arguments)]`
+/// that would otherwise be needed at every stage).
+struct SshCtx<'a> {
+    remote: &'a Remote,
+    paths: &'a dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    ui: &'a Ui,
+}
+
+impl SshCtx<'_> {
+    async fn ssh(&self, command: &str) -> Result<CommandOutput> {
+        ssh_once(self.remote, self.paths, self.runner.clone(), command).await
+    }
+
+    /// Same as [`Self::ssh`], but with `stdin` piped to the command — for
+    /// streaming the binary itself, which `ssh_once` has no room for.
+    async fn ssh_with_stdin(&self, command: String, stdin: Vec<u8>) -> Result<CommandOutput> {
+        let mut args = identity::ssh_options(self.remote, self.paths, true);
+        args.push(self.remote.target());
+        args.push(command);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.runner
+            .run(
+                "ssh",
+                &refs,
+                &RunOptions {
+                    stdin: Some(stdin),
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+}
+
+/// The network calls made before anything is trusted — a seam so the
+/// *composed* install path (`ensure_riabuild` through `write_binary`) is
+/// testable end to end without a real GitHub release to fetch, mirroring how
+/// `CommandRunner` seams out `ssh`. `target` and `expected` are adjacent,
+/// same-typed `&str` parameters handed into [`ensure_matching_binary`]; with
+/// each stage previously only testable in isolation, transposing them would
+/// have compiled and passed every existing test silently. `RealDownloads` is
+/// what production uses; tests substitute a fixed pair of responses.
+#[async_trait]
+trait Downloads: Send + Sync {
+    async fn checksums(&self, version: &str) -> Result<String>;
+    async fn tarball(&self, version: &str, target: &str) -> Result<Vec<u8>>;
+}
+
+struct RealDownloads;
+
+#[async_trait]
+impl Downloads for RealDownloads {
+    async fn checksums(&self, version: &str) -> Result<String> {
+        download::fetch_text(&download::riabuild_checksums_url(version))
+            .await
+            .map_err(|error| {
+                Failure::new(
+                    format!("verifying the riabuild {version} download"),
+                    "Check this laptop's network connection, then run `riabuild remote` again.",
+                )
+                .detail(error.to_string())
+                .into()
+            })
+    }
+
+    async fn tarball(&self, version: &str, target: &str) -> Result<Vec<u8>> {
+        download::fetch_bytes(&download::riabuild_asset_url(version, target))
+            .await
+            .map_err(|error| {
+                Failure::new(
+                    format!("downloading riabuild {version} for this server"),
+                    "Check this laptop's network connection, then run `riabuild remote` again.",
+                )
+                .detail(error.to_string())
+                .into()
+            })
+    }
+}
+
 /// Where riabuild's own layout (`paths::riabuild_dir`) lands when evaluated
-/// against a *remote* home rather than this laptop's. `RealPaths::with_root`
-/// exists precisely so this is derived rather than formatted a second time —
-/// see R10 in `decisions.md`.
+/// against a *remote* home rather than this laptop's. The second argument to
+/// `with_root` is inert here on purpose: `RealPaths::tools_root()` always
+/// resolves against `home` and ignores `root` (Task 6's tested invariant —
+/// state is per-developer, toolchains are shared), so there is no other root
+/// to hand it; `home` is simply repeated. See R10 in `decisions.md`.
 fn remote_riabuild_dir(home: &str, version: &str) -> PathBuf {
     RealPaths::with_root(home, home).riabuild_dir(version)
 }
@@ -32,13 +116,34 @@ pub fn remote_binary_path(home: &str, version: &str) -> String {
         .into_owned()
 }
 
-/// `sha256sum` on Linux, `shasum -a 256` on macOS; whichever exists prints the
-/// digest as its first word.
+/// `sha256sum` on Linux, `shasum -a 256` on macOS; whichever exists prints
+/// the digest as its first word. A shell fragment, not a full command —
+/// callers wrap it with `shell_command`.
+fn digest_probe(path: &str) -> String {
+    let quoted = shell_quote(path);
+    format!(
+        "if command -v sha256sum >/dev/null 2>&1; then sha256sum {quoted}; \
+         else shasum -a 256 {quoted}; fi | cut -d' ' -f1"
+    )
+}
+
 fn digest_command(path: &str) -> String {
+    shell_command(&digest_probe(path))
+}
+
+/// Computes the on-disk digest of `path` and, if it does not match
+/// `expected`, removes `path` — in the *same* SSH round trip as the check.
+/// Without this, a corrupted transfer would leave a `chmod 755`'d file
+/// sitting at a well-known, shared path between the failed check and
+/// whatever retries, and anything that invokes `remote_binary_path` directly
+/// in that window executes unverified bytes — the exact thing digest
+/// verification exists to prevent, one step late.
+fn verify_or_remove_command(path: &str, expected: &str) -> String {
     shell_command(&format!(
-        "if command -v sha256sum >/dev/null 2>&1; then sha256sum {q}; \
-         else shasum -a 256 {q}; fi | cut -d' ' -f1",
-        q = shell_quote(path)
+        "digest=$({probe}); if [ \"$digest\" != {expected} ]; then rm -f {path}; fi; printf %s \"$digest\"",
+        probe = digest_probe(path),
+        expected = shell_quote(expected),
+        path = shell_quote(path),
     ))
 }
 
@@ -58,10 +163,27 @@ pub async fn ensure_riabuild(
     home: &str,
     version: &str,
 ) -> Result<String> {
-    let platform = ssh_once(remote, paths, runner.clone(), "uname -sm").await?;
+    let ctx = SshCtx {
+        remote,
+        paths,
+        runner,
+        ui,
+    };
+    ensure_riabuild_with(&ctx, home, version, &RealDownloads).await
+}
+
+/// The body of [`ensure_riabuild`], taking [`Downloads`] as a seam so the
+/// whole composed path is testable without a real release to fetch.
+async fn ensure_riabuild_with(
+    ctx: &SshCtx<'_>,
+    home: &str,
+    version: &str,
+    downloads: &dyn Downloads,
+) -> Result<String> {
+    let platform = ctx.ssh("uname -sm").await?;
     if !platform.ok() {
         return Err(Failure::new(
-            format!("asking {} what it is", remote.host),
+            format!("asking {} what it is", ctx.remote.host),
             "Check that you can `ssh` to that server yourself, then run `riabuild remote` again.",
         )
         .command("uname -sm")
@@ -73,7 +195,7 @@ pub async fn ensure_riabuild(
     let machine = parts.next().unwrap_or_default();
     let target = download::rust_target(system, machine).map_err(|error| {
         Failure::new(
-            format!("installing riabuild on {}", remote.host),
+            format!("installing riabuild on {}", ctx.remote.host),
             "Use a server riabuild publishes a build for: Linux or macOS, on x86_64 or arm64.",
         )
         .detail(error.to_string())
@@ -81,7 +203,7 @@ pub async fn ensure_riabuild(
 
     // Computed before it is compared against anything or trusted to skip an
     // install — see R8(b).
-    let checksums = download::fetch_text(&download::riabuild_checksums_url(version)).await?;
+    let checksums = downloads.checksums(version).await?;
     let asset = download::riabuild_asset(version, &target);
     let expected = download::digest_for(&checksums, &asset).ok_or_else(|| {
         Failure::new(
@@ -90,25 +212,18 @@ pub async fn ensure_riabuild(
         )
     })?;
 
-    ensure_matching_binary(remote, paths, runner, ui, home, version, &target, &expected).await
+    ensure_matching_binary(ctx, home, version, &target, &expected, downloads).await
 }
 
-/// The part of [`ensure_riabuild`] that needs no network beyond the tarball
-/// download itself. Split out so "already correct, nothing to do" is
-/// testable against a `FakeRunner` alone, with `expected` supplied already
-/// resolved rather than requiring a real fetch of
-/// `riabuild-*-checksums.txt` — which does not exist for a test's made-up
-/// version — in every test that exercises it.
-#[allow(clippy::too_many_arguments)]
+/// The part of [`ensure_riabuild_with`] that needs no network beyond the
+/// tarball download itself.
 async fn ensure_matching_binary(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: Arc<dyn CommandRunner>,
-    ui: &Ui,
+    ctx: &SshCtx<'_>,
     home: &str,
     version: &str,
     target: &str,
     expected: &str,
+    downloads: &dyn Downloads,
 ) -> Result<String> {
     let path = remote_binary_path(home, version);
 
@@ -117,16 +232,17 @@ async fn ensure_matching_binary(
     // every other developer on a shared account would then execute it with
     // their session token in the environment. `sha256sum`/`shasum` is asked
     // for the digest of what is actually there.
-    let installed = ssh_once(remote, paths, runner.clone(), &digest_command(&path)).await?;
+    let installed = ctx.ssh(&digest_command(&path)).await?;
     if installed.ok() && installed.trimmed() == expected {
         return Ok(path);
     }
 
-    ui.working("riabuild", &format!("installing {version} on the server"));
+    ctx.ui
+        .working("riabuild", &format!("installing {version} on the server"));
 
     // Verified against `expected` before a single byte is extracted or sent
     // anywhere near the server.
-    let tarball = download::fetch_bytes(&download::riabuild_asset_url(version, target)).await?;
+    let tarball = downloads.tarball(version, target).await?;
     if download::sha256_hex(&tarball) != expected {
         return Err(Failure::new(
             format!("verifying the riabuild {version} download"),
@@ -137,19 +253,15 @@ async fn ensure_matching_binary(
     }
     let binary = download::extract_single_file(&tarball, "riabuild")?;
 
-    write_binary(remote, paths, runner, ui, home, version, expected, binary).await
+    write_binary(ctx, home, version, expected, binary).await
 }
 
 /// Streams already-verified bytes onto the server and confirms what landed —
 /// split out from [`ensure_matching_binary`] so the write, and its failure
 /// and corruption paths, are testable against a `FakeRunner` without ever
 /// downloading anything.
-#[allow(clippy::too_many_arguments)]
 async fn write_binary(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: Arc<dyn CommandRunner>,
-    ui: &Ui,
+    ctx: &SshCtx<'_>,
     home: &str,
     version: &str,
     expected: &str,
@@ -167,52 +279,48 @@ async fn write_binary(
         .to_string_lossy()
         .into_owned();
     let part = format!("{dir}/.riabuild.{}.part", std::process::id());
-    let final_path = format!("{dir}/riabuild");
     let quoted_dir = shell_quote(&dir);
     let quoted_part = shell_quote(&part);
-    let quoted_final = shell_quote(&final_path);
+    let quoted_path = shell_quote(&path);
     let install = shell_command(&format!(
         "umask 077 && mkdir -p {quoted_dir} && cat > {quoted_part} && \
-         chmod 755 {quoted_part} && mv {quoted_part} {quoted_final}"
+         chmod 755 {quoted_part} && mv {quoted_part} {quoted_path}"
     ));
-    let mut args = identity::ssh_options(remote, paths, true);
-    args.push(remote.target());
-    args.push(install);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let written = runner
-        .run(
-            "ssh",
-            &refs,
-            &RunOptions {
-                stdin: Some(binary),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let written = ctx.ssh_with_stdin(install, binary).await?;
     if !written.ok() {
         return Err(Failure::new(
-            format!("installing riabuild on {}", remote.host),
+            format!("installing riabuild on {}", ctx.remote.host),
             "Check there is space in your home directory on that server, then run `riabuild remote` again.",
         )
         .detail(written.stderr)
         .into());
     }
 
-    // Re-verified after writing: a truncated or corrupted transfer must not
-    // be reported as a successful install.
-    let confirmed = ssh_once(remote, paths, runner.clone(), &digest_command(&path)).await?;
-    if !confirmed.ok() || confirmed.trimmed() != expected {
+    // Re-verified after writing, and cleaned up in the same round trip on a
+    // mismatch (see `verify_or_remove_command`): a truncated or corrupted
+    // transfer must never be left behind at this well-known, shared path,
+    // and must never be reported as a successful install.
+    let confirmed = ctx.ssh(&verify_or_remove_command(&path, expected)).await?;
+    if !confirmed.ok() {
         return Err(Failure::new(
-            format!("installing riabuild on {}", remote.host),
+            format!("verifying riabuild on {}", ctx.remote.host),
+            "Run `riabuild remote` again. If it keeps failing, tell your team lead.",
+        )
+        .detail(confirmed.stderr)
+        .into());
+    }
+    if confirmed.trimmed() != expected {
+        return Err(Failure::new(
+            format!("installing riabuild on {}", ctx.remote.host),
             "Run `riabuild remote` again. If it keeps failing, tell your team lead.",
         )
         .detail(format!(
-            "the server reports {:?} after installing {version}",
+            "the server reports {:?} after installing {version} — the file was removed rather than left behind",
             confirmed.trimmed()
         ))
         .into());
     }
-    ui.applied("riabuild");
+    ctx.ui.applied("riabuild");
     Ok(path)
 }
 
@@ -231,6 +339,29 @@ mod tests {
     }
 
     const EXPECTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The exact prefix `identity::ssh_options` plus the login target
+    /// produces — shared by every command sent to `remote`, so it is what
+    /// lets `FakeRunner::then` sequence responses to *successive* remote
+    /// calls in order, regardless of which trailing command each one sends.
+    fn ssh_prefix(remote: &Remote, paths: &dyn Paths) -> String {
+        let options = identity::ssh_options(remote, paths, true).join(" ");
+        format!("ssh {options} {}", remote.target())
+    }
+
+    /// A `Downloads` that panics if called — for tests proving a path never
+    /// touches the network at all.
+    struct UnreachableDownloads;
+
+    #[async_trait]
+    impl Downloads for UnreachableDownloads {
+        async fn checksums(&self, _version: &str) -> Result<String> {
+            panic!("must not fetch checksums on this path");
+        }
+        async fn tarball(&self, _version: &str, _target: &str) -> Result<Vec<u8>> {
+            panic!("must not download a tarball on this path");
+        }
+    }
 
     #[test]
     fn the_remote_path_is_versioned_and_shared() {
@@ -278,28 +409,30 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_already_holding_the_right_binary_is_left_alone() {
-        // Exercises `ensure_matching_binary` directly, with `expected` already
-        // resolved: `ensure_riabuild` itself always fetches
-        // `riabuild-*-checksums.txt` first (R8(b) — that digest must exist
-        // before anything is compared against it), which is a real network call
-        // this test has no business making, and no real release exists for a
-        // made-up test version anyway.
+        // `UnreachableDownloads` makes the property absolute: this path must
+        // not touch the network at all, not merely "happens not to" in this
+        // particular stub.
         let laptop = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(laptop.path());
         // The digest of what is on disk, not the version it claims. A co-tenant
         // can put a script at that path that prints any version string.
         let fake =
             Arc::new(FakeRunner::new().containing("sha256sum", 0, &format!("{EXPECTED}\n"), ""));
+        let remote = remote();
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake.clone(),
+            ui: &Ui::new(true),
+        };
 
         let path = ensure_matching_binary(
-            &remote(),
-            &paths,
-            fake.clone(),
-            &Ui::new(true),
+            &ctx,
             "/home/dev",
             "2026.08.06",
             "aarch64-apple-darwin",
             EXPECTED,
+            &UnreachableDownloads,
         )
         .await
         .expect("already installed");
@@ -312,6 +445,93 @@ mod tests {
         );
     }
 
+    fn make_tarball(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, payload)
+            .expect("append");
+        let tar_bytes = archive.into_inner().expect("finish");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
+        encoder.finish().expect("gzip")
+    }
+
+    /// Returns the exact tarball for whichever `target` `ensure_riabuild_with`
+    /// asks for, and errors on any other — so a bug that hands this function
+    /// the wrong argument (say, `target` and `expected` transposed at the
+    /// call into `ensure_matching_binary`) is caught immediately rather than
+    /// producing a merely-wrong digest later.
+    struct FixedDownloads {
+        checksums: String,
+        tarball: Vec<u8>,
+        target: &'static str,
+    }
+
+    #[async_trait]
+    impl Downloads for FixedDownloads {
+        async fn checksums(&self, _version: &str) -> Result<String> {
+            Ok(self.checksums.clone())
+        }
+        async fn tarball(&self, _version: &str, target: &str) -> Result<Vec<u8>> {
+            if target != self.target {
+                anyhow::bail!(
+                    "wrong target requested: {target:?}, expected {:?}",
+                    self.target
+                );
+            }
+            Ok(self.tarball.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_composed_install_path_downloads_verifies_and_writes() {
+        // Drives `ensure_riabuild_with` end to end — platform detection,
+        // checksum lookup, download, digest verification, and the write —
+        // against a fixed `Downloads` and a `FakeRunner` sequenced by call
+        // order. This is what would fail if `target` and `expected` were
+        // ever transposed at the handoff into `ensure_matching_binary`: they
+        // are adjacent, same-typed `&str` parameters, and no per-stage test
+        // can see that handoff at all.
+        let laptop = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(laptop.path());
+        let remote = remote();
+        let version = "2026.08.06";
+        let target = "x86_64-unknown-linux-musl";
+
+        let tarball = make_tarball("riabuild", b"a real riabuild binary, or close enough");
+        let digest = download::sha256_hex(&tarball);
+        let asset = download::riabuild_asset(version, target);
+        let downloads = FixedDownloads {
+            checksums: format!("{digest}  {asset}\n"),
+            tarball,
+            target,
+        };
+
+        let prefix = ssh_prefix(&remote, &paths);
+        let fake = Arc::new(
+            FakeRunner::new()
+                .then(&prefix, 0, "Linux x86_64\n", "") // uname -sm
+                .then(&prefix, 1, "", "No such file") // installed check: nothing there yet
+                .then(&prefix, 0, "", "") // the write
+                .then(&prefix, 0, &format!("{digest}\n"), ""), // post-write reverify
+        );
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake,
+            ui: &Ui::new(true),
+        };
+
+        let path = ensure_riabuild_with(&ctx, "/home/dev", version, &downloads)
+            .await
+            .expect("installs end to end");
+        assert_eq!(path, remote_binary_path("/home/dev", version));
+    }
+
     #[tokio::test]
     async fn a_missing_binary_is_written_verified_and_confirmed() {
         let laptop = tempfile::TempDir::new().expect("tempdir");
@@ -321,12 +541,16 @@ mod tests {
                 .containing("mkdir -p", 0, "", "")
                 .containing("sha256sum", 0, &format!("{EXPECTED}\n"), ""),
         );
+        let remote = remote();
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake.clone(),
+            ui: &Ui::new(true),
+        };
 
         let path = write_binary(
-            &remote(),
-            &paths,
-            fake.clone(),
-            &Ui::new(true),
+            &ctx,
             "/home/dev",
             "2026.08.06",
             EXPECTED,
@@ -349,12 +573,16 @@ mod tests {
         let paths = crate::paths::RealPaths::rooted_at(laptop.path());
         let fake =
             Arc::new(FakeRunner::new().containing("mkdir -p", 1, "", "No space left on device"));
+        let remote = remote();
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake,
+            ui: &Ui::new(true),
+        };
 
         let error = write_binary(
-            &remote(),
-            &paths,
-            fake,
-            &Ui::new(true),
+            &ctx,
             "/home/dev",
             "2026.08.06",
             EXPECTED,
@@ -370,23 +598,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_corrupted_transfer_is_caught_after_writing() {
+    async fn a_corrupted_transfer_is_caught_and_the_bad_file_is_removed() {
         // The write itself reported success, but what the server can now read
         // back does not match — a truncated or interleaved transfer, say. This
-        // must not be reported as an install that worked.
+        // must not be reported as an install that worked, and must not leave
+        // an executable file behind at a well-known, shared path.
         let laptop = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(laptop.path());
+        let remote = remote();
+        let path = remote_binary_path("/home/dev", "2026.08.06");
+
+        let prefix = ssh_prefix(&remote, &paths);
         let fake = Arc::new(
             FakeRunner::new()
-                .containing("mkdir -p", 0, "", "")
-                .containing("sha256sum", 0, "deadbeef\n", ""),
+                .then(&prefix, 0, "", "") // the write
+                .then(&prefix, 0, "deadbeef\n", "") // post-write reverify: mismatch
+                // This test's own follow-up probe, standing in for "whatever
+                // runs next" — proving the mismatched file is actually gone,
+                // not merely that a removal command was composed.
+                .then(&prefix, 1, "", "No such file or directory"),
         );
+        let ctx = SshCtx {
+            remote: &remote,
+            paths: &paths,
+            runner: fake.clone(),
+            ui: &Ui::new(true),
+        };
 
         let error = write_binary(
-            &remote(),
-            &paths,
-            fake,
-            &Ui::new(true),
+            &ctx,
             "/home/dev",
             "2026.08.06",
             EXPECTED,
@@ -399,5 +639,22 @@ mod tests {
             .downcast_ref::<Failure>()
             .expect("must be the actionable Failure");
         assert!(failure.detail.contains("deadbeef"), "{}", failure.detail);
+
+        // The removal must be issued in the very same round trip as the
+        // mismatch check — not a second command a retry might never reach.
+        let issued = fake.calls();
+        let reverify = issued
+            .iter()
+            .rev()
+            .find(|call| call.contains("sha256sum") || call.contains("shasum"))
+            .expect("a reverify call was made");
+        assert!(reverify.contains("rm -f"), "{reverify}");
+        assert!(reverify.contains(&path), "{reverify}");
+
+        // And a follow-up probe against the same path finds nothing there.
+        let probe = ssh_once(&remote, &paths, fake, &digest_command(&path))
+            .await
+            .expect("probe runs");
+        assert!(!probe.ok(), "the file must be gone: {probe:?}");
     }
 }
