@@ -255,21 +255,26 @@ jobs:
 
           # A package that does not put the binary on PATH installs nothing
           # useful, and neither dpkg-deb nor rpmbuild would say so.
+          # Captured before searching, never piped into `grep -q`: grep exits
+          # at its first match and closes the pipe, dpkg-deb's tar subprocess
+          # fails its next write, and `pipefail` makes that a failed step. The
+          # race only shows once the archive is long enough that tar is still
+          # writing when grep leaves, which is why it took a release to find.
           for deb in dist/*.deb; do
-            dpkg-deb --contents "$deb" | grep -q './usr/bin/riabuild'
-            dpkg-deb --field "$deb" Version | grep -qx "$version"
+            grep -q './usr/bin/riabuild' <<<"$(dpkg-deb --contents "$deb")"
+            test "$(dpkg-deb --field "$deb" Version)" = "$version"
           done
           for rpm in dist/*.rpm; do
-            rpm -qlp "$rpm" | grep -qx '/usr/bin/riabuild'
+            grep -qx '/usr/bin/riabuild' <<<"$(rpm -qlp "$rpm")"
             test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version"
             # AutoReq is off, so an explicit Requires is the only way git gets
             # declared — and dropping it is invisible until someone installs on
             # a machine without git and riabuild fails at the first checkout.
-            rpm -qp --requires "$rpm" | grep -qx 'git'
+            grep -qx 'git' <<<"$(rpm -qp --requires "$rpm")"
             # MIT asks that the notice travel with every copy. `-qL` lists only
             # files marked %license, so this checks the marking too, not merely
             # that a file called LICENSE got swept into the payload.
-            rpm -qLp "$rpm" | grep -q 'LICENSE'
+            grep -q 'LICENSE' <<<"$(rpm -qLp "$rpm")"
             test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
           done
 
