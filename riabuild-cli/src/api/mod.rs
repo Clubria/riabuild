@@ -12,9 +12,6 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::time::Duration;
 
-/// The dashboard a browser is sent to.
-pub const DEFAULT_WEB_URL: &str = "https://riabuild.clubria.com";
-
 /// The `/api/v1` origin — the Convex deployment's own hostname.
 ///
 /// Not `api.riabuild.clubria.com`, which cannot be made to work for free:
@@ -27,9 +24,10 @@ pub const DEFAULT_WEB_URL: &str = "https://riabuild.clubria.com";
 /// `RIABUILD_API_URL` for local development.
 pub const DEFAULT_API_URL: &str = "https://handsome-vulture-127.eu-west-1.convex.site";
 
-pub fn web_url() -> String {
-    trim(std::env::var("RIABUILD_WEB_URL").unwrap_or_else(|_| DEFAULT_WEB_URL.to_string()))
-}
+// There is deliberately no `web_url()`. The CLI no longer builds any dashboard
+// link: `POST /api/v1/cli/device` returns the verification URL, because the
+// server is the thing that knows where the dashboard is deployed. A second copy
+// of that answer here could disagree with it.
 
 pub fn api_url() -> String {
     trim(std::env::var("RIABUILD_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string()))

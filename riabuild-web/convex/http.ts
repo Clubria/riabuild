@@ -3,7 +3,13 @@ import { httpAction, ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { auth } from "./auth";
 import { Id } from "./_generated/dataModel";
-import { pkceChallenge, randomToken, sha256Hex } from "./lib/crypto";
+import {
+  formatUserCode,
+  randomToken,
+  randomUserCode,
+  sha256Hex,
+} from "./lib/crypto";
+import { DEVICE_CODE_TTL_MS, POLL_INTERVAL_SECONDS } from "./cliAuth";
 import { meetsMinimum } from "./lib/version";
 import { ApiFailure, apiError, fail, jsonResponse } from "./lib/responses";
 import { checkOrgMembership, orgLogin } from "./github";
@@ -111,6 +117,21 @@ async function loadConfig(ctx: ActionCtx): Promise<OrgConfig> {
 }
 
 /**
+ * The dashboard a developer is sent to, which is not this origin — `/api/v1` is
+ * served from the Convex deployment while the pages are on Cloudflare.
+ *
+ * `SITE_URL` rather than a new variable of our own: the deployment already sets
+ * it for auth redirects, and it already means "where the dashboard lives". A
+ * second variable holding the same answer is a second variable that can
+ * disagree with the first, and the failure would be a verification link
+ * pointing somewhere nobody is signed in.
+ */
+function dashboardUrl(): string {
+  const configured = process.env.SITE_URL ?? "https://riabuild.clubria.com";
+  return configured.replace(/\/+$/, "");
+}
+
+/**
  * `/org/config` and `/cli/token` deliberately never enforce this: the first is
  * how a CLI learns it must upgrade, and the second is how it signs in to be told
  * so. Enforcing everywhere would leave an old CLI with no path forward.
@@ -161,18 +182,109 @@ function memberPayload(member: MemberView) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* POST /api/v1/cli/token — exchange a one-time code for a session token       */
+/* POST /api/v1/cli/device — start a device authorisation                      */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Unauthenticated: this is how a machine *becomes* authenticated.
+ *
+ * It is also the one place the version floor reaches a machine that has never
+ * signed in. `/api/v1/org/config` carries `minCliVersion` but requires a
+ * session, so before this endpoint existed an unsigned machine on an old build
+ * had no way to be told it had to upgrade.
+ */
+http.route({
+  path: "/api/v1/cli/device",
+  method: "POST",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const config = await loadConfig(ctx);
+      enforceMinVersion(req, config);
+
+      const body: unknown = await req.json().catch(() => null);
+      const rawLabel = (body as { deviceLabel?: unknown } | null)?.deviceLabel;
+      if (rawLabel !== undefined && typeof rawLabel !== "string") {
+        fail(
+          400,
+          "bad_request",
+          "riabuild sent a malformed sign-in request.",
+          "Run `riabuild login` again.",
+        );
+      }
+
+      const deviceLabel = (rawLabel ?? "").slice(0, 80) || "unknown device";
+      const cliVersion =
+        (req.headers.get("x-riabuild-cli-version") ?? "").slice(0, 32) ||
+        "unknown";
+
+      const deviceCode = randomToken(32);
+      const expiresAt = Date.now() + DEVICE_CODE_TTL_MS;
+
+      // Retried rather than assumed unique: a collision would wire one
+      // developer's approval screen to another developer's terminal, and it
+      // would do it silently.
+      let userCode = "";
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = randomUserCode();
+        const result = await ctx.runMutation(internal.cliAuth.startDevice, {
+          deviceCodeHash: await sha256Hex(deviceCode),
+          userCode: candidate,
+          deviceLabel,
+          cliVersion,
+          expiresAt,
+          now: Date.now(),
+        });
+        if (result.status === "ok") {
+          userCode = candidate;
+          break;
+        }
+      }
+      if (userCode === "") {
+        console.error("could not mint a free user code in five attempts");
+        fail(
+          500,
+          "upstream_error",
+          "riabuild could not start a sign-in just now.",
+          "Try `riabuild login` again in a moment.",
+        );
+      }
+
+      const verificationUri = `${dashboardUrl()}/cli`;
+      return jsonResponse({
+        deviceCode,
+        userCode: formatUserCode(userCode),
+        verificationUri,
+        verificationUriComplete: `${verificationUri}?code=${formatUserCode(userCode)}`,
+        // Relative seconds, unlike `expiresAt` elsewhere in this API: riabuild's
+        // first run happens on freshly provisioned machines where NTP may not
+        // have settled, and a skewed clock would make the CLI abandon a live
+        // code or keep polling a dead one. A duration is immune to that.
+        expiresIn: Math.round(DEVICE_CODE_TTL_MS / 1000),
+        interval: POLL_INTERVAL_SECONDS,
+      });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
+/* POST /api/v1/cli/token — poll a device code, eventually for a session       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Polling states come back as 200 with a discriminated body rather than RFC
+ * 8628's `400 authorization_pending`. "Not yet" is the expected answer in a
+ * loop that runs dozens of times per login, and the CLI turns every non-2xx
+ * into an error that unwinds — encoding the normal path that way would mean
+ * reconstructing the happy path from an error code on every tick.
+ */
 http.route({
   path: "/api/v1/cli/token",
   method: "POST",
   handler: httpAction(
     endpoint(async (ctx, req) => {
       const body: unknown = await req.json().catch(() => null);
-      const code = (body as { code?: unknown } | null)?.code;
-      const verifier = (body as { verifier?: unknown } | null)?.verifier;
-      if (typeof code !== "string" || typeof verifier !== "string") {
+      const deviceCode = (body as { deviceCode?: unknown } | null)?.deviceCode;
+      if (typeof deviceCode !== "string") {
         fail(
           400,
           "bad_request",
@@ -183,30 +295,39 @@ http.route({
 
       const token = randomToken(32);
       const result = await ctx.runMutation(internal.cliAuth.redeem, {
-        codeHash: await sha256Hex(code),
-        computedChallenge: await pkceChallenge(verifier),
+        deviceCodeHash: await sha256Hex(deviceCode),
         tokenHash: await sha256Hex(token),
         now: Date.now(),
       });
 
+      if (result.status === "pending") {
+        return jsonResponse({
+          status: "pending",
+          interval: POLL_INTERVAL_SECONDS,
+        });
+      }
+      if (result.status === "denied") {
+        return jsonResponse({ status: "denied" });
+      }
+      if (result.status === "suspended") {
+        fail(
+          403,
+          "suspended",
+          "Your riabuild account is suspended.",
+          "Ask your team lead to reactivate it.",
+        );
+      }
       if (result.status !== "ok") {
-        if (result.status === "suspended") {
-          fail(
-            403,
-            "suspended",
-            "Your riabuild account is suspended.",
-            "Ask your team lead to reactivate it.",
-          );
-        }
         fail(
           401,
           "unauthenticated",
-          "That sign-in link is no longer valid.",
+          "That sign-in request is no longer valid.",
           "Run `riabuild login` again.",
         );
       }
 
       return jsonResponse({
+        status: "ok",
         token,
         expiresAt: result.expiresAt,
         member: memberPayload(result.member),

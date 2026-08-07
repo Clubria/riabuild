@@ -106,19 +106,28 @@ export type Data = {
    */
   devSignIn?(login: string): Promise<void>;
   signOut(): Promise<void>;
-  authorizeCli(p: {
-    challenge: string;
-    deviceLabel: string;
-    cliVersion: string;
-  }): Promise<{ code: string }>;
   /**
-   * Hands the one-time code back to the CLI listening on loopback.
+   * Looks up the code a developer read off their terminal.
    *
-   * This is a `Data` method rather than a bare `window.location.href =` in the
-   * page because it is the last side effect before the browser leaves. Owning
-   * it here is what lets the fixture provider stop at the "approved" screen so
-   * that screen can be looked at — a state that otherwise exists for one frame
-   * before navigating to a port no test can serve.
+   * A promise rather than a `Loadable` field because the argument comes from a
+   * text box: there is nothing to load until someone has typed something.
    */
-  handOffToCli(url: string): void;
+  lookupDeviceCode(p: { userCode: string }): Promise<DeviceRequest>;
+  approveDeviceCode(p: { userCode: string }): Promise<DeviceDecision>;
+  denyDeviceCode(p: { userCode: string }): Promise<DeviceDecision>;
+};
+
+/** A pending `riabuild login`, as shown to whoever is asked to approve it. */
+export type DeviceRequest =
+  | {
+      status: "pending";
+      deviceLabel: string;
+      cliVersion: string;
+      requestedAt: number;
+      expiresAt: number;
+    }
+  | { status: "unknown" | "expired" | "used" };
+
+export type DeviceDecision = {
+  status: "ok" | "unknown" | "expired" | "used";
 };

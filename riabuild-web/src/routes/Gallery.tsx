@@ -171,7 +171,7 @@ export function Gallery() {
           rows={[
             { label: "device", value: "dana-mbp-16" },
             { label: "riabuild", value: "v2026.08.04", tone: "accent" },
-            { label: "callback", value: "127.0.0.1:51789" },
+            { label: "asked", value: "just now" },
             { label: "empty", value: "" },
             { label: "long".repeat(6), value: "y".repeat(200) },
           ]}

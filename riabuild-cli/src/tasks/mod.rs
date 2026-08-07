@@ -97,7 +97,6 @@ pub struct Ctx {
     pub org: Option<OrgConfig>,
     pub member: Option<Member>,
     pub cli_version: String,
-    pub web_url: String,
     /// Environment the shell will be spawned with.
     pub env: Vec<(String, String)>,
     /// Report-only findings, printed after the run. `repo_status` fills this.

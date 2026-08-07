@@ -106,6 +106,12 @@ Role promotion happens in the riabuild dashboard, performed by a `lead`, and wri
 
 ### CLI login — loopback OAuth
 
+> **Superseded on 2026-08-07** by
+> `2026-08-07-device-code-login-design.md`. The reasoning below assumed the terminal and
+> the browser share a machine, which is false over SSH — the CLI bound a port on the
+> server while the browser resolved `127.0.0.1` on the laptop. riabuild now polls a device
+> code. None of the following describes shipped code; it is kept for the record.
+
 The same shape `gh` uses. Chosen over device-code flow because the target is a macOS
 desktop with a browser, and because it matches the intended feel: the dashboard sends
 the developer straight back to their terminal.

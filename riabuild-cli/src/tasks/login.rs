@@ -63,10 +63,7 @@ impl Task for Login {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let web_url = ctx.web_url.clone();
-        let version = ctx.cli_version.clone();
-        let (token, member) =
-            auth::login(&ctx.api, ctx.runner.as_ref(), &ctx.ui, &web_url, &version).await?;
+        let (token, member) = auth::login(&ctx.api, ctx.runner.as_ref(), &ctx.ui).await?;
 
         ctx.keychain.set(&token).await?;
         ctx.api.set_token(Some(token));

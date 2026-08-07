@@ -63,13 +63,10 @@ test.describe("against a real backend", () => {
     await page.getByRole("button", { name: /sign in as devlead/i }).click();
     await expect(page.getByText("One command builds the machine.")).toBeVisible();
 
-    await page.goto(
-      `/cli/authorize?state=${"s".repeat(20)}&challenge=${"c".repeat(40)}` +
-        `&port=51789&label=smoke-machine&version=2026.08.04`,
-    );
-    await expect(
-      page.getByRole("button", { name: /approve this machine/i }),
-    ).toBeVisible();
+    // No code: against a real backend there is no pending request to find, so
+    // the code box is what this proves renders and accepts input.
+    await page.goto("/cli");
+    await expect(page.getByLabel(/code from your terminal/i)).toBeVisible();
     await checkPage(page, info, consoleErrors, { screenshot: "smoke-authorize" });
   });
 });

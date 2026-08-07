@@ -11,7 +11,7 @@ test.describe("scenarios", () => {
       const path =
         query === undefined
           ? `/?scenario=${scenario}`
-          : `/cli/authorize?scenario=${scenario}&${query}`;
+          : `/cli?scenario=${scenario}&${query}`;
 
       await page.goto(path);
       await checkPage(page, info, consoleErrors, {
@@ -126,30 +126,51 @@ test.describe("interaction states", () => {
     });
   });
 
-  test("a rejected authorisation surfaces in a panel", async ({
+  test("a failed lookup surfaces in a panel", async ({
     page,
     consoleErrors,
   }, info) => {
     await page.goto(
-      `/cli/authorize?scenario=authorize-error&${AUTHORIZE_QUERY["authorize-error"]}`,
+      `/cli?scenario=authorize-error&${AUTHORIZE_QUERY["authorize-error"]}`,
     );
-    await page.getByRole("button", { name: /approve this machine/i }).click();
     await expect(page.getByText("Not approved")).toBeVisible();
     await checkPage(page, info, consoleErrors, {
-      screenshot: "authorize-error-after-click",
+      screenshot: "authorize-error-after-lookup",
     });
   });
 
-  test("approving reaches the hand-off screen", async ({
+  test("approving reaches the back-to-your-terminal screen", async ({
     page,
     consoleErrors,
   }, info) => {
-    await page.goto(
-      `/cli/authorize?scenario=authorize&${AUTHORIZE_QUERY.authorize}`,
-    );
+    await page.goto(`/cli?scenario=authorize&${AUTHORIZE_QUERY.authorize}`);
     await page.getByRole("button", { name: /approve this machine/i }).click();
     await expect(page.getByText("Back to your terminal.")).toBeVisible();
     await checkPage(page, info, consoleErrors, { screenshot: "authorize-done" });
+  });
+
+  test("denying says plainly that nothing was granted", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto(`/cli?scenario=authorize&${AUTHORIZE_QUERY.authorize}`);
+    await page.getByRole("button", { name: /^deny$/i }).click();
+    await expect(page.getByText("Nothing was granted.")).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "authorize-denied",
+    });
+  });
+
+  test("typing a code by hand finds the machine", async ({ page }) => {
+    // The SSH path: no prefilled code, the developer reads eight characters off
+    // a terminal on another computer and types them here.
+    await page.goto(`/cli?scenario=authorize-empty`);
+    await page
+      .getByLabel(/code from your terminal/i)
+      .fill("wxzbcdfg");
+    await expect(
+      page.getByRole("button", { name: /approve this machine/i }),
+    ).toBeVisible();
   });
 
   test("an unknown scenario name fails loudly", async ({ page }) => {
