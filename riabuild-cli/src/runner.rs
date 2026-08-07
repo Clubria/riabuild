@@ -337,13 +337,17 @@ impl CommandRunner for FakeRunner {
 /// remembers to pass — the runner every task already holds carries them, so a
 /// task that forgets is not a thing anyone can write.
 ///
-/// Caller environment is applied after the scope's, so a task passing its own
-/// variable — `env_local` and `INFISICAL_TOKEN` — still wins. This is a
-/// deliberate choice, not an oversight: it is also the limit of what this type
-/// protects. Nothing stops a task from passing `GH_CONFIG_DIR` itself and
-/// overriding the scope for that one key — `ScopedRunner` only guarantees the
-/// namespace is present when a task says nothing, not that a task cannot
-/// override it. See the precedence tests below.
+/// The scope's own keys — `RIABUILD_ROOT`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL` —
+/// are applied *after* the caller's `RunOptions.env`, so they are not
+/// overridable: `std::process::Command::env()` (see `RealRunner::build`)
+/// overwrites on a repeated key, and the scope's entries are the ones applied
+/// last. A task cannot escape its namespace even by naming one of these keys
+/// itself — accidentally (a copy-pasted env vector from another task) or
+/// otherwise. Every other variable a caller sets — `env_local`'s
+/// `INFISICAL_TOKEN`, for instance — has nothing here to collide with, so it
+/// reaches the child untouched. See the precedence tests below, including one
+/// that pins the collision case: it is written to fail if the merge order were
+/// ever put back the other way around.
 #[allow(dead_code)] // consumed by Task 19
 pub struct ScopedRunner {
     inner: Arc<dyn CommandRunner>,
@@ -358,8 +362,8 @@ impl ScopedRunner {
 
     fn merge(&self, options: &RunOptions) -> RunOptions {
         let mut merged = options.clone();
-        let mut env = self.env.clone();
-        env.extend(options.env.iter().cloned());
+        let mut env = options.env.clone();
+        env.extend(self.env.iter().cloned());
         merged.env = env;
         merged
     }
@@ -467,11 +471,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_caller_setting_the_same_key_the_scope_sets_wins_and_that_is_the_bypass() {
-        // The scope does not protect a key a task explicitly names — only a key
-        // a task says nothing about. A task that (by bug or by malice) passes
-        // its own GH_CONFIG_DIR silently escapes the namespace. Recorded here
-        // so the property is asserted, not assumed.
+    async fn a_caller_cannot_override_a_namespace_key() {
+        // A task cannot escape its namespace even by naming one of the scope's
+        // own keys itself — accidentally (a copy-pasted env vector from another
+        // task) or otherwise. Both entries still reach the inner runner (this
+        // type does not deduplicate), but `std::process::Command::env` (see
+        // `RealRunner::build`) overwrites on a repeated key with whichever call
+        // came last, and the scope's entry is appended after the caller's in
+        // `merge()` — so it is the scope's value the real child process sees.
+        // This is written to fail if that merge order were ever put back the
+        // other way around: see "Prove it bites" in the Task 8 report.
         let fake = Arc::new(FakeRunner::new().with("gh auth status", 0, "", ""));
         let scoped = ScopedRunner::new(
             fake.clone(),
@@ -490,23 +499,20 @@ mod tests {
             .await
             .expect("runs");
 
-        // Both entries reach the inner runner — this type does not deduplicate —
-        // but `std::process::Command::env` (see `RealRunner::build`) applies them
-        // in order and the later one wins, so the real child process sees
-        // `/tmp/some-other-place`, not the scope's namespace.
         let env = fake.env_of("gh auth status");
         assert_eq!(
             env,
             vec![
                 (
                     "GH_CONFIG_DIR".to_string(),
-                    "/run/user/1000/riabuild-gh".to_string()
+                    "/tmp/some-other-place".to_string()
                 ),
                 (
                     "GH_CONFIG_DIR".to_string(),
-                    "/tmp/some-other-place".to_string()
+                    "/run/user/1000/riabuild-gh".to_string()
                 ),
-            ]
+            ],
+            "the scope's entry must be last, since std::process::Command::env() lets the last call for a key win"
         );
     }
 
