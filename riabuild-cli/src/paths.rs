@@ -38,7 +38,6 @@ pub trait Paths: Send + Sync {
     }
     /// Who this namespace belongs to, in words, for whoever has a shell on the
     /// box and finds a directory named after a UUID.
-    #[allow(dead_code)] // consumed by Task 18
     fn owner_file(&self) -> PathBuf {
         self.root().join("owner.json")
     }
@@ -173,7 +172,6 @@ pub fn root_for(home: &Path, override_root: Option<&str>) -> anyhow::Result<Path
 /// as a `String`, for a remote command rather than a local `PathBuf`, and calls
 /// this rather than formatting its own — two spellings of one layout is how the
 /// two drift apart, and one of them is what `rm -rf` is pointed at.
-#[allow(dead_code)] // consumed by Task 18
 pub fn remote_namespace(home: &Path, member_id: &str) -> PathBuf {
     home.join(".riabuild-remote").join(member_id)
 }

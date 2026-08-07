@@ -10,6 +10,7 @@
 pub mod authorise;
 pub mod identity;
 pub mod install;
+pub mod session;
 pub mod store;
 
 use crate::paths::Paths;
@@ -189,7 +190,6 @@ pub async fn ssh_once(
 /// it, mosh runs commands with no shell at all, and an unexpanded `~` that
 /// reached `paths::root_for` would be refused outright rather than
 /// silently collapsing every developer on the box into one namespace.
-#[allow(dead_code)] // consumed by Tasks 17, 18, 20, 21
 pub async fn resolve_home(
     remote: &Remote,
     paths: &dyn Paths,

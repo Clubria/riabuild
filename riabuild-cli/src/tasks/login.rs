@@ -65,8 +65,17 @@ impl Task for Login {
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let web_url = ctx.web_url.clone();
         let version = ctx.cli_version.clone();
-        let (token, member) =
-            auth::login(&ctx.api, ctx.runner.as_ref(), &ctx.ui, &web_url, &version).await?;
+        let label = auth::device_label(ctx.runner.as_ref()).await;
+        ctx.ui.heading("Signing this machine in to riabuild");
+        let (token, member) = auth::login(
+            &ctx.api,
+            ctx.runner.as_ref(),
+            &ctx.ui,
+            &web_url,
+            &version,
+            &label,
+        )
+        .await?;
 
         ctx.keychain.set(&token).await?;
         ctx.api.set_token(Some(token));

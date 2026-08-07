@@ -29,11 +29,22 @@ pub trait Keychain: Send + Sync {
 /// macOS: `security(1)`, which talks to the login keychain.
 pub struct SecurityCliKeychain {
     runner: Arc<dyn CommandRunner>,
+    account: String,
 }
 
 impl SecurityCliKeychain {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self::for_account(runner, ACCOUNT)
+    }
+
+    /// Like `new`, but under a named account rather than this laptop's own —
+    /// used to cache a server's session under `remote:<hash>`, alongside this
+    /// laptop's own item, without either one overwriting the other.
+    pub fn for_account(runner: Arc<dyn CommandRunner>, account: &str) -> Self {
+        Self {
+            runner,
+            account: account.to_string(),
+        }
     }
 }
 
@@ -44,7 +55,14 @@ impl Keychain for SecurityCliKeychain {
             .runner
             .run(
                 "security",
-                &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"],
+                &[
+                    "find-generic-password",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    &self.account,
+                    "-w",
+                ],
                 &RunOptions::default(),
             )
             .await?;
@@ -68,7 +86,7 @@ impl Keychain for SecurityCliKeychain {
                     "-s",
                     SERVICE,
                     "-a",
-                    ACCOUNT,
+                    &self.account,
                     "-w",
                     token,
                 ],
@@ -89,7 +107,13 @@ impl Keychain for SecurityCliKeychain {
         self.runner
             .run(
                 "security",
-                &["delete-generic-password", "-s", SERVICE, "-a", ACCOUNT],
+                &[
+                    "delete-generic-password",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    &self.account,
+                ],
                 &RunOptions::default(),
             )
             .await?;
@@ -105,11 +129,21 @@ impl Keychain for SecurityCliKeychain {
 /// rather than a rewrite when we get there.
 pub struct SecretToolKeychain {
     runner: Arc<dyn CommandRunner>,
+    account: String,
 }
 
 impl SecretToolKeychain {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self::for_account(runner, ACCOUNT)
+    }
+
+    /// Like `new`, but under a named account rather than this laptop's own —
+    /// see `SecurityCliKeychain::for_account`.
+    pub fn for_account(runner: Arc<dyn CommandRunner>, account: &str) -> Self {
+        Self {
+            runner,
+            account: account.to_string(),
+        }
     }
 
     /// A machine with no keyring is an ordinary situation on Linux — a headless
@@ -138,7 +172,7 @@ impl Keychain for SecretToolKeychain {
             .runner
             .run(
                 "secret-tool",
-                &["lookup", "service", SERVICE, "account", ACCOUNT],
+                &["lookup", "service", SERVICE, "account", &self.account],
                 &RunOptions::default(),
             )
             .await?;
@@ -161,7 +195,7 @@ impl Keychain for SecretToolKeychain {
                     "service",
                     SERVICE,
                     "account",
-                    ACCOUNT,
+                    &self.account,
                 ],
                 &RunOptions {
                     stdin: Some(token.as_bytes().to_vec()),
@@ -187,7 +221,7 @@ impl Keychain for SecretToolKeychain {
         self.runner
             .run(
                 "secret-tool",
-                &["clear", "service", SERVICE, "account", ACCOUNT],
+                &["clear", "service", SERVICE, "account", &self.account],
                 &RunOptions::default(),
             )
             .await?;
@@ -197,6 +231,32 @@ impl Keychain for SecretToolKeychain {
     fn describe(&self) -> &'static str {
         "system keyring"
     }
+}
+
+/// The keychain account a server's session is stored under, on the laptop.
+pub fn remote_account(hash: &str) -> String {
+    format!("remote:{hash}")
+}
+
+/// Like `for_platform`, but for a named account rather than this machine's
+/// own. Used to cache a server's own session token on the laptop that minted
+/// it, so a second `riabuild remote <server>` finds it without re-minting.
+///
+/// `RIABUILD_TOKEN` is deliberately *not* consulted here: it is this
+/// machine's override, and using it for a server's session would give every
+/// server the same token.
+pub fn for_account(
+    runner: Arc<dyn CommandRunner>,
+    account: &str,
+    session_token_file: Option<PathBuf>,
+) -> Box<dyn Keychain> {
+    if let Some(path) = session_token_file {
+        return Box::new(FileKeychain::new(path));
+    }
+    if cfg!(target_os = "macos") {
+        return Box::new(SecurityCliKeychain::for_account(runner, account));
+    }
+    Box::new(SecretToolKeychain::for_account(runner, account))
 }
 
 /// A server's own session, in the developer's namespace at 0600.
@@ -444,6 +504,37 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_servers_session_is_stored_under_its_own_account() {
+        // One laptop, several servers, one keychain: the account is what keeps
+        // them apart, and revoking one must not sign the laptop out.
+        assert_eq!(
+            remote_account("9f2c000000000000"),
+            "remote:9f2c000000000000"
+        );
+        assert_ne!(remote_account("aaaa"), remote_account("bbbb"));
+    }
+
+    #[tokio::test]
+    async fn a_remote_account_reads_and_writes_its_own_item() {
+        let runner = Arc::new(
+            FakeRunner::new()
+                .with("security find-generic-password", 0, "rb_remote_token\n", "")
+                .with("security add-generic-password", 0, "", ""),
+        );
+        let keychain = SecurityCliKeychain::for_account(runner.clone(), "remote:9f2c");
+        keychain.set("rb_remote_token").await.expect("write");
+
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("remote:9f2c")),
+            "{:?}",
+            runner.calls()
+        );
+    }
 
     #[tokio::test]
     async fn reads_a_token_from_the_macos_keychain() {

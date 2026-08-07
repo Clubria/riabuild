@@ -210,7 +210,10 @@ async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<S
         .map_err(|_| anyhow!("no reply from the browser within three minutes"))?
 }
 
-async fn device_label(runner: &dyn CommandRunner) -> String {
+/// A label for this machine, from its hostname. `pub`: `tasks::login` calls
+/// this for a laptop's own login; `remote::session::ensure` passes the
+/// server's hostname instead, so the dashboard lists each session correctly.
+pub async fn device_label(runner: &dyn CommandRunner) -> String {
     let hostname = runner
         .run("hostname", &[], &RunOptions::default())
         .await
@@ -242,12 +245,18 @@ struct TokenResponse {
 
 /// Runs the whole flow and returns the session token. The caller stores it in
 /// the keychain; it is never written to `~/.riabuild`.
+///
+/// `label` is the caller's to choose, so the dashboard lists each session
+/// under the device it belongs to rather than always "this machine" — and
+/// for the same reason, printing *why* this login is happening is the
+/// caller's too: the heading lives at each call site, not here.
 pub async fn login(
     api: &ApiClient,
     runner: &dyn CommandRunner,
     ui: &Ui,
     web_url: &str,
     version: &str,
+    label: &str,
 ) -> Result<(String, Member)> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
         Failure::new(
@@ -259,10 +268,8 @@ pub async fn login(
     let port = listener.local_addr()?.port();
 
     let flow = LoginFlow::new();
-    let label = device_label(runner).await;
-    let url = flow.authorize_url(web_url, port, &label, version);
+    let url = flow.authorize_url(web_url, port, label, version);
 
-    ui.heading("Signing this machine in to riabuild");
     if !open_browser(runner, &url).await {
         ui.note("Could not open your browser. Open this link yourself:");
     }
