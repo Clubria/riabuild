@@ -51,7 +51,7 @@ pub fn key_path(remote: &Remote, paths: &dyn Paths) -> PathBuf {
 
 /// The `-C` comment `ensure_key` puts on a freshly generated key.
 ///
-/// `member_id` comes first and is what `remote::flow::forget_remote`'s
+/// `member_id` comes first and is what `remote::forget::forget_remote`'s
 /// server-side cleanup greps `authorized_keys` for via
 /// [`key_comment_marker`] — see `ensure_key`'s doc comment for why the member
 /// id, not the login target, has to be the unique part.

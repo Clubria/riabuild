@@ -296,6 +296,19 @@ async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>
     // so riabuild hangs with no output until something outside kills it. An
     // unattended run has to be told what to do instead, and there is a real
     // answer — `GH_TOKEN` needs no browser.
+    //
+    // This guard is not riabuild's single chokepoint for delegated prompts —
+    // an earlier version of this comment, and R15 in `decisions.md`, both
+    // said so and both were wrong. It is the only *unbounded* one. The other
+    // `run_interactive` sites each have something that ends them:
+    // `auth::login`'s browser wait is bounded at 180s, `shell::open` is
+    // skipped by `--no-shell`, and `update.rs` re-execs riabuild itself.
+    // `remote::authorise`'s `ssh-copy-id` is the real second delegated-prompt
+    // site and is deliberately *not* guarded here: it typically errors rather
+    // than hanging with no controlling terminal, which if true makes a guard
+    // unnecessary — but nothing proves it, because `e2e/remote/run.sh`
+    // sidesteps that path with an ssh-agent. Treat it as unproven, not as
+    // covered.
     if !ctx.ui.can_prompt() {
         return Err(Failure::new(
             attempting,

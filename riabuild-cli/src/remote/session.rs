@@ -215,7 +215,7 @@ pub async fn ensure(
             // actually saving the store, not just mutating it in memory.
             // `session_id` is what lets `riabuild remote forget` name this
             // exact session when it revokes it through
-            // `DELETE /api/v1/cli/sessions/<id>` — see `flow::forget_remote`.
+            // `DELETE /api/v1/cli/sessions/<id>` — see `forget::forget_remote`.
             if let Some(saved) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
                 saved.session_expires_at = crate::config::now_millis() + SESSION_TTL_MS;
                 saved.session_id = session_id;

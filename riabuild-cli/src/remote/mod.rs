@@ -9,6 +9,7 @@
 
 pub mod authorise;
 pub mod flow;
+pub mod forget;
 pub mod identity;
 pub mod install;
 pub mod seed;

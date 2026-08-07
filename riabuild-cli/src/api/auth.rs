@@ -244,7 +244,15 @@ struct TokenResponse {
     /// keeps it in `remotes.json` so `riabuild remote forget` knows exactly
     /// which session to revoke through `DELETE /api/v1/cli/sessions/<id>`
     /// rather than guessing from a device label.
-    #[serde(rename = "sessionId")]
+    ///
+    /// `#[serde(default)]` removes a deploy-order dependency, and costs
+    /// nothing: without it, a CLI that ships before — or ahead of a rollback
+    /// of — the riabuild-web that sends this field fails *login itself* on a
+    /// decode error, which is a far worse outcome than not knowing a session
+    /// id. `store::Record::session_id` already carries the same attribute and
+    /// already treats empty as "nothing to revoke", so an empty string flows
+    /// through the rest of remote mode as a state it is written to handle.
+    #[serde(rename = "sessionId", default)]
     session_id: String,
     member: Member,
 }
@@ -308,6 +316,30 @@ pub async fn login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_without_a_session_id_still_signs_the_developer_in() {
+        // A riabuild-web older than this binary — or one that has just been
+        // rolled back — does not send `sessionId`. Failing the decode would
+        // fail *login*, on every command, over a field only `riabuild remote
+        // forget` ever reads. Empty is the same state `store::Record` already
+        // treats as "no session to revoke".
+        let older: TokenResponse = serde_json::from_value(serde_json::json!({
+            "token": "rb_live_abc",
+            "member": {
+                "githubLogin": "ada",
+                "memberId": "550e8400-e29b-41d4-a716-446655440000",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "email": "ada@clubria.dev",
+                "role": "member",
+                "status": "active"
+            }
+        }))
+        .expect("a missing sessionId must not fail login");
+        assert_eq!(older.session_id, "");
+        assert_eq!(older.token, "rb_live_abc");
+    }
 
     #[test]
     fn parses_a_callback() {

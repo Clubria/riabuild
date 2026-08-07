@@ -37,7 +37,7 @@ pub struct Record {
     /// `TokenResponse::session_id`. Empty until `remote::session::ensure`
     /// mints a session for the first time (or for a `remotes.json` written
     /// before this field existed — `#[serde(default)]` again, not
-    /// struct-literal construction). `remote::flow::forget_remote` treats
+    /// struct-literal construction). `remote::forget::forget_remote` treats
     /// empty as "nothing minted, nothing to revoke" and skips straight to
     /// the SSH cleanup rather than calling the API with an empty id.
     #[serde(default)]

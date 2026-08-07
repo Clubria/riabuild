@@ -225,6 +225,14 @@ async fn ensure_riabuild_with(
             format!("verifying the riabuild {version} download"),
             "Tell your team lead — the release is missing a checksum for this platform.",
         )
+        // Names the asset it looked for, so "this platform" is answerable
+        // from the message alone. `e2e/remote/run.sh` also keys its
+        // known-gap check on the target appearing here: without it, a
+        // release that is simply missing the *right* asset name reads
+        // identically to the tracked Linux/musl gap.
+        .detail(format!(
+            "no checksum for {asset} in the release's checksums file"
+        ))
     })?;
 
     ensure_matching_binary(ctx, home, version, &target, &expected, downloads).await

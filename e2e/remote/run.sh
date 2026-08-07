@@ -36,8 +36,38 @@
 # "Stopped at the install step" is only an acceptable outcome once those
 # have been proven; on its own it is indistinguishable from "stopped at step
 # one", which is exactly how an earlier version of this script reported a
-# hang as a success. The moment a Linux checksum ships, the full assertions
-# below start running with no edit needed here.
+# hang as a success.
+#
+# WHAT A LINUX/MUSL CHECKSUM ALONE WILL NOT UNBLOCK. An earlier version of
+# this comment claimed the six assertions would start running the moment
+# that asset shipped, with no edit needed here. That is false, and saying so
+# is the point of this paragraph — the next step after the install is
+# `session::ensure`, and it needs three things this setup does not have:
+#
+#   a. A keyring. `session::ensure` calls `keychain::for_account(…, None)`,
+#      which on Linux is `secret-tool` and *errors* when it is missing
+#      ("reading the riabuild token from your keyring") rather than falling
+#      back. `RIABUILD_TOKEN` cannot answer this: `for_account` ignores it
+#      deliberately, because that variable is this machine's own override
+#      and honouring it here would hand every server the same token. A
+#      GitHub ubuntu runner has no `secret-tool`, so this needs an
+#      `apt-get install -y libsecret-tools` in the job (and a session bus,
+#      or `--no-keyring`-equivalent handling, for it to actually store).
+#   b. `POST /api/v1/cli/token` in the stub. `stub_web.py` implements only
+#      `do_GET` and `do_DELETE`, so a POST gets BaseHTTPRequestHandler's
+#      stock 501.
+#   c. An answer to the loopback browser callback. `auth::login` opens a
+#      local port and waits for the dashboard to redirect a browser back to
+#      it. Nothing in this script plays that browser. Adding `do_POST` to
+#      the stub is not enough on its own; something has to complete the
+#      callback, or `session::ensure` needs a seam this test can enter
+#      through instead.
+#
+# None of that is written yet, on purpose: it is a second piece of work, not
+# a line to sneak into this file. When a musl checksum ships, this script
+# will get *further* than it does today and then stop at (a) — which the
+# `known_gap` check below will correctly refuse to forgive, and that failure
+# is the reminder.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
@@ -67,6 +97,26 @@ if [ ! -x "$RIABUILD_BIN" ]; then
   echo "  cd riabuild-cli && cargo build --release --locked" >&2
   exit 1
 fi
+
+# The tools this script drives, checked here for the same reason the token is:
+# a missing one otherwise surfaces as `docker: command not found` in the
+# middle of a build step, or as a stub that never answers and a curl loop that
+# quietly times out.
+command -v docker >/dev/null 2>&1 || {
+  echo "docker is not installed (or not on PATH). This test runs a real sshd" >&2
+  echo "in a container; there is no way to fake that half." >&2
+  exit 1
+}
+command -v python3 >/dev/null 2>&1 || {
+  echo "python3 is not installed (or not on PATH). It runs stub_web.py, the" >&2
+  echo "stand-in for riabuild-web's /api/v1 endpoints." >&2
+  exit 1
+}
+command -v ssh-keygen >/dev/null 2>&1 && command -v ssh-keyscan >/dev/null 2>&1 || {
+  echo "ssh-keygen and ssh-keyscan are needed: this script generates the seed" >&2
+  echo "key and reads the container's host key fingerprint with them." >&2
+  exit 1
+}
 
 # Prerequisite 1. Checked here, before a container is built, because the
 # failure four steps in is unreadable: riabuild would report a GitHub
@@ -207,8 +257,22 @@ ada_status=$?
 set -e
 cat "$work/ada.log"
 
+# The one failure this script is allowed to exit 0 on — and it has to be
+# *that* failure, named. `could not download.*(404|Not Found)` used to be
+# enough, which forgave any 404 the install step produced: a wrong asset
+# name, a wrong repo, a version that resolved to nothing. Absorbing those
+# under a banner that asserts the earlier stages ran is how a real regression
+# gets reported as a known gap. Both branches below now require
+# `x86_64-unknown-linux-musl` — the target riabuild actually resolved for
+# this container — to appear in the message.
 known_gap() {
-  grep -qE "missing a checksum for this platform|could not download.*(404|Not Found)" "$work/ada.log"
+  # The asset itself is not published: the URL on that line carries the target.
+  grep -qE "could not download.*x86_64-unknown-linux-musl" "$work/ada.log" && return 0
+  # Or it is published without a checksum. `Failure` prints its action and
+  # its detail on separate lines, so this is two greps rather than one
+  # same-line regex that could never match.
+  grep -q "missing a checksum for this platform" "$work/ada.log" \
+    && grep -q "no checksum for riabuild-.*-x86_64-unknown-linux-musl" "$work/ada.log"
 }
 
 if [ "$ada_status" -eq 124 ]; then
@@ -224,10 +288,19 @@ fi
 assert_reached_the_server() {
   local failed=""
   # A key pair this run generated, on the laptop side (identity::ensure_key).
-  [ -f "$work/laptop-ada/.riabuild/remote/id_ed25519.pub" ] \
+  # One file per `Remote::hash()` under `<root>/ssh-identities` (paths.rs's
+  # `identity_dir`), and the hash is not predictable from here — so glob.
+  # `<root>` is `$HOME/.riabuild`, because `run_as` sets no RIABUILD_ROOT.
+  ls "$work/laptop-ada/.riabuild/ssh-identities/"*.pub >/dev/null 2>&1 \
     || failed="$failed\n  - no SSH key pair was generated on the laptop"
-  # The container's host key, pinned (identity::trust_host).
-  grep -q "\[localhost\]:$CONTAINER_PORT" "$work/laptop-ada/.ssh/known_hosts" 2>/dev/null \
+  # The container's host key, pinned (identity::trust_host) — in riabuild's
+  # own known_hosts, never the developer's `~/.ssh/known_hosts`. That is
+  # deliberate (`ssh_options` passes `-F /dev/null` and points
+  # `UserKnownHostsFile` at `<root>/ssh/known_hosts`) and identity.rs has a
+  # test asserting it, so checking `~/.ssh/known_hosts` here could only ever
+  # fail.
+  grep -q "\[localhost\]:$CONTAINER_PORT" \
+    "$work/laptop-ada/.riabuild/ssh/known_hosts" 2>/dev/null \
     || failed="$failed\n  - the container host key was never pinned"
   # riabuild's own key, added to the account it must reach (authorise).
   if [ "$(in_container 'wc -l < ~/.ssh/authorized_keys')" -lt 2 ]; then
