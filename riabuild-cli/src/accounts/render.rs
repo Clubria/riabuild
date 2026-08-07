@@ -78,14 +78,23 @@ fn hints(accounts: &[Account]) -> Vec<(String, String)> {
         ));
     }
     if accounts.len() > 1 {
-        hints.push((
-            "Delete an account:".to_string(),
-            format!("riabuild claude delete {}", accounts.len()),
-        ));
-        hints.push((
-            "Make it primary:".to_string(),
-            "riabuild claude primary 2".to_string(),
-        ));
+        // Both numbers come out of the accounts themselves rather than from the
+        // length or a literal. `&[Account]` does not promise a contiguous
+        // `1..N`, and a caller that passed a filtered list would otherwise be
+        // told to delete or promote an account the box above never showed —
+        // exactly the hint-that-refuses this function exists to avoid.
+        if let Some(last) = accounts.last() {
+            hints.push((
+                "Delete an account:".to_string(),
+                format!("riabuild claude delete {}", last.number),
+            ));
+        }
+        if let Some(second) = accounts.get(1) {
+            hints.push((
+                "Make it primary:".to_string(),
+                format!("riabuild claude primary {}", second.number),
+            ));
+        }
     }
     if let Some(account) = accounts
         .iter()
@@ -165,6 +174,21 @@ mod tests {
             text.contains("Log in:             claude-3 auth login"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn every_hint_names_an_account_that_is_in_the_box() {
+        // The numbers a developer would type have to come from the accounts
+        // shown, not from how many there are: a list whose numbers do not start
+        // at 1 and run on would otherwise be told to delete an account it never
+        // listed, which is the hint-that-refuses this function exists to avoid.
+        let odd = vec![
+            account(4, Identity::LoggedIn("a@example.com".into())),
+            account(7, Identity::LoggedIn("b@example.com".into())),
+        ];
+        let text = accounts_box(&odd, false);
+        assert!(text.contains("riabuild claude delete 7"), "{text}");
+        assert!(text.contains("riabuild claude primary 7"), "{text}");
     }
 
     #[test]

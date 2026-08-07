@@ -136,7 +136,11 @@ src/
 is what makes "verified before anything is written" a property of the code rather than a
 convention.
 
-One task per file. When a file passes roughly 300 lines, it is doing too much.
+One task per file. Roughly 300 lines of **production** code is the point at which
+a file is doing too much — `#[cfg(test)]` modules do not count towards it. The number
+is about how much behaviour one file owns, and a test module is not behaviour: a
+small implementation under a long test module is the shape this repo wants, and
+counting the tests would make writing more of them look like a problem.
 
 ## Claude Code accounts
 
