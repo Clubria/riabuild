@@ -91,7 +91,7 @@ impl Task for ClaudeTrust {
         // The profile supplies the config file to write into; the project
         // supplies the path being trusted. A checkout moved by `project` has to
         // be re-trusted at its new path, which is what this edge buys.
-        &["claude_profiles", "project"]
+        &["claude_accounts", "project"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
@@ -201,15 +201,15 @@ async fn load_or_reset(ctx: &mut Ctx, file: &Path) -> Result<Map<String, Value>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::new_id;
     use crate::runner::FakeRunner;
-    use crate::tasks::claude_profiles::new_profile_id;
     use crate::testing::{ctx_with, write_file};
     use std::path::PathBuf;
 
     /// A ctx with a profile and a real checkout directory on disk.
     async fn ready() -> (Ctx, tempfile::TempDir, String, PathBuf) {
         let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
-        let profile = new_profile_id();
+        let profile = new_id();
         tokio::fs::create_dir_all(ctx.paths.claude_dir().join(&profile))
             .await
             .expect("profile dir");
