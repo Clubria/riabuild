@@ -85,6 +85,11 @@ build could never learn it had to upgrade.
 ← 409 cli_too_old
 ```
 
+`verificationUri` is built from the deployment's existing `SITE_URL`, not from a new
+variable and not from anything the CLI knows. The server is the thing that knows where
+the dashboard is deployed; a copy of that answer in the binary could disagree with it,
+and the symptom would be a verification link pointing somewhere nobody is signed in.
+
 `expiresIn` and `interval` are **relative seconds**, unlike `expiresAt` everywhere else
 in the API. Deliberate: riabuild's first run happens on freshly provisioned machines
 where NTP may not have settled, and a skewed clock would make the CLI abandon a live code

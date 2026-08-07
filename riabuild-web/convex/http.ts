@@ -117,14 +117,17 @@ async function loadConfig(ctx: ActionCtx): Promise<OrgConfig> {
 }
 
 /**
- * The dashboard a developer is sent to, which is not this origin — `/api/v1`
- * is served from the Convex deployment while the pages are on Cloudflare.
- * Overridable the same way `orgLogin()` is, so a local deployment can point at
- * a local Vite server.
+ * The dashboard a developer is sent to, which is not this origin — `/api/v1` is
+ * served from the Convex deployment while the pages are on Cloudflare.
+ *
+ * `SITE_URL` rather than a new variable of our own: the deployment already sets
+ * it for auth redirects, and it already means "where the dashboard lives". A
+ * second variable holding the same answer is a second variable that can
+ * disagree with the first, and the failure would be a verification link
+ * pointing somewhere nobody is signed in.
  */
 function dashboardUrl(): string {
-  const configured =
-    process.env.RIABUILD_WEB_URL ?? "https://riabuild.clubria.com";
+  const configured = process.env.SITE_URL ?? "https://riabuild.clubria.com";
   return configured.replace(/\/+$/, "");
 }
 
