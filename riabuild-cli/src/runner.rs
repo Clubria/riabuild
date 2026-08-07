@@ -348,13 +348,11 @@ impl CommandRunner for FakeRunner {
 /// reaches the child untouched. See the precedence tests below, including one
 /// that pins the collision case: it is written to fail if the merge order were
 /// ever put back the other way around.
-#[allow(dead_code)] // consumed by Task 19
 pub struct ScopedRunner {
     inner: Arc<dyn CommandRunner>,
     env: Vec<(String, String)>,
 }
 
-#[allow(dead_code)] // consumed by Task 19
 impl ScopedRunner {
     pub fn new(inner: Arc<dyn CommandRunner>, env: Vec<(String, String)>) -> Self {
         Self { inner, env }

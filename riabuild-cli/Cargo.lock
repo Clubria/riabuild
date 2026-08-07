@@ -1032,6 +1032,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",

@@ -29,7 +29,7 @@
 //! `STALE_AFTER_SECS`, rather than trusting liveness alone.
 
 use crate::runner::{CommandRunner, RunOptions};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,7 +37,6 @@ use std::sync::Arc;
 /// pids are recycled and a stale marker would otherwise match a live stranger.
 const STALE_AFTER_SECS: u64 = 24 * 60 * 60;
 
-#[allow(dead_code)] // consumed by Task 20
 pub fn choose_runtime_dir(xdg: Option<&str>, tmpdir: Option<&str>) -> Result<PathBuf> {
     for candidate in [xdg, tmpdir] {
         if let Some(path) = candidate.filter(|value| !value.is_empty()) {
@@ -47,13 +46,11 @@ pub fn choose_runtime_dir(xdg: Option<&str>, tmpdir: Option<&str>) -> Result<Pat
     Ok(PathBuf::from("/tmp"))
 }
 
-#[allow(dead_code)] // consumed by Task 20
 pub struct GhSession {
     dir: PathBuf,
     marker: PathBuf,
 }
 
-#[allow(dead_code)] // consumed by Task 20
 impl GhSession {
     /// The directory, created safely, with no claim on its lifetime. Used by the
     /// seed and setup runs, and by a `riabuild` typed inside the shell.
@@ -88,38 +85,50 @@ impl GhSession {
 ///
 /// This is the backstop that matters, because it is the one that does not depend
 /// on a dying process getting a chance to run code.
-#[allow(dead_code)] // consumed by Task 20
+///
+/// A missing `sessions/` directory (never created, or already swept) reads as
+/// zero live sessions. Any other `read_dir` failure — a permission problem, a
+/// transient IO error — does not: treating it as "nothing is live" would wipe
+/// a credential a session still holds out from under it because the sweep
+/// happened to hit a bad moment, rather than because nobody needed it anymore.
 pub async fn sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Result<bool> {
     let sessions = dir.join("sessions");
     let mut live = 0;
 
-    if let Ok(mut entries) = tokio::fs::read_dir(&sessions).await {
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let Some(pid) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let written: u64 = tokio::fs::read_to_string(&path)
-                .await
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(0);
+    match tokio::fs::read_dir(&sessions).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let Some(pid) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let written: u64 = tokio::fs::read_to_string(&path)
+                    .await
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                    .unwrap_or(0);
 
-            let running = runner
-                .run("kill", &["-0", pid], &RunOptions::default())
-                .await
-                .map(|output| output.ok())
-                .unwrap_or(false);
+                let running = runner
+                    .run("kill", &["-0", pid], &RunOptions::default())
+                    .await
+                    .map(|output| output.ok())
+                    .unwrap_or(false);
 
-            // The age cap applies to a marker whose process is *gone*, to cover
-            // pid recycling. Applying it to a live one would delete a working
-            // developer's credential out from under them, and a mosh session
-            // older than a day is the normal case rather than the exception.
-            if running && now.saturating_sub(written) <= STALE_AFTER_SECS {
-                live += 1;
-            } else {
-                let _ = tokio::fs::remove_file(&path).await;
+                // The age cap applies to a marker whose process is *gone*, to
+                // cover pid recycling. Applying it to a live one would delete
+                // a working developer's credential out from under them, and a
+                // mosh session older than a day is the normal case rather
+                // than the exception.
+                if running && now.saturating_sub(written) <= STALE_AFTER_SECS {
+                    live += 1;
+                } else {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
             }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", sessions.display()));
         }
     }
 
@@ -148,17 +157,90 @@ pub async fn sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Resu
 /// repairs the mode before returning.
 #[cfg(unix)]
 async fn ensure_private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     tokio::fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
         .create(path)
         .await?;
 
-    let meta = tokio::fs::symlink_metadata(path).await?;
-    let ours = meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == current_uid();
-    if !ours {
+    let owned = path.to_path_buf();
+    // Blocking, not async: opening by descriptor and `fstat`/`fchmod`-ing it
+    // are POSIX calls tokio has no async wrapper for, same as `current_uid`
+    // below. `spawn_blocking` — unlike `block_in_place` — runs on tokio's
+    // dedicated blocking-task pool rather than a reactor worker thread, so it
+    // needs no `rt-multi-thread` and never stalls another future.
+    tokio::task::spawn_blocking(move || verify_and_repair_mode(&owned)).await??;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn ensure_private_dir(path: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(path).await?;
+    Ok(())
+}
+
+/// Verifies (and if needed, repairs) the mode of a directory that
+/// `DirBuilder::create` reports already existed — by descriptor, not by name.
+///
+/// Statting the path and then, in a second call, `chmod`-ing the same path
+/// leaves a window between the two where the name could be repointed at
+/// something else — a symlink swapped in by a concurrent local process. Doing
+/// both through one file descriptor opened with `O_NOFOLLOW | O_DIRECTORY`
+/// closes that window: the fd names one fixed inode from open to close, there
+/// is no second name lookup for an attacker to win, and a symlink at `path`
+/// makes `open` itself fail rather than silently following it.
+#[cfg(unix)]
+fn verify_and_repair_mode(path: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} contains a NUL byte", path.display()))?;
+
+    // SAFETY: `c_path` is a valid, NUL-terminated C string that outlives this
+    // call. `O_NOFOLLOW` refuses to open a symlink at the final path
+    // component instead of following it; `O_DIRECTORY` refuses anything that
+    // is not actually a directory. Either failure surfaces as `open`
+    // returning -1, handled below.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening {} to check it is private", path.display()));
+    }
+
+    let result = check_and_chmod(fd, path);
+
+    // SAFETY: `fd` was returned by the `open` call above and is not used
+    // again after this point on any path.
+    unsafe {
+        libc::close(fd);
+    }
+    result
+}
+
+/// The `fstat` + ownership check + `fchmod` performed against an already-open,
+/// already-verified-to-be-a-real-directory descriptor. Split out of
+/// `verify_and_repair_mode` so that function's `close` always runs, on every
+/// return path from here, including an early `?`.
+#[cfg(unix)]
+fn check_and_chmod(fd: i32, path: &Path) -> Result<()> {
+    // SAFETY: `stat` is zero-initialized before being handed to `fstat`,
+    // which fills every field `libc::stat`'s layout defines; nothing here
+    // reads a field `fstat` did not write.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open and valid for the duration of this call, and
+    // `&mut stat` is a valid, writable buffer of `fstat`'s expected layout.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("checking who owns {}", path.display()));
+    }
+
+    if stat.st_uid != current_uid() {
         return Err(crate::ui::Failure::new(
             "opening a private directory for your GitHub sign-in",
             format!(
@@ -170,29 +252,24 @@ async fn ensure_private_dir(path: &Path) -> Result<()> {
         .into());
     }
 
-    if meta.permissions().mode() & 0o777 != 0o700 {
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    if stat.st_mode & 0o777 != 0o700 {
+        // SAFETY: `fd` is open, valid, and known (by the `fstat` above) to
+        // name a directory this process owns.
+        if unsafe { libc::fchmod(fd, 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("repairing {} to mode 0700", path.display()));
+        }
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-async fn ensure_private_dir(path: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path).await?;
-    Ok(())
-}
-
-/// The running process's uid, via a direct POSIX call rather than a new crate
-/// dependency — `getuid()` takes no arguments and cannot fail, matching the
-/// FFI pattern already used for stdin redirection in `ui/prompt.rs`.
+/// The running process's uid. `libc::getuid` takes no arguments and cannot
+/// fail.
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
     // SAFETY: POSIX `getuid` takes no arguments, has no preconditions, and
     // cannot fail.
-    unsafe { getuid() }
+    unsafe { libc::getuid() }
 }
 
 #[cfg(test)]
@@ -273,6 +350,33 @@ mod tests {
             mode & 0o777,
             0o700,
             "a pre-existing directory must be repaired before anything is written into it"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlink_at_the_target_path_is_refused() {
+        // The one branch that actually defends against a cross-account
+        // attacker: the directory name is predictable (a member id is
+        // public), so someone else on the box could pre-plant a symlink
+        // there pointing wherever they like, hoping riabuild writes a GitHub
+        // credential through it. `O_NOFOLLOW` is what refuses to open through
+        // it at all, rather than trusting a `symlink_metadata` check that a
+        // second, separate syscall could race.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let elsewhere = home.path().join("elsewhere");
+        tokio::fs::create_dir_all(&elsewhere)
+            .await
+            .expect("mkdir elsewhere");
+        let link = home.path().join("riabuild-gh-550e8400");
+        tokio::fs::symlink(&elsewhere, &link)
+            .await
+            .expect("symlink");
+
+        let result = ensure_private_dir(&link).await;
+        assert!(
+            result.is_err(),
+            "a symlink standing in for the directory must be refused, not followed"
         );
     }
 

@@ -83,10 +83,56 @@ async fn run(cli: Cli) -> Result<i32> {
 
     tokio::fs::create_dir_all(paths.root()).await?;
 
+    // Only a remote scope claims a GitHub session — see `gh_session`. This is
+    // deliberately unconditional over every subcommand a remote-scoped
+    // invocation might run, not just the shell: each SSH invocation is its
+    // own process, and bracketing this one's whole lifetime with open/close
+    // is what keeps the marker honest no matter which command runs inside it.
+    let gh = if scope.is_remote() {
+        let runtime = gh_session::choose_runtime_dir(
+            std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+            std::env::var("TMPDIR").ok().as_deref(),
+        )?;
+        let member_id = paths
+            .root()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?)
+    } else {
+        None
+    };
+
+    // Bound before the shadowing `match` below, which moves `runner` in both
+    // arms. `base_runner` is the unwrapped `RealRunner`: `kill -0` (run by
+    // `close`, via `sweep`) needs no namespace environment, and closing has
+    // to work even once the scoped runner built below is gone.
+    let base_runner = runner.clone();
+    let runner: Arc<dyn CommandRunner> = match &gh {
+        Some(session) => Arc::new(runner::ScopedRunner::new(
+            runner,
+            vec![
+                (
+                    "GH_CONFIG_DIR".into(),
+                    session.config_dir().to_string_lossy().into_owned(),
+                ),
+                (
+                    "GIT_CONFIG_GLOBAL".into(),
+                    paths
+                        .root()
+                        .join("gitconfig")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ],
+        )),
+        None => runner,
+    };
+
     let mut ctx = build_ctx(
         &scope,
         paths.clone(),
-        runner.clone(),
+        runner,
         keychain.clone(),
         ui,
         UserConfig::load(paths.as_ref()).await,
@@ -94,25 +140,45 @@ async fn run(cli: Cli) -> Result<i32> {
         cli.check || matches!(cli.command, Some(Command::Status)),
     );
 
-    if let Some(project) = &cli.project {
-        let expanded = expand_tilde(project, &paths.home());
-        ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
-        ctx.config.save(paths.as_ref()).await?;
+    let code = run_inner(&cli, &mut ctx).await;
+
+    if let Some(session) = gh
+        && let Err(error) = session.close(base_runner).await
+    {
+        // Not `let _`: a credential that failed to wipe is exactly the thing
+        // the developer needs told about.
+        ctx.ui.warn(&format!(
+            "could not remove this session's GitHub sign-in: {error}"
+        ));
     }
 
-    match cli.command {
-        Some(Command::Logout) => return logout(&mut ctx).await,
-        Some(Command::Env) => return print_env(&ctx),
-        Some(Command::Shell) => return open_shell(&mut ctx).await,
+    code
+}
+
+/// Everything `run` does after a remote scope's GitHub session (if any) is
+/// open, so `run` can guarantee `close` runs on every return from here —
+/// including an error, not just the successful paths dotted through the
+/// match below.
+async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
+    if let Some(project) = &cli.project {
+        let expanded = expand_tilde(project, &ctx.paths.home());
+        ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
+        ctx.config.save(ctx.paths.as_ref()).await?;
+    }
+
+    match &cli.command {
+        Some(Command::Logout) => return logout(ctx).await,
+        Some(Command::Env) => return print_env(ctx),
+        Some(Command::Shell) => return open_shell(ctx).await,
         Some(Command::Login) => {
             use tasks::Task;
-            connect(&mut ctx).await?;
-            tasks::login::Login.apply(&mut ctx).await?;
+            connect(ctx).await?;
+            tasks::login::Login.apply(ctx).await?;
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
         Some(Command::Remote { .. }) => {
-            // Task 21 replaces this with `remote::run(&mut ctx, &cli, target,
+            // Task 21 replaces this with `remote::run(ctx, cli, target,
             // action).await`. Until then this only needs to exist so the CLI
             // surface (Task 14) compiles and its own tests pass.
             return Ok(0);
@@ -120,7 +186,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Some(Command::Status) | None => {}
     }
 
-    provision(&mut ctx, &cli).await
+    provision(ctx, cli).await
 }
 
 /// Assembles the `Ctx` a run works against.
