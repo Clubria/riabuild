@@ -1,7 +1,8 @@
 # riabuild-web
 
 Convex backend and dashboard at `riabuild.clubria.com`. Serves the onboarding flow, member
-administration, the CLI login callback, and the `/api/v1` contract the CLI depends on.
+administration, the CLI device-approval screen, and the `/api/v1` contract the CLI
+depends on.
 
 Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 `../docs/superpowers/specs/2026-08-04-riabuild-design.md`.

@@ -117,17 +117,17 @@ fix teaches people to ignore red checks.
 
 ## How the session is faked, and how it is not
 
-There is no browser in CI to approve a loopback sign-in, so `run.sh` mints a
+There is nobody in CI to approve a device-code sign-in, so `run.sh` mints a
 token, sends only its **SHA-256** to `devSeed:seedForE2e`, and puts the raw token
 in the Keychain. Every request after that authenticates the way a real one does:
 hashed, looked up in `cliSessions`, checked for expiry and revocation.
 
 `state.json` starts with a record for `login` — and only `login`. The task engine
 treats a missing record as `NeverRun` and applies without calling `check()`
-first, so without it every run would open a browser and time out after three
-minutes however good the session already is. What is skipped is the browser
-approval, which is un-automatable by construction. What is still exercised is
-everything the approval produces.
+first, so without it every run would print a code and poll for fifteen minutes
+however good the session already is. What is skipped is the human approval, which
+is un-automatable by construction. What is still exercised is everything the
+approval produces.
 
 ## Two things `--check` does that it says it does not
 
