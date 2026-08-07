@@ -16,6 +16,49 @@ use std::time::Duration;
 /// the body in one call, so the cap is checked after the fact instead.
 const MAX_DOWNLOAD: usize = 400 * 1024 * 1024;
 
+const RELEASES: &str = "https://github.com/Clubria/riabuild/releases/download";
+
+/// The Rust target triple a server's `uname -sm` corresponds to.
+///
+/// Remote mode provisions a server that is frequently a different platform
+/// than the laptop driving it, so — unlike `node_platform` above — this takes
+/// the platform as an argument rather than reading `std::env::consts` for the
+/// host riabuild happens to be running on.
+#[allow(dead_code)] // consumed by Task 17
+pub fn rust_target(uname_s: &str, uname_m: &str) -> Result<String> {
+    let arch = match uname_m.trim() {
+        "x86_64" | "amd64" => "x86_64",
+        "arm64" | "aarch64" => "aarch64",
+        other => return Err(anyhow!("riabuild does not publish a build for {other}")),
+    };
+    match uname_s.trim() {
+        "Darwin" => Ok(format!("{arch}-apple-darwin")),
+        // musl rather than gnu: one Linux build then runs on any distribution
+        // instead of only on distributions with a glibc at least as new as the
+        // one the release runner happened to build against.
+        "Linux" => Ok(format!("{arch}-unknown-linux-musl")),
+        other => Err(anyhow!("riabuild does not publish a build for {other}")),
+    }
+}
+
+/// The release asset name for a given version and target triple, e.g.
+/// `riabuild-2026.08.06-aarch64-apple-darwin.tar.gz`. Matches the tarball
+/// name `.github/workflows/release.yml`'s Package step produces.
+#[allow(dead_code)] // consumed by Task 17
+pub fn riabuild_asset(version: &str, target: &str) -> String {
+    format!("riabuild-{version}-{target}.tar.gz")
+}
+
+#[allow(dead_code)] // consumed by Task 17
+pub fn riabuild_asset_url(version: &str, target: &str) -> String {
+    format!("{RELEASES}/v{version}/{}", riabuild_asset(version, target))
+}
+
+#[allow(dead_code)] // consumed by Task 17
+pub fn riabuild_checksums_url(version: &str) -> String {
+    format!("{RELEASES}/v{version}/riabuild-{version}-checksums.txt")
+}
+
 /// The Node distribution name for this machine, e.g. `darwin-arm64`.
 pub fn node_platform() -> Result<String> {
     let os = match std::env::consts::OS {
@@ -319,6 +362,68 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert!(
             ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"].contains(&platform.as_str()),
             "unexpected platform {platform}"
+        );
+    }
+
+    #[test]
+    fn uname_output_maps_to_the_target_the_release_publishes() {
+        // Captured from real `uname -sm` output. Apple's arm64 is Rust's aarch64,
+        // and Linux binaries are musl so one build runs on every distribution rather
+        // than on everything newer than the runner's glibc.
+        assert_eq!(
+            rust_target("Darwin", "arm64").expect("mac"),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            rust_target("Darwin", "x86_64").expect("mac"),
+            "x86_64-apple-darwin"
+        );
+        assert_eq!(
+            rust_target("Linux", "x86_64").expect("linux"),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            rust_target("Linux", "aarch64").expect("linux"),
+            "aarch64-unknown-linux-musl"
+        );
+        // Some distributions report arm64 rather than aarch64.
+        assert_eq!(
+            rust_target("Linux", "arm64").expect("linux"),
+            "aarch64-unknown-linux-musl"
+        );
+        // `uname` output arrives with a trailing newline.
+        assert_eq!(
+            rust_target("Linux\n", "x86_64\n").expect("linux"),
+            "x86_64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_platform_is_an_error_rather_than_a_guess() {
+        // Installing the wrong architecture produces an exec format error on the
+        // server with nothing in it that names riabuild.
+        assert!(rust_target("Linux", "i686").is_err());
+        assert!(rust_target("Linux", "armv7l").is_err());
+        assert!(rust_target("FreeBSD", "x86_64").is_err());
+        assert!(rust_target("Darwin", "ppc").is_err());
+    }
+
+    #[test]
+    fn asset_names_match_what_the_release_workflow_uploads() {
+        // release.yml builds `riabuild-$version-$target.tar.gz` and appends each
+        // digest to `riabuild-$version-checksums.txt`. If either is renamed there,
+        // this test is what fails.
+        assert_eq!(
+            riabuild_asset("2026.08.06", "aarch64-apple-darwin"),
+            "riabuild-2026.08.06-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            riabuild_asset_url("2026.08.06", "x86_64-unknown-linux-musl"),
+            "https://github.com/Clubria/riabuild/releases/download/v2026.08.06/riabuild-2026.08.06-x86_64-unknown-linux-musl.tar.gz"
+        );
+        assert_eq!(
+            riabuild_checksums_url("2026.08.06"),
+            "https://github.com/Clubria/riabuild/releases/download/v2026.08.06/riabuild-2026.08.06-checksums.txt"
         );
     }
 }
