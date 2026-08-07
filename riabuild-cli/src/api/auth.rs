@@ -135,6 +135,23 @@ async fn start_device(api: &ApiClient, label: &str) -> Result<DeviceStart> {
     .await
 }
 
+/// Whether a failed poll is worth another attempt before the deadline.
+///
+/// Only a failure to reach the server at all. This loop stays open for up to
+/// fifteen minutes while a developer walks to another machine, and a closed lid
+/// or a wifi handover in the middle of that is not a reason to throw away a code
+/// they are about to approve.
+///
+/// Everything the server actually answered is final. Retrying a 401 would poll a
+/// spent code until the deadline and then report that nobody approved it, which
+/// is both wrong and the least useful thing to say.
+pub fn survives_a_failed_poll(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::api::ApiError>(),
+        Some(api_error) if api_error.code == "unreachable"
+    )
+}
+
 /// Polls until the request is answered, expires, or the developer gives up.
 async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<(String, Member)> {
     let lifetime = start
@@ -157,12 +174,18 @@ async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<(Stri
             ));
         }
 
-        let response: PollResponse = api
-            .post_json(
+        let polled = api
+            .post_json::<PollResponse>(
                 "/api/v1/cli/token",
                 serde_json::json!({ "deviceCode": start.device_code }),
             )
-            .await?;
+            .await;
+
+        let response = match polled {
+            Ok(response) => response,
+            Err(error) if survives_a_failed_poll(&error) => continue,
+            Err(error) => return Err(error),
+        };
 
         match response {
             PollResponse::Pending { interval } => {
@@ -312,6 +335,41 @@ mod tests {
         assert_eq!(poll_delay(Some(3600)), MAX_POLL);
         assert_eq!(poll_delay(Some(5)), Duration::from_secs(5));
         assert_eq!(poll_delay(None), DEFAULT_POLL);
+    }
+
+    fn api_error(code: &str) -> anyhow::Error {
+        crate::api::ApiError {
+            status: 0,
+            code: code.into(),
+            message: "x".into(),
+            action: "y".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_dropped_connection_does_not_end_a_fifteen_minute_wait() {
+        // This loop runs for up to fifteen minutes while a developer walks to
+        // another machine. A closed lid or a wifi handover in the middle of
+        // that must not throw away a code they are about to approve.
+        assert!(survives_a_failed_poll(&api_error("unreachable")));
+    }
+
+    #[test]
+    fn a_server_that_says_the_code_is_dead_stops_the_loop() {
+        // The opposite mistake: retrying a 401 would poll a spent code until
+        // the deadline and then blame the developer for not approving it.
+        assert!(!survives_a_failed_poll(&api_error("unauthenticated")));
+        assert!(!survives_a_failed_poll(&api_error("suspended")));
+        assert!(!survives_a_failed_poll(&api_error("cli_too_old")));
+    }
+
+    #[test]
+    fn an_error_that_is_not_the_servers_stops_the_loop() {
+        // A malformed body is a bug, not weather. Retrying hides it.
+        assert!(!survives_a_failed_poll(&anyhow!(
+            "could not read the reply"
+        )));
     }
 
     #[test]
