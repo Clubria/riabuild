@@ -40,8 +40,18 @@ pub async fn seed_github(
     ui: &Ui,
     riabuild_path: &str,
 ) -> Result<()> {
+    // The `gh` riabuild owns on *this laptop*, by absolute path, for the same
+    // reason every other call site uses one: `~/.riabuild/bin` is not on `PATH`
+    // during provisioning, so a bare `gh` reads whatever the developer happens
+    // to have — a different install, with a different `hosts.yml`, holding a
+    // sign-in that is not the one riabuild's own tasks verified.
+    let gh = paths
+        .tool_dir("gh", crate::tools::GH_VERSION)
+        .join(crate::tools::GH_MEMBER)
+        .to_string_lossy()
+        .into_owned();
     let token = runner
-        .run("gh", &["auth", "token"], &RunOptions::default())
+        .run(&gh, &["auth", "token"], &RunOptions::default())
         .await?;
     if !token.ok() || token.trimmed().is_empty() {
         ui.note("This laptop has no GitHub sign-in to lend; the server will sign in itself.");
@@ -76,6 +86,15 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
 
+    /// The absolute `gh` `seed_github` will run for these `Paths`.
+    fn gh_path(paths: &dyn Paths) -> String {
+        paths
+            .tool_dir("gh", crate::tools::GH_VERSION)
+            .join(crate::tools::GH_MEMBER)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn remote() -> Remote {
         Remote {
             name: "build-01".into(),
@@ -91,9 +110,13 @@ mod tests {
         // `keychain/platform.rs` already makes about `secret-tool`.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
+        // `FakeRunner` matches on an invocation prefix, so the stub has to
+        // carry the same absolute path the code resolves — a bare "gh" here
+        // would never match, and the call would fall through to the default.
+        let gh = gh_path(&paths);
         let fake = Arc::new(
             FakeRunner::new()
-                .with("gh auth token", 0, "gho_super_secret\n", "")
+                .with(&format!("{gh} auth token"), 0, "gho_super_secret\n", "")
                 .with("ssh", 0, "", ""),
         );
 
@@ -142,7 +165,12 @@ mod tests {
         // the TTY that setup already has.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(FakeRunner::new().with("gh auth token", 1, "", "not logged in"));
+        let fake = Arc::new(FakeRunner::new().with(
+            &format!("{} auth token", gh_path(&paths)),
+            1,
+            "",
+            "not logged in",
+        ));
 
         seed_github(&remote(), &paths, fake.clone(), &Ui::new(true), "riabuild")
             .await

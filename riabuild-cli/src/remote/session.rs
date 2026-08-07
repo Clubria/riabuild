@@ -168,7 +168,10 @@ pub async fn ensure(
     ui: &Ui,
     api: &ApiClient,
     member: &Member,
-    web_url: &str,
+    // Only for the `ApiClient` that probes a cached token below. There is no
+    // `web_url` beside it any more: `auth::login` builds no dashboard link, the
+    // server returns the verification URL because it is the thing that knows
+    // where the dashboard is deployed.
     version: &str,
     store: &mut super::store::Store,
 ) -> Result<()> {
@@ -187,8 +190,10 @@ pub async fn ensure(
 
     // A stored token is not automatically a live one. It expires, and
     // `forget` on another laptop may have revoked it. Writing a dead token to
-    // the server strands it: the loopback login needs a browser the server
-    // does not have, so its riabuild 401s with no way forward.
+    // the server strands whoever lands on it: the server's own riabuild 401s,
+    // and while the device-code flow *can* now sign in over SSH, doing so from
+    // the server would mint a session nothing on this laptop recorded — so no
+    // `riabuild remote forget` could ever revoke it again.
     let record = store.find(&remote.name).cloned();
     let usable = match (keychain.get().await?, record.as_ref()) {
         (Some(token), Some(record)) if !expires_soon(record) => {
@@ -206,9 +211,15 @@ pub async fn ensure(
             ui.note("Approve it in your browser.");
             // Laptop's browser, server's hostname as the label: the dashboard
             // lists this session as its own revocable device, distinct from
-            // the laptop's.
-            let (token, _member, session_id) =
-                auth::login(api, runner.as_ref(), ui, web_url, version, &remote.host).await?;
+            // the laptop's. The heading above is why `auth::login` prints none
+            // of its own — "Signing this machine in" would be a lie here.
+            //
+            // The `member` the grant carries is dropped on purpose: it
+            // describes the developer approving in the browser, who is the
+            // same person `ensure` was already handed as `member`.
+            let auth::Session {
+                token, session_id, ..
+            } = auth::login(api, runner.as_ref(), ui, &remote.host).await?;
             keychain.set(&token).await?;
             // Recorded so the check above can skip the round trip next time,
             // and so `riabuild remote list` can show it — which requires

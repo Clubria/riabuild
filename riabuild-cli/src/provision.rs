@@ -42,7 +42,7 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     let registry = tasks::registry();
     let outcome = engine::run_all(&registry, ctx).await?;
 
-    shims::write_all(ctx).await?;
+    write_launchers(ctx).await?;
 
     let notes = std::mem::take(&mut ctx.notes);
     if !notes.is_empty() {
@@ -76,6 +76,26 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     open_shell(ctx).await
 }
 
+/// The Claude Code launchers, written unless this run promised to change nothing.
+///
+/// `--check` is documented as "check everything and report, changing nothing",
+/// and `shims::write_all` deletes as well as writes: `prune` removes the old `c`
+/// launcher and every `claude-<n>` past the end of the account list. The sharp
+/// edge is the machine most in need of a `--check`: `UserConfig::load` answers an
+/// unparseable `config.json` with `Default`, so `claude_accounts` is empty, and
+/// `prune(bin, 0)` would take `claude` and all nine numbered launchers with it
+/// during a run that promised to touch nothing.
+///
+/// Nothing under `--check` consumes the launchers — `provision` returns before
+/// the environment shell is spawned — so skipping them costs the dry run
+/// nothing.
+async fn write_launchers(ctx: &Ctx) -> Result<()> {
+    if ctx.dry_run {
+        return Ok(());
+    }
+    shims::write_all(ctx).await
+}
+
 /// Who riabuild thinks this machine belongs to, and where the token lives.
 ///
 /// Printed on every run because "riabuild is using the wrong account" is
@@ -83,7 +103,7 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
 fn describe_session(ctx: &Ctx) {
     let Some(member) = &ctx.member else {
         ctx.ui
-            .note("not signed in yet — riabuild will open your browser");
+            .note("not signed in yet — riabuild will give you a code to approve");
         return;
     };
     ctx.ui.note(&format!(
@@ -144,4 +164,56 @@ pub(crate) async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     // line is only separation from the task list above.
     ctx.ui.info("");
     shell::spawn(ctx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts;
+    use crate::runner::FakeRunner;
+    use crate::testing::ctx_with;
+
+    #[tokio::test]
+    async fn a_dry_run_writes_launchers_for_the_accounts_it_found() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.claude_accounts = vec![accounts::new_id(), accounts::new_id()];
+        write_launchers(&ctx).await.unwrap();
+
+        ctx.dry_run = true;
+        write_launchers(&ctx).await.unwrap();
+
+        let bin = ctx.paths.bin_dir();
+        assert!(tokio::fs::try_exists(bin.join("claude")).await.unwrap());
+        assert!(tokio::fs::try_exists(bin.join("claude-2")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_on_a_machine_with_an_unreadable_config_deletes_no_launcher() {
+        // The reason this is gated at all. `UserConfig::load` answers an
+        // unparseable `config.json` with `Default`, so `claude_accounts` is
+        // empty on exactly the machine a developer would run `riabuild --check`
+        // on — and `shims::prune` would then delete `claude` and every
+        // `claude-1..9` during a run documented as changing nothing.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.claude_accounts = vec![accounts::new_id(), accounts::new_id()];
+        write_launchers(&ctx).await.unwrap();
+
+        ctx.config.claude_accounts.clear();
+        ctx.dry_run = true;
+        write_launchers(&ctx).await.unwrap();
+
+        let bin = ctx.paths.bin_dir();
+        assert!(
+            tokio::fs::try_exists(bin.join("claude")).await.unwrap(),
+            "--check deleted the primary launcher"
+        );
+        assert!(
+            tokio::fs::try_exists(bin.join("claude-1")).await.unwrap(),
+            "--check deleted a numbered launcher"
+        );
+        assert!(
+            tokio::fs::try_exists(bin.join("claude-2")).await.unwrap(),
+            "--check deleted a numbered launcher"
+        );
+    }
 }

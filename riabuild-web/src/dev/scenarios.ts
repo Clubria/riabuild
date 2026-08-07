@@ -1,6 +1,7 @@
 import {
   AuditEntry,
   Data,
+  DeviceRequest,
   Member,
   OrgConfig,
   Session,
@@ -231,12 +232,20 @@ function base(viewer: Member | null): Data {
     updateOrg: NOOP,
     signIn: NOOP,
     signOut: NOOP,
-    authorizeCli: async () => ({ code: "fixture-code" }),
-    // Deliberately inert: the fixture run stops at the "approved" screen instead
-    // of navigating to a loopback port nothing is listening on.
-    handOffToCli: () => {},
+    lookupDeviceCode: async () => PENDING_REQUEST,
+    approveDeviceCode: async () => ({ status: "ok" }),
+    denyDeviceCode: async () => ({ status: "ok" }),
   };
 }
+
+/** The machine a fixture developer is being asked to approve. */
+const PENDING_REQUEST: DeviceRequest = {
+  status: "pending",
+  deviceLabel: "build-01.fly.dev",
+  cliVersion: "2026.08.07",
+  requestedAt: NOW - 40 * 1000,
+  expiresAt: NOW + 14 * MINUTE,
+};
 
 export const SCENARIOS: Record<string, () => Data> = {
   loading: () => ({
@@ -371,19 +380,47 @@ export const SCENARIOS: Record<string, () => Data> = {
     },
   }),
 
+  /** Code prefilled from the terminal, machine found, waiting on a decision. */
   authorize: () => base(DEVELOPER),
 
-  "authorize-bad-params": () => base(DEVELOPER),
-
-  "authorize-overflow": () => base(DEVELOPER),
+  /** Landing on /cli with nothing typed yet — the empty code box. */
+  "authorize-empty": () => base(DEVELOPER),
 
   "authorize-signed-out": () => base(null),
 
+  "authorize-unknown": () => ({
+    ...base(DEVELOPER),
+    lookupDeviceCode: async () => ({ status: "unknown" as const }),
+  }),
+
+  "authorize-expired": () => ({
+    ...base(DEVELOPER),
+    lookupDeviceCode: async () => ({ status: "expired" as const }),
+  }),
+
+  "authorize-used": () => ({
+    ...base(DEVELOPER),
+    lookupDeviceCode: async () => ({ status: "used" as const }),
+  }),
+
+  /**
+   * A device label long enough to break the panel if anything stopped wrapping.
+   * Hostnames really do get this long once a cloud provider generates them.
+   */
+  "authorize-overflow": () => ({
+    ...base(DEVELOPER),
+    lookupDeviceCode: async () => ({
+      ...PENDING_REQUEST,
+      deviceLabel: `${"build-01.".repeat(9)}fly.dev`,
+      cliVersion: "9".repeat(32),
+    }),
+  }),
+
   "authorize-error": () => ({
     ...base(DEVELOPER),
-    authorizeCli: async (): Promise<never> => {
+    lookupDeviceCode: async (): Promise<never> => {
       throw new Error(
-        "[CONVEX A(cliAuth:authorize)] Uncaught Error: That approval link has expired. Run riabuild again.",
+        "[CONVEX Q(cliAuth:deviceRequest)] Uncaught Error: Not signed in.",
       );
     },
   }),
@@ -393,22 +430,25 @@ export const SCENARIOS: Record<string, () => Data> = {
   },
 };
 
-const VALID_AUTHORIZE_QUERY =
-  `state=${"s".repeat(20)}&challenge=${"c".repeat(40)}&port=51789` +
-  `&label=dana-mbp-16&version=2026.08.04`;
+/** What `verificationUriComplete` puts in the address bar. */
+const PREFILLED_CODE = "code=WXZB-CDFG";
 
 /**
- * Scenarios that belong on `/cli/authorize` rather than `/`, and the query
- * string each one needs. The visual suite reads this to know which path to open.
+ * Scenarios that belong on `/cli` rather than `/`, and the query string each one
+ * needs. The visual suite reads this to know which path to open.
+ *
+ * A scenario with no entry here still gets screenshotted — on `/`. Only the
+ * ones that need a prefilled code appear.
  */
 export const AUTHORIZE_QUERY: Record<string, string> = {
-  authorize: VALID_AUTHORIZE_QUERY,
-  "authorize-error": VALID_AUTHORIZE_QUERY,
-  "authorize-signed-out": VALID_AUTHORIZE_QUERY,
-  "authorize-bad-params": "state=short&challenge=short&port=80",
-  "authorize-overflow":
-    `state=${"s".repeat(20)}&challenge=${"c".repeat(40)}&port=65535` +
-    `&label=${"L".repeat(80)}&version=${"9".repeat(32)}`,
+  authorize: PREFILLED_CODE,
+  "authorize-empty": "",
+  "authorize-signed-out": PREFILLED_CODE,
+  "authorize-unknown": PREFILLED_CODE,
+  "authorize-expired": PREFILLED_CODE,
+  "authorize-used": PREFILLED_CODE,
+  "authorize-overflow": PREFILLED_CODE,
+  "authorize-error": PREFILLED_CODE,
 };
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS);

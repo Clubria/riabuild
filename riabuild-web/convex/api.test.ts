@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
 import schema from "./schema";
-import { pkceChallenge, randomToken, sha256Hex } from "./lib/crypto";
+import { randomToken, sha256Hex } from "./lib/crypto";
 
 const modules = import.meta.glob("./**/*.ts");
 
@@ -117,28 +117,67 @@ describe("member payloads", () => {
   });
 });
 
-describe("CLI login — loopback code exchange", () => {
-  test("approves in the browser, redeems in the terminal", async () => {
-    const t = setup();
-    const { userId, rowId } = await seedMember(t);
-    const verifier = randomToken(32);
-
-    const asAda = t.withIdentity({ subject: `${userId}|session` });
-    const { code } = await asAda.action(api.cliAuth.authorize, {
-      challenge: await pkceChallenge(verifier),
-      deviceLabel: "ada-mbp",
-      cliVersion: "0.1.0",
+describe("CLI login — device authorisation", () => {
+  /** What the CLI does first: ask for a pair of codes. */
+  async function startDevice(
+    t: ReturnType<typeof setup>,
+    options: { label?: string; version?: string } = {},
+  ) {
+    const headers: Record<string, string> = {};
+    if (options.version !== undefined) {
+      headers["x-riabuild-cli-version"] = options.version;
+    }
+    const response = await t.fetch("/api/v1/cli/device", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ deviceLabel: options.label ?? "build-01" }),
     });
+    return { response, body: await response.json() };
+  }
 
+  /** One tick of the CLI's poll loop. */
+  async function poll(t: ReturnType<typeof setup>, deviceCode: string) {
     const response = await t.fetch("/api/v1/cli/token", {
       method: "POST",
-      body: JSON.stringify({ code, verifier }),
+      body: JSON.stringify({ deviceCode }),
     });
-    expect(response.status).toBe(200);
+    return { response, body: await response.json() };
+  }
 
-    const body = await response.json();
-    expect(body.member.githubLogin).toBe("ada");
-    expect(typeof body.token).toBe("string");
+  test("prints a code, waits, and signs in once it is approved", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t);
+    const { body: device } = await startDevice(t, { label: "build-01" });
+
+    expect(device.userCode).toMatch(
+      /^[BCDFGHJKMNPQRSTVWXZ]{4}-[BCDFGHJKMNPQRSTVWXZ]{4}$/,
+    );
+    expect(device.verificationUriComplete).toContain(device.userCode);
+    expect(device.interval).toBeGreaterThan(0);
+
+    // Nothing has happened yet, so the CLI is told to keep waiting rather than
+    // handed an error to unwind on every tick of its loop.
+    const waiting = await poll(t, device.deviceCode);
+    expect(waiting.response.status).toBe(200);
+    expect(waiting.body.status).toBe("pending");
+
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+    const seen = await asAda.query(api.cliAuth.deviceRequest, {
+      userCode: device.userCode,
+    });
+    // The developer checks this against their own terminal before approving.
+    expect(seen).toMatchObject({ status: "pending", deviceLabel: "build-01" });
+
+    expect(
+      await asAda.mutation(api.cliAuth.approve, { userCode: device.userCode }),
+    ).toEqual({ status: "ok" });
+
+    const granted = await poll(t, device.deviceCode);
+    expect(granted.response.status).toBe(200);
+    expect(granted.body.status).toBe("ok");
+    expect(granted.body.member.githubLogin).toBe("ada");
+    expect(typeof granted.body.token).toBe("string");
+    expect(granted.body.member.memberId).toMatch(UUID);
 
     // `riabuild remote forget` needs this to name the exact session it is
     // revoking: it must be the real row id, not just present.
@@ -146,10 +185,12 @@ describe("CLI login — loopback code exchange", () => {
       const rows = await ctx.db.query("cliSessions").collect();
       return rows[0]?._id;
     });
-    expect(body.sessionId).toBe(sessionRowId);
+    expect(granted.body.sessionId).toBe(sessionRowId);
 
     // The session is real: it authenticates the next request.
-    const me = await t.fetch("/api/v1/me", { headers: bearer(body.token) });
+    const me = await t.fetch("/api/v1/me", {
+      headers: bearer(granted.body.token),
+    });
     expect(me.status).toBe(200);
     expect((await me.json()).member.role).toBe("developer");
 
@@ -159,77 +200,256 @@ describe("CLI login — loopback code exchange", () => {
       return rows.map((row) => row.tokenHash);
     });
     expect(stored).toHaveLength(1);
-    expect(stored[0]).not.toBe(body.token);
-    expect(stored[0]).toBe(await sha256Hex(body.token));
-    expect(rowId).toBeDefined();
+    expect(stored[0]).not.toBe(granted.body.token);
+    expect(stored[0]).toBe(await sha256Hex(granted.body.token));
   });
 
-  test("a code presented with the wrong verifier is refused", async () => {
+  test("the device code is stored hashed and the user code is not", async () => {
     const t = setup();
-    const { userId } = await seedMember(t);
-    const asAda = t.withIdentity({ subject: `${userId}|session` });
-    const { code } = await asAda.action(api.cliAuth.authorize, {
-      challenge: await pkceChallenge(randomToken(32)),
-      deviceLabel: "ada-mbp",
-      cliVersion: "0.1.0",
+    const { body: device } = await startDevice(t);
+
+    const row = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliDeviceCodes").collect();
+      return rows[0];
     });
 
-    const response = await t.fetch("/api/v1/cli/token", {
-      method: "POST",
-      body: JSON.stringify({ code, verifier: randomToken(32) }),
-    });
-    expect(response.status).toBe(401);
+    // The device code is the one that can be exchanged for a session, so a
+    // dump of this table must not contain it.
+    expect(row.deviceCodeHash).not.toBe(device.deviceCode);
+    expect(row.deviceCodeHash).toBe(await sha256Hex(device.deviceCode));
+
+    // The user code identifies a request and grants nothing, so it is stored
+    // as-is — hashing it would only stop the dashboard from looking it up.
+    expect(row.userCode).toBe(device.userCode.replace("-", ""));
+  });
+
+  test("a lowercase, dashless retype finds the same request", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t);
+    const { body: device } = await startDevice(t);
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+
+    const typed = device.userCode.replace("-", "").toLowerCase();
+    expect(
+      await asAda.query(api.cliAuth.deviceRequest, { userCode: typed }),
+    ).toMatchObject({ status: "pending" });
+  });
+
+  test("a denied request stops the CLI instead of stranding it", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t);
+    const { body: device } = await startDevice(t);
+
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+    await asAda.mutation(api.cliAuth.deny, { userCode: device.userCode });
+
+    // 200, not an error: "no" is an answer, and the CLI needs to tell the
+    // difference between a refusal and a network problem.
+    const denied = await poll(t, device.deviceCode);
+    expect(denied.response.status).toBe(200);
+    expect(denied.body.status).toBe("denied");
+
     const sessions = await t.run(async (ctx) =>
       ctx.db.query("cliSessions").collect(),
     );
     expect(sessions).toHaveLength(0);
   });
 
-  test("a code is spent even by a failed attempt", async () => {
+  test("a device code is single-use", async () => {
     const t = setup();
     const { userId } = await seedMember(t);
-    const verifier = randomToken(32);
+    const { body: device } = await startDevice(t);
     const asAda = t.withIdentity({ subject: `${userId}|session` });
-    const { code } = await asAda.action(api.cliAuth.authorize, {
-      challenge: await pkceChallenge(verifier),
-      deviceLabel: "ada-mbp",
-      cliVersion: "0.1.0",
+    await asAda.mutation(api.cliAuth.approve, { userCode: device.userCode });
+
+    expect((await poll(t, device.deviceCode)).body.status).toBe("ok");
+
+    const replay = await poll(t, device.deviceCode);
+    expect(replay.response.status).toBe(401);
+    const sessions = await t.run(async (ctx) =>
+      ctx.db.query("cliSessions").collect(),
+    );
+    expect(sessions).toHaveLength(1);
+  });
+
+  test("an expired request cannot be approved or redeemed", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t);
+    const { body: device } = await startDevice(t);
+
+    await t.run(async (ctx) => {
+      const row = (await ctx.db.query("cliDeviceCodes").collect())[0];
+      await ctx.db.patch("cliDeviceCodes", row._id, { expiresAt: 1 });
     });
 
-    // Wrong verifier first, correct verifier second: the code must not survive
-    // the failed attempt for someone who intercepted it to retry.
-    await t.fetch("/api/v1/cli/token", {
-      method: "POST",
-      body: JSON.stringify({ code, verifier: randomToken(32) }),
-    });
-    const retry = await t.fetch("/api/v1/cli/token", {
-      method: "POST",
-      body: JSON.stringify({ code, verifier }),
-    });
-    expect(retry.status).toBe(401);
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+    expect(
+      await asAda.query(api.cliAuth.deviceRequest, {
+        userCode: device.userCode,
+      }),
+    ).toEqual({ status: "expired" });
+    expect(
+      await asAda.mutation(api.cliAuth.approve, { userCode: device.userCode }),
+    ).toEqual({ status: "expired" });
+    expect((await poll(t, device.deviceCode)).response.status).toBe(401);
+  });
+
+  test("an unknown device code is refused", async () => {
+    const t = setup();
+    const unknown = await poll(t, randomToken(32));
+    expect(unknown.response.status).toBe(401);
+    expect(unknown.body.error.code).toBe("unauthenticated");
   });
 
   test("a suspended member cannot approve a machine", async () => {
     const t = setup();
     const { userId } = await seedMember(t, { status: "suspended" });
+    const { body: device } = await startDevice(t);
     const asAda = t.withIdentity({ subject: `${userId}|session` });
+
     await expect(
-      asAda.action(api.cliAuth.authorize, {
-        challenge: await pkceChallenge(randomToken(32)),
-        deviceLabel: "ada-mbp",
-        cliVersion: "0.1.0",
-      }),
+      asAda.mutation(api.cliAuth.approve, { userCode: device.userCode }),
     ).rejects.toThrow(/suspended/i);
+  });
+
+  test("suspension between approval and the next poll is a 403", async () => {
+    const t = setup();
+    const { userId, rowId } = await seedMember(t);
+    const { body: device } = await startDevice(t);
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+    await asAda.mutation(api.cliAuth.approve, { userCode: device.userCode });
+
+    // Minutes can pass between approving and the poll that lands, and the
+    // session comes into existence at the poll — so that is where status has
+    // to be checked, not only at approval.
+    await t.run(async (ctx) => {
+      await ctx.db.patch("members", rowId, { status: "suspended" });
+    });
+
+    const blocked = await poll(t, device.deviceCode);
+    expect(blocked.response.status).toBe(403);
+    expect(blocked.body.error.code).toBe("suspended");
+  });
+
+  test("looking a code up requires signing in first", async () => {
+    const t = setup();
+    const { body: device } = await startDevice(t);
+    // Otherwise this is an oracle anyone can walk the code space with.
+    await expect(
+      t.query(api.cliAuth.deviceRequest, { userCode: device.userCode }),
+    ).rejects.toThrow(/signed in/i);
+  });
+
+  test("a CLI below the floor is told to upgrade before it prints anything", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{}",
+        claudeSettingsUpdatedAt: 0,
+        repoSlug: "clubria/app",
+        minCliVersion: "2026.08.07",
+        latestCliVersion: "2026.08.07",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    // This endpoint is the only place the floor reaches a machine that has
+    // never signed in — /org/config needs a session it does not have yet.
+    const { response, body } = await startDevice(t, { version: "2026.08.01" });
+    expect(response.status).toBe(409);
+    expect(body.error.code).toBe("cli_too_old");
   });
 
   test("a malformed body is a 400, not a 500", async () => {
     const t = setup();
     const response = await t.fetch("/api/v1/cli/token", {
       method: "POST",
-      body: JSON.stringify({ code: 17 }),
+      body: JSON.stringify({ deviceCode: 17 }),
     });
     expect(response.status).toBe(400);
     expect((await response.json()).error.code).toBe("bad_request");
+  });
+
+  test("expired requests are swept rather than left to accumulate", async () => {
+    const t = setup();
+    await startDevice(t);
+    await t.run(async (ctx) => {
+      const row = (await ctx.db.query("cliDeviceCodes").collect())[0];
+      // Two hours dead: past expiry plus the reaper's grace period.
+      await ctx.db.patch("cliDeviceCodes", row._id, {
+        expiresAt: Date.now() - 2 * 60 * 60 * 1000,
+      });
+    });
+
+    expect(await t.mutation(internal.cliAuth.reapExpired, {})).toEqual({
+      deleted: 1,
+    });
+    const left = await t.run(async (ctx) =>
+      ctx.db.query("cliDeviceCodes").collect(),
+    );
+    expect(left).toHaveLength(0);
+  });
+
+  test("a user code already in play is never handed out twice", async () => {
+    const t = setup();
+    const { body: first } = await startDevice(t, { label: "build-01" });
+    const taken = first.userCode.replace("-", "");
+
+    // Reusing a live code would wire one developer's approval screen to another
+    // developer's terminal, silently. The odds are 1 in 19^8, which is exactly
+    // why nobody would ever find it in the field.
+    const collided = await t.mutation(internal.cliAuth.startDevice, {
+      deviceCodeHash: await sha256Hex(randomToken(32)),
+      userCode: taken,
+      deviceLabel: "laptop-02",
+      cliVersion: "2026.08.07",
+      expiresAt: Date.now() + 60_000,
+      now: Date.now(),
+    });
+    expect(collided).toEqual({ status: "collision" });
+
+    const rows = await t.run(async (ctx) =>
+      ctx.db.query("cliDeviceCodes").collect(),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].deviceLabel).toBe("build-01");
+  });
+
+  test("a code freed up by expiry can be issued again", async () => {
+    const t = setup();
+    const { body: first } = await startDevice(t);
+    const code = first.userCode.replace("-", "");
+    await t.run(async (ctx) => {
+      const row = (await ctx.db.query("cliDeviceCodes").collect())[0];
+      await ctx.db.patch("cliDeviceCodes", row._id, { expiresAt: 1 });
+    });
+
+    // Codes are reaped rather than reserved forever, so the space has to be
+    // reusable — and every lookup has to cope with two rows sharing a code.
+    const reissued = await t.mutation(internal.cliAuth.startDevice, {
+      deviceCodeHash: await sha256Hex(randomToken(32)),
+      userCode: code,
+      deviceLabel: "laptop-02",
+      cliVersion: "2026.08.07",
+      expiresAt: Date.now() + 60_000,
+      now: Date.now(),
+    });
+    expect(reissued).toEqual({ status: "ok" });
+
+    const { userId } = await seedMember(t);
+    const asAda = t.withIdentity({ subject: `${userId}|session` });
+    // The newest row wins, not whichever `.unique()` would have thrown over.
+    expect(
+      await asAda.query(api.cliAuth.deviceRequest, { userCode: code }),
+    ).toMatchObject({ status: "pending", deviceLabel: "laptop-02" });
+  });
+
+  test("a live request survives the sweep", async () => {
+    const t = setup();
+    await startDevice(t);
+    expect(await t.mutation(internal.cliAuth.reapExpired, {})).toEqual({
+      deleted: 0,
+    });
   });
 });
 
@@ -409,6 +629,150 @@ describe("org config and claude settings", () => {
     const body = await response.json();
     expect(body.settings).toEqual({ env: { CLUBRIA: "1" } });
     expect(body.updatedAt).toBe(1234);
+  });
+
+  test("the default settings ask for bypass mode and pre-accept its disclaimer", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/org/claude-settings", {
+      headers: bearer(token),
+    });
+    const { settings } = await response.json();
+
+    expect(settings.theme).toBe("auto");
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+    // These two are one setting wearing two names. Claude Code downgrades
+    // bypassPermissions to default unless the disclaimer has been accepted, so
+    // shipping the mode alone produces a developer who thinks permissions are
+    // off and gets prompted anyway.
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+  });
+
+  test("the default settings carry the context-window status line", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
+
+    const response = await t.fetch("/api/v1/org/claude-settings", {
+      headers: bearer(token),
+    });
+    // The path is load-bearing across two repositories: riabuild-cli's
+    // `claude_statusline` task writes exactly this file.
+    expect((await response.json()).settings.statusLine).toEqual({
+      type: "command",
+      command: "node ~/.riabuild/claude-statusline.js",
+    });
+  });
+
+  test("the backfill adds a status line to settings a lead saved earlier", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: JSON.stringify({ env: { CLUBRIA_ORG: "1" } }),
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(true);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    const settings = JSON.parse(row!.claudeSettings);
+    expect(settings.statusLine.command).toBe(
+      "node ~/.riabuild/claude-statusline.js",
+    );
+    // Settings a lead already chose survive the migration.
+    expect(settings.env).toEqual({ CLUBRIA_ORG: "1" });
+    // The CLI re-fetches by comparing this. A backfill that left it at 1234
+    // would change the database and nobody's laptop.
+    expect(row!.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
+  });
+
+  test("the backfill leaves a status line a lead chose alone", async () => {
+    const t = setup();
+    const chosen = { type: "command", command: "my-own-statusline" };
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: JSON.stringify({ statusLine: chosen }),
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(false);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    expect(JSON.parse(row!.claudeSettings).statusLine).toEqual(chosen);
+    expect(row!.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("running the backfill twice is a no-op the second time", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{}",
+        claudeSettingsUpdatedAt: 0,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
+      true,
+    );
+    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
+      false,
+    );
+
+    const entries = await t.run(async (ctx) =>
+      ctx.db
+        .query("auditLog")
+        .collect()
+        .then((rows) =>
+          rows.filter((row) => row.meta.via === "backfillStatusLine"),
+        ),
+    );
+    expect(entries).toHaveLength(1);
+  });
+
+  test("the backfill refuses to guess at settings it cannot parse", async () => {
+    const t = setup();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{ not json",
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const result = await t.mutation(internal.org.backfillStatusLine, {});
+    expect(result.updated).toBe(false);
+    expect(result.reason).toMatch(/dashboard/i);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    // Replacing unreadable settings with generated ones would lose whatever the
+    // lead meant to write.
+    expect(row!.claudeSettings).toBe("{ not json");
   });
 });
 

@@ -9,6 +9,7 @@ edition = "2024"
 description = "Sets up a Clubria developer's machine and opens the Clubria environment"
 homepage = "https://riabuild.clubria.com"
 repository = "https://github.com/Clubria/riabuild"
+license = "MIT"
 # riabuild is distributed through the Homebrew tap, never crates.io.
 publish = false
 
@@ -59,6 +60,10 @@ flate2 = "1.0"
 # they come from `libc` rather than being hand-picked — it is already resolved
 # in Cargo.lock as a transitive dependency of several crates above.
 libc = "0.2"
+# PNG and TIFF decode, PNG encode, for the clipboard channel's MAX_LONG_EDGE
+# ceiling. Default features pull in a dozen codecs that never appear on a
+# pasteboard, and this binary is downloaded over a laptop connection.
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 rand = "0.9"
 # `rustls-tls-native-roots` reads the OS trust store rather than bundling
 # webpki-roots. A developer behind a corporate TLS-inspecting proxy has that
@@ -90,6 +95,7 @@ tokio = { version = "1", default-features = false, features = [
     "io-std",
     "time",
 ] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

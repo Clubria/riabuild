@@ -16,7 +16,9 @@ export function route(pathname: string): Route {
   const path = normalise(pathname);
 
   if (path === "/") return { kind: "dashboard" };
-  if (path === "/cli/authorize") return { kind: "authorize" };
+  // Short because a developer types it by hand, off a terminal that may be on
+  // another machine entirely.
+  if (path === "/cli") return { kind: "authorize" };
   if (path === "/__ui" && import.meta.env.DEV) return { kind: "gallery" };
 
   return { kind: "notFound", path };

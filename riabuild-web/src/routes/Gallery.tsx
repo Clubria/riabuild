@@ -18,6 +18,8 @@ import {
   Tone,
 } from "../ui";
 import { SCENARIO_NAMES } from "../dev/scenarios";
+import { Install } from "../components/Install";
+import { Platform } from "../lib/platform";
 
 const TONES: Tone[] = ["default", "accent", "ok", "warn", "danger", "muted"];
 
@@ -177,12 +179,20 @@ export function Gallery() {
         </Row>
       </Section>
 
+      {/* All three, forced, because the live panel only ever shows the one it
+          guessed — and apt is the widest thing the console renders. */}
+      <Section name="Install">
+        {(["macos", "apt", "dnf"] as Platform[]).map((platform) => (
+          <Install key={platform} platform={platform} />
+        ))}
+      </Section>
+
       <Section name="KeyValue">
         <KeyValue
           rows={[
             { label: "device", value: "dana-mbp-16" },
             { label: "riabuild", value: "v2026.08.04", tone: "accent" },
-            { label: "callback", value: "127.0.0.1:51789" },
+            { label: "asked", value: "just now" },
             { label: "empty", value: "" },
             { label: "long".repeat(6), value: "y".repeat(200) },
           ]}

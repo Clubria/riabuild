@@ -62,7 +62,7 @@ pub(super) async fn run_gh_auth(
     // unnecessary — but nothing proves it, because `e2e/remote/run.sh`
     // sidesteps that path with an ssh-agent. Treat it as unproven, not as
     // covered.
-    if !ctx.ui.can_prompt() {
+    if !ctx.ui.interactive() {
         return Err(Failure::new(
             attempting,
             "Set GH_TOKEN to a GitHub token with the `read:org` permission, \
@@ -73,9 +73,13 @@ pub(super) async fn run_gh_auth(
         .into());
     }
 
+    // The `gh` riabuild owns, by absolute path. `~/.riabuild/bin` is not on
+    // `PATH` during provisioning, so the bare name would start an unverified
+    // `gh` — or none at all — and this is the sign-in every later check rests
+    // on. See `Ctx::gh`.
     let code = ctx
         .runner
-        .run_interactive("gh", args, &RunOptions::default())
+        .run_interactive(&ctx.gh(), args, &RunOptions::default())
         .await?;
     if code != 0 {
         return Err(Failure::new(

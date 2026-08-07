@@ -10,6 +10,7 @@
 //! answer as a digest and only ever asks whether the server holds it.
 
 use super::{Downloads, SshCtx};
+use crate::archive;
 use crate::download;
 use crate::paths::{Paths, RealPaths};
 use crate::remote::{shell_command, shell_quote};
@@ -121,7 +122,7 @@ pub(super) async fn ensure_matching_binary(
         .detail("the download did not match its published digest")
         .into());
     }
-    let binary = download::extract_single_file(&tarball, "riabuild")?;
+    let binary = archive::extract_single_file(&tarball, "riabuild")?;
 
     write_binary(ctx, home, version, expected, binary).await
 }

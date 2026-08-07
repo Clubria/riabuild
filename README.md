@@ -7,34 +7,66 @@ decision.
 ```
 Lead      → invites the developer to the Clubria GitHub org
 Developer → riabuild.clubria.com → "Sign in with GitHub" → confirm profile
-          → brew install clubria/tap/riabuild
+          → install riabuild (below)
           → riabuild
 ```
 
 ## Install
 
+macOS on Apple silicon or Intel, Linux on x86_64 or aarch64. The dashboard shows
+the block for your platform; all three are here.
+
+**macOS**
+
 ```sh
 brew tap clubria/tap https://github.com/Clubria/riabuild
 brew install clubria/tap/riabuild
-riabuild
 ```
 
-macOS, Apple silicon or Intel. riabuild keeps itself current: it learns the
-published version from the dashboard and runs `brew upgrade` on its own when a
-newer one exists.
+**Debian, Ubuntu**
 
-This repository *is* the tap — the formula is `Formula/riabuild.rb`, written by
-the release workflow. The explicit `brew tap` line is what the second command
+```sh
+curl -fsSL https://clubria.github.io/riabuild/clubria.gpg \
+  | sudo tee /usr/share/keyrings/clubria.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/clubria.gpg] https://clubria.github.io/riabuild/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/clubria.list >/dev/null
+sudo apt update && sudo apt install riabuild
+```
+
+**Fedora, RHEL**
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/clubria.repo \
+  https://clubria.github.io/riabuild/rpm/clubria.repo
+sudo dnf install riabuild
+```
+
+Then `riabuild`.
+
+riabuild keeps itself current: it learns the published version from the
+dashboard and upgrades through whichever package manager installed it — asking
+first on Linux, where that needs sudo. A copy no package manager owns is never
+sudoed over; it prints the command instead.
+
+This repository *is* all three repositories. The formula is `Formula/riabuild.rb`,
+written by the release workflow; the apt and dnf indexes are rebuilt onto GitHub
+Pages on every release. The explicit `brew tap` line is what the macOS install
 needs: Homebrew only auto-taps `clubria/tap` when it can guess the repository
 name, and it guesses `Clubria/homebrew-tap`.
+
+The Linux binaries are statically linked against musl, so there is no
+distribution or glibc requirement beyond what the packages declare.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI, shipped via Homebrew tap `clubria/tap` |
+| `riabuild-cli/` | Rust CLI, shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `packaging/homebrew/` | the formula template — edit this one |
+| `packaging/debian/` | the `.deb` control template |
+| `packaging/rpm/` | the `.rpm` spec template and the dnf `.repo` file |
+| `packaging/pages/` | the landing page for the apt and dnf repositories |
 | `Formula/riabuild.rb` | the rendered formula `brew tap` reads — generated, do not edit |
 | `docs/superpowers/specs/` | design specs |
 | `docs/deploying.md` | putting it on the domain |
@@ -42,7 +74,7 @@ name, and it guesses `Clubria/homebrew-tap`.
 
 ## What `riabuild` does to a machine
 
-Nine setup tasks, compiled into the binary, run in dependency order. Each one checks
+Eleven setup tasks, compiled into the binary, run in dependency order. Each one checks
 whether the machine is *currently* correct, repairs it if not, and then re-checks —
 a task never records a success it has not verified.
 
@@ -54,11 +86,30 @@ a task never records a success it has not verified.
 | 4 | `toolchain` | riabuild-owned Node and pnpm at the versions the repo pins |
 | 5 | `project` | the checkout exists and `origin` really is our repo |
 | 6 | `repo_status` | reports ahead/behind and dirty state — **never pulls** |
-| 7 | `claude_profiles` | Claude Code installed, with a profile of your own |
+| 7 | `claude_accounts` | Claude Code installed, and at least one account of your own, signed in |
 | 8 | `org_settings` | the team's Claude settings, cached and current |
-| 9 | `env_local` | `.env.local`, freshly brokered, parseable, and git-ignored |
+| 9 | `claude_trust` | every account trusts the checkout, so no modal on first launch |
+| 10 | `env_local` | `.env.local`, freshly brokered, parseable, and git-ignored |
+| 11 | `claude_statusline` | the status line script the org settings name |
 
-Then it drops you into your own shell with the environment applied.
+Then it drops you into your own shell with the environment applied, opening with a box
+listing your Claude Code accounts and who is signed into each.
+
+## Claude Code accounts
+
+You can have up to nine, each with its own sign-in, its own sessions, and its own history.
+In the environment shell, `claude` starts Claude Code on your primary account and
+`claude-1` … `claude-9` start a particular one. All of them get the org's Claude settings
+and trust the checkout.
+
+| Command | What |
+|---|---|
+| `riabuild claude list` | your accounts and who is signed into each |
+| `riabuild claude new` | adds an account and signs it in |
+| `riabuild claude delete <n>` | signs it out and removes it; later accounts move up a number |
+| `riabuild claude primary <n>` | makes account `<n>` the one `claude` runs |
+
+`riabuild claude` on its own is `list`.
 
 ## Working on a server
 
@@ -112,7 +163,7 @@ identity and mints short-lived tokens on demand; the CLI pipes them straight int
 ```sh
 cd riabuild-web  && pnpm dev            # convex + vite
 cd riabuild-web  && pnpm ui:check       # Playwright: every UI state × 3 viewports
-cd riabuild-cli  && cargo test          # 112 unit tests, no machine state needed
+cd riabuild-cli  && cargo test          # unit tests only, no machine state needed
 ```
 
 Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.
@@ -134,3 +185,7 @@ holds a placeholder. `docs/releasing.md` covers why, and the rest.
 
 All work goes through a pull request, and is not finished until CI has passed. See
 `CLAUDE.md`.
+
+MIT licensed — see `LICENSE`. The `.deb` carries it as
+`/usr/share/doc/riabuild/copyright` and the `.rpm` as `rpm -qL riabuild`, so the
+notice travels with the binary rather than only with the source.

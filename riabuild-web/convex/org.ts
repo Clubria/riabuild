@@ -10,17 +10,57 @@ import { viewerMember, writeAudit } from "./members";
 import { compareVersions } from "./lib/version";
 
 /**
+ * The context-window bar every Clubria developer gets by default.
+ *
+ * This is a pointer, not a program. The script it names is compiled into the
+ * riabuild binary and written to `~/.riabuild/claude-statusline.js` by the
+ * `claude_statusline` setup task, so what actually executes on a laptop arrives
+ * through a signed Homebrew release. Changing this string cannot make a
+ * developer's machine run something new — only `brew upgrade` can.
+ *
+ * `node` resolves to the Node riabuild installed: it shares `PATH` with the `c`
+ * launcher inside the Clubria environment shell.
+ */
+export const DEFAULT_STATUS_LINE = {
+  type: "command",
+  command: "node ~/.riabuild/claude-statusline.js",
+};
+
+/**
  * Defaults exist so a fresh deployment serves a coherent config before any lead
  * has opened the settings screen. A CLI that gets a 404 for org config cannot do
  * anything useful, and "set this up first" is a worse first run than sane
  * defaults a lead can correct.
+ *
+ * Every key here is settings data Claude Code reads from the file each account
+ * launcher — `claude`, `claude-1` … `claude-N` — passes to `--settings` (source
+ * `flagSettings`, verified against 2.1.223). Nothing here is written into
+ * anyone's own `settings.json`.
+ *
+ * `statusLine` is the one key that names a program, and it still carries none:
+ * the script it points at ships inside the riabuild binary. See
+ * `DEFAULT_STATUS_LINE`.
+ *
+ * `skipDangerousModePermissionPrompt` is what accepting the bypass-permissions
+ * disclaimer sets. Without it Claude Code silently downgrades the mode —
+ * "Permission mode downgraded to default — bypass requires accepting the
+ * disclaimer interactively first" — so shipping `defaultMode` without it would
+ * look configured and behave otherwise.
+ *
+ * Trusting the checkout is deliberately *not* here: `hasTrustDialogAccepted` is
+ * per-project state in `.claude.json`, not a settings key, and no settings file
+ * can express it. `claude_trust` in the CLI does that half.
  */
 export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
   {
+    theme: "auto",
     permissions: {
+      defaultMode: "bypassPermissions",
       deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
     },
+    skipDangerousModePermissionPrompt: true,
     env: { CLUBRIA_ORG: "1" },
+    statusLine: DEFAULT_STATUS_LINE,
   },
   null,
   2,
@@ -240,5 +280,73 @@ export const setLatestCliVersion = internalMutation({
     });
 
     return { updated: true, latestCliVersion: version };
+  },
+});
+
+/**
+ * Adds the status line to an org that saved its settings before riabuild had
+ * one.
+ *
+ * `DEFAULT_CLAUDE_SETTINGS` is only ever read by a deployment with no
+ * `orgConfig` row, so on any org where a lead has pressed save even once, a new
+ * default reaches nobody. Run this once per deployment:
+ *
+ *     npx convex run org:backfillStatusLine --prod
+ *
+ * Internal on purpose, like `setLatestCliVersion`: reachable from CI and the
+ * Convex dashboard, and from no browser client.
+ *
+ * Conservative by design. An org that already names a status line is left
+ * alone, whichever one it names. Overwriting a lead's deliberate choice because
+ * a migration ran a second time is worse than the migration doing nothing.
+ */
+export const backfillStatusLine = internalMutation({
+  args: {},
+  returns: v.object({ updated: v.boolean(), reason: v.string() }),
+  handler: async (ctx) => {
+    const row = await ctx.db.query("orgConfig").first();
+    if (row === null) {
+      return {
+        updated: false,
+        reason: "No stored config — the served default already carries it.",
+      };
+    }
+
+    let settings: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(row.claudeSettings);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("not an object");
+      settings = parsed as Record<string, unknown>;
+    } catch {
+      // `org.update` rejects invalid JSON, so this means the row predates that
+      // check or was written by hand. Guessing at a repair here would replace
+      // settings nobody can see with settings nobody chose.
+      return {
+        updated: false,
+        reason:
+          "Stored settings are not a JSON object. Fix them in the dashboard first.",
+      };
+    }
+
+    if (settings.statusLine !== undefined) {
+      return { updated: false, reason: "A status line is already configured." };
+    }
+
+    settings.statusLine = DEFAULT_STATUS_LINE;
+    await ctx.db.patch("orgConfig", row._id, {
+      claudeSettings: JSON.stringify(settings, null, 2),
+      // Moving this is the point: the CLI decides whether to re-fetch by
+      // comparing it, so a settings change that leaves it alone never lands.
+      claudeSettingsUpdatedAt: Date.now(),
+    });
+
+    // No actorId: this is a migration, not a person.
+    await writeAudit(ctx, {
+      action: "org.config_updated",
+      meta: { fields: "claudeSettings", via: "backfillStatusLine" },
+    });
+
+    return { updated: true, reason: "Status line added." };
   },
 });

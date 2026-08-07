@@ -23,9 +23,13 @@
 #    than discovering it four steps in.
 #
 # 2. A published release with an `x86_64-unknown-linux-musl` checksum.
-#    `install::ensure_riabuild` downloads a real release from real GitHub,
-#    and no release has that asset yet (Task 11's finding: release.yml
-#    builds macOS only). Until one ships, the run cannot get past the
+#    `install::ensure_riabuild` downloads a real release from real GitHub.
+#    The musl *tarball* now ships (release.yml gained a Linux matrix), but
+#    the Linux job never appends to `riabuild-$version-checksums.txt` — that
+#    file is written only by the macOS job. `ensure_riabuild` fetches the
+#    checksums before the tarball and refuses without a digest, which is the
+#    right way round to fail: it will not install a binary it cannot verify.
+#    Until the Linux job publishes its digests, the run cannot get past the
 #    install step.
 #
 # Because of (2) the five isolation assertions at the bottom DO NOT RUN yet.
@@ -353,9 +357,9 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo
   echo "############################################################"
   echo "# KNOWN GAP, not a regression: remote mode stopped at the"
-  echo "# binary-install step. riabuild v$version has no published"
-  echo "# checksum for x86_64-unknown-linux-musl yet (release.yml"
-  echo "# builds macOS only — Task 11)."
+  echo "# binary-install step. riabuild v$version publishes an"
+  echo "# x86_64-unknown-linux-musl tarball but no checksum for it:"
+  echo "# release.yml writes the checksums file in its macOS job only."
   echo "#"
   echo "# Asserted just now, not assumed: a key pair was generated,"
   echo "# the container's host key was pinned, and riabuild's key was"
@@ -363,7 +367,8 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "#"
   echo "# The five isolation assertions this test names were NOT run:"
   echo "# they need an installed server binary, which does not exist"
-  echo "# yet. This is expected until a Linux/musl release ships."
+  echo "# yet. This is expected until release.yml publishes the"
+  echo "# musl digests alongside the musl tarballs."
   echo "############################################################"
   exit 0
 fi

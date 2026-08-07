@@ -34,7 +34,7 @@ pub struct Record {
     #[serde(default)]
     pub home: String,
     /// The `cliSessions` row id behind this server's own session, from
-    /// `TokenResponse::session_id`. Empty until `remote::session::ensure`
+    /// `auth::Session::session_id`. Empty until `remote::session::ensure`
     /// mints a session for the first time (or for a `remotes.json` written
     /// before this field existed — `#[serde(default)]` again, not
     /// struct-literal construction). `remote::forget::forget_remote` treats
@@ -228,7 +228,7 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
                     ),
                 ));
             }
-            let answer = ctx.ui.ask("", Some("1"))?;
+            let answer = ctx.ui.ask_required("", Some("1"))?;
             let index: usize = answer.trim().parse().unwrap_or(1);
             let record = store
                 .remotes
@@ -242,9 +242,13 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
 /// The three questions, once, on a first run.
 async fn ask_for_one(ctx: &mut Ctx, store: &Store) -> Result<Remote> {
     ctx.ui.heading("Adding a server");
-    let host = ctx.ui.ask("Hostname  ", None)?;
-    let port: u16 = ctx.ui.ask("Port      ", Some("22"))?.parse().unwrap_or(22);
-    let user = ctx.ui.ask("Username  ", Some(&whoami()))?;
+    let host = ctx.ui.ask_required("Hostname  ", None)?;
+    let port: u16 = ctx
+        .ui
+        .ask_required("Port      ", Some("22"))?
+        .parse()
+        .unwrap_or(22);
+    let user = ctx.ui.ask_required("Username  ", Some(&whoami()))?;
     let name = allocate_name(&host, &store.names());
     ctx.ui
         .note(&format!("This server will be known as {name}."));

@@ -160,7 +160,6 @@ pub(super) async fn connect_and_setup(
         &ctx.ui,
         &ctx.api,
         &member,
-        &ctx.web_url,
         &ctx.cli_version,
         store,
     )

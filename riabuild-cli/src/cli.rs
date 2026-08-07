@@ -64,6 +64,12 @@ pub enum Command {
     Status,
     /// Open the Clubria environment shell without checking anything.
     Shell,
+    /// Move the Clubria checkout somewhere else.
+    MoveProject {
+        /// Where to move it to. Asked for if left out.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
     /// Print the environment riabuild would apply, as `export` lines.
     Env,
     /// Set up a server and open the Clubria environment on it.
@@ -93,6 +99,26 @@ pub enum Command {
         #[command(subcommand)]
         action: InternalAction,
     },
+    /// The laptop channel: what makes paste work over a remote session.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
+    /// Remove `~/.riabuild` so the next run sets this machine up from scratch.
+    ///
+    /// Runs no setup tasks: the point of a reset is the machine no check can
+    /// repair, and checking first would mean fixing the tree about to be
+    /// deleted.
+    Reset {
+        /// Remove it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage your Claude Code accounts.
+    Claude {
+        #[command(subcommand)]
+        action: Option<ClaudeAction>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -116,6 +142,63 @@ fn accept_host_key_shape(value: &str) -> Result<String, String> {
     } else {
         Err("must look like a `ssh-keygen -lf` fingerprint, e.g. `SHA256:qKqv...`".to_string())
     }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ClaudeAction {
+    /// List your Claude Code accounts.
+    List,
+    /// Add an account and sign it in.
+    New,
+    /// Remove an account. Later accounts move up a number.
+    Delete {
+        /// Which account, as shown by `riabuild claude`.
+        #[arg(value_name = "NUMBER")]
+        number: usize,
+        /// Remove it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Make an account the one `claude` runs.
+    Primary {
+        #[arg(value_name = "NUMBER")]
+        number: usize,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ChannelAction {
+    /// Serve this laptop's clipboard to a remote session.
+    ///
+    /// Hidden: started by the remote flow, not by a developer.
+    #[command(hide = true)]
+    Agent {
+        /// Where to listen. Defaults to the session's runtime directory.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+    /// Stand in for `xclip` or `wl-paste` on the server.
+    ///
+    /// Hidden: invoked by the generated shims in `~/.riabuild/bin`.
+    #[command(hide = true)]
+    Shim {
+        /// The tool being shadowed.
+        tool: String,
+        /// That tool's own arguments, passed through untouched.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Open a link in the laptop's browser.
+    ///
+    /// Hidden: invoked by the generated `xdg-open` shim and by `$BROWSER`.
+    #[command(hide = true)]
+    Open {
+        /// The link, and any options the caller passed alongside it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Report whether the clipboard channel is up.
+    Status,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -163,6 +246,119 @@ mod tests {
         let cli = Cli::parse_from(["riabuild", "--check", "status"]);
         assert!(cli.check);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn the_checkout_can_be_moved_with_or_without_a_path() {
+        // Without one it asks; with one it is scriptable, and usable over a
+        // session that has no terminal to ask through.
+        let cli = Cli::parse_from(["riabuild", "move-project"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::MoveProject { path: None })
+        ));
+
+        let cli = Cli::parse_from(["riabuild", "move-project", "~/work/hub"]);
+        let Some(Command::MoveProject { path }) = cli.command else {
+            panic!("expected move-project");
+        };
+        assert_eq!(path.as_deref(), Some("~/work/hub"));
+    }
+
+    #[test]
+    fn reset_asks_before_removing_anything() {
+        let cli = Cli::parse_from(["riabuild", "reset"]);
+        assert!(matches!(cli.command, Some(Command::Reset { yes: false })));
+    }
+
+    #[test]
+    fn reset_can_be_told_not_to_ask() {
+        let cli = Cli::parse_from(["riabuild", "reset", "--yes"]);
+        assert!(matches!(cli.command, Some(Command::Reset { yes: true })));
+    }
+
+    #[test]
+    fn the_shim_passes_its_arguments_through_verbatim() {
+        // The generated ~/.riabuild/bin/xclip runs exactly this. Flags that
+        // look like riabuild's own must reach the parser as the tool's.
+        let cli = Cli::parse_from([
+            "riabuild",
+            "channel",
+            "shim",
+            "xclip",
+            "-selection",
+            "clipboard",
+            "-t",
+            "TARGETS",
+            "-o",
+        ]);
+        let Some(Command::Channel {
+            action: ChannelAction::Shim { tool, args },
+        }) = cli.command
+        else {
+            panic!("expected a shim invocation");
+        };
+        assert_eq!(tool, "xclip");
+        assert_eq!(args, ["-selection", "clipboard", "-t", "TARGETS", "-o"]);
+    }
+
+    /// `--quiet` is a riabuild flag, and the shim must not eat it out of the
+    /// tool's own argument list.
+    #[test]
+    fn a_tool_flag_that_collides_with_riabuilds_own_still_reaches_the_tool() {
+        let cli = Cli::parse_from(["riabuild", "channel", "shim", "xclip", "-quiet", "-o"]);
+        let Some(Command::Channel {
+            action: ChannelAction::Shim { args, .. },
+        }) = cli.command
+        else {
+            panic!("expected a shim invocation");
+        };
+        assert_eq!(args, ["-quiet", "-o"]);
+    }
+
+    #[test]
+    fn the_agent_can_be_told_where_to_listen() {
+        let cli = Cli::parse_from(["riabuild", "channel", "agent", "--socket", "/tmp/a.sock"]);
+        let Some(Command::Channel {
+            action: ChannelAction::Agent { socket },
+        }) = cli.command
+        else {
+            panic!("expected the agent");
+        };
+        assert_eq!(socket.as_deref(), Some("/tmp/a.sock"));
+    }
+
+    #[test]
+    fn channel_status_is_a_plain_subcommand() {
+        let cli = Cli::parse_from(["riabuild", "channel", "status"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Channel {
+                action: ChannelAction::Status
+            })
+        ));
+    }
+
+    #[test]
+    fn bare_claude_lists_the_accounts() {
+        let cli = Cli::parse_from(["riabuild", "claude"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Claude { action: None })
+        ));
+    }
+
+    #[test]
+    fn deleting_an_account_takes_a_number_and_can_skip_the_prompt() {
+        let cli = Cli::parse_from(["riabuild", "claude", "delete", "3", "--yes"]);
+        let Some(Command::Claude {
+            action: Some(ClaudeAction::Delete { number, yes }),
+        }) = cli.command
+        else {
+            panic!("expected claude delete");
+        };
+        assert_eq!(number, 3);
+        assert!(yes);
     }
 
     #[test]

@@ -1,0 +1,106 @@
+name: End to end
+
+# Runs the real CLI against a real backend on a real Mac — the only place
+# riabuild is exercised the way a developer experiences it.
+#
+# ci.yml proves the code is correct in isolation: 100-odd unit tests against
+# canned `gh`, `git` and `node` output, and Convex functions under convex-test.
+# Neither side can catch the failure that actually strands people — riabuild-web
+# renaming a field the Rust client deserialises. Both suites stay green while
+# every laptop breaks. This job is what closes that gap, so it deliberately
+# fakes as little as possible: one stubbed third-party host, and nothing else.
+#
+# It needs macOS rather than merely preferring it. `security(1)`, the ad-hoc
+# signed binary, Homebrew installs and the `~/Documents/Clubria` checkout
+# location are all macOS behaviour, and macOS is the only platform riabuild
+# ships to.
+#
+# The logic lives in e2e/run.sh so a failure can be reproduced on a laptop with
+# one command instead of by pushing commits at a runner.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: riabuild on macOS
+    runs-on: macos-latest
+    # Generous, because it downloads a Convex backend, a Node tarball, pnpm,
+    # Claude Code and the Infisical formula. Tight enough that a hang is a
+    # failure rather than an hour of billing.
+    timeout-minutes: 30
+    env:
+      E2E_GITHUB_TOKEN: ${{ secrets.E2E_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repository is public, so pull requests from forks get no secrets
+      # and there is nothing this job could do with the ones it has. Skipping
+      # loudly beats failing: a red check a contributor cannot fix teaches
+      # people to ignore red checks.
+      #
+      # The same branch runs it for real once the pull request is from here.
+      - name: Check for a test identity
+        id: identity
+        run: |
+          if [ -z "${E2E_GITHUB_TOKEN:-}" ]; then
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::secrets.E2E_GITHUB_TOKEN is not set, so riabuild was NOT tested end to end."
+            echo "::warning::Fork pull requests never receive secrets; this is expected there."
+            # Single quotes: backticks inside a double-quoted string are command
+            # substitution, and this one would have run `gh secret set`.
+            echo '::warning::Otherwise: create a fine-grained PAT with Organization permissions ->'
+            echo '::warning::Members: Read, then run: gh secret set E2E_GITHUB_TOKEN. See e2e/README.md.'
+          else
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.identity.outputs.have_token == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.identity.outputs.have_token == 'true'
+        with:
+          workspaces: riabuild-cli
+
+      - uses: pnpm/action-setup@v4
+        if: steps.identity.outputs.have_token == 'true'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: steps.identity.outputs.have_token == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+
+      # The backend is served by `npx convex dev` out of this directory, so its
+      # dependencies have to be present before run.sh starts.
+      - name: Install riabuild-web dependencies
+        if: steps.identity.outputs.have_token == 'true'
+        working-directory: riabuild-web
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the end-to-end test
+        if: steps.identity.outputs.have_token == 'true'
+        run: e2e/run.sh
+
+      # A failed run's most useful evidence is what the backend and the
+      # Infisical stand-in saw, and run.sh deletes its scratch directory on the
+      # way out. E2E_KEEP=1 is not used here — it would leak the seeded token
+      # into an artifact — so the logs are copied out by run.sh itself.
+      - name: Upload logs
+        if: failure() && steps.identity.outputs.have_token == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: e2e-logs/
+          if-no-files-found: ignore

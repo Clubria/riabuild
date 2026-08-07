@@ -1,213 +1,141 @@
-//! CLI login — loopback OAuth, the same shape `gh` uses.
+//! CLI login — device authorisation, the flow shaped after RFC 8628.
 //!
-//! The CLI binds an ephemeral port on 127.0.0.1, sends the developer to the
-//! dashboard, and the dashboard redirects the browser back to that port with a
-//! one-time code. Chosen over device-code because the target is a desktop with a
-//! browser, and because it puts the developer back in their terminal.
+//! riabuild asks the server for a pair of codes, prints the short one, and
+//! polls until a developer approves it in a browser. Nothing here binds a
+//! socket and nothing travels through a redirect, so a terminal on a server
+//! reached over SSH signs in exactly the way a terminal on a laptop does.
 //!
-//! `state` is generated here and verified here, so a callback riabuild did not
-//! start is rejected. The verifier never leaves this process until it is
-//! exchanged over TLS.
+//! Two codes, two jobs. The `device_code` never leaves this process and is what
+//! the poll is authenticated with; the `user_code` is read aloud off the
+//! terminal and typed into the dashboard, and can be exchanged for nothing. The
+//! developer matching one against the other is what stops a stranger's approval
+//! link signing a stranger's machine in.
 
 use crate::api::{ApiClient, Member};
 use crate::runner::{CommandRunner, RunOptions};
 use crate::ui::{Failure, Ui};
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep};
 
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
-
-pub struct LoginFlow {
-    pub state: String,
-    pub verifier: String,
-    pub challenge: String,
-}
-
-impl Default for LoginFlow {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LoginFlow {
-    pub fn new() -> Self {
-        let state = random_b64(32);
-        let verifier = random_b64(32);
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        Self {
-            state,
-            verifier,
-            challenge,
-        }
-    }
-
-    pub fn authorize_url(&self, web_url: &str, port: u16, label: &str, version: &str) -> String {
-        format!(
-            "{web_url}/cli/authorize?state={}&challenge={}&port={port}&label={}&version={}",
-            urlencode(&self.state),
-            urlencode(&self.challenge),
-            urlencode(label),
-            urlencode(version),
-        )
-    }
-}
-
-fn random_b64(bytes: usize) -> String {
-    let mut buffer = vec![0u8; bytes];
-    rand::rng().fill_bytes(&mut buffer);
-    URL_SAFE_NO_PAD.encode(buffer)
-}
-
-fn urlencode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            b' ' => "+".to_string(),
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
-/// Pulls `code` and `state` out of a callback request line.
+/// Bounds on the poll interval the server asks for.
 ///
-/// Pure, so the rejection rules are unit-testable without a socket.
-pub fn parse_callback(request_line: &str) -> Option<(String, String)> {
-    let mut parts = request_line.split_whitespace();
-    if parts.next()? != "GET" {
-        return None;
-    }
-    let target = parts.next()?;
-    let (path, query) = target.split_once('?')?;
-    if path != "/callback" {
-        return None;
-    }
+/// The server picks the cadence, but not without limits: a zero would spin this
+/// loop against the API and a very large one would leave a developer staring at
+/// an approved browser tab and a terminal that has not noticed.
+const MIN_POLL: Duration = Duration::from_secs(1);
+const MAX_POLL: Duration = Duration::from_secs(60);
+const DEFAULT_POLL: Duration = Duration::from_secs(5);
 
-    let mut code = None;
-    let mut state = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        match key {
-            "code" => code = Some(urldecode(value)),
-            "state" => state = Some(urldecode(value)),
-            _ => {}
-        }
-    }
-    Some((code?, state?))
+/// A ceiling on how long to wait when the server does not say.
+const FALLBACK_EXPIRY: Duration = Duration::from_secs(15 * 60);
+
+/// What `POST /api/v1/cli/device` hands back.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceStart {
+    #[serde(rename = "deviceCode")]
+    pub device_code: String,
+    #[serde(rename = "userCode")]
+    pub user_code: String,
+    #[serde(rename = "verificationUri")]
+    pub verification_uri: String,
+    #[serde(rename = "verificationUriComplete")]
+    pub verification_uri_complete: Option<String>,
+    /// Seconds, not a timestamp: a machine on its first boot may not have
+    /// finished talking to NTP, and a duration does not care what time it is.
+    #[serde(rename = "expiresIn")]
+    pub expires_in: Option<u64>,
+    pub interval: Option<u64>,
 }
 
-fn urldecode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
+/// One tick of the poll loop.
+///
+/// Tagged by `status` so the wire contract is the type: "not yet" is an
+/// ordinary 200 rather than an error to unwind, because it is the answer this
+/// loop expects most of the time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PollResponse {
+    Pending {
+        interval: Option<u64>,
+    },
+    Denied,
+    Ok {
+        token: String,
+        member: Member,
+        /// The `cliSessions` row this token belongs to. `remote::session::ensure`
+        /// keeps it in `remotes.json` so `riabuild remote forget` knows exactly
+        /// which session to revoke through `DELETE /api/v1/cli/sessions/<id>`
+        /// rather than guessing from a device label.
+        ///
+        /// `#[serde(default)]` removes a deploy-order dependency, and costs
+        /// nothing: without it, a CLI that ships before — or ahead of a rollback
+        /// of — the riabuild-web that sends this field fails *login itself* on a
+        /// decode error, which is a far worse outcome than not knowing a session
+        /// id. `store::Record::session_id` already carries the same attribute and
+        /// already treats empty as "nothing to revoke", so an empty string flows
+        /// through the rest of remote mode as a state it is written to handle.
+        #[serde(rename = "sessionId", default)]
+        session_id: String,
+    },
+}
+
+/// What a completed sign-in produces.
+///
+/// A struct rather than the `(String, Member, String)` tuple this used to
+/// return: two of the three values are a `String`, and swapping them at a call
+/// site compiles perfectly while writing a session id into the keychain and a
+/// live bearer token into `remotes.json`. The names are the check the compiler
+/// cannot otherwise make.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub token: String,
+    pub member: Member,
+    /// Not a secret — it names a row, not a credential. Only
+    /// `remote::session::ensure` keeps it, for `riabuild remote forget` to
+    /// revoke by later; a laptop's own sign-in has nothing to revoke it with.
+    pub session_id: String,
+}
+
+/// Clamps whatever the server asked for into something sane.
+pub fn poll_delay(requested: Option<u64>) -> Duration {
+    match requested {
+        None => DEFAULT_POLL,
+        Some(seconds) => Duration::from_secs(seconds).clamp(MIN_POLL, MAX_POLL),
     }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Errors are swallowed on purpose: a browser that hangs up before reading the
-/// courtesy page must not fail a login that has already succeeded.
-async fn respond(stream: &mut TcpStream, title: &str, detail: &str) {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>riabuild</title>\
-         <body style=\"font:16px/1.5 -apple-system,system-ui,sans-serif;padding:3rem\">\
-         <h1 style=\"font-size:1.4rem\">{title}</h1><p>{detail}</p></body>"
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.flush().await;
+/// What riabuild has to know to decide whether opening a browser is worth it.
+///
+/// Passed in rather than read here so the decision is testable without
+/// rewriting the process environment underneath a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserEnv {
+    pub over_ssh: bool,
+    pub macos: bool,
+    pub has_display: bool,
 }
 
-/// Waits for the browser to come back. Rejects any callback whose `state` is not
-/// the one this process generated.
-async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    // The timeout wraps the whole accept loop rather than a single accept:
-    // favicon requests and stray probes `continue`, and a per-accept timeout
-    // would hand each of them a fresh three-minute budget.
-    let wait = async {
-        loop {
-            let (mut stream, _) = listener.accept().await?;
+/// Whether to try to open a browser at all.
+///
+/// Over SSH the answer is always no: the terminal is on a server and the
+/// browser that matters is on the laptop in front of the developer, so spawning
+/// anything here at best opens a window nobody is looking at.
+pub fn browser_available(env: BrowserEnv) -> bool {
+    if env.over_ssh {
+        return false;
+    }
+    env.macos || env.has_display
+}
 
-            let mut line = String::new();
-            let mut reader = BufReader::new(&mut stream);
-            // One connection that opens and then says nothing must not park a
-            // real callback behind it. The outer timeout would eventually fire,
-            // but this keeps a stalled probe from consuming the whole window.
-            if timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .is_err()
-            {
-                continue;
-            }
-
-            match parse_callback(line.trim_end()) {
-                Some((code, state)) if state == expected_state => {
-                    respond(
-                        &mut stream,
-                        "You are signed in.",
-                        "riabuild has what it needs. You can close this tab.",
-                    )
-                    .await;
-                    return Ok(code);
-                }
-                Some(_) => {
-                    respond(
-                        &mut stream,
-                        "That did not come from riabuild.",
-                        "The sign-in was not the one this terminal started. Run <code>riabuild login</code> again.",
-                    )
-                    .await;
-                    return Err(anyhow!(
-                        "the browser came back with a sign-in riabuild did not start"
-                    ));
-                }
-                None => {
-                    // Favicon requests and stray probes land here.
-                    respond(&mut stream, "riabuild", "Nothing to do here.").await;
-                }
-            }
-        }
-    };
-
-    timeout(LOGIN_TIMEOUT, wait)
-        .await
-        .map_err(|_| anyhow!("no reply from the browser within three minutes"))?
+fn current_browser_env() -> BrowserEnv {
+    let set = |key: &str| std::env::var(key).is_ok_and(|value| !value.is_empty());
+    BrowserEnv {
+        over_ssh: set("SSH_CONNECTION") || set("SSH_TTY") || set("SSH_CLIENT"),
+        macos: cfg!(target_os = "macos"),
+        has_display: set("DISPLAY") || set("WAYLAND_DISPLAY"),
+    }
 }
 
 /// A label for this machine, from its hostname. `pub`: `tasks::login` calls
@@ -237,80 +165,141 @@ async fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    token: String,
-    /// The `cliSessions` row this token belongs to. `remote::session::ensure`
-    /// keeps it in `remotes.json` so `riabuild remote forget` knows exactly
-    /// which session to revoke through `DELETE /api/v1/cli/sessions/<id>`
-    /// rather than guessing from a device label.
-    ///
-    /// `#[serde(default)]` removes a deploy-order dependency, and costs
-    /// nothing: without it, a CLI that ships before — or ahead of a rollback
-    /// of — the riabuild-web that sends this field fails *login itself* on a
-    /// decode error, which is a far worse outcome than not knowing a session
-    /// id. `store::Record::session_id` already carries the same attribute and
-    /// already treats empty as "nothing to revoke", so an empty string flows
-    /// through the rest of remote mode as a state it is written to handle.
-    #[serde(rename = "sessionId", default)]
-    session_id: String,
-    member: Member,
+/// Asks the server to start a device authorisation.
+async fn start_device(api: &ApiClient, label: &str) -> Result<DeviceStart> {
+    api.post_json(
+        "/api/v1/cli/device",
+        serde_json::json!({ "deviceLabel": label }),
+    )
+    .await
+}
+
+/// Whether a failed poll is worth another attempt before the deadline.
+///
+/// Only a failure to reach the server at all. This loop stays open for up to
+/// fifteen minutes while a developer walks to another machine, and a closed lid
+/// or a wifi handover in the middle of that is not a reason to throw away a code
+/// they are about to approve.
+///
+/// Everything the server actually answered is final. Retrying a 401 would poll a
+/// spent code until the deadline and then report that nobody approved it, which
+/// is both wrong and the least useful thing to say.
+pub fn survives_a_failed_poll(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::api::ApiError>(),
+        Some(api_error) if api_error.code == "unreachable"
+    )
+}
+
+/// Polls until the request is answered, expires, or the developer gives up.
+async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<Session> {
+    let lifetime = start
+        .expires_in
+        .map(Duration::from_secs)
+        .unwrap_or(FALLBACK_EXPIRY);
+    let deadline = Instant::now() + lifetime;
+    let mut delay = poll_delay(start.interval);
+
+    loop {
+        // Waiting first, not last: the developer has not had time to read the
+        // code yet, let alone type it, so an immediate poll only ever costs a
+        // request to be told "pending".
+        sleep(delay).await;
+
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "that code expired before it was approved (codes last {} minutes)",
+                lifetime.as_secs() / 60
+            ));
+        }
+
+        let polled = api
+            .post_json::<PollResponse>(
+                "/api/v1/cli/token",
+                serde_json::json!({ "deviceCode": start.device_code }),
+            )
+            .await;
+
+        let response = match polled {
+            Ok(response) => response,
+            Err(error) if survives_a_failed_poll(&error) => continue,
+            Err(error) => return Err(error),
+        };
+
+        match response {
+            PollResponse::Pending { interval } => {
+                delay = poll_delay(interval.or(start.interval));
+            }
+            PollResponse::Denied => {
+                return Err(anyhow!("that request was denied in the browser"));
+            }
+            PollResponse::Ok {
+                token,
+                member,
+                session_id,
+            } => {
+                return Ok(Session {
+                    token,
+                    member,
+                    session_id,
+                });
+            }
+        }
+    }
 }
 
 /// Runs the whole flow and returns the session token, the member it belongs
 /// to, and the `cliSessions` row id behind it. The caller stores the token in
-/// the keychain; it is never written to `~/.riabuild`. The session id is not
-/// a secret — it names a row, not a credential — and `remote::session::ensure`
-/// is the one caller that keeps it, for `riabuild remote forget` to revoke by
-/// later.
+/// the keychain; it is never written to `~/.riabuild`.
 ///
-/// `label` is the caller's to choose, so the dashboard lists each session
-/// under the device it belongs to rather than always "this machine" — and
-/// for the same reason, printing *why* this login is happening is the
+/// Takes neither a dashboard URL nor a version: the server builds the
+/// verification URL, because it is the thing that knows where the dashboard is
+/// deployed, and reads the version off the `x-riabuild-cli-version` header
+/// `ApiClient` already sends on every request.
+///
+/// `label` *is* the caller's to choose, so the dashboard lists each session
+/// under the device it belongs to rather than always the hostname of the
+/// machine running this code: `remote::session::ensure` signs a *server* in
+/// from the laptop's browser, and labelling that session after the laptop
+/// would leave `riabuild remote list` and `forget` unable to tell the two
+/// apart. `device_label` is the answer a laptop's own sign-in passes.
+/// For the same reason, printing *why* this login is happening is the
 /// caller's too: the heading lives at each call site, not here.
 pub async fn login(
     api: &ApiClient,
     runner: &dyn CommandRunner,
     ui: &Ui,
-    web_url: &str,
-    version: &str,
     label: &str,
-) -> Result<(String, Member, String)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
+) -> Result<Session> {
+    let start = start_device(api, label).await?;
+
+    // Printed before any browser is attempted, and printed whatever happens.
+    // Over SSH this is the whole interface, and on a laptop it is what the
+    // developer checks the browser against.
+    ui.note(&format!("Open {}", start.verification_uri));
+    ui.note(&format!("Enter code {}", start.user_code));
+
+    if browser_available(current_browser_env()) {
+        let target = start
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&start.verification_uri);
+        if !open_browser(runner, target).await {
+            ui.note("Could not open your browser — use the link above.");
+        }
+    }
+
+    ui.info("");
+    ui.info("Waiting for you to approve this machine…");
+
+    wait_for_approval(api, &start).await.map_err(|error| {
         Failure::new(
-            "opening a local port for the browser to come back to",
-            "Check whether something is blocking loopback connections, then run `riabuild login` again.",
+            "waiting for you to approve this machine in the browser",
+            "Run `riabuild login` again and approve the request.",
         )
         .detail(error.to_string())
-    })?;
-    let port = listener.local_addr()?.port();
-
-    let flow = LoginFlow::new();
-    let url = flow.authorize_url(web_url, port, label, version);
-
-    if !open_browser(runner, &url).await {
-        ui.note("Could not open your browser. Open this link yourself:");
-    }
-    ui.note(&url);
-
-    let code = wait_for_code(&listener, &flow.state)
-        .await
-        .map_err(|error| {
-            Failure::new(
-                "waiting for you to approve this machine in the browser",
-                "Run `riabuild login` again and approve the request.",
-            )
-            .detail(error.to_string())
-        })?;
-
-    let response: TokenResponse = api
-        .post_json(
-            "/api/v1/cli/token",
-            serde_json::json!({ "code": code, "verifier": flow.verifier }),
-        )
-        .await?;
-
-    Ok((response.token, response.member, response.session_id))
+        .into()
+    })
 }
 
 #[cfg(test)]
@@ -318,13 +307,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_reply_without_a_session_id_still_signs_the_developer_in() {
+    fn a_grant_without_a_session_id_still_signs_the_developer_in() {
         // A riabuild-web older than this binary — or one that has just been
         // rolled back — does not send `sessionId`. Failing the decode would
         // fail *login*, on every command, over a field only `riabuild remote
         // forget` ever reads. Empty is the same state `store::Record` already
         // treats as "no session to revoke".
-        let older: TokenResponse = serde_json::from_value(serde_json::json!({
+        let older: PollResponse = serde_json::from_value(serde_json::json!({
+            "status": "ok",
             "token": "rb_live_abc",
             "member": {
                 "githubLogin": "ada",
@@ -337,59 +327,191 @@ mod tests {
             }
         }))
         .expect("a missing sessionId must not fail login");
-        assert_eq!(older.session_id, "");
-        assert_eq!(older.token, "rb_live_abc");
+        match older {
+            PollResponse::Ok {
+                token, session_id, ..
+            } => {
+                assert_eq!(session_id, "");
+                assert_eq!(token, "rb_live_abc");
+            }
+            other => panic!("expected a grant, got {other:?}"),
+        }
     }
 
     #[test]
-    fn parses_a_callback() {
-        let parsed = parse_callback("GET /callback?code=abc123&state=xyz HTTP/1.1");
-        assert_eq!(parsed, Some(("abc123".into(), "xyz".into())));
+    fn a_pending_poll_is_a_normal_reply_not_an_error() {
+        // The CLI sees this dozens of times per login. Decoding it as anything
+        // other than an ordinary response would mean unwinding on every tick.
+        let response: PollResponse =
+            serde_json::from_str(r#"{"status":"pending","interval":5}"#).unwrap();
+        assert!(matches!(
+            response,
+            PollResponse::Pending { interval: Some(5) }
+        ));
     }
 
     #[test]
-    fn decodes_percent_escapes() {
-        let parsed = parse_callback("GET /callback?code=a%2Bb%3Dc&state=s%2F1 HTTP/1.1").unwrap();
-        assert_eq!(parsed.0, "a+b=c");
-        assert_eq!(parsed.1, "s/1");
+    fn a_pending_poll_without_an_interval_still_decodes() {
+        let response: PollResponse = serde_json::from_str(r#"{"status":"pending"}"#).unwrap();
+        assert!(matches!(response, PollResponse::Pending { interval: None }));
     }
 
     #[test]
-    fn ignores_anything_that_is_not_the_callback() {
-        assert!(parse_callback("GET /favicon.ico HTTP/1.1").is_none());
-        assert!(parse_callback("POST /callback?code=a&state=b HTTP/1.1").is_none());
-        assert!(parse_callback("GET /callback HTTP/1.1").is_none());
-        assert!(parse_callback("garbage").is_none());
+    fn a_denial_is_distinguishable_from_a_wait() {
+        // "No" and "not yet" lead to opposite behaviour: one stops, the other
+        // keeps polling. Collapsing them would hang a refused login forever.
+        let response: PollResponse = serde_json::from_str(r#"{"status":"denied"}"#).unwrap();
+        assert!(matches!(response, PollResponse::Denied));
     }
 
     #[test]
-    fn a_challenge_is_the_sha256_of_the_verifier() {
-        let flow = LoginFlow::new();
-        let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(flow.verifier.as_bytes()));
-        assert_eq!(flow.challenge, expected);
-        assert_ne!(flow.state, flow.verifier);
-        // Long enough that the dashboard's own length checks pass.
-        assert!(flow.state.len() >= 16);
-        assert!(flow.challenge.len() >= 32);
+    fn a_grant_carries_the_token_the_member_and_the_session_it_opened() {
+        // The session id is what `riabuild remote forget` revokes a *server's*
+        // token by, through `DELETE /api/v1/cli/sessions/<id>`. Dropping it
+        // here would compile and would leave a live 90-day bearer credential
+        // on a shared box after a `forget` that reported success.
+        let response: PollResponse = serde_json::from_str(
+            r#"{"status":"ok","token":"tok_1","sessionId":"sess_1","expiresAt":123,"member":{
+                 "githubLogin":"ada","memberId":"550e8400-e29b-41d4-a716-446655440000",
+                 "firstName":"Ada","lastName":"Lovelace",
+                 "email":"ada@clubria.dev","role":"developer","status":"active"}}"#,
+        )
+        .unwrap();
+        match response {
+            PollResponse::Ok {
+                token,
+                member,
+                session_id,
+            } => {
+                assert_eq!(token, "tok_1");
+                assert_eq!(member.github_login, "ada");
+                assert_eq!(session_id, "sess_1");
+            }
+            other => panic!("expected a grant, got {other:?}"),
+        }
     }
 
     #[test]
-    fn each_login_is_unique() {
-        let a = LoginFlow::new();
-        let b = LoginFlow::new();
-        assert_ne!(a.state, b.state);
-        assert_ne!(a.verifier, b.verifier);
+    fn an_unknown_status_is_refused_rather_than_guessed() {
+        // A future server state must not be read as one of today's. Failing to
+        // decode surfaces as an error; guessing "ok" would invent a session.
+        assert!(serde_json::from_str::<PollResponse>(r#"{"status":"slow_down"}"#).is_err());
     }
 
     #[test]
-    fn the_authorize_url_carries_everything_the_dashboard_needs() {
-        let flow = LoginFlow::new();
-        let url = flow.authorize_url("https://riabuild.clubria.com", 51234, "Ada's MBP", "0.1.0");
-        assert!(url.starts_with("https://riabuild.clubria.com/cli/authorize?"));
-        assert!(url.contains("port=51234"));
-        assert!(url.contains("label=Ada%27s+MBP"));
-        assert!(url.contains(&format!("challenge={}", urlencode(&flow.challenge))));
-        // The verifier is the one thing that must not appear in a URL.
-        assert!(!url.contains(&flow.verifier));
+    fn the_device_start_reads_the_fields_the_server_sends() {
+        let start: DeviceStart = serde_json::from_str(
+            r#"{"deviceCode":"dc_1","userCode":"WXZB-CDFG",
+                "verificationUri":"https://riabuild.clubria.com/cli",
+                "verificationUriComplete":"https://riabuild.clubria.com/cli?code=WXZB-CDFG",
+                "expiresIn":900,"interval":5}"#,
+        )
+        .unwrap();
+        assert_eq!(start.device_code, "dc_1");
+        assert_eq!(start.user_code, "WXZB-CDFG");
+        assert_eq!(start.expires_in, Some(900));
+    }
+
+    #[test]
+    fn a_server_that_omits_the_optional_fields_still_starts_a_login() {
+        // Every optional field has a working default, so an older or trimmed
+        // response degrades rather than failing the login outright.
+        let start: DeviceStart = serde_json::from_str(
+            r#"{"deviceCode":"dc_1","userCode":"WXZB-CDFG",
+                "verificationUri":"https://riabuild.clubria.com/cli"}"#,
+        )
+        .unwrap();
+        assert_eq!(start.verification_uri_complete, None);
+        assert_eq!(poll_delay(start.interval), DEFAULT_POLL);
+    }
+
+    #[test]
+    fn the_poll_interval_is_clamped_at_both_ends() {
+        // A zero would spin this loop against the API; an hour would leave a
+        // developer looking at an approved tab and a terminal that has not
+        // noticed. Neither is worth trusting a server field for.
+        assert_eq!(poll_delay(Some(0)), MIN_POLL);
+        assert_eq!(poll_delay(Some(3600)), MAX_POLL);
+        assert_eq!(poll_delay(Some(5)), Duration::from_secs(5));
+        assert_eq!(poll_delay(None), DEFAULT_POLL);
+    }
+
+    fn api_error(code: &str) -> anyhow::Error {
+        crate::api::ApiError {
+            status: 0,
+            code: code.into(),
+            message: "x".into(),
+            action: "y".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_dropped_connection_does_not_end_a_fifteen_minute_wait() {
+        // This loop runs for up to fifteen minutes while a developer walks to
+        // another machine. A closed lid or a wifi handover in the middle of
+        // that must not throw away a code they are about to approve.
+        assert!(survives_a_failed_poll(&api_error("unreachable")));
+    }
+
+    #[test]
+    fn a_server_that_says_the_code_is_dead_stops_the_loop() {
+        // The opposite mistake: retrying a 401 would poll a spent code until
+        // the deadline and then blame the developer for not approving it.
+        assert!(!survives_a_failed_poll(&api_error("unauthenticated")));
+        assert!(!survives_a_failed_poll(&api_error("suspended")));
+        assert!(!survives_a_failed_poll(&api_error("cli_too_old")));
+    }
+
+    #[test]
+    fn an_error_that_is_not_the_servers_stops_the_loop() {
+        // A malformed body is a bug, not weather. Retrying hides it.
+        assert!(!survives_a_failed_poll(&anyhow!(
+            "could not read the reply"
+        )));
+    }
+
+    #[test]
+    fn ssh_never_opens_a_browser() {
+        // The whole reason this flow exists: over SSH the browser that matters
+        // is on the laptop, and anything opened here is on the wrong machine.
+        for env in [
+            BrowserEnv {
+                over_ssh: true,
+                macos: true,
+                has_display: true,
+            },
+            BrowserEnv {
+                over_ssh: true,
+                macos: false,
+                has_display: false,
+            },
+        ] {
+            assert!(!browser_available(env), "{env:?}");
+        }
+    }
+
+    #[test]
+    fn a_desktop_session_still_gets_its_browser_opened() {
+        assert!(browser_available(BrowserEnv {
+            over_ssh: false,
+            macos: true,
+            has_display: false,
+        }));
+        assert!(browser_available(BrowserEnv {
+            over_ssh: false,
+            macos: false,
+            has_display: true,
+        }));
+    }
+
+    #[test]
+    fn a_linux_box_with_no_display_is_not_offered_a_browser() {
+        // A headless server someone is sitting at physically, or a container.
+        assert!(!browser_available(BrowserEnv {
+            over_ssh: false,
+            macos: false,
+            has_display: false,
+        }));
     }
 }

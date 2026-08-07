@@ -16,22 +16,29 @@
 // binary target, which is the build that reaches a developer's laptop.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod accounts;
 mod api;
+mod archive;
+mod channel;
 mod cli;
 mod config;
 mod download;
+mod fs_move;
 mod gh_session;
 mod internal;
 mod keychain;
+mod move_project;
 mod paths;
 mod provision;
 mod remote;
+mod reset;
 mod runner;
 mod scope;
 mod shell;
 mod shims;
 mod tasks;
 mod testing;
+mod tools;
 mod ui;
 mod update;
 mod version;
@@ -84,6 +91,29 @@ async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let scope = scope::Scope::detect();
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
+
+    // Dispatched before the setup flow: the shim runs on every Ctrl+V, so it
+    // must not check the machine, talk to the API, or print a banner.
+    if let Some(Command::Channel { action }) = &cli.command {
+        return channel::dispatch(action, cli.quiet).await;
+    }
+
+    // Dispatched before anything creates or reads the tree. riabuild must not
+    // recreate the directory it is about to remove, and a reset must not depend
+    // on a config or state file that may be the reason it was asked for.
+    if let Some(Command::Reset { yes }) = &cli.command {
+        return reset::run(
+            paths.as_ref(),
+            &ui,
+            reset::Request {
+                assume_yes: *yes,
+                dry_run: cli.check,
+                inside_shell: shell::already_inside(),
+            },
+        )
+        .await;
+    }
+
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     // A server has no keyring an SSH session can unlock, so its own session
     // lives in a file in its namespace instead — see `scope.rs`.
@@ -190,12 +220,20 @@ async fn run(cli: Cli) -> Result<i32> {
 pub(crate) fn opens_shell(cli: &Cli) -> bool {
     match &cli.command {
         Some(Command::Shell) => true,
+        // `Channel` and `Reset` return from `run` before a `Ctx` exists, so
+        // they never reach here — named anyway rather than swept into a
+        // wildcard, so that adding a subcommand that *should* open a shell is
+        // a compile error rather than a silently wrong `false`.
         Some(
             Command::Internal { .. }
             | Command::Login
             | Command::Logout
             | Command::Env
             | Command::Remote { .. }
+            | Command::MoveProject { .. }
+            | Command::Channel { .. }
+            | Command::Reset { .. }
+            | Command::Claude { .. }
             | Command::Status,
         ) => false,
         None => !cli.check && !cli.no_shell,
@@ -242,6 +280,19 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::SeedGithub,
         }) => return internal::seed_github(ctx).await,
+        Some(Command::MoveProject { path }) => {
+            return move_project::run(ctx, path.as_deref()).await;
+        }
+        // Deliberately not behind `connect`: this manages local directories and
+        // talks only to Claude Code, so it must work with no riabuild session,
+        // no network, and a machine nothing has provisioned.
+        Some(Command::Claude { action }) => {
+            return accounts::command::run(ctx, action.clone()).await;
+        }
+        Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
+        Some(Command::Channel { .. }) => {
+            unreachable!("the channel returns before the setup flow starts")
+        }
         Some(Command::Status) | None => {}
     }
 
@@ -304,7 +355,6 @@ pub(crate) fn build_ctx(
         member: None,
         server: scope.server.clone(),
         cli_version: cli::VERSION.to_string(),
-        web_url: api::web_url(),
         env: Vec::new(),
         notes: Vec::new(),
         dry_run,

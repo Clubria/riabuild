@@ -154,7 +154,8 @@ VITE_CONVEX_URL=https://handsome-vulture-127.eu-west-1.convex.cloud pnpm deploy:
 ```
 
 `public/_redirects` is load-bearing: it serves `index.html` for unmatched paths, so
-`/cli/authorize` works on a cold load — which is exactly how the CLI opens it.
+`/cli` works on a cold load — which is exactly how a developer reaches it, by typing the
+URL riabuild printed in a terminal.
 
 ### The old Workers route, for reference
 

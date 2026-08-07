@@ -40,6 +40,24 @@ pub async fn ctx_with(runner: FakeRunner) -> (Ctx, TempDir) {
     (ctx, home)
 }
 
+/// A `Ctx` on a machine where riabuild has already installed the tools it owns.
+///
+/// The file contents are irrelevant — every invocation goes through
+/// `FakeRunner` — but the files must exist, because their existence is exactly
+/// what `check()` uses to tell a provisioned machine from a bare one. Tests
+/// that want the bare case use `ctx_with` and assert the task asks to install.
+pub async fn ctx_with_tools(runner: FakeRunner) -> (Ctx, TempDir) {
+    let (ctx, home) = ctx_with(runner).await;
+    install_owned_tools(&ctx).await;
+    (ctx, home)
+}
+
+pub async fn install_owned_tools(ctx: &Ctx) {
+    for binary in [ctx.gh(), ctx.infisical()] {
+        write_file(std::path::Path::new(&binary), "#!/bin/sh\n").await;
+    }
+}
+
 /// Like `ctx_with`, but hands back the runner as well.
 ///
 /// Some things a task must get right are only visible in *what it ran*: that a
@@ -65,17 +83,25 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         runner,
         keychain,
         api: ApiClient::new("0.1.0"),
-        // A test Ctx models a developer sitting at a terminal. `cargo test`
-        // gives the process no tty, so without this every test would take the
-        // unattended path and stop covering the interactive one.
-        ui: Ui::new(true).assume_prompts_work(true),
+        // Deliberately *not* interactive. `cargo test` gives the process no
+        // tty, and this models that honestly — which is also what a CI job
+        // has. An earlier version of this file called
+        // `.assume_prompts_work(true)` here so that tests of the interactive
+        // path would exercise it; the cost was that every other test silently
+        // became interactive too, including the ones asserting that riabuild
+        // refuses rather than assumes when there is nobody to ask.
+        //
+        // So the default is the unattended machine, and a test that wants a
+        // developer at the keyboard says so: `ctx.ui =
+        // Ui::new(true).assume_prompts_work(true);`, or `Ui::scripted([...])`
+        // to supply the answers as well.
+        ui: Ui::new(true),
         config: UserConfig::default(),
         state: State::default(),
         org: Some(org_config()),
         member: None,
         server: None,
         cli_version: "0.1.0".into(),
-        web_url: "https://riabuild.clubria.com".into(),
         env: Vec::new(),
         notes: Vec::new(),
         dry_run: false,

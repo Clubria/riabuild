@@ -1,8 +1,9 @@
 //! Task 8 — cache the org's Claude Code settings.
 //!
-//! The file is handed to `claude --settings` by the `c` launcher, which layers
-//! it over the developer's own profile settings at launch. Nothing is merged
-//! into anyone's `settings.json`.
+//! The file is handed to `claude --settings` by every account launcher —
+//! `claude` and `claude-1` … `claude-N` — which layers it over that account's
+//! own settings at launch. One cached file serves all of them: org policy is
+//! org-wide by definition. Nothing is merged into anyone's `settings.json`.
 //!
 //! A recurring deep-merge cannot express removal, cannot tell org keys from
 //! developer keys after the first run, and silently clobbers edits. Layering at
@@ -49,6 +50,20 @@ impl Task for OrgSettings {
             return Ok(Status::needs("the cached team settings are not valid JSON"));
         }
 
+        // Nothing to compare against until this machine is signed in, and the
+        // question has to be *asked* before it can be answered — an
+        // unauthenticated request gets a 401, which `?` turns into a hard error
+        // and takes the whole run down with it.
+        //
+        // That is the difference between `riabuild --check` telling a developer
+        // with an expired session "you are not signed in" and it refusing to
+        // report anything at all, which is the moment that command matters
+        // most. `login` runs first and this re-checks once it has. Same guard
+        // `project` and `env_local` already use.
+        if ctx.member.is_none() {
+            return Ok(Status::needs("waiting for sign-in"));
+        }
+
         // The authoritative comparison: what the server says it published.
         let remote = org::fetch_claude_settings(&ctx.api).await?;
         match ctx.config.org_settings_updated_at {
@@ -83,6 +98,24 @@ mod tests {
         let status = OrgSettings.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("not been fetched"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_machine_is_reported_not_thrown() {
+        // Regression: with a valid cache on disk and no session, `check()` used
+        // to ask the server anyway, take a 401, and turn `riabuild --check`
+        // into a hard failure — on exactly the machine whose problem is that
+        // the session expired. There is no runner output here because a
+        // signed-out check must not reach the network at all.
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_file(&ctx.paths.org_settings_file(), r#"{"env":{}}"#).await;
+        assert!(ctx.member.is_none());
+
+        let status = OrgSettings.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("waiting for sign-in"),
             "{status:?}"
         );
     }

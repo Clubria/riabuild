@@ -104,8 +104,8 @@ impl Shell {
     }
 }
 
-/// `PATH` with riabuild's own directories in front, so `node`, `pnpm` and `c`
-/// resolve to the versions riabuild installed.
+/// `PATH` with riabuild's own directories in front, so `node`, `pnpm` and
+/// `claude` resolve to the versions riabuild installed.
 pub fn path_with_riabuild(ctx: &Ctx, current_path: &str) -> String {
     let mut prefix = vec![ctx.paths.bin_dir()];
     if let Some(node_version) = &ctx.config.node_version {
@@ -124,18 +124,62 @@ pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
         ("PATH".to_string(), path_with_riabuild(ctx, &current_path)),
         ("RIABUILD_SHELL".to_string(), "1".to_string()),
     ];
-    if let Some(profile) = &ctx.config.claude_profile {
-        env.push((
-            "CLAUDE_CONFIG_DIR".to_string(),
-            ctx.paths
-                .claude_dir()
-                .join(profile)
-                .to_string_lossy()
-                .into_owned(),
-        ));
-    }
     env.extend(ctx.env.iter().cloned());
+    if let Some(browser) = browser_for(ctx, &env) {
+        env.push(("BROWSER".to_string(), browser));
+    }
     env
+}
+
+/// `$BROWSER`, but only for a session that has a laptop to open links on.
+///
+/// Claude Code checks `BROWSER` before it checks anything else, and on a
+/// headless server that check is the only thing standing between a login URL
+/// and a terminal browser rendering over the session. Pointing it at the shim
+/// is what makes remote links open on the laptop.
+///
+/// Conditional because the shim has nowhere to send a link without a channel.
+/// A local session opens browsers perfectly well on its own, and exporting this
+/// there would turn a working sign-in into an exit 1 — so the variable appears
+/// exactly where the channel it depends on does.
+fn browser_for(ctx: &Ctx, env: &[(String, String)]) -> Option<String> {
+    let configured = env
+        .iter()
+        .any(|(name, value)| name == crate::channel::SOCKET_ENV && !value.is_empty());
+    if !configured {
+        return None;
+    }
+    Some(
+        ctx.paths
+            .bin_dir()
+            .join(crate::shims::BROWSER_TOOL)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Everything printed when the environment shell starts: the account box, then
+/// the banner.
+///
+/// One string so that each shell's existing `banner_command` — and the
+/// `[[ -t 1 ]]` guard inside it that keeps this out of captured output — covers
+/// both without any of them learning what an account is.
+///
+/// `server` is threaded through rather than re-derived here for the same reason
+/// `colour` is: this text is baked into a generated rcfile, and the only thing
+/// that knows which machine the shell is being started on is the `Ctx` back in
+/// `spawn`. Dropping it would compile and read as a working banner — a
+/// developer on `build-01` would simply be told they are on their laptop.
+pub fn prelude(
+    accounts: &[crate::accounts::status::Account],
+    colour: bool,
+    server: Option<&str>,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        crate::accounts::render::accounts_box(accounts, colour),
+        banner(colour, server)
+    )
 }
 
 /// True when riabuild is already inside its own shell.
@@ -150,15 +194,18 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let shell = Shell::detect();
     let env = environment(ctx);
 
+    let accounts = crate::accounts::status::read_all(ctx).await;
+    let prelude = prelude(&accounts, ctx.ui.colour(), ctx.server.as_deref());
+
     let (args, extra_env) = match &shell {
-        Shell::Zsh => zsh::prepare(ctx).await?,
-        Shell::Bash => bash::prepare(ctx).await?,
-        Shell::Fish => fish::prepare(ctx).await?,
+        Shell::Zsh => zsh::prepare(ctx, &prelude).await?,
+        Shell::Bash => bash::prepare(ctx, &prelude).await?,
+        Shell::Fish => fish::prepare(ctx, &prelude).await?,
         // riabuild generates no startup file for a shell it does not know, so
-        // there is nothing inside it to print the banner or touch the prompt.
-        // The parent says it instead — and only here, so it is still said once.
+        // there is nothing inside it to print this. The parent says it instead
+        // — and only here, so it is still said once.
         Shell::Other(_) => {
-            ctx.ui.info(&banner(ctx.ui.colour(), ctx.server.as_deref()));
+            ctx.ui.info(&prelude);
             (Vec::new(), Vec::new())
         }
     };
@@ -181,6 +228,52 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
+
+    /// A local session opens browsers on its own. Exporting BROWSER there would
+    /// point Claude Code at a shim with nowhere to send the link, turning a
+    /// working sign-in into an exit 1.
+    #[tokio::test]
+    async fn a_session_with_no_channel_gets_no_browser_variable() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let env = environment(&ctx);
+        assert!(!env.iter().any(|(name, _)| name == "BROWSER"), "{env:?}");
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_channel_points_browser_at_the_shim() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.env.push((
+            crate::channel::SOCKET_ENV.to_string(),
+            "/run/user/1000/riabuild/channel.sock".to_string(),
+        ));
+
+        let env = environment(&ctx);
+        let browser = env
+            .iter()
+            .find(|(name, _)| name == "BROWSER")
+            .map(|(_, value)| value.clone())
+            .expect("BROWSER should be set when the channel is");
+
+        assert_eq!(
+            browser,
+            ctx.paths
+                .bin_dir()
+                .join(crate::shims::BROWSER_TOOL)
+                .to_string_lossy()
+        );
+    }
+
+    /// An empty socket variable is not a channel. Treating it as one would set
+    /// BROWSER on a session that cannot open anything.
+    #[tokio::test]
+    async fn an_empty_socket_variable_does_not_count_as_a_channel() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.env
+            .push((crate::channel::SOCKET_ENV.to_string(), String::new()));
+
+        let env = environment(&ctx);
+        assert!(!env.iter().any(|(name, _)| name == "BROWSER"), "{env:?}");
+    }
 
     #[test]
     fn recognises_the_common_shells() {
@@ -258,18 +351,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_environment_marks_the_session_and_points_claude_at_the_profile() {
+    async fn the_environment_marks_the_session_but_pins_no_account() {
+        // The launchers each set CLAUDE_CONFIG_DIR themselves. Exporting it too
+        // would go stale the moment `riabuild claude primary` reorders the
+        // list, and would send any claude started outside a launcher to a
+        // Clubria account with no org settings layered.
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        ctx.config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
+        ctx.config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
         let env = environment(&ctx);
 
-        let lookup = |key: &str| {
+        assert!(
             env.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default()
-        };
-        assert_eq!(lookup("RIABUILD_SHELL"), "1");
-        assert!(lookup("CLAUDE_CONFIG_DIR").ends_with("11111111-2222-4333-8444-555555555555"));
+                .any(|(key, value)| key == "RIABUILD_SHELL" && value == "1")
+        );
+        assert!(
+            !env.iter().any(|(key, _)| key == "CLAUDE_CONFIG_DIR"),
+            "{env:?}"
+        );
+    }
+
+    fn one_account() -> Vec<crate::accounts::status::Account> {
+        use crate::accounts::status::{Account, Identity};
+        vec![Account {
+            number: 1,
+            id: "id-1".into(),
+            identity: Identity::LoggedIn("clubria@proton.me".into()),
+        }]
+    }
+
+    #[test]
+    fn the_prelude_is_the_box_then_the_banner() {
+        let text = prelude(&one_account(), false, None);
+
+        let box_line = text.find("Your Claude Code accounts:").unwrap();
+        let banner_line = text.find("Clubria environment active").unwrap();
+        // The banner says how to leave, so it reads last, closest to the prompt.
+        assert!(box_line < banner_line, "{text}");
+    }
+
+    #[test]
+    fn a_servers_prelude_names_the_server() {
+        // The prelude is the only thing the generated rcfiles print, so a
+        // `server` that stops at `prelude` is a banner that never reaches a
+        // shell: everything still compiles, every other test still passes, and
+        // a developer on `build-01` is told they are on their laptop with no
+        // way to tell the difference.
+        let text = prelude(&one_account(), false, Some("build-01"));
+        assert!(text.contains("build-01"), "{text}");
+        // And the laptop case is still the laptop case.
+        assert!(!prelude(&one_account(), false, None).contains("build-01"));
     }
 }

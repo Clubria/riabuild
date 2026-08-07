@@ -44,6 +44,14 @@ pub trait Paths: Send + Sync {
     fn bin_dir(&self) -> PathBuf {
         self.root().join("bin")
     }
+    /// The Claude Code status line script. It sits beside `org-settings.json`
+    /// rather than in `bin/` because it is a Node script Claude Code runs by
+    /// name, not something that belongs on `PATH`. The org settings name this
+    /// path as `node ~/.riabuild/claude-statusline.js`, so it cannot move
+    /// without them.
+    fn claude_statusline_file(&self) -> PathBuf {
+        self.root().join("claude-statusline.js")
+    }
     fn node_dir(&self, version: &str) -> PathBuf {
         self.tools_root().join("node").join(version)
     }
@@ -55,8 +63,24 @@ pub trait Paths: Send + Sync {
     fn riabuild_dir(&self, version: &str) -> PathBuf {
         self.tools_root().join("riabuild").join(version)
     }
+    /// `~/.riabuild/<tool>/<version>` — an owned copy of a third-party CLI.
+    ///
+    /// Versioned, so bumping a pin installs beside the old copy rather than
+    /// writing over a binary that may be running.
+    fn tool_dir(&self, tool: &str, version: &str) -> PathBuf {
+        self.root().join(tool).join(version)
+    }
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
+    }
+    /// One developer's Claude Code profile — what `CLAUDE_CONFIG_DIR` points at.
+    fn claude_profile_dir(&self, profile: &str) -> PathBuf {
+        self.claude_dir().join(profile)
+    }
+    /// Claude Code's own state for that profile. Named by Claude Code, not by
+    /// riabuild: it puts `.claude.json` inside whatever `CLAUDE_CONFIG_DIR` is.
+    fn claude_config_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join(".claude.json")
     }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)
@@ -184,23 +208,35 @@ const ORG_DIR: &str = "Clubria";
 /// Where a repository is checked out when the developer has not chosen a place.
 ///
 /// This is the only decision riabuild makes from the operating system, which is
-/// why it lives in the file that is allowed to know about one. A Mac developer
-/// keeps work in `~/Documents`, and finding a checkout in `~/code` on macOS
-/// reads as riabuild dumping a folder somewhere arbitrary; `~/code` is the
-/// convention everywhere else.
+/// why it lives in the file that is allowed to know about one.
+///
+/// | | |
+/// |---|---|
+/// | macOS | `~/Documents/Clubria/<repo>` |
+/// | Linux | `~/Clubria/<repo>` |
+/// | anything else | `~/code/<repo>` |
+///
+/// A Mac developer keeps work in `~/Documents`, and finding a checkout in
+/// `~/code` on macOS reads as riabuild dumping a folder somewhere arbitrary.
+/// Linux has no `~/Documents` worth speaking of, so the same organisation
+/// grouping sits directly in the home directory.
+///
+/// The repository name comes from the org config's slug, so none of this is
+/// tied to one repository.
 ///
 /// It used to be a single string sent by the server, which cannot be right on
-/// both platforms at once. A developer who wants somewhere else passes
+/// every platform at once. A developer who wants somewhere else passes
 /// `riabuild --project <path>`, and that choice is remembered.
 pub fn default_project_dir(home: &Path, repo_name: &str) -> PathBuf {
     default_project_dir_on(std::env::consts::OS, home, repo_name)
 }
 
-/// Split out so both platforms' answers are testable from either platform —
-/// `cfg!` would compile one of these branches out of the test binary entirely.
+/// Split out so every platform's answer is testable from any platform —
+/// `cfg!` would compile all but one of these branches out of the test binary.
 fn default_project_dir_on(os: &str, home: &Path, repo_name: &str) -> PathBuf {
     match os {
         "macos" => home.join("Documents").join(ORG_DIR).join(repo_name),
+        "linux" => home.join(ORG_DIR).join(repo_name),
         _ => home.join("code").join(repo_name),
     }
 }
@@ -282,6 +318,16 @@ mod tests {
     }
 
     #[test]
+    fn a_linux_checkout_lands_under_the_org_directory() {
+        // The same grouping macOS puts inside ~/Documents, minus the
+        // ~/Documents that Linux does not really have.
+        assert_eq!(
+            default_project_dir_on("linux", Path::new("/home/ada"), "ai-builders-hub"),
+            PathBuf::from("/home/ada/Clubria/ai-builders-hub")
+        );
+    }
+
+    #[test]
     fn two_developers_sharing_a_server_get_different_checkouts() {
         // Same home, different GitHub logins — isolates login as the variable
         // that must produce different paths, which is the whole point of
@@ -295,12 +341,22 @@ mod tests {
 
     #[test]
     fn everywhere_else_uses_the_code_directory() {
-        for os in ["linux", "freebsd"] {
+        for os in ["freebsd", "openbsd"] {
             assert_eq!(
                 default_project_dir_on(os, Path::new("/home/ada"), "ai-builders-hub"),
                 PathBuf::from("/home/ada/code/ai-builders-hub"),
                 "{os}"
             );
+        }
+    }
+
+    #[test]
+    fn the_repository_name_is_never_hardcoded() {
+        // The slug comes from the org config, so pointing riabuild at another
+        // repository must not still say ai-builders-hub.
+        for os in ["macos", "linux", "freebsd"] {
+            let dir = default_project_dir_on(os, Path::new("/home/ada"), "some-other-repo");
+            assert!(dir.ends_with("some-other-repo"), "{os}: {dir:?}");
         }
     }
 

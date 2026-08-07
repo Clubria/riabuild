@@ -1,7 +1,8 @@
 # riabuild-web
 
 Convex backend and dashboard at `riabuild.clubria.com`. Serves the onboarding flow, member
-administration, the CLI login callback, and the `/api/v1` contract the CLI depends on.
+administration, the CLI device-approval screen, and the `/api/v1` contract the CLI
+depends on.
 
 Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 `../docs/superpowers/specs/2026-08-04-riabuild-design.md`.
@@ -75,7 +76,9 @@ not by our code.
 session revocation.
 
 **The server ships data, never logic.** No endpoint returns anything the CLI will
-execute. See `../CLAUDE.md`.
+execute. The Claude settings may name a program riabuild installs from its own binary —
+`statusLine` names `node ~/.riabuild/claude-statusline.js` — but never carry the program.
+See `../CLAUDE.md`.
 
 ## The `/api/v1` contract
 

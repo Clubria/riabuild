@@ -6,6 +6,7 @@
 //! checkout exists. An undeclared edge means running against stale state.
 
 use super::{Ctx, Status, Task, TaskId};
+use crate::archive;
 use crate::download;
 use crate::runner::RunOptions;
 use crate::shims;
@@ -225,7 +226,7 @@ async fn ensure_node(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
     }
     ctx.ui.note(&format!("Downloading Node {version}…"));
     let bytes = downloads.node(version).await?;
-    download::extract_node_tarball(&bytes, &tree)
+    archive::extract_node_tarball(&bytes, &tree)
 }
 
 /// pnpm, in the two halves it actually has.
@@ -251,12 +252,14 @@ async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
         return write_executable(&target, &bytes).await;
     }
 
+    // pnpm 11 is a launcher plus the `dist/` tree it loads from beside itself,
+    // so it is installed as a tree and reached through a shim.
     let tree = ctx.paths.pnpm_dir(version);
     let launcher = tree.join("pnpm");
     if !is_current(ctx, &launcher, version).await? {
         ctx.ui.note(&format!("Downloading pnpm {version}…"));
         let bytes = downloads.pnpm(version, &asset).await?;
-        download::extract_pnpm_tarball(&bytes, &tree)?;
+        archive::extract_pnpm_tarball(&bytes, &tree)?;
         if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
             return Err(Failure::new(
                 format!("installing pnpm {version}"),
@@ -267,9 +270,9 @@ async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
             ))
             .into());
         }
-        download::make_executable(&launcher).await?;
+        archive::make_executable(&launcher).await?;
     }
-    write_executable(&target, shims::pnpm_shim(&launcher).as_bytes()).await
+    write_executable(&target, shims::exec_shim(&launcher).as_bytes()).await
 }
 
 /// Writes an executable via a staging file, so an interrupted run cannot leave
@@ -277,7 +280,7 @@ async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
 async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
     let staging = target.with_extension("partial");
     tokio::fs::write(&staging, bytes).await?;
-    download::make_executable(&staging).await?;
+    archive::make_executable(&staging).await?;
     tokio::fs::rename(&staging, target).await?;
     Ok(())
 }
@@ -334,16 +337,16 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let tree = home.path().join(FALLBACK_PNPM);
-        download::extract_pnpm_tarball(&bytes, &tree).unwrap();
+        archive::extract_pnpm_tarball(&bytes, &tree).unwrap();
         let launcher = tree.join("pnpm");
         assert!(
             tokio::fs::try_exists(&launcher).await.unwrap_or(false),
             "{asset} has no launcher at its root"
         );
-        download::make_executable(&launcher).await.unwrap();
+        archive::make_executable(&launcher).await.unwrap();
 
         let shim = home.path().join("pnpm");
-        write_executable(&shim, shims::pnpm_shim(&launcher).as_bytes())
+        write_executable(&shim, shims::exec_shim(&launcher).as_bytes())
             .await
             .unwrap();
 
@@ -576,6 +579,29 @@ mod tests {
             _args: &[&str],
             _options: &RunOptions,
         ) -> Result<crate::runner::CommandOutput> {
+            Err(anyhow::anyhow!(
+                "could not start `{program}`: Resource temporarily unavailable (os error 11)"
+            ))
+        }
+        // The same refusal as `run`: what this double models is a machine that
+        // cannot spawn *anything*, so answering one entry point and not the
+        // others would make the double disagree with its own premise.
+        async fn run_bytes(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<crate::runner::BytesOutput> {
+            Err(anyhow::anyhow!(
+                "could not start `{program}`: Resource temporarily unavailable (os error 11)"
+            ))
+        }
+        async fn run_forking(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
             Err(anyhow::anyhow!(
                 "could not start `{program}`: Resource temporarily unavailable (os error 11)"
             ))

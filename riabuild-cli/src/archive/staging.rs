@@ -174,7 +174,16 @@ fn unpack(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
         if relative.as_os_str().is_empty() {
             continue;
         }
-        let destination = target.join(relative);
+        // `super::safe_join`, not `target.join`: this file's job is that a
+        // replacement is *atomic*, and the parent module's is that an archived
+        // path cannot land outside the directory it was aimed at. Both halves
+        // arrived separately — the staging swap here, the traversal guard
+        // there — and an unpacker needs both. The tarballs reaching this point
+        // have already matched a published digest, so this is not what stands
+        // between a developer and a hostile archive; it is here so that the
+        // day one is extracted without a digest, the guarantee does not
+        // quietly depend on a check somewhere else in the program.
+        let destination = super::safe_join(target, &relative)?;
         // `unpack` will not create the directories above a file, and an
         // archive is not obliged to carry an entry for every directory it
         // uses. Both Node and pnpm happen to carry them today.

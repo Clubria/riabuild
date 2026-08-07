@@ -1,0 +1,108 @@
+<!doctype html>
+<!--
+  The landing page for the apt and dnf repositories, served at
+  clubria.github.io/riabuild by .github/workflows/release.yml.
+
+  Deliberately one file with no assets: it is served from the same place as the
+  package indexes, and anything it referenced would be one more thing that can
+  404 in front of someone trying to install a tool.
+
+  This is not the product page — riabuild.clubria.com is. This exists so that a
+  developer who lands on the repository URL by pasting half a command finds the
+  other half rather than a directory listing.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>riabuild — apt and dnf repositories</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #16181d;
+        --fg-faint: #666b76;
+        --bg: #fbfbfa;
+        --sunk: #f0f0ee;
+        --rule: #d9d9d4;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6e6e3;
+          --fg-faint: #9a9aa2;
+          --bg: #16181d;
+          --sunk: #1e2027;
+          --rule: #33363f;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0 auto;
+        padding: 3rem 1.25rem 5rem;
+        max-width: 46rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+      h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+      h2 { font-size: 1rem; margin: 2.5rem 0 0.5rem; }
+      p { margin: 0 0 1rem; }
+      .lede { color: var(--fg-faint); margin-bottom: 2rem; }
+      pre {
+        background: var(--sunk);
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        padding: 0.85rem 1rem;
+        /* Wide commands scroll inside their own box rather than pushing the
+           page sideways on a phone. */
+        overflow-x: auto;
+        font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      footer {
+        margin-top: 3rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--rule);
+        color: var(--fg-faint);
+        font-size: 0.875rem;
+      }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <h1>riabuild</h1>
+    <p class="lede">
+      Sets up a Clubria developer's machine and opens the Clubria environment.
+      Latest release: <strong>@VERSION@</strong>.
+    </p>
+
+    <h2>Debian, Ubuntu</h2>
+    <pre><code>curl -fsSL https://clubria.github.io/riabuild/clubria.gpg \
+  | sudo tee /usr/share/keyrings/clubria.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/clubria.gpg] https://clubria.github.io/riabuild/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/clubria.list >/dev/null
+sudo apt update &amp;&amp; sudo apt install riabuild</code></pre>
+
+    <h2>Fedora, RHEL</h2>
+    <pre><code>sudo curl -fsSL -o /etc/yum.repos.d/clubria.repo \
+  https://clubria.github.io/riabuild/rpm/clubria.repo
+sudo dnf install riabuild</code></pre>
+
+    <h2>macOS</h2>
+    <pre><code>brew tap clubria/tap https://github.com/Clubria/riabuild
+brew install clubria/tap/riabuild</code></pre>
+
+    <h2>Then</h2>
+    <pre><code>riabuild</code></pre>
+    <p>
+      riabuild keeps itself current from here: it learns the published version
+      from the dashboard and offers the upgrade on its own.
+    </p>
+
+    <footer>
+      x86_64 and aarch64. The Linux builds are statically linked, so there is no
+      distribution or glibc requirement beyond what the packages declare.
+      <br />
+      <a href="https://riabuild.clubria.com">riabuild.clubria.com</a> ·
+      <a href="https://github.com/Clubria/riabuild">source</a>
+    </footer>
+  </body>
+</html>

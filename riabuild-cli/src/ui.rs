@@ -8,26 +8,48 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// `Ui::ask`, `Ui::confirm`, and the pure rules behind them — the interactive
-/// half of this module, split out because it and the status/failure
-/// rendering below it are two different concerns that both happened to fit
-/// under 300 lines only while one of them didn't exist yet.
+/// `Ui::ask`, `Ui::confirm`, their must-be-answered counterparts, and the pure
+/// rules behind them — the interactive half of this module, split out because
+/// it and the status/failure rendering below it are two different concerns
+/// that both happened to fit under 300 lines only while one of them didn't
+/// exist yet.
 mod prompt;
 
 pub struct Ui {
     colour: bool,
     quiet: bool,
-    /// Whether there is a terminal a person could answer a prompt on.
+    /// Whether there is a developer on the other end to answer a question.
     ///
-    /// riabuild's own prompts are not the only ones that matter. `gh auth
+    /// riabuild's own prompts are not the only thing this gates. `gh auth
     /// login --web` runs a device-code flow: it prints a code and waits for a
     /// human to finish in a browser. Handed no terminal it does not fail — it
     /// waits, silently, forever. Every command riabuild hands the terminal to
-    /// has to know whether that terminal exists.
-    can_prompt: bool,
+    /// has to read the same flag riabuild's own prompts do, or the two answers
+    /// disagree and one of them is wrong.
+    interactive: bool,
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
     pending: AtomicUsize,
+    /// Answers a test feeds to `ask` in place of a terminal.
+    #[cfg(test)]
+    answers: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Every question actually put to the developer.
+    ///
+    /// Recorded because the question text is the whole safety guarantee of a
+    /// destructive prompt, and it is the one part of it `info` cannot carry:
+    /// `info` is silent under `--quiet` and `ask` is not. Without this a
+    /// subcommand could name the account in lines nobody sees and still pass.
+    #[cfg(test)]
+    asked: std::sync::Mutex<Vec<String>>,
+    /// Every note actually printed.
+    ///
+    /// Recorded for the same reason as `asked`, one step further along: a note
+    /// is a claim about the machine — "Signed out you@example.com" — and a claim
+    /// printed whether or not the thing happened is the failure mode worth
+    /// pinning. Filled after the `--quiet` return, so this says the developer
+    /// saw it rather than that someone called `note`.
+    #[cfg(test)]
+    noted: std::sync::Mutex<Vec<String>>,
 }
 
 /// Spaces needed for `line` to cover a status line `previous` columns wide.
@@ -82,31 +104,57 @@ impl Ui {
         let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         Self {
             colour,
+            // Both halves matter. A piped stdin with a terminal stdout is the
+            // shape a CI job has, and a question asked there blocks until
+            // something times out. `cfg!(test)` is the same hazard indoors: a
+            // test run inherits the terminal `cargo test` was started from.
+            interactive: !cfg!(test)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal(),
             quiet,
-            can_prompt: std::io::stdin().is_terminal(),
             pending: AtomicUsize::new(0),
+            #[cfg(test)]
+            answers: Default::default(),
+            #[cfg(test)]
+            asked: Default::default(),
+            #[cfg(test)]
+            noted: Default::default(),
         }
     }
 
-    /// Whether a command that prompts can be handed the terminal.
-    ///
-    /// Read it before delegating to anything that waits on a person. A `false`
-    /// here is not a reason to prompt more quietly — it means the answer can
-    /// never arrive, so the only honest move is to say so and stop.
-    pub fn can_prompt(&self) -> bool {
-        self.can_prompt
+    /// Every question this `Ui` put, in order.
+    #[cfg(test)]
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+
+    /// Every note this `Ui` printed, in order.
+    #[cfg(test)]
+    pub fn noted(&self) -> Vec<String> {
+        self.noted.lock().unwrap().clone()
+    }
+
+    /// A `Ui` that answers its own questions, for tests.
+    #[cfg(test)]
+    pub fn scripted<'a>(answers: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            interactive: true,
+            answers: std::sync::Mutex::new(answers.into_iter().map(ToString::to_string).collect()),
+            ..Self::new(false)
+        }
     }
 
     /// Overrides terminal detection.
     ///
     /// Tests model a developer sitting at a terminal, but `cargo test` hands
-    /// them no tty, so without this every test would silently take the
-    /// unattended path and stop covering the interactive one. Test-only on
-    /// purpose: production must read the real terminal, never be told.
+    /// them no tty — and `interactive` is hard-false under `cfg!(test)` anyway
+    /// — so without this every test would silently take the unattended path and
+    /// stop covering the interactive one. Test-only on purpose: production must
+    /// read the real terminal, never be told.
     #[cfg(test)]
     #[must_use]
     pub fn assume_prompts_work(mut self, yes: bool) -> Self {
-        self.can_prompt = yes;
+        self.interactive = yes;
         self
     }
 
@@ -122,6 +170,22 @@ impl Ui {
     /// same `NO_COLOR` decision this made.
     pub fn colour(&self) -> bool {
         self.colour
+    }
+
+    /// Whether there is a developer on the other end to answer a question.
+    ///
+    /// Exposed so a caller can tell "nobody to ask" apart from "asked, and they
+    /// chose the default" — `ask` returns `None` for both. A destructive
+    /// subcommand needs that distinction: an empty answer at a real prompt is a
+    /// deliberate no, while no terminal at all means the choice was never
+    /// offered and should be refused rather than silently taken either way.
+    ///
+    /// Read it before delegating to anything that waits on a person, too — `gh
+    /// auth login --web` and the rest. A `false` here is not a reason to prompt
+    /// more quietly: it means the answer can never arrive, so the only honest
+    /// move is to say so and stop.
+    pub fn interactive(&self) -> bool {
+        self.interactive
     }
 
     fn paint(&self, code: &str, text: &str) -> String {
@@ -198,6 +262,8 @@ impl Ui {
         // A note is written on the end of the status line and ends it, so
         // there is nothing left for `applied` to cover.
         self.take_pending();
+        #[cfg(test)]
+        self.noted.lock().unwrap().push(text.to_string());
         println!("    {}", self.paint("2", text));
     }
 
@@ -348,6 +414,19 @@ mod tests {
     #[test]
     fn an_expired_credential_does_not_read_as_zero_minutes() {
         assert_eq!(duration_words(0), "less than a minute");
+    }
+
+    #[test]
+    fn there_is_one_answer_to_whether_a_person_is_here() {
+        // Two flags — one for riabuild's own prompts, one for commands riabuild
+        // hands the terminal to — is the bug this collapse fixes: they
+        // disagreed, and the disagreement compiled. `assume_prompts_work` is
+        // the only thing that may move it, and only in a test.
+        assert!(!Ui::new(false).interactive());
+        assert!(Ui::new(false).assume_prompts_work(true).interactive());
+        assert!(!Ui::new(false).assume_prompts_work(false).interactive());
+        // `scripted` models a developer answering, so it is interactive too.
+        assert!(Ui::scripted(["y"]).interactive());
     }
 
     #[test]

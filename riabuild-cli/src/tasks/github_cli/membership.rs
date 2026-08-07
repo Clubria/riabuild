@@ -63,7 +63,11 @@ pub(super) async fn membership(ctx: &Ctx) -> Result<Membership> {
     let output = ctx
         .runner
         .run(
-            "gh",
+            // The `gh` riabuild owns, never the bare name: during provisioning
+            // `~/.riabuild/bin` is not on `PATH`, so `"gh"` finds whatever the
+            // developer happens to have — or nothing — rather than the binary
+            // `check()` verified. See `Ctx::gh`.
+            &ctx.gh(),
             &["api", &format!("/user/memberships/orgs/{ORG}")],
             &RunOptions::default(),
         )

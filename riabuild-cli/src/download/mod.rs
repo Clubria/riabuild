@@ -1,7 +1,10 @@
-//! Fetching and verifying the Node and pnpm distributions: where each release
+//! Fetching and verifying the distributions riabuild owns: where each release
 //! lives, what its asset is called on this platform, and the sha256 that says
-//! the bytes are the ones upstream published. Landing a verified archive at its
-//! final path is `staging`'s job.
+//! the bytes are the ones upstream published.
+//!
+//! Where the bytes come from and whether they are the right bytes. Unpacking
+//! them is `archive.rs`, which only ever sees a buffer that has already matched
+//! a published digest; landing a verified tree at its final path is `staging`'s.
 //!
 //! riabuild owns its Node rather than driving nvm: nvm is a bash function, not a
 //! binary, so Rust cannot drive it without spawning a login shell, it does not
@@ -9,14 +12,12 @@
 //! is not an option either — it was removed from Node.js 25+ distributions.
 //! Owning the tarball is a few dozen lines and removes a class of
 //! works-in-my-shell failures.
-
-mod staging;
-
-pub(crate) use staging::{extract_node_tarball, extract_pnpm_tarball};
+//!
+//! The same reasoning extends to `gh` and `infisical` — see `tools.rs`, which
+//! describes where their releases live and what the assets are called.
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::time::Duration;
 
 /// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
@@ -146,6 +147,46 @@ pub fn digest_for(shasums: &str, filename: &str) -> Option<String> {
     })
 }
 
+/// Finds a digest across several published checksum files, trying each in turn.
+///
+/// A list rather than a URL because Infisical publishes three files and the one
+/// named after the release is not the one with the digests in it:
+///
+/// | File | Covers |
+/// |---|---|
+/// | `cli_<version>_checksums.txt` | one line, for `windows_amd64` |
+/// | `checksums.txt` | everything **except** darwin |
+/// | `checksums-darwin.txt` | the two darwin tarballs |
+///
+/// The darwin builds are produced separately — presumably notarised on a macOS
+/// runner — and their digests never reach the main file. Reading only the file
+/// named after the release finds nothing on any platform riabuild ships.
+///
+/// A digest in none of them is an error, never a skipped verification: an
+/// unverified download of a credential tool is worse than no download.
+pub async fn digest_from_any(urls: &[String], filename: &str) -> Result<String> {
+    let mut failures = Vec::new();
+    for url in urls {
+        match fetch_text(url).await {
+            Ok(body) => {
+                if let Some(digest) = digest_for(&body, filename) {
+                    return Ok(digest);
+                }
+                failures.push(format!("{url} does not list it"));
+            }
+            // A checksum file that 404s is ordinary — the list is deliberately
+            // wider than any one release needs — so it only matters if every
+            // entry fails.
+            Err(error) => failures.push(format!("{url} could not be read: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "riabuild could not find a published checksum for {filename}, so it \
+         refused to install it ({})",
+        failures.join("; ")
+    ))
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -186,42 +227,6 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 
 pub async fn fetch_text(url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&fetch_bytes(url).await?).into_owned())
-}
-
-/// One named member of a gzipped tarball, in memory.
-///
-/// The release tarball holds `riabuild` at its root. The bytes are wanted rather
-/// than a path, because they go straight down an SSH pipe to a server.
-pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        let matches = path.file_name().is_some_and(|found| found == name);
-        if matches {
-            let mut buffer = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buffer)?;
-            return Ok(buffer);
-        }
-    }
-    anyhow::bail!("{name} is not in that archive")
-}
-
-#[cfg(unix)]
-pub async fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = tokio::fs::metadata(path).await?.permissions();
-    permissions.set_mode(0o755);
-    tokio::fs::set_permissions(path, permissions).await?;
-    Ok(())
-}
-
-// `async`, matching the `unix` arm: every caller awaits this, so the
-// signatures have to agree even though this body has nothing to await.
-#[cfg(not(unix))]
-pub async fn make_executable(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -288,6 +293,28 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert_eq!(digest_for(shasums, "node-v99.0.0-linux-x64.tar.gz"), None);
     }
 
+    /// Proves this build can resolve a name, complete a TLS handshake, and
+    /// read a real body.
+    ///
+    /// Ignored by default because it needs the network. CI runs it against the
+    /// musl artefact, where it is the only thing standing between us and a
+    /// static binary that builds, links, reports its version, and then cannot
+    /// reach anything on a developer's machine — the two ways that happens are
+    /// `rustls-tls-native-roots` finding no certificate store and musl's
+    /// resolver behaving differently from glibc's, and neither is visible
+    /// without actually making a request.
+    #[tokio::test]
+    #[ignore = "requires network; pins TLS and DNS for this build"]
+    async fn tls_and_dns_work_on_this_build() {
+        let shasums = fetch_text(&node_shasums_url("22.23.1"))
+            .await
+            .expect("fetch");
+        assert!(
+            digest_for(&shasums, "node-v22.23.1-linux-x64.tar.gz").is_some(),
+            "reached nodejs.org but the body was not SHASUMS256.txt"
+        );
+    }
+
     #[test]
     fn hashes_match_the_published_format() {
         // Lowercase hex, the same shape SHASUMS256.txt uses.
@@ -347,31 +374,6 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert!(rust_target("Linux", "armv7l").is_err());
         assert!(rust_target("FreeBSD", "x86_64").is_err());
         assert!(rust_target("Darwin", "ppc").is_err());
-    }
-
-    #[test]
-    fn a_single_member_is_lifted_out_of_a_tarball() {
-        // Built in memory, so the test needs no fixture file and no network.
-        let mut archive = tar::Builder::new(Vec::new());
-        let payload = b"\x7fELF fake binary";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "riabuild", &payload[..])
-            .expect("append");
-        let tar_bytes = archive.into_inner().expect("finish");
-
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
-        let gz = encoder.finish().expect("gzip");
-
-        assert_eq!(
-            extract_single_file(&gz, "riabuild").expect("extract"),
-            payload
-        );
-        assert!(extract_single_file(&gz, "not-there").is_err());
     }
 
     #[test]

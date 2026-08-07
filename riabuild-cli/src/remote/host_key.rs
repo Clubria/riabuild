@@ -214,7 +214,7 @@ pub async fn trust_host(
     }
 
     ui.note(&format!("fingerprint {fingerprint}"));
-    if !ui.confirm("is that the server you expected?")? {
+    if !ui.confirm_required("is that the server you expected?")? {
         // Declined, not mismatched: no expected value was ever supplied to
         // compare against — worded as a next step, not an alarm.
         return Err(Failure::new(
@@ -615,6 +615,28 @@ mod tests {
                     .expect("inject a concurrent pin");
             }
             self.inner.run(program, args, options).await
+        }
+
+        // Delegated like the rest: this double exists only to inject a
+        // concurrent `known_hosts` write in the middle of `ssh-keyscan`, so
+        // every other entry point should behave exactly as the wrapped runner
+        // does rather than acquire a second, divergent set of answers.
+        async fn run_bytes(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<crate::runner::BytesOutput> {
+            self.inner.run_bytes(program, args, options).await
+        }
+
+        async fn run_forking(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<i32> {
+            self.inner.run_forking(program, args, options).await
         }
 
         async fn run_interactive(
