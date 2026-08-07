@@ -75,6 +75,12 @@ test.describe("section anchors", () => {
     await page.goto("/?scenario=lead");
 
     const tabs = page.locator('nav[aria-label="Sections"] a');
+    // `evaluateAll` does not auto-wait the way `click` and `textContent` do:
+    // it resolves against whatever matches at that instant, and zero matches
+    // is a valid answer, so it returns [] rather than retrying. Without this
+    // the test races the first render — which it lost about one viewport in
+    // three, failing on an assertion written as a sanity check.
+    await expect(tabs.first()).toBeVisible();
     const hrefs = await tabs.evaluateAll((els) =>
       els.map((el) => el.getAttribute("href") ?? ""),
     );

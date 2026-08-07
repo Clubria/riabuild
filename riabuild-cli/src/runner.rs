@@ -7,8 +7,6 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-#[cfg(test)]
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -282,14 +280,33 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+/// One scripted response, and the conditions it answers to.
+struct Stub {
+    invocation: String,
+    /// Environment entries that must all be present for this stub to apply.
+    /// Empty means "any environment", which is what `with` produces.
+    env: Vec<(String, String)>,
+    output: CommandOutput,
+    /// Raw stdout, for a command whose output is not text. `None` falls back to
+    /// `output.stdout`, so a test that only cares about the exit code can stub
+    /// with `with` and still be read through `run_bytes`.
+    bytes: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
 /// Scripted `CommandRunner` for tests.
 ///
-/// Keys are `"program arg1 arg2"` prefixes; the longest matching prefix wins, so
-/// a test can stub `gh auth status` and `gh --version` independently.
+/// Each `Stub` is matched by `"program arg1 arg2"` prefix; the longest matching
+/// prefix wins, so a test can stub `gh auth status` and `gh --version`
+/// independently.
+///
+/// A stub can also require environment entries. `claude auth status --json` is
+/// the same command string for every Claude Code account — only
+/// `CLAUDE_CONFIG_DIR` differs — so without this the central behaviour of the
+/// account feature could not be written as a test at all.
 #[derive(Default)]
 pub struct FakeRunner {
-    responses: HashMap<String, CommandOutput>,
-    byte_responses: HashMap<String, Vec<u8>>,
+    responses: Vec<Stub>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
     /// What each call was given on stdin. A clipboard write is *only* its
@@ -304,15 +321,32 @@ impl FakeRunner {
         Self::default()
     }
 
-    pub fn with(mut self, invocation: &str, code: i32, stdout: &str, stderr: &str) -> Self {
-        self.responses.insert(
-            invocation.to_string(),
-            CommandOutput {
+    pub fn with(self, invocation: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.with_env(invocation, &[], code, stdout, stderr)
+    }
+
+    /// A stub that only answers when the environment carries every named pair.
+    pub fn with_env(
+        mut self,
+        invocation: &str,
+        env: &[(&str, &str)],
+        code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> Self {
+        self.responses.push(Stub {
+            invocation: invocation.to_string(),
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            output: CommandOutput {
                 code: Some(code),
                 stdout: stdout.to_string(),
                 stderr: stderr.to_string(),
             },
-        );
+            bytes: None,
+        });
         let program = invocation.split_whitespace().next().unwrap_or_default();
         if !self.available.iter().any(|p| p == program) {
             self.available.push(program.to_string());
@@ -322,12 +356,15 @@ impl FakeRunner {
 
     /// Scripts a command whose stdout is binary.
     ///
-    /// Registers a text stub too, so `which` and the exit code resolve through
-    /// exactly the same path as `with` and only stdout differs.
+    /// One stub, like every other, so `which`, the exit code and the env
+    /// matching all resolve through exactly the same path as `with` — only
+    /// stdout differs.
     pub fn with_bytes(mut self, invocation: &str, code: i32, stdout: &[u8], stderr: &str) -> Self {
-        self.byte_responses
-            .insert(invocation.to_string(), stdout.to_vec());
-        self.with(invocation, code, "", stderr)
+        self = self.with(invocation, code, "", stderr);
+        if let Some(stub) = self.responses.last_mut() {
+            stub.bytes = Some(stdout.to_vec());
+        }
+        self
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -385,51 +422,64 @@ impl FakeRunner {
     /// name, and a test should be able to say whichever it means. `toolchain`
     /// stubs the exact `~/.riabuild/node/<version>/bin/node` it is asserting
     /// about; `github_cli` says `gh --version` and does not care where gh is.
-    fn resolve(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
+    fn resolve(&self, program: &str, args: &[&str], options: &RunOptions) -> Option<CommandOutput> {
         let full = format!("{program} {}", args.join(" "))
             .trim_end()
             .to_string();
-        self.stubbed(&full)
-            .or_else(|| self.stubbed(&FakeRunner::stub_key(program, args)))
+        self.stubbed(&full, options)
+            .or_else(|| self.stubbed(&FakeRunner::stub_key(program, args), options))
     }
 
-    fn stubbed(&self, invocation: &str) -> Option<CommandOutput> {
-        let mut best: Option<(&String, &CommandOutput)> = None;
-        for (key, value) in &self.responses {
-            if invocation == key || invocation.starts_with(&format!("{key} ")) {
-                let better = best.map(|(k, _)| key.len() > k.len()).unwrap_or(true);
-                if better {
-                    best = Some((key, value));
-                }
-            }
-        }
-        best.map(|(_, output)| output.clone())
+    fn stubbed(&self, invocation: &str, options: &RunOptions) -> Option<CommandOutput> {
+        self.matching(invocation, options)
+            .map(|stub| stub.output.clone())
     }
 
-    /// The byte-stub twin of `stubbed`, with the same longest-prefix rule.
-    fn stubbed_bytes(&self, invocation: &str) -> Option<Vec<u8>> {
-        let mut best: Option<(&String, &Vec<u8>)> = None;
-        for (key, value) in &self.byte_responses {
-            if invocation == key || invocation.starts_with(&format!("{key} ")) {
-                let better = best.map(|(k, _)| key.len() > k.len()).unwrap_or(true);
-                if better {
-                    best = Some((key, value));
-                }
-            }
-        }
-        best.map(|(_, bytes)| bytes.clone())
+    /// The stub an invocation selects, if any.
+    ///
+    /// Shared by the text and byte lookups so a binary stub can never be
+    /// selected by different rules from the text one beside it.
+    fn matching(&self, invocation: &str, options: &RunOptions) -> Option<&Stub> {
+        self.responses
+            .iter()
+            .filter(|stub| {
+                let name_matches = invocation == stub.invocation
+                    || invocation.starts_with(&format!("{} ", stub.invocation));
+                name_matches
+                    && stub
+                        .env
+                        .iter()
+                        .all(|(key, value)| options.env.iter().any(|(k, v)| k == key && v == value))
+            })
+            // Most specific wins: the longest command, then the most
+            // environment entries. `max_by_key` keeps the last of equal
+            // candidates, so a later identical stub replaces an earlier one —
+            // which is what the map this replaced did.
+            //
+            // Command length is compared before env-pair count, so a longer
+            // env-less stub outranks a shorter env-scoped one: `with("claude
+            // auth status --json")` beats `with_env("claude auth", &[("CLAUDE_
+            // CONFIG_DIR", "/one")])` for `claude auth status --json` run in
+            // `/one`. That is fine for the account use case, where every
+            // account is asked the identical command string, but it means env
+            // specificity only breaks ties between stubs that already match on
+            // the same invocation length.
+            .max_by_key(|stub| (stub.invocation.len(), stub.env.len()))
     }
 
-    fn resolve_bytes(&self, program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    /// The byte-stub twin of `resolve`, matched by exactly the same rules so a
+    /// binary stub cannot be selected differently from a text one.
+    fn resolve_bytes(&self, program: &str, args: &[&str], options: &RunOptions) -> Option<Vec<u8>> {
         let full = format!("{program} {}", args.join(" "))
             .trim_end()
             .to_string();
-        self.stubbed_bytes(&full)
-            .or_else(|| self.stubbed_bytes(&FakeRunner::stub_key(program, args)))
+        self.matching(&full, options)
+            .or_else(|| self.matching(&FakeRunner::stub_key(program, args), options))
+            .and_then(|stub| stub.bytes.clone())
     }
 
-    fn lookup(&self, program: &str, args: &[&str]) -> CommandOutput {
-        self.resolve(program, args)
+    fn lookup(&self, program: &str, args: &[&str], options: &RunOptions) -> CommandOutput {
+        self.resolve(program, args, options)
             .unwrap_or_else(|| CommandOutput {
                 code: Some(127),
                 stdout: String::new(),
@@ -451,7 +501,7 @@ impl CommandRunner for FakeRunner {
         options: &RunOptions,
     ) -> Result<CommandOutput> {
         self.record(program, args, options);
-        Ok(self.lookup(program, args))
+        Ok(self.lookup(program, args, options))
     }
 
     async fn run_bytes(
@@ -462,11 +512,11 @@ impl CommandRunner for FakeRunner {
     ) -> Result<BytesOutput> {
         self.record(program, args, options);
 
-        let text = self.lookup(program, args);
+        let text = self.lookup(program, args, options);
         // A test that only cares about the exit code can stub with `with` and
         // still be read through `run_bytes`.
         let stdout = self
-            .resolve_bytes(program, args)
+            .resolve_bytes(program, args, options)
             .unwrap_or_else(|| text.stdout.into_bytes());
 
         Ok(BytesOutput {
@@ -478,7 +528,7 @@ impl CommandRunner for FakeRunner {
 
     async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
         self.record(program, args, options);
-        Ok(self.lookup(program, args).code.unwrap_or(0))
+        Ok(self.lookup(program, args, options).code.unwrap_or(0))
     }
 
     async fn run_interactive(
@@ -494,7 +544,7 @@ impl CommandRunner for FakeRunner {
         // it never got. Unstubbed commands still succeed, so tests that only
         // care about which commands ran need not script every prompt.
         Ok(self
-            .resolve(program, args)
+            .resolve(program, args, options)
             .and_then(|output| output.code)
             .unwrap_or(0))
     }
@@ -589,5 +639,175 @@ mod bytes_tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, [0x89u8, b'P', b'N', b'G', 0xFF]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_dir(dir: &str) -> RunOptions {
+        RunOptions {
+            env: vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stub_can_be_scoped_to_an_environment_variable() {
+        // The same command, twice, told apart only by the directory it is
+        // pointed at — which is exactly how riabuild asks each Claude Code
+        // account who it is.
+        let runner = FakeRunner::new()
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/one")],
+                0,
+                r#"{"loggedIn":true,"email":"first@example.com"}"#,
+                "",
+            )
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/two")],
+                1,
+                r#"{"loggedIn":false}"#,
+                "",
+            );
+
+        let one = runner
+            .run("claude", &["auth", "status", "--json"], &in_dir("/one"))
+            .await
+            .unwrap();
+        assert!(one.stdout.contains("first@example.com"), "{one:?}");
+
+        let two = runner
+            .run("claude", &["auth", "status", "--json"], &in_dir("/two"))
+            .await
+            .unwrap();
+        assert_eq!(two.code, Some(1));
+        assert!(two.stdout.contains("false"), "{two:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stub_with_no_environment_still_matches_anything() {
+        let runner = FakeRunner::new().with("claude --version", 0, "2.1.223 (Claude Code)", "");
+        let output = runner
+            .run("claude", &["--version"], &in_dir("/anywhere"))
+            .await
+            .unwrap();
+        assert!(output.ok(), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn an_environment_stub_beats_a_general_one() {
+        let runner = FakeRunner::new()
+            .with("claude auth status --json", 1, r#"{"loggedIn":false}"#, "")
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/one")],
+                0,
+                r#"{"loggedIn":true,"email":"first@example.com"}"#,
+                "",
+            );
+
+        let one = runner
+            .run("claude", &["auth", "status", "--json"], &in_dir("/one"))
+            .await
+            .unwrap();
+        assert!(one.stdout.contains("first@example.com"), "{one:?}");
+
+        let other = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &in_dir("/elsewhere"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn an_invocation_naming_no_account_matches_no_account_specific_stub() {
+        // Pins the direction of the match: requiring an env pair is a real
+        // requirement, not merely a tie-breaker. A caller that names no
+        // `CLAUDE_CONFIG_DIR` at all must come away empty-handed even though
+        // two stubs exist for this exact command — each scoped to a different
+        // account. If this ever passed, the account-lookup feature could go
+        // green in its own tests while the production code never actually
+        // threaded `CLAUDE_CONFIG_DIR` through to `claude auth status --json`
+        // — every account would silently be answered by whichever stub ranks
+        // first.
+        let runner = FakeRunner::new()
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/one")],
+                0,
+                r#"{"loggedIn":true,"email":"first@example.com"}"#,
+                "",
+            )
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/two")],
+                1,
+                r#"{"loggedIn":false}"#,
+                "",
+            );
+
+        let unscoped = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unscoped.code, Some(127), "{unscoped:?}");
+        assert!(
+            unscoped
+                .stderr
+                .contains("fake runner: no stub for `claude auth status --json`"),
+            "{unscoped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_stub_replaces_an_identical_earlier_one() {
+        let runner = FakeRunner::new()
+            .with("claude --version", 0, "2.0.0 (Claude Code)", "")
+            .with("claude --version", 0, "2.1.223 (Claude Code)", "");
+        let output = runner
+            .run("claude", &["--version"], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(output.trimmed(), "2.1.223 (Claude Code)");
+    }
+
+    /// A binary stub is selected by exactly the same rules as a text one, so
+    /// the byte lookup cannot quietly diverge from the command that ran.
+    #[tokio::test]
+    async fn a_byte_stub_can_be_scoped_to_an_environment_variable_too() {
+        let runner = FakeRunner::new()
+            .with_bytes("xclip -o", 0, b"\x89PNG\xFF", "")
+            .with_env("xclip -o", &[("DISPLAY", ":1")], 1, "", "no display");
+
+        let scoped = runner
+            .run_bytes("xclip", &["-o"], &in_env("DISPLAY", ":1"))
+            .await
+            .unwrap();
+        assert_eq!(scoped.code, Some(1), "the env-scoped stub should win");
+
+        let plain = runner
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(plain.stdout, b"\x89PNG\xFF");
+    }
+
+    fn in_env(key: &str, value: &str) -> RunOptions {
+        RunOptions {
+            env: vec![(key.to_string(), value.to_string())],
+            ..Default::default()
+        }
     }
 }

@@ -111,19 +111,19 @@ What is still exercised is everything it produces.
 1. `--check` reports work to do, clones nothing, and records no task as
    satisfied.
 2. A full run exits 0 and leaves: nine task records, Node and pnpm at the pinned
-   versions, an executable `c`, a checkout whose `origin` is the repository the
-   *server* named, valid `org-settings.json` carrying this deployment's marker, a
-   Claude profile, and a `.env.local` that parses, carries brokered secrets and is
-   git-ignored.
+   versions, a checkout whose `origin` is the repository the *server* named,
+   valid `org-settings.json` carrying this deployment's marker, a Claude Code
+   account with its launchers in place and no retired `c` launcher beside them,
+   and a `.env.local` that parses, carries brokered secrets and is git-ignored.
 3. No secret was written anywhere under `~/.riabuild`.
 4. The stub saw both the broker call and the CLI's fetch, and was never asked for
    anything it does not implement.
 5. A second run logs `applied=[]`.
 6. Deleting `~/.riabuild/bin/pnpm` repairs `toolchain`, cascades to
-   `claude_profiles`, and leaves `login`, `github_cli` and `project` alone.
+   `claude_accounts`, and leaves `login`, `github_cli` and `project` alone.
 7. Real `zsh` and `bash`, spawned through `riabuild shell`, resolve `node`,
-   `pnpm` and `c` inside the environment, and the generated `.zshrc` sources the
-   developer's own first.
+   `pnpm` and `claude` inside the environment, and the generated `.zshrc` sources
+   the developer's own first.
 8. `CLAUDE_CONFIG_DIR` still keeps Claude Code's configuration out of `$HOME`.
 9. `riabuild logout` empties the Keychain and the next `--check` still reports.
 

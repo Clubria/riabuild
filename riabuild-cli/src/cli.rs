@@ -87,6 +87,33 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Manage your Claude Code accounts.
+    Claude {
+        #[command(subcommand)]
+        action: Option<ClaudeAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClaudeAction {
+    /// List your Claude Code accounts.
+    List,
+    /// Add an account and sign it in.
+    New,
+    /// Remove an account. Later accounts move up a number.
+    Delete {
+        /// Which account, as shown by `riabuild claude`.
+        #[arg(value_name = "NUMBER")]
+        number: usize,
+        /// Remove it without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Make an account the one `claude` runs.
+    Primary {
+        #[arg(value_name = "NUMBER")]
+        number: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -240,6 +267,28 @@ mod tests {
                 action: ChannelAction::Status
             })
         ));
+    }
+
+    #[test]
+    fn bare_claude_lists_the_accounts() {
+        let cli = Cli::parse_from(["riabuild", "claude"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Claude { action: None })
+        ));
+    }
+
+    #[test]
+    fn deleting_an_account_takes_a_number_and_can_skip_the_prompt() {
+        let cli = Cli::parse_from(["riabuild", "claude", "delete", "3", "--yes"]);
+        let Some(Command::Claude {
+            action: Some(ClaudeAction::Delete { number, yes }),
+        }) = cli.command
+        else {
+            panic!("expected claude delete");
+        };
+        assert_eq!(number, 3);
+        assert!(yes);
     }
 
     #[test]
