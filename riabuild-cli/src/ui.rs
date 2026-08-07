@@ -27,6 +27,15 @@ pub struct Ui {
     /// subcommand could name the account in lines nobody sees and still pass.
     #[cfg(test)]
     asked: std::sync::Mutex<Vec<String>>,
+    /// Every note actually printed.
+    ///
+    /// Recorded for the same reason as `asked`, one step further along: a note
+    /// is a claim about the machine — "Signed out you@example.com" — and a claim
+    /// printed whether or not the thing happened is the failure mode worth
+    /// pinning. Filled after the `--quiet` return, so this says the developer
+    /// saw it rather than that someone called `note`.
+    #[cfg(test)]
+    noted: std::sync::Mutex<Vec<String>>,
 }
 
 /// Spaces needed for `line` to cover a status line `previous` columns wide.
@@ -94,6 +103,8 @@ impl Ui {
             answers: Default::default(),
             #[cfg(test)]
             asked: Default::default(),
+            #[cfg(test)]
+            noted: Default::default(),
         }
     }
 
@@ -101,6 +112,12 @@ impl Ui {
     #[cfg(test)]
     pub fn asked(&self) -> Vec<String> {
         self.asked.lock().unwrap().clone()
+    }
+
+    /// Every note this `Ui` printed, in order.
+    #[cfg(test)]
+    pub fn noted(&self) -> Vec<String> {
+        self.noted.lock().unwrap().clone()
     }
 
     /// A `Ui` that answers its own questions, for tests.
@@ -212,6 +229,8 @@ impl Ui {
         // A note is written on the end of the status line and ends it, so
         // there is nothing left for `applied` to cover.
         self.take_pending();
+        #[cfg(test)]
+        self.noted.lock().unwrap().push(text.to_string());
         println!("    {}", self.paint("2", text));
     }
 

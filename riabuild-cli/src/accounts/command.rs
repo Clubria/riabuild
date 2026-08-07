@@ -207,12 +207,9 @@ async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
     // first orphans a credential nothing can ever reach again. A logout that
     // fails is not fatal — the directory still has to go.
     let dir = ctx.paths.claude_profile_dir(&id);
-    let claude = ctx.claude();
-    let _ = ctx
-        .runner
-        .run(&claude, &["auth", "logout"], &in_account(&dir))
-        .await;
-    ctx.ui.note(&format!("Signed out {named}"));
+    if sign_out(ctx, &dir).await {
+        ctx.ui.note(&format!("Signed out {named}"));
+    }
 
     let shown = contract_tilde(&dir, &ctx.paths.home());
     tokio::fs::remove_dir_all(&dir).await.map_err(|error| {
@@ -233,6 +230,26 @@ async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
     }
 
     list(ctx).await
+}
+
+/// Signs one account out, and answers whether that actually happened.
+///
+/// The failure is swallowed on purpose — a logout that did not work must not
+/// block the removal, because the directory still has to go — but the answer is
+/// not, because riabuild then prints a line about it. On an unprovisioned
+/// machine the spawn fails outright and "Signed out you@example.com" is a
+/// sentence about the machine that is simply false. Half the value of a
+/// provisioner is telling the truth about the machine, so when this says no,
+/// nothing is printed: the removal note follows immediately and carries the
+/// outcome on its own.
+async fn sign_out(ctx: &Ctx, dir: &Path) -> bool {
+    let claude = ctx.claude();
+    matches!(
+        ctx.runner
+            .run(&claude, &["auth", "logout"], &in_account(dir))
+            .await,
+        Ok(output) if output.ok()
+    )
 }
 
 async fn primary(ctx: &mut Ctx, number: usize) -> Result<i32> {
@@ -431,6 +448,48 @@ mod tests {
             !tokio::fs::try_exists(ctx.paths.claude_profile_dir(&ids[1]))
                 .await
                 .unwrap()
+        );
+        assert_eq!(ctx.config.claude_accounts, vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_that_happened_is_reported() {
+        // A non-quiet Ui, because `note` returns early under --quiet and
+        // `Ui::noted` records only what was actually printed.
+        let (mut ctx, _home, _ids) = with_accounts(2).await;
+        ctx.ui = Ui::scripted([]);
+        ctx.runner = Arc::new(signed_in().with("claude auth logout", 0, "", ""));
+
+        delete(&mut ctx, 2, true).await.unwrap();
+
+        let notes = ctx.ui.noted();
+        assert!(
+            notes.iter().any(|note| note.contains("Signed out")),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_that_did_not_happen_is_not_claimed() {
+        // The unprovisioned machine: `claude` cannot be started at all, so
+        // nothing was signed out. Saying so anyway is riabuild describing a
+        // machine it did not touch — and this is the removal path, where a
+        // developer has no way left to check. The removal itself still has to
+        // happen, and still has to be reported.
+        let (mut ctx, _home, ids) = with_accounts(2).await;
+        ctx.ui = Ui::scripted([]);
+        ctx.runner = Arc::new(NothingInstalled);
+
+        delete(&mut ctx, 2, true).await.unwrap();
+
+        let notes = ctx.ui.noted();
+        assert!(
+            !notes.iter().any(|note| note.contains("Signed out")),
+            "riabuild claimed a sign-out that never ran: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("Removed")),
+            "{notes:?}"
         );
         assert_eq!(ctx.config.claude_accounts, vec![ids[0].clone()]);
     }
