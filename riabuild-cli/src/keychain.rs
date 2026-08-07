@@ -292,13 +292,16 @@ async fn write_private_token(path: &Path, contents: &str) -> Result<()> {
         .mode(0o600)
         .open(path)
         .await?;
-    file.write_all(contents.as_bytes()).await?;
-    drop(file);
     // `OpenOptions::mode` applies at creation only, and `truncate` does not reset
-    // permissions. A file left looser by an interrupted write would otherwise be
-    // rewritten at its old mode — and this is the one file the "no secrets in
-    // ~/.riabuild" invariant is being amended for.
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    // permissions — so on the repair path (this call found a file already on
+    // disk, at some looser mode) the mode is still whatever it was until we
+    // change it. That has to happen on the open file handle, before the write,
+    // not after: setting it by path once the content is already written would
+    // leave the fresh token briefly readable at the file's old mode, on exactly
+    // the file the "no secrets in ~/.riabuild" invariant is being amended for.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await?;
+    file.write_all(contents.as_bytes()).await?;
     Ok(())
 }
 
@@ -373,26 +376,60 @@ impl Keychain for MemoryKeychain {
     }
 }
 
-/// Picks the right store for this machine.
+/// The outcome of [`select`] — which store, and (for the file store) where.
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    Env,
+    File(PathBuf),
+    Macos,
+    Linux,
+}
+
+/// The ordering decision itself, as a pure function of inputs rather than of
+/// `cfg!`/`std::env` directly.
+///
+/// Pulled out of `for_platform` so the ordering is testable on any host: a
+/// `cfg!(target_os = "macos")` branch can only be exercised by a test running
+/// *on* macOS, which the CI that gates pull requests never does (only the
+/// release workflow's tag-triggered job has a macOS runner). Taking
+/// `is_macos` as a plain `bool` means a Linux test can still assert what
+/// happens when it's `true`.
 ///
 /// Order matters. An explicit `RIABUILD_TOKEN` wins so automation can run with no
 /// store at all. A server comes next, *before* any platform question: a macOS
 /// server has `security(1)` and a login keychain an SSH session cannot unlock, so
 /// asking the platform first would pick a store that always fails.
+fn select(is_macos: bool, token_env: Option<&str>, session_token_file: Option<PathBuf>) -> Choice {
+    if token_env.is_some_and(|value| !value.is_empty()) {
+        return Choice::Env;
+    }
+    if let Some(path) = session_token_file {
+        return Choice::File(path);
+    }
+    if is_macos {
+        Choice::Macos
+    } else {
+        Choice::Linux
+    }
+}
+
+/// Picks the right store for this machine. See [`select`] for the ordering
+/// this delegates to.
 pub fn for_platform(
     runner: Arc<dyn CommandRunner>,
     session_token_file: Option<PathBuf>,
 ) -> Box<dyn Keychain> {
-    if std::env::var("RIABUILD_TOKEN").is_ok_and(|value| !value.is_empty()) {
-        return Box::new(EnvKeychain);
+    let token_env = std::env::var("RIABUILD_TOKEN").ok();
+    match select(
+        cfg!(target_os = "macos"),
+        token_env.as_deref(),
+        session_token_file,
+    ) {
+        Choice::Env => Box::new(EnvKeychain),
+        Choice::File(path) => Box::new(FileKeychain::new(path)),
+        Choice::Macos => Box::new(SecurityCliKeychain::new(runner)),
+        Choice::Linux => Box::new(SecretToolKeychain::new(runner)),
     }
-    if let Some(path) = session_token_file {
-        return Box::new(FileKeychain::new(path));
-    }
-    if cfg!(target_os = "macos") {
-        return Box::new(SecurityCliKeychain::new(runner));
-    }
-    Box::new(SecretToolKeychain::new(runner))
 }
 
 #[cfg(test)]
@@ -512,7 +549,8 @@ mod tests {
         // Creating with mode 0600 does not fix a file that is already 0644 — the
         // token still works, it is just readable by every co-tenant on the
         // shared account. `set()` must repair the mode of a file that already
-        // exists, not only of one it creates.
+        // exists, not only of one it creates, and it must still write the new
+        // token correctly while doing so.
         use std::os::unix::fs::PermissionsExt;
         let home = TempDir::new().expect("tempdir");
         let path = home.path().join("session.token");
@@ -520,11 +558,14 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("loosen permissions");
 
-        FileKeychain::new(path.clone())
-            .set("rb_live_token")
-            .await
-            .expect("write");
+        let keychain = FileKeychain::new(path.clone());
+        keychain.set("rb_live_token").await.expect("write");
 
+        assert_eq!(
+            keychain.get().await.expect("read"),
+            Some("rb_live_token".to_string()),
+            "the repair path must still write the new token"
+        );
         let mode = tokio::fs::metadata(&path)
             .await
             .expect("stat")
@@ -536,6 +577,35 @@ mod tests {
             "an existing 0644 file must be repaired"
         );
     }
+
+    // NOTE ON WHAT THE TEST ABOVE DOES AND DOES NOT PROVE, for a reviewer
+    // looking for a test that pins the *ordering* rather than the end state:
+    //
+    // It proves content and mode are both correct once `set()` returns. It
+    // cannot prove there was never a moment in between where the new token sat
+    // behind the file's old, looser mode — a black-box test can only observe
+    // before-and-after, not the sequence of syscalls a single sequential async
+    // task made in between. Making that window observable would need a second
+    // task genuinely running in parallel with the write, and this crate
+    // deliberately does not enable tokio's `rt-multi-thread` feature (see the
+    // comment on the `tokio` dependency in Cargo.toml: "so a stray
+    // `Runtime::new()` cannot quietly spawn a worker pool") — pulling that in
+    // for one test, even a test-only one, would itself be inconsistent with
+    // that constraint, and a race against real disk I/O timing would be
+    // nondeterministic regardless: it could pass on a fast disk and fail on a
+    // slow one, which is a worse property than an honest gap.
+    //
+    // So the ordering claim is not directly black-box testable here, and is
+    // instead fixed by construction: `write_private_token` calls
+    // `File::set_permissions` on the *already-open* handle and `.await`s it to
+    // completion before calling `write_all` on that same handle, both in one
+    // sequential task. There is no scheduling outcome under which the write
+    // happens first — the two calls have a program-order happens-before
+    // relationship, not merely a probable one. The bug this replaced had the
+    // opposite shape (write the content, `drop` the handle, `chmod` the path
+    // afterward), which is a real ordering a reviewer should keep checking for
+    // by reading `write_private_token` itself, since no test can substitute for
+    // that reading here.
 
     #[cfg(unix)]
     #[tokio::test]
@@ -612,5 +682,40 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
         let laptop = for_platform(runner, None);
         assert_ne!(laptop.describe(), "this server's riabuild namespace");
+    }
+
+    // The three tests above go through `for_platform`, so on this (Linux) host
+    // `cfg!(target_os = "macos")` is always `false` inside it — meaning none of
+    // them can catch a regression that swaps the remote check and the platform
+    // check in `select`, and neither can PR CI, which only runs `ubuntu-latest`
+    // (the sole macOS runner is `release.yml`'s tag-triggered job, not the
+    // pull_request gate). The tests below call `select` directly with
+    // `is_macos: true` so that exact regression is caught on any host,
+    // including this one.
+
+    #[test]
+    fn select_prefers_the_file_store_over_macos_even_when_is_macos_is_true() {
+        // This is the test that would fail if `select`'s remote-check and
+        // platform-check branches were swapped: with `is_macos: true` and a
+        // `session_token_file`, swapped code would return `Choice::Macos`
+        // instead. Confirmed by temporarily swapping the branches locally —
+        // this test fails with:
+        //   assertion `left == right` failed
+        //     left: Macos
+        //    right: File("/home/dev/ns/session.token")
+        let path = PathBuf::from("/home/dev/ns/session.token");
+        assert_eq!(select(true, None, Some(path.clone())), Choice::File(path));
+    }
+
+    #[test]
+    fn select_prefers_env_over_the_file_store_and_over_macos() {
+        let path = PathBuf::from("/home/dev/ns/session.token");
+        assert_eq!(select(true, Some("rb_live_token"), Some(path)), Choice::Env);
+    }
+
+    #[test]
+    fn select_falls_back_to_the_platform_keyring_with_no_server_and_no_env() {
+        assert_eq!(select(true, None, None), Choice::Macos);
+        assert_eq!(select(false, None, None), Choice::Linux);
     }
 }
