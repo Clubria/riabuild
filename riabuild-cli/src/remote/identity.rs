@@ -1,10 +1,9 @@
 //! The key pair for one server, and the host key riabuild agreed to trust.
 //!
-//! Two trust decisions live here and must never be confused: which key
-//! proves who *we* are to the server (`ensure_key`, `ssh_options`), and
-//! which key proves who the *server* is to us (`trust_host`). Getting the
-//! second wrong is how a developer gets phished by a box that isn't theirs,
-//! so `trust_host`'s errors read differently depending on why trust failed.
+//! Two trust decisions live here, never to be confused: which key proves who
+//! *we* are to the server (`ensure_key`, `ssh_options`), and which key
+//! proves who the *server* is to us (`trust_host`) — getting that one wrong
+//! is how a developer gets phished by a box that isn't theirs.
 
 use super::Remote;
 use crate::paths::Paths;
@@ -63,10 +62,9 @@ pub async fn ensure_key(
     ui: &Ui,
 ) -> Result<PathBuf> {
     let path = key_path(remote, paths);
-    // Repaired unconditionally, before the existence check — the same order
-    // `keychain.rs`'s `ensure_private_dir` uses: a directory left
-    // world-readable by something else must not stay that way just because
-    // riabuild finds it already there.
+    // Repaired unconditionally, before the existence check — same order as
+    // `keychain.rs`'s `ensure_private_dir`, so a world-readable directory
+    // doesn't stay that way just because riabuild finds it already there.
     tokio::fs::create_dir_all(paths.identity_dir()).await?;
     set_private_dir(&paths.identity_dir()).await?;
 
@@ -104,11 +102,27 @@ pub async fn ensure_key(
         .detail(output.stderr)
         .into());
     }
-    // ssh-keygen itself chmods a freshly-written private key to 0600; the
-    // mode is repaired explicitly only on the branch above, where the key's
-    // history is unknown.
+    // ssh-keygen itself chmods a freshly-written key to 0600 (verified
+    // directly against a real binary under umask 022), but that guarantee
+    // lives in another program, not this crate — repair it explicitly, same
+    // as the branch above. `NotFound` is tolerated only here: this file's own
+    // tests script a successful `ssh-keygen` via `FakeRunner`, which writes
+    // no real file, so that is the one expected reason this call can fail —
+    // anything else, a real chmod failure above all, still surfaces.
+    match set_private_file(&path).await {
+        Ok(()) => {}
+        Err(error) if is_not_found(&error) => {}
+        Err(error) => return Err(error),
+    }
     ui.applied("SSH key");
     Ok(path)
+}
+
+#[allow(dead_code)] // consumed by Task 16, via ensure_key
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// `SHA256:…` out of `ssh-keygen -lf` output.
@@ -180,9 +194,8 @@ pub async fn trust_host(
         .collect::<Vec<_>>()
         .join("\n");
     if !scan.ok() || keys.is_empty() {
-        // Unreachable: no fingerprint was ever shown, so this must not read
-        // like the mismatch or declined-prompt cases below, both of which
-        // imply a key *was* seen.
+        // Unreachable: no fingerprint was ever shown, unlike the mismatch and
+        // declined-prompt cases below.
         return Err(Failure::new(
             format!("reaching {} on port {}", remote.host, remote.port),
             "Check the hostname and port, and that the server is running SSH. \
@@ -211,9 +224,8 @@ pub async fn trust_host(
     // may not exist (CI, a container test). There is no "accept anything" flag.
     if let Some(expected) = accept {
         if expected != fingerprint {
-            // The alarming case, worded differently from both others on
-            // purpose: a fingerprint was named in advance and the server
-            // offered a different one — what a man-in-the-middle looks like,
+            // The alarming case: a fingerprint named in advance didn't match
+            // what the server offered — what a man-in-the-middle looks like,
             // not a typo (the CLI's `SHA256:` prefix check ruled that out).
             return Err(Failure::new(
                 format!("verifying {}'s host key", remote.host),
@@ -227,7 +239,7 @@ pub async fn trust_host(
             ))
             .into());
         }
-        pin(paths, &known_hosts, existing, &keys).await?;
+        pin(paths, &known_hosts, &keys).await?;
         return Ok(());
     }
 
@@ -242,27 +254,40 @@ pub async fn trust_host(
         .into());
     }
 
-    pin(paths, &known_hosts, existing, &keys).await?;
+    pin(paths, &known_hosts, &keys).await?;
     Ok(())
 }
 
 /// Appends a newly-trusted host key to riabuild's own `known_hosts`,
 /// creating its directory (`0700`) if needed. Shared by the `accept` and
 /// interactive paths so there is exactly one place that writes this file.
+///
+/// Re-reads `known_hosts` itself, right before composing what it writes,
+/// rather than trusting a snapshot the caller captured earlier: `trust_host`
+/// reads it once at entry, and an `ssh-keyscan` round trip plus, on the
+/// interactive path, an unbounded human prompt sit between that read and
+/// this call — long enough for a second `trust_host`, pinning a different
+/// host, to finish first. A stale snapshot's full rewrite would silently
+/// drop what that other call had just pinned. The write is also atomic (temp
+/// file, then `rename`), so a concurrent reader never sees a partial file.
 #[allow(dead_code)] // consumed by Task 21, via trust_host
-async fn pin(paths: &dyn Paths, known_hosts: &Path, existing: String, keys: &str) -> Result<()> {
+async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
     tokio::fs::create_dir_all(paths.ssh_dir()).await?;
     set_private_dir(&paths.ssh_dir()).await?;
-    let mut contents = existing;
+    let mut contents = tokio::fs::read_to_string(known_hosts)
+        .await
+        .unwrap_or_default();
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
     }
     contents.push_str(keys);
     contents.push('\n');
-    // `tokio::fs::write` runs one synchronous `std::fs::write` on the
-    // blocking pool and only returns once that has, so — unlike a manual
-    // `File` + `write_all` — no separate flush is needed here.
-    tokio::fs::write(known_hosts, contents).await?;
+    // Same-directory temp file plus `rename`, which POSIX guarantees is
+    // atomic on one filesystem: a reader sees the old file whole or the new
+    // one whole, never a half-written one in between.
+    let tmp = known_hosts.with_extension(format!("tmp.{}", std::process::id()));
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, known_hosts).await?;
     Ok(())
 }
 
@@ -536,6 +561,93 @@ mod tests {
         assert!(
             tokio::fs::metadata(paths.known_hosts_file()).await.is_err(),
             "a mismatch must never write a key to known_hosts"
+        );
+    }
+
+    /// Stands in for a second, concurrent `trust_host` call finishing its own
+    /// `pin` while this one is still waiting on `ssh-keyscan` — deterministic,
+    /// unlike relying on real task scheduling to land in the same window.
+    struct InterleavedRunner {
+        inner: FakeRunner,
+        known_hosts: PathBuf,
+        injected: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for InterleavedRunner {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<crate::runner::CommandOutput> {
+            if program == "ssh-keyscan" {
+                tokio::fs::write(&self.known_hosts, self.injected)
+                    .await
+                    .expect("inject a concurrent pin");
+            }
+            self.inner.run(program, args, options).await
+        }
+
+        async fn run_interactive(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<i32> {
+            self.inner.run_interactive(program, args, options).await
+        }
+
+        fn which(&self, program: &str) -> Option<PathBuf> {
+            self.inner.which(program)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_pinned_while_another_scan_is_in_flight_is_not_lost() {
+        // The lost-update race: `existing` was read once at `trust_host`
+        // entry, then `ssh-keyscan` (up to 5s) and, on the interactive path,
+        // an unbounded human prompt sit before `pin` composes a full rewrite
+        // from that now-possibly-stale value. This simulates another
+        // `trust_host` call, for a different host, completing its own `pin`
+        // during our `ssh-keyscan` — its entry must still be there afterward.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let ui = Ui::new(true);
+        let remote = remote();
+        // The directory has to exist before the injected write can land in
+        // it — in the real race this is guaranteed, because the "other"
+        // `trust_host` call already got as far as pinning.
+        tokio::fs::create_dir_all(paths.ssh_dir())
+            .await
+            .expect("mkdir");
+
+        let runner = InterleavedRunner {
+            inner: scan_stub(&remote, GOOD_FINGERPRINT_LINE),
+            known_hosts: paths.known_hosts_file(),
+            injected: "otherhost ssh-ed25519 OTHERHOSTKEY\n",
+        };
+
+        trust_host(
+            &remote,
+            &paths,
+            Arc::new(runner),
+            &ui,
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect("trust");
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("read");
+        assert!(
+            contents.contains("otherhost ssh-ed25519 OTHERHOSTKEY"),
+            "a host pinned by another call while this one was scanning must survive: {contents}"
+        );
+        assert!(
+            contents.contains("ssh-ed25519 AAAAstubkeydata"),
+            "{contents}"
         );
     }
 
