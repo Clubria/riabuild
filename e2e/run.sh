@@ -391,9 +391,9 @@ if [ "$PLATFORM" = macos ]; then
   # against the real home and a process whose HOME points elsewhere cannot see
   # it — `security find-generic-password` searches a list that is simply not
   # there. An earlier version of this set the keychain up with the real HOME,
-  # verified the read, passed, and then left riabuild reporting "not signed in",
-  # opening a browser and timing out three minutes later. The verification
-  # passed *because* it ran in the wrong environment.
+  # verified the read, passed, and then left riabuild reporting "not signed in"
+  # and starting a sign-in nobody was there to approve. The verification passed
+  # *because* it ran in the wrong environment.
   KEYCHAIN="$SCRATCH/riabuild-e2e.keychain-db"
   mkdir -p "$E2E_HOME/Library/Preferences"
   keychain() { env HOME="$E2E_HOME" security "$@"; }
@@ -437,13 +437,13 @@ LOG="$RIA_HOME/logs/riabuild.log"
 #
 # The task engine treats "no record in state.json" as `NeverRun` and applies the
 # task *without calling check() first* — by design, and documented as rule 1 in
-# the spec. For `login` that means a browser sign-in on any machine with no
-# state file, however good the session already in the Keychain is. There is no
-# human here to approve one, and the loopback listener times out after three
-# minutes.
+# the spec. For `login` that means a fresh sign-in on any machine with no state
+# file, however good the session already in the Keychain is. There is no human
+# here to approve a device code, so it would print one and poll until the code
+# expired fifteen minutes later.
 #
 # So `login` starts with a record, and only `login`. Every other task meets a
-# genuinely empty state file and runs for real. What is skipped is the browser
+# genuinely empty state file and runs for real. What is skipped is the human
 # approval, which is un-automatable by construction; what is still exercised is
 # the session it produces — every request after this authenticates with the real
 # token against the real endpoint.
@@ -857,7 +857,7 @@ if [ "$PLATFORM" = macos ]; then
   check_missing "the token is gone from the Keychain" \
     "$(keychain find-generic-password -s com.clubria.riabuild -a session-token -w 2>&1 || true)" \
     "$SESSION_TOKEN"
-  # Must not open a browser, and must not fail: `--check` reports, it never
+  # Must not start a sign-in, and must not fail: `--check` reports, it never
   # applies. An expired session is the single most likely reason someone runs
   # this, so it has to answer rather than refuse.
   #
