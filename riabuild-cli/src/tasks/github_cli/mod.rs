@@ -6,6 +6,17 @@
 //! read org membership, an invite never accepted, and a developer removed from
 //! the org. Each one has a different remedy, so each one is detected
 //! separately.
+//!
+//! This file holds the task itself — what `check` looks at, what `apply` does
+//! about it, and installing `gh` when it is missing entirely. The two pieces
+//! `apply` drives sit beside it: `membership` asks GitHub the org question and
+//! decodes the answer, and `sign_in` is the browser round trip.
+
+mod membership;
+mod sign_in;
+
+use membership::{Membership, membership};
+use sign_in::{run_gh_auth, sign_in};
 
 use super::{Ctx, Status, Task, TaskId};
 use crate::runner::RunOptions;
@@ -17,7 +28,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 const MIN_VERSION: &str = "2.40.0";
-const ORG: &str = "Clubria";
+pub(super) const ORG: &str = "Clubria";
 
 /// The scope riabuild *requests* when a token cannot read org membership.
 ///
@@ -25,7 +36,7 @@ const ORG: &str = "Clubria";
 /// `admin:org`, `read:org`, `repo`, `user`, and `write:org` on the membership
 /// endpoint, and folds `read:org` into `admin:org` when both are granted. See
 /// `membership`.
-const ORG_SCOPE: &str = "read:org";
+pub(super) const ORG_SCOPE: &str = "read:org";
 
 pub struct GithubCli;
 
@@ -171,157 +182,6 @@ impl Task for GithubCli {
     }
 }
 
-/// What GitHub says when asked whether this developer is in the org.
-///
-/// One variant per remedy: anything that collapses two of these together ends
-/// up telling a developer to do something that cannot help.
-#[derive(Debug, PartialEq, Eq)]
-enum Membership {
-    Active,
-    /// Invited, but the invite has not been accepted.
-    Pending,
-    /// GitHub answered, and the answer is no.
-    NotAMember,
-    /// The token is gone — expired, revoked, or signed out from under us.
-    SignedOut,
-    /// The token is valid but may not read organisation membership.
-    Forbidden,
-    /// Rate limit, outage, captive portal, corporate proxy.
-    Unreadable(String),
-}
-
-impl Membership {
-    fn describe(&self) -> String {
-        match self {
-            Membership::Active => format!("you are an active member of {ORG}"),
-            Membership::Pending => format!("your {ORG} invite has not been accepted yet"),
-            Membership::NotAMember => {
-                format!("GitHub does not report you as a member of {ORG}")
-            }
-            Membership::SignedOut => "your GitHub sign-in is no longer valid".into(),
-            Membership::Forbidden => {
-                format!("your GitHub token may not read {ORG} membership")
-            }
-            Membership::Unreadable(why) => {
-                format!("could not check your {ORG} membership: {why}")
-            }
-        }
-    }
-}
-
-/// Asks GitHub the only question this task actually cares about.
-///
-/// This replaced a test for the literal string `read:org` in `gh auth status`,
-/// which asked a different question and got it wrong in both directions.
-/// GitHub accepts `admin:org`, `read:org`, `repo`, `user`, or `write:org` here,
-/// and folds `read:org` into `admin:org` when both are granted — so a developer
-/// holding `admin:org` was told they lacked permission, sent through a browser
-/// sign-in that could not add a scope they already had, and told to try again.
-/// Forever: no run of `gh auth refresh` can make that string appear.
-async fn membership(ctx: &Ctx) -> Result<Membership> {
-    let output = ctx
-        .runner
-        .run(
-            &ctx.gh(),
-            &["api", &format!("/user/memberships/orgs/{ORG}")],
-            &RunOptions::default(),
-        )
-        .await?;
-
-    if output.ok() {
-        // Tolerant of pretty-printed bodies: `gh api` emits compact JSON today,
-        // and a formatting change should not read as "not a member".
-        let body: String = output
-            .stdout
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        if body.contains(r#""state":"active""#) {
-            return Ok(Membership::Active);
-        }
-        if body.contains(r#""state":"pending""#) {
-            return Ok(Membership::Pending);
-        }
-        return Ok(Membership::Unreadable(
-            "GitHub replied without a membership state".into(),
-        ));
-    }
-
-    Ok(match http_status(&output.stderr) {
-        Some(401) => Membership::SignedOut,
-        Some(403) => Membership::Forbidden,
-        // GitHub returns 404 rather than 403 when there is simply no
-        // membership to report. The `NotAMember` remedy names the scope case
-        // too, because this endpoint is the only evidence available here.
-        Some(404) => Membership::NotAMember,
-        _ => Membership::Unreadable(first_line(&output.stderr)),
-    })
-}
-
-/// `gh` reports a failed API call as `gh: Not Found (HTTP 404)` on stderr.
-fn http_status(stderr: &str) -> Option<u16> {
-    stderr
-        .split("(HTTP ")
-        .nth(1)?
-        .split(')')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("gh gave no explanation")
-        .to_string()
-}
-
-async fn sign_in(ctx: &mut Ctx) -> Result<()> {
-    // Interactive on purpose: this is a browser sign-in, and there is no
-    // non-interactive path that does not involve pasting a token.
-    ctx.ui.note("Opening GitHub to sign you in…");
-    run_gh_auth(
-        ctx,
-        &[
-            "auth",
-            "login",
-            "--hostname",
-            "github.com",
-            "--git-protocol",
-            "https",
-            "--web",
-            "--scopes",
-            ORG_SCOPE,
-        ],
-        "signing you in to GitHub",
-    )
-    .await
-}
-
-/// Runs an interactive `gh auth` command and insists that it worked.
-///
-/// The exit code used to be discarded. Cancelling the device-code prompt left
-/// riabuild convinced it had signed the developer in, and the only symptom was
-/// a later check failing for a reason that did not mention the sign-in.
-async fn run_gh_auth(ctx: &mut Ctx, args: &[&str], attempting: impl Into<String>) -> Result<()> {
-    let code = ctx
-        .runner
-        .run_interactive(&ctx.gh(), args, &RunOptions::default())
-        .await?;
-    if code != 0 {
-        return Err(Failure::new(
-            attempting,
-            "Run `riabuild` again and finish the GitHub sign-in in your browser.",
-        )
-        .command(format!("gh {}", args.join(" ")))
-        .detail(format!("that command exited with status {code}"))
-        .into());
-    }
-    Ok(())
-}
-
 /// Downloads the pinned `gh` into `~/.riabuild/gh/<version>/`.
 ///
 /// This used to be `brew install gh`, which meant riabuild could not set up a
@@ -349,6 +209,7 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_and_runner, ctx_with, ctx_with_tools, install_owned_tools};
+    use crate::ui::Ui;
 
     const MEMBERSHIP: &str = "gh api /user/memberships/orgs/Clubria";
 
@@ -475,6 +336,11 @@ mod tests {
             .with("gh auth refresh", 0, "", "");
         let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
         install_owned_tools(&ctx).await;
+        // `gh auth refresh` is an interactive sign-in, and `run_gh_auth`
+        // refuses to start one with nobody to answer it. `ctx_with` models an
+        // unattended machine, so this test says explicitly that a developer is
+        // here — otherwise it would assert the refusal, not the repair.
+        ctx.ui = Ui::new(true).assume_prompts_work(true);
 
         // The refresh runs, and because the stub still reports 403 afterwards,
         // apply() reports that rather than claiming success.
@@ -499,6 +365,41 @@ mod tests {
         let (mut ctx, _home) = ctx_with_tools(runner).await;
         let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
         assert!(error.contains("signing you in"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_never_waits_on_a_browser_sign_in() {
+        // The bug this covers hung `riabuild remote` forever. `gh auth login
+        // --web` prints a device code and waits for a person; handed no
+        // terminal it waits with no output and no timeout, so the container
+        // test sat there until something outside killed it. Failing with the
+        // remedy is the only useful thing riabuild can do here.
+        let runner = healthy()
+            .with("gh auth status", 1, "", "You are not logged into any hosts")
+            .with("gh auth login", 0, "", "");
+        let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
+        // The owned gh has to be on disk, or `apply()` stops at the install
+        // step and this never reaches the sign-in it is about.
+        install_owned_tools(&ctx).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(false);
+
+        let error = GithubCli.apply(&mut ctx).await.unwrap_err().to_string();
+        assert!(error.contains("GH_TOKEN"), "{error}");
+        assert!(
+            !calls.calls().iter().any(|call| call.contains("auth login")),
+            "gh must never be started at all: reaching it is the hang. {:?}",
+            calls.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_already_works_needs_no_terminal() {
+        // The guard must not turn every unattended run into a failure. A
+        // GH_TOKEN that already answers the membership question never reaches
+        // a prompt, so it must still succeed with no terminal at all.
+        let (mut ctx, _home) = ctx_with_tools(healthy()).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(false);
+        GithubCli.apply(&mut ctx).await.unwrap();
     }
 
     #[tokio::test]
@@ -530,12 +431,5 @@ mod tests {
         for call in &gh_calls {
             assert!(call.starts_with(&owned), "ran `{call}`, not {owned}");
         }
-    }
-
-    #[test]
-    fn an_http_status_is_read_out_of_ghs_message() {
-        assert_eq!(http_status("gh: Not Found (HTTP 404)"), Some(404));
-        assert_eq!(http_status("gh: Forbidden (HTTP 403)\n"), Some(403));
-        assert_eq!(http_status("dial tcp: no such host"), None);
     }
 }

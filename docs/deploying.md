@@ -224,6 +224,64 @@ Neither is derived from GitHub, so a published release reaches nobody until
 `latestCliVersion` names it. `minCliVersion` hard-blocks people mid-workday. Raise it
 deliberately.
 
+## 7. Migrating a schema field from optional to required
+
+Applies whenever a schema change promotes a field from `v.optional(...)` to required on
+a table that already has documents in production — the current case is
+`members.memberId`, going from `v.optional(v.string())` to `v.string()`.
+
+**Why the order matters.** Convex validates every existing document against a table's
+schema at deploy time. Deploying a schema where a field is required is rejected outright
+if even one production document is missing that field — there is no partial or lazy
+migration; a required field either matches every row already there, or the deploy does
+not go through at all.
+
+**The required order, and why each step has to finish before the next starts:**
+
+1. **Deploy with the field still optional**, alongside the code that mints it going
+   forward (new rows get it from application code) and a one-shot internal mutation that
+   backfills old rows — `members.backfillMemberIds` is that mutation for `memberId`. At
+   this point new rows have the field; rows written before this deploy may not.
+2. **Run the backfill against production**: `npx convex run members:backfillMemberIds
+   --prod`. It patches only the rows still missing the field and returns how many it
+   changed — 0 means every row already has one, which is what you want to see, not a
+   sign nothing happened. It is idempotent: running it again after it has already
+   finished is safe and returns 0.
+3. **Deploy again with the field now required.** This is the deploy that actually turns
+   the constraint on; only run it once step 2's count is verified back to 0 on a repeat
+   run, meaning nothing is left to backfill.
+
+**This matters more than a normal runbook step because deploys are automatic.**
+`.github/workflows/deploy.yml` runs `npx convex deploy -y` on every push to `main` that
+touches `riabuild-web/**`, with no manual approval gate. Whoever merges a change like
+this must make sure step 2 has already happened against production *before* the commit
+that flips the field to required reaches `main` — if a single merge carries both the
+"add the optional field and the backfill" commit and the "make it required" commit at
+once, the first and only automatic deploy that follows applies the required schema
+straight against a production table where nothing has been backfilled yet, and it fails
+as described below. (Landing the optional-field commit and the required-field commit as
+two separate merges to `main`, with the backfill run by hand in between, makes this
+per-push automation enforce the order on its own instead of relying on whoever merges
+reading this section first.)
+
+**What a failed deploy looks like.** The `riabuild.clubria.com` job's "Deploy Convex
+functions" step runs `npx convex deploy -y`, which refuses to push a schema any existing
+document violates and exits non-zero, naming the table and the field it could not
+validate (an error to the effect of a document in `members` not matching the schema
+because `memberId` is missing). That step failing fails the whole job before the later
+"Build and deploy to Cloudflare Pages" step ever runs, so **neither the backend nor the
+dashboard update** — production keeps serving whatever was live before the push, and the
+only visible symptom is a red `riabuild.clubria.com` run under the `deploy-web`
+concurrency group, with a Convex schema-validation message in the "Deploy Convex
+functions" step's log rather than a network or auth error. It is not stuck forever: the
+concurrency group only blocks runs that are actively in progress, so the next push that
+touches `riabuild-web/**` still triggers and runs normally.
+
+**To recover:** run the backfill mutation against `--prod` (step 2 above) — Convex
+production access is required for this, same as anywhere else in this document — confirm
+a repeat run returns 0, then re-run the failed workflow (or push again) so the required
+schema deploy is retried.
+
 ## Verifying a deployment
 
 ```sh

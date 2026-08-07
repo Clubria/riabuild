@@ -42,52 +42,15 @@ impl Kind {
     }
 }
 
-/// Unpacks a `node-v*.tar.gz` into `target` so that `target/bin/node` is the
-/// binary: Node wraps everything in one `node-v22.23.1-darwin-arm64/` directory.
-pub fn extract_node_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 1)
-}
+mod staging;
 
-/// pnpm has no wrapper directory: the `pnpm` launcher and the `dist/` tree it
-/// loads sit at the root of the archive, and must stay beside each other.
-pub fn extract_pnpm_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 0)
-}
-
-fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-
-    if target.exists() {
-        // A half-extracted directory from an interrupted run must not be
-        // mistaken for a working install — `apply()` starts from nothing.
-        std::fs::remove_dir_all(target)
-            .with_context(|| format!("could not clear {}", target.display()))?;
-    }
-    std::fs::create_dir_all(target)?;
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let mut components = path.components();
-        for _ in 0..strip_components {
-            components.next();
-        }
-        let relative: PathBuf = components.collect();
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let destination = safe_join(target, &relative)?;
-        // `unpack` will not create the directories above a file, and an
-        // archive is not obliged to carry an entry for every directory it
-        // uses. Both Node and pnpm happen to carry them today.
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        entry.unpack(destination)?;
-    }
-    Ok(())
-}
+// The tarball extractors live in `staging` because *how* a tree lands matters
+// as much as what is in it: `tools_root()` is shared by every developer with an
+// account on a server, so a replacement has to be atomic rather than a delete
+// followed by an unpack. This module used to carry a simpler pair that opened
+// with `remove_dir_all(target)` — correct on a single-user laptop, and a way to
+// delete the Node a colleague's `pnpm dev` is running out of anywhere else.
+pub use staging::{extract_node_tarball, extract_pnpm_tarball};
 
 /// Writes one file out of an archive to `destination`, executable.
 ///
@@ -198,6 +161,29 @@ fn safe_join(target: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(target.join(relative))
 }
 
+/// One named member of a gzipped tarball, returned in memory.
+///
+/// The sibling of [`extract_member`], for the one caller that wants bytes
+/// rather than a file: the release tarball holds `riabuild` at its root, and
+/// those bytes go straight down an SSH pipe to a server rather than landing on
+/// this machine at all. Writing them out only to read them back would put a
+/// second copy of the binary on the laptop for no reason.
+pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        let matches = path.file_name().is_some_and(|found| found == name);
+        if matches {
+            let mut buffer = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buffer)?;
+            return Ok(buffer);
+        }
+    }
+    anyhow::bail!("{name} is not in that archive")
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -230,6 +216,31 @@ pub async fn make_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_member_is_lifted_out_of_a_tarball() {
+        // Built in memory, so the test needs no fixture file and no network.
+        let mut archive = tar::Builder::new(Vec::new());
+        let payload = b"\x7fELF fake binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "riabuild", &payload[..])
+            .expect("append");
+        let tar_bytes = archive.into_inner().expect("finish");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
+        let gz = encoder.finish().expect("gzip");
+
+        assert_eq!(
+            extract_single_file(&gz, "riabuild").expect("extract"),
+            payload
+        );
+        assert!(extract_single_file(&gz, "not-there").is_err());
+    }
 
     pub fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(

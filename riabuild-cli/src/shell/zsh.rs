@@ -120,7 +120,7 @@ mod tests {
             id: "id-1".into(),
             identity: Identity::LoggedIn("clubria@proton.me".into()),
         }];
-        let prelude = crate::shell::prelude(&accounts, false);
+        let prelude = crate::shell::prelude(&accounts, false, Some("build-01"));
 
         prepare(&ctx, &prelude).await.unwrap();
 
@@ -131,6 +131,11 @@ mod tests {
         // box is dropped, truncated, or swapped for the banner alone.
         assert!(written.contains("Your Claude Code accounts:"), "{written}");
         assert!(written.contains("clubria@proton.me"), "{written}");
+        // And the server name survives the whole path from `prelude` into the
+        // generated rcfile. The rcfile is the only thing that prints the
+        // banner, so a server dropped anywhere along here is a developer on
+        // `build-01` being told they are on their laptop — with nothing failing.
+        assert!(written.contains("build-01"), "{written}");
     }
 
     #[test]

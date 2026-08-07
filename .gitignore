@@ -9,5 +9,8 @@ target/
 # OS
 .DS_Store
 
+# e2e/remote/run.sh writes this from a freshly generated key each run —
+# never a real credential, but never something to commit either.
+e2e/remote/authorized_keys
 # Written by e2e/run.sh when a run fails, and uploaded as a CI artifact.
 e2e-logs/

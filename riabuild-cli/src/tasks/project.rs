@@ -33,10 +33,14 @@ async fn origin_url(ctx: &Ctx, dir: &Path) -> Option<String> {
 /// The default is what riabuild would have done silently before, so a developer
 /// with no opinion still makes no decision: Enter, no terminal, or an answer
 /// riabuild cannot use all land on it.
-async fn choose_dir(ctx: &Ctx, home: &Path, repo_name: &str) -> PathBuf {
-    // Where this lands is riabuild's decision, and it differs per platform —
-    // see `paths::default_project_dir`.
-    let default = crate::paths::default_project_dir(home, repo_name);
+///
+/// `default` is `Ctx::default_checkout`'s answer, never
+/// `paths::default_project_dir`'s. The two differ on a server, where several
+/// developers share one Unix account and the platform default is one directory
+/// all of them would land in — so offering it here would put one working tree,
+/// one set of branches, and one `.env.local` of brokered secrets in front of
+/// everybody who pressed Enter.
+async fn choose_dir(ctx: &Ctx, home: &Path, default: PathBuf) -> PathBuf {
     let question = format!(
         "The repository will be installed at {}. Choose a different path? (press enter for default)",
         contract_tilde(&default, home)
@@ -49,7 +53,7 @@ async fn choose_dir(ctx: &Ctx, home: &Path, repo_name: &str) -> PathBuf {
             break;
         };
         let chosen = expand_tilde(&answer, home);
-        match objection(&chosen).await {
+        match objection(ctx, &chosen, &default).await {
             None => return chosen,
             Some(objection) => ctx.ui.warn(&objection),
         }
@@ -67,12 +71,16 @@ async fn choose_dir(ctx: &Ctx, home: &Path, repo_name: &str) -> PathBuf {
 /// Checked while they are still being asked. The alternative is learning it
 /// from a failed `gh repo clone` several seconds later, by which point the
 /// answer has been recorded and the developer has to work out how to change it.
-async fn objection(path: &Path) -> Option<String> {
+async fn objection(ctx: &Ctx, path: &Path, default: &Path) -> Option<String> {
     if !path.is_absolute() {
         return Some(format!(
             "{} is relative — give a path starting with / or ~/",
             path.display()
         ));
+    }
+
+    if let Some(escape) = outside_the_namespace(ctx, path, default) {
+        return Some(escape);
     }
 
     // A checkout already sitting there is not an obstacle: `apply` adopts one,
@@ -96,6 +104,52 @@ async fn objection(path: &Path) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// Why a typed path is not somewhere this developer may put a checkout, if it
+/// is not. Always `None` on a laptop, where the whole filesystem is theirs.
+///
+/// On a server it is not. Several developers share one Unix account and are kept
+/// apart only by which directories belong to whom: state under
+/// `paths::remote_namespace`, checkouts under their own directory in
+/// `paths::remote_project_dir`. The prompt above runs against a real terminal
+/// there — `riabuild remote` connects with `ssh -t` — so without this an
+/// absolute path typed at it walks straight out of the namespace, and the
+/// developer ends up in a colleague's tree: one working tree, one set of
+/// branches, and one `.env.local` holding the brokered Infisical secrets of
+/// whoever ran riabuild last.
+fn outside_the_namespace(ctx: &Ctx, path: &Path, default: &Path) -> Option<String> {
+    // Laptops are untouched by this: there is no co-tenant to collide with, and
+    // where a developer keeps their own checkout is their business. `?` rather
+    // than an `if`, because clippy reads the explicit form as a `?` waiting to
+    // happen — the meaning is "not a server, no objection".
+    ctx.server.as_ref()?;
+    let home = ctx.paths.home();
+
+    // The developer's own directory under the org folder. Taken from the
+    // *parent* of the default rather than rebuilt, so somebody whose GitHub
+    // login was already claimed — `Ctx::default_checkout` hands them `<login>-2`
+    // — is allowed their own directory and not the first one.
+    let own = default.parent().unwrap_or(default);
+    // `Path::starts_with` compares whole components, so `~/Clubria/ada-2` is not
+    // inside `~/Clubria/ada`. A string prefix test would have said it was.
+    if path.starts_with(own) {
+        return None;
+    }
+    // The state namespace is this developer's alone too. An odd place for a
+    // checkout, but not a shared one, so there is nothing here to refuse.
+    if let Some(member) = ctx.member.as_ref()
+        && path.starts_with(crate::paths::remote_namespace(&home, &member.member_id))
+    {
+        return None;
+    }
+
+    Some(format!(
+        "{} is not yours on this server — several developers share this account, \
+         so the checkout has to sit under {}",
+        path.display(),
+        contract_tilde(own, &home)
+    ))
 }
 
 #[async_trait]
@@ -157,7 +211,15 @@ impl Task for Project {
 
         let dir = match ctx.config.project_path.clone() {
             Some(path) => expand_tilde(&path, &home),
-            None => choose_dir(ctx, &home, org.repo_name()).await,
+            None => {
+                // Where this lands is riabuild's decision, and it differs per
+                // platform, and per machine when several developers share one
+                // Unix account — see `Ctx::default_checkout`. That answer is
+                // then offered rather than taken silently, and the developer may
+                // say otherwise within the bounds `choose_dir` enforces.
+                let default = ctx.default_checkout().await;
+                choose_dir(ctx, &home, default).await
+            }
         };
 
         if tokio::fs::try_exists(&dir.join(".git"))
@@ -205,6 +267,18 @@ impl Task for Project {
                 .detail(output.stderr)
                 .into());
             }
+            // Marks this checkout as this namespace's own, so a re-run of
+            // `Ctx::default_checkout` recognises its own tree instead of
+            // claiming the next suffix beside it every time. `create_dir_all`
+            // is a no-op after a real clone (the directory already exists);
+            // it exists here mainly so a faked `gh repo clone` in tests has
+            // somewhere to write the marker.
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(
+                dir.join(".riabuild-owner"),
+                ctx.paths.root().to_string_lossy().as_bytes(),
+            )
+            .await?;
         }
 
         ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
@@ -216,10 +290,99 @@ impl Task for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Member;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
     use crate::ui::Ui;
     use std::sync::Arc;
+
+    fn member_named(login: &str) -> Member {
+        Member {
+            github_login: login.into(),
+            member_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            email: "ada@clubria.dev".into(),
+            role: "developer".into(),
+            status: "active".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_laptop_checkout_is_unchanged() {
+        let (ctx, home) = ctx_with(FakeRunner::new()).await;
+        assert_eq!(
+            ctx.default_checkout().await,
+            crate::paths::default_project_dir(home.path(), "ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_checkout_is_grouped_by_developer() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+
+        assert_eq!(
+            ctx.default_checkout().await,
+            home.path()
+                .join("Clubria")
+                .join("ada")
+                .join("ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taken_default_is_claimed_beside_rather_than_shared() {
+        // Two developers, one Unix account, and a login that already has a tree —
+        // a reused GitHub login, or somebody who set it up by hand. Sharing it
+        // would put two people's branches and one .env.local in one checkout.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let taken = home.path().join("Clubria").join("ada");
+        tokio::fs::create_dir_all(taken.join("ai-builders-hub"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            taken.join("ai-builders-hub/.riabuild-owner"),
+            "someone-else",
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(
+            ctx.default_checkout().await,
+            home.path()
+                .join("Clubria")
+                .join("ada-2")
+                .join("ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_run_recognises_its_own_checkout_by_the_owner_marker() {
+        // The claiming loop must not push a developer's own tree to `-2` on a
+        // second run — apply() writes `.riabuild-owner`, and this is what makes
+        // that marker mean something.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let own = home
+            .path()
+            .join("Clubria")
+            .join("ada")
+            .join("ai-builders-hub");
+        tokio::fs::create_dir_all(&own).await.expect("mkdir");
+        tokio::fs::write(
+            own.join(".riabuild-owner"),
+            ctx.paths.root().to_string_lossy().as_bytes(),
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(ctx.default_checkout().await, own);
+    }
 
     #[tokio::test]
     async fn an_unchosen_project_needs_setting_up() {
@@ -243,6 +406,124 @@ mod tests {
         );
         // Named after the repository, not the whole owner/repo slug.
         assert!(expected.ends_with("ai-builders-hub"), "{expected:?}");
+    }
+
+    #[tokio::test]
+    async fn a_server_run_clones_into_the_developer_grouped_path_and_marks_it() {
+        // Proves the actual wiring, not just `default_checkout` in isolation:
+        // `apply()` on a server must land the clone under the developer's own
+        // directory, and leave the marker that keeps a re-run from claiming a
+        // `-2` beside it.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        Project.apply(&mut ctx).await.unwrap();
+
+        let expected = home
+            .path()
+            .join("Clubria")
+            .join("ada")
+            .join("ai-builders-hub");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(expected.to_string_lossy().as_ref()),
+            "a server checkout must be grouped under the developer, not the platform default"
+        );
+        let marker = tokio::fs::read_to_string(expected.join(".riabuild-owner"))
+            .await
+            .expect("apply() must leave an owner marker");
+        assert_eq!(marker, ctx.paths.root().to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn a_server_offers_the_namespaced_path_as_the_default() {
+        // What the prompt *offers* is what every developer who presses Enter
+        // gets, so it has to be the namespaced answer and not the platform
+        // default that all of them share.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        // Scripted with *no* answers: `Ui::scripted` is interactive, so the
+        // prompt is really asked and really recorded in `asked()`, and an empty
+        // queue is a developer pressing Enter — precisely the case where the
+        // offered default becomes the answer. `ctx_with`'s own `Ui` models an
+        // unattended machine, which would skip the prompt entirely and prove
+        // nothing about what it offers.
+        ctx.ui = Ui::scripted([]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        let expected = home
+            .path()
+            .join("Clubria")
+            .join("ada")
+            .join("ai-builders-hub");
+        let asked = ctx.ui.asked();
+        let offered = contract_tilde(&expected, home.path());
+        let shared = contract_tilde(
+            &crate::paths::default_project_dir(home.path(), "ai-builders-hub"),
+            home.path(),
+        );
+        assert!(
+            asked.iter().any(|question| question.contains(&offered)),
+            "the offered default must be {offered}: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|question| question.contains(&shared)),
+            "the shared platform default {shared} must never be offered on a server: {asked:?}"
+        );
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_refuses_an_answer_outside_the_developers_namespace() {
+        // `riabuild remote` connects with `ssh -t`, so this prompt has a real
+        // terminal on a server and a developer can type anything. An absolute
+        // path into a colleague's directory would give the two of them one
+        // working tree, one set of branches, and one `.env.local` of brokered
+        // secrets — so it is refused and the namespaced default stands.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let someone_else = home.path().join("Clubria").join("bob").join("hub");
+        ctx.ui = Ui::scripted([someone_else.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(
+                home.path()
+                    .join("Clubria")
+                    .join("ada")
+                    .join("ai-builders-hub")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "a refused answer must fall back to this developer's own path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_still_lets_a_developer_choose_inside_their_own_directory() {
+        // The refusal must not collapse into "no choice at all": the point of
+        // asking is that a developer can name their own checkout, and anywhere
+        // under their own directory is theirs alone.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let mine = home.path().join("Clubria").join("ada").join("hub");
+        ctx.ui = Ui::scripted([mine.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(mine.to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

@@ -57,9 +57,45 @@ pub struct DeviceStart {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PollResponse {
-    Pending { interval: Option<u64> },
+    Pending {
+        interval: Option<u64>,
+    },
     Denied,
-    Ok { token: String, member: Member },
+    Ok {
+        token: String,
+        member: Member,
+        /// The `cliSessions` row this token belongs to. `remote::session::ensure`
+        /// keeps it in `remotes.json` so `riabuild remote forget` knows exactly
+        /// which session to revoke through `DELETE /api/v1/cli/sessions/<id>`
+        /// rather than guessing from a device label.
+        ///
+        /// `#[serde(default)]` removes a deploy-order dependency, and costs
+        /// nothing: without it, a CLI that ships before — or ahead of a rollback
+        /// of — the riabuild-web that sends this field fails *login itself* on a
+        /// decode error, which is a far worse outcome than not knowing a session
+        /// id. `store::Record::session_id` already carries the same attribute and
+        /// already treats empty as "nothing to revoke", so an empty string flows
+        /// through the rest of remote mode as a state it is written to handle.
+        #[serde(rename = "sessionId", default)]
+        session_id: String,
+    },
+}
+
+/// What a completed sign-in produces.
+///
+/// A struct rather than the `(String, Member, String)` tuple this used to
+/// return: two of the three values are a `String`, and swapping them at a call
+/// site compiles perfectly while writing a session id into the keychain and a
+/// live bearer token into `remotes.json`. The names are the check the compiler
+/// cannot otherwise make.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub token: String,
+    pub member: Member,
+    /// Not a secret — it names a row, not a credential. Only
+    /// `remote::session::ensure` keeps it, for `riabuild remote forget` to
+    /// revoke by later; a laptop's own sign-in has nothing to revoke it with.
+    pub session_id: String,
 }
 
 /// Clamps whatever the server asked for into something sane.
@@ -102,7 +138,10 @@ fn current_browser_env() -> BrowserEnv {
     }
 }
 
-async fn device_label(runner: &dyn CommandRunner) -> String {
+/// A label for this machine, from its hostname. `pub`: `tasks::login` calls
+/// this for a laptop's own login; `remote::session::ensure` passes the
+/// server's hostname instead, so the dashboard lists each session correctly.
+pub async fn device_label(runner: &dyn CommandRunner) -> String {
     let hostname = runner
         .run("hostname", &[], &RunOptions::default())
         .await
@@ -153,7 +192,7 @@ pub fn survives_a_failed_poll(error: &anyhow::Error) -> bool {
 }
 
 /// Polls until the request is answered, expires, or the developer gives up.
-async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<(String, Member)> {
+async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<Session> {
     let lifetime = start
         .expires_in
         .map(Duration::from_secs)
@@ -194,27 +233,45 @@ async fn wait_for_approval(api: &ApiClient, start: &DeviceStart) -> Result<(Stri
             PollResponse::Denied => {
                 return Err(anyhow!("that request was denied in the browser"));
             }
-            PollResponse::Ok { token, member } => return Ok((token, member)),
+            PollResponse::Ok {
+                token,
+                member,
+                session_id,
+            } => {
+                return Ok(Session {
+                    token,
+                    member,
+                    session_id,
+                });
+            }
         }
     }
 }
 
-/// Runs the whole flow and returns the session token. The caller stores it in
+/// Runs the whole flow and returns the session token, the member it belongs
+/// to, and the `cliSessions` row id behind it. The caller stores the token in
 /// the keychain; it is never written to `~/.riabuild`.
 ///
 /// Takes neither a dashboard URL nor a version: the server builds the
 /// verification URL, because it is the thing that knows where the dashboard is
 /// deployed, and reads the version off the `x-riabuild-cli-version` header
 /// `ApiClient` already sends on every request.
+///
+/// `label` *is* the caller's to choose, so the dashboard lists each session
+/// under the device it belongs to rather than always the hostname of the
+/// machine running this code: `remote::session::ensure` signs a *server* in
+/// from the laptop's browser, and labelling that session after the laptop
+/// would leave `riabuild remote list` and `forget` unable to tell the two
+/// apart. `device_label` is the answer a laptop's own sign-in passes.
+/// For the same reason, printing *why* this login is happening is the
+/// caller's too: the heading lives at each call site, not here.
 pub async fn login(
     api: &ApiClient,
     runner: &dyn CommandRunner,
     ui: &Ui,
-) -> Result<(String, Member)> {
-    let label = device_label(runner).await;
-    let start = start_device(api, &label).await?;
-
-    ui.heading("Signing this machine in to riabuild");
+    label: &str,
+) -> Result<Session> {
+    let start = start_device(api, label).await?;
 
     // Printed before any browser is attempted, and printed whatever happens.
     // Over SSH this is the whole interface, and on a laptop it is what the
@@ -250,6 +307,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_grant_without_a_session_id_still_signs_the_developer_in() {
+        // A riabuild-web older than this binary — or one that has just been
+        // rolled back — does not send `sessionId`. Failing the decode would
+        // fail *login*, on every command, over a field only `riabuild remote
+        // forget` ever reads. Empty is the same state `store::Record` already
+        // treats as "no session to revoke".
+        let older: PollResponse = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "token": "rb_live_abc",
+            "member": {
+                "githubLogin": "ada",
+                "memberId": "550e8400-e29b-41d4-a716-446655440000",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "email": "ada@clubria.dev",
+                "role": "member",
+                "status": "active"
+            }
+        }))
+        .expect("a missing sessionId must not fail login");
+        match older {
+            PollResponse::Ok {
+                token, session_id, ..
+            } => {
+                assert_eq!(session_id, "");
+                assert_eq!(token, "rb_live_abc");
+            }
+            other => panic!("expected a grant, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_pending_poll_is_a_normal_reply_not_an_error() {
         // The CLI sees this dozens of times per login. Decoding it as anything
         // other than an ordinary response would mean unwinding on every tick.
@@ -276,17 +365,27 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_carries_the_token_and_the_member() {
+    fn a_grant_carries_the_token_the_member_and_the_session_it_opened() {
+        // The session id is what `riabuild remote forget` revokes a *server's*
+        // token by, through `DELETE /api/v1/cli/sessions/<id>`. Dropping it
+        // here would compile and would leave a live 90-day bearer credential
+        // on a shared box after a `forget` that reported success.
         let response: PollResponse = serde_json::from_str(
-            r#"{"status":"ok","token":"tok_1","expiresAt":123,"member":{
-                 "githubLogin":"ada","firstName":"Ada","lastName":"Lovelace",
+            r#"{"status":"ok","token":"tok_1","sessionId":"sess_1","expiresAt":123,"member":{
+                 "githubLogin":"ada","memberId":"550e8400-e29b-41d4-a716-446655440000",
+                 "firstName":"Ada","lastName":"Lovelace",
                  "email":"ada@clubria.dev","role":"developer","status":"active"}}"#,
         )
         .unwrap();
         match response {
-            PollResponse::Ok { token, member } => {
+            PollResponse::Ok {
+                token,
+                member,
+                session_id,
+            } => {
                 assert_eq!(token, "tok_1");
                 assert_eq!(member.github_login, "ada");
+                assert_eq!(session_id, "sess_1");
             }
             other => panic!("expected a grant, got {other:?}"),
         }

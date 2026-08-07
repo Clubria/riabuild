@@ -2,7 +2,7 @@ import { FormEvent, useState } from "react";
 import { useData } from "../data/context";
 import { Member } from "../data/types";
 import { readError } from "../lib/errors";
-import { Alert, Button, Field } from "../ui";
+import { Alert, Button, Copyable, Field, KeyValue } from "../ui";
 
 /**
  * Prefilled from the GitHub profile and its verified email list. The developer
@@ -39,6 +39,16 @@ export function Profile({ member }: { member: Member }) {
 
   return (
     <form onSubmit={onSubmit} className="max-w-xl">
+      <div className="mb-5">
+        <KeyValue
+          rows={[
+            {
+              label: "member id",
+              value: <Copyable value={member.memberId} label="member id" />,
+            },
+          ]}
+        />
+      </div>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field
           label="first name"

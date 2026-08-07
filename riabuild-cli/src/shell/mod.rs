@@ -33,17 +33,35 @@ const BULLET: &str = "●";
 const HEADLINE: &str = "Clubria environment active";
 const HINT: &str = "— type `exit` to leave, `code .` to open your editor here";
 
+/// The remote counterpart to [`HINT`], named in `scope::Scope::banner` too —
+/// `a_servers_banner_matches_between_colour_and_plain` guards the two from
+/// drifting apart.
+const REMOTE_HINT: &str = "— type `exit` to leave, `claude` to start working";
+
 /// The banner with colour, matching what `Ui` does elsewhere: a green bullet
 /// for a good state, and the trailing advice dimmed so the headline reads first.
 ///
 /// The escapes are baked into the generated rcfile because that file, not
 /// `Ui`, is what prints them — so `colour` has to be threaded across that
 /// boundary rather than re-derived inside the shell.
-pub fn banner(colour: bool) -> String {
+///
+/// `server` is the name of the box this riabuild is managing, from
+/// `Ctx::server` (see `scope.rs`) — `None` on a developer's own laptop. The
+/// uncoloured text is `scope::Scope`'s own construction, read straight
+/// through rather than re-formatted a second time, so there is exactly one
+/// sentence for "the environment is active" and one for "it is active on
+/// this named server".
+pub fn banner(colour: bool, server: Option<&str>) -> String {
+    let plain = crate::scope::Scope::read(server).banner();
     if !colour {
-        return BANNER.to_string();
+        return plain;
     }
-    format!("\x1b[32m{BULLET}\x1b[0m {HEADLINE} \x1b[2m{HINT}\x1b[0m")
+    match server {
+        Some(name) => format!(
+            "\x1b[32m{BULLET}\x1b[0m Clubria environment active on {name} \x1b[2m{REMOTE_HINT}\x1b[0m"
+        ),
+        None => format!("\x1b[32m{BULLET}\x1b[0m {HEADLINE} \x1b[2m{HINT}\x1b[0m"),
+    }
 }
 
 /// Marks the prompt so a developer can tell at a glance which shell they are in.
@@ -146,11 +164,21 @@ fn browser_for(ctx: &Ctx, env: &[(String, String)]) -> Option<String> {
 /// One string so that each shell's existing `banner_command` — and the
 /// `[[ -t 1 ]]` guard inside it that keeps this out of captured output — covers
 /// both without any of them learning what an account is.
-pub fn prelude(accounts: &[crate::accounts::status::Account], colour: bool) -> String {
+///
+/// `server` is threaded through rather than re-derived here for the same reason
+/// `colour` is: this text is baked into a generated rcfile, and the only thing
+/// that knows which machine the shell is being started on is the `Ctx` back in
+/// `spawn`. Dropping it would compile and read as a working banner — a
+/// developer on `build-01` would simply be told they are on their laptop.
+pub fn prelude(
+    accounts: &[crate::accounts::status::Account],
+    colour: bool,
+    server: Option<&str>,
+) -> String {
     format!(
         "{}\n\n{}",
         crate::accounts::render::accounts_box(accounts, colour),
-        banner(colour)
+        banner(colour, server)
     )
 }
 
@@ -167,7 +195,7 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let env = environment(ctx);
 
     let accounts = crate::accounts::status::read_all(ctx).await;
-    let prelude = prelude(&accounts, ctx.ui.colour());
+    let prelude = prelude(&accounts, ctx.ui.colour(), ctx.server.as_deref());
 
     let (args, extra_env) = match &shell {
         Shell::Zsh => zsh::prepare(ctx, &prelude).await?,
@@ -263,17 +291,46 @@ mod tests {
         // Two spellings of one sentence drift apart. This is what stops the
         // NO_COLOR path and the coloured path from disagreeing.
         assert_eq!(BANNER, format!("{BULLET} {HEADLINE} {HINT}"));
-        assert_eq!(banner(false), BANNER);
+        assert_eq!(banner(false, None), BANNER);
     }
 
     #[test]
     fn colour_wraps_the_bullet_and_dims_the_advice() {
-        let coloured = banner(true);
+        let coloured = banner(true, None);
         assert!(coloured.starts_with("\x1b[32m●\x1b[0m "), "{coloured:?}");
         assert!(coloured.contains("\x1b[2m— type `exit`"), "{coloured:?}");
         assert!(coloured.ends_with("\x1b[0m"), "{coloured:?}");
         // The words survive the escapes.
         assert!(coloured.contains(HEADLINE));
+    }
+
+    #[test]
+    fn a_laptop_banner_is_unchanged_byte_for_byte() {
+        // The whole reason `server` is a parameter and not a rewrite: a
+        // laptop's banner — the case every existing developer sees — must be
+        // exactly what it was before remote mode existed.
+        assert_eq!(banner(false, None), BANNER);
+    }
+
+    #[test]
+    fn a_servers_banner_names_it_in_both_variants() {
+        let plain = banner(false, Some("build-01"));
+        let coloured = banner(true, Some("build-01"));
+        assert!(plain.contains("build-01"), "{plain}");
+        assert!(coloured.contains("build-01"), "{coloured}");
+        assert!(coloured.starts_with("\x1b[32m●\x1b[0m "), "{coloured:?}");
+    }
+
+    #[test]
+    fn a_servers_banner_matches_between_colour_and_plain() {
+        // REMOTE_HINT (used by the coloured path) and scope::Scope::banner
+        // (used by the plain path) are two spellings of one sentence — this
+        // is what stops them drifting apart the way BANNER and HINT are
+        // guarded above.
+        let plain = banner(false, Some("build-01"));
+        let coloured = banner(true, Some("build-01"));
+        assert!(plain.contains("`exit` to leave, `claude` to start working"));
+        assert!(coloured.contains("`exit` to leave, `claude` to start working"));
     }
 
     #[tokio::test]
@@ -313,19 +370,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_prelude_is_the_box_then_the_banner() {
+    fn one_account() -> Vec<crate::accounts::status::Account> {
         use crate::accounts::status::{Account, Identity};
-        let accounts = vec![Account {
+        vec![Account {
             number: 1,
             id: "id-1".into(),
             identity: Identity::LoggedIn("clubria@proton.me".into()),
-        }];
-        let text = prelude(&accounts, false);
+        }]
+    }
+
+    #[test]
+    fn the_prelude_is_the_box_then_the_banner() {
+        let text = prelude(&one_account(), false, None);
 
         let box_line = text.find("Your Claude Code accounts:").unwrap();
         let banner_line = text.find("Clubria environment active").unwrap();
         // The banner says how to leave, so it reads last, closest to the prompt.
         assert!(box_line < banner_line, "{text}");
+    }
+
+    #[test]
+    fn a_servers_prelude_names_the_server() {
+        // The prelude is the only thing the generated rcfiles print, so a
+        // `server` that stops at `prelude` is a banner that never reaches a
+        // shell: everything still compiles, every other test still passes, and
+        // a developer on `build-01` is told they are on their laptop with no
+        // way to tell the difference.
+        let text = prelude(&one_account(), false, Some("build-01"));
+        assert!(text.contains("build-01"), "{text}");
+        // And the laptop case is still the laptop case.
+        assert!(!prelude(&one_account(), false, None).contains("build-01"));
     }
 }

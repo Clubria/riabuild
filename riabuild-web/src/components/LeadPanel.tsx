@@ -8,6 +8,7 @@ import {
   Badge,
   Button,
   Column,
+  Copyable,
   DataTable,
   Empty,
   Field,
@@ -60,6 +61,14 @@ export function Members({ viewerId }: { viewerId: string }) {
             ? "—"
             : `${m.firstName} ${m.lastName}`}
         </span>
+      ),
+    },
+    {
+      key: "id",
+      header: "member id",
+      priority: "wide",
+      render: (m) => (
+        <Copyable value={m.memberId} label={`member id for @${m.githubLogin}`} />
       ),
     },
     {

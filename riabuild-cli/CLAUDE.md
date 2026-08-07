@@ -54,6 +54,15 @@ answer turns an unattended run into one that hangs with no output until somethin
 out. Prompts also belong in `apply()` or a subcommand, never in `check()`, which runs
 under `--check`.
 
+`ui::prompt` also has an `ask_required` / `confirm_required` pair, which returns
+`Result` and fails when nobody can answer. That is not an exemption from the rule
+above — it is the rule made explicit for the one case it does not cover:
+`riabuild remote` with no saved server has to learn a hostname, and there is no
+default that could be right. So it *refuses*, loudly and immediately, instead of
+inventing an answer or blocking on a read that will never return. If you find
+yourself reaching for the `_required` pair anywhere a sensible default exists, use
+`ask`/`confirm` instead.
+
 **`apply()` must be safe to run twice.** Tasks re-run whenever a dependency changes, a
 version bumps, or a check fails. There is no "already done" branch to rely on.
 
@@ -69,8 +78,14 @@ around a check that does not detect a real state, fix the check.
 `keychain.rs`. Infisical tokens are short-lived, brokered per use, and piped straight into
 `infisical export` — never written down.
 
+A riabuild-managed **server** is the one exception: it may hold its own session
+token at `<namespace>/session.token`, mode 0600. It has no keyring, the token is
+minted for that server alone, it is labelled and listed in the dashboard, and
+`riabuild remote forget` revokes it. Laptops are unchanged, and the Infisical
+credential is still brokered per use and never written down.
+
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
-`paths.rs`, `keychain.rs`, `tools.rs`, `download.rs` and `update.rs` are the only files
+`paths.rs`, `keychain/`, `tools.rs`, `download/` and `update.rs` are the only files
 that may know which one they are running on. A `cfg!(target_os)` or a
 `std::env::consts::OS` anywhere else is a bug — it puts a platform decision somewhere no
 test on the other platform can reach it.
@@ -117,24 +132,46 @@ dependency edges you must declare.
 
 ```
 src/
-  main.rs      top-level flow          cli.rs       clap definitions
+  main.rs      entry point, dispatch   cli.rs       clap definitions
+  provision.rs the default flow        internal.rs  `riabuild internal …` handlers
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
-  keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
+  keychain/    secret storage: trait,  runner.rs    CommandRunner — all subprocesses
+               the two platform CLIs,
+               the server's file store
   update.rs    version check, re-exec  ui.rs        output and prompts
+  scope.rs     laptop vs. server, from gh_session/  where the GitHub config dir
+               RIABUILD_REMOTE, and the             goes, how it is created safely
+               namespace it implies: member         against a co-tenant, and how
+               id, server session token file        long it lives
   move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
   reset.rs     removes ~/.riabuild
-  download.rs  fetching and digests    archive.rs   tar and zip extraction
   tools.rs     the gh and infisical releases riabuild owns
   version.rs   parsing and comparison  testing.rs   test helpers
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
+  download/    where a release lives, what its asset is called, and the digest that
+               says the bytes are the ones upstream published
+  archive/     unpacking what download fetched: tar and zip, one member or a whole
+               tree, and `staging` for landing that tree atomically
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
+  channel/     the laptop channel: clipboard and browser over the SSH reverse-forward
   accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
+  remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
+               trust, authorising a key, installing the server's own binary, minting its
+               session, seeding a GitHub sign-in, and the mosh/ssh shell handoff
 ```
 
-`download.rs` decides where bytes come from and whether they are the right bytes;
-`archive.rs` only ever sees a buffer that already matched a digest. Keep that split — it
+`download/` decides where bytes come from and whether they are the right bytes;
+`archive/` only ever sees a buffer that already matched a digest. Keep that split — it
 is what makes "verified before anything is written" a property of the code rather than a
 convention.
+
+Inside `archive/`, `staging.rs` owns *how* a tree lands: unpack into a sibling
+directory and `rename` it into place, never `remove_dir_all` the target first.
+`tools_root()` is shared by every developer with an account on a server, so the
+tree being replaced may be one a colleague's `pnpm dev` is running out of. A
+delete-then-unpack is correct on a single-user laptop and silently destructive
+anywhere else — and it compiles and passes every test either way, because no
+test has a co-tenant.
 
 One task per file. Roughly 300 lines of **production** code is the point at which
 a file is doing too much — `#[cfg(test)]` modules do not count towards it. The number

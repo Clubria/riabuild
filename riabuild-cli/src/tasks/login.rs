@@ -63,7 +63,18 @@ impl Task for Login {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let (token, member) = auth::login(&ctx.api, ctx.runner.as_ref(), &ctx.ui).await?;
+        // This machine's own hostname: a laptop signing itself in. The label is
+        // passed rather than derived inside `auth::login` because
+        // `remote::session::ensure` drives the same flow for a *server* and
+        // must label that session after the server, not after this laptop.
+        let label = auth::device_label(ctx.runner.as_ref()).await;
+        ctx.ui.heading("Signing this machine in to riabuild");
+        // The session id `auth::login` also returns is only ever needed to
+        // revoke a *server's* session (`remote::session::ensure` keeps it for
+        // that); a laptop's own sign-in has no analogous "forget" command, so
+        // there is nothing here to keep it for.
+        let auth::Session { token, member, .. } =
+            auth::login(&ctx.api, ctx.runner.as_ref(), &ctx.ui, &label).await?;
 
         ctx.keychain.set(&token).await?;
         ctx.api.set_token(Some(token));
@@ -92,6 +103,7 @@ mod tests {
     fn member(status: &str) -> Member {
         Member {
             github_login: "ada".into(),
+            member_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             first_name: "Ada".into(),
             last_name: "Lovelace".into(),
             email: "ada@clubria.dev".into(),
