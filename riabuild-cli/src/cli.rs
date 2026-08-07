@@ -87,6 +87,20 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<RemoteAction>,
     },
+    /// Internal plumbing, invoked by riabuild over SSH. Not for people.
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        action: InternalAction,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum InternalAction {
+    /// Read a GitHub token on stdin and hand it to `gh`.
+    SeedGithub,
+    /// Remove what a session that died without cleaning up left behind.
+    GhSweep,
 }
 
 /// `identity::fingerprint_of` (Task 15) only ever extracts a token starting
@@ -269,6 +283,30 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["riabuild", "--accept-host-key", "SHA256:aaaa"]).is_err());
+    }
+
+    #[test]
+    fn internal_plumbing_parses_and_stays_hidden_from_help() {
+        // Not for people: no developer ever types `riabuild internal ...`
+        // themselves, so it must not clutter `--help`.
+        let seed = Cli::parse_from(["riabuild", "internal", "seed-github"]);
+        assert!(matches!(
+            seed.command,
+            Some(Command::Internal {
+                action: InternalAction::SeedGithub
+            })
+        ));
+
+        let sweep = Cli::parse_from(["riabuild", "internal", "gh-sweep"]);
+        assert!(matches!(
+            sweep.command,
+            Some(Command::Internal {
+                action: InternalAction::GhSweep
+            })
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("internal"), "{help}");
     }
 
     #[test]

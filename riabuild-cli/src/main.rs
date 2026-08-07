@@ -33,7 +33,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::{State, UserConfig};
 use paths::{Paths, RealPaths, expand_tilde};
-use runner::{CommandRunner, RealRunner};
+use runner::{CommandRunner, RealRunner, RunOptions};
 use std::sync::Arc;
 use tasks::{Ctx, engine};
 use ui::{Failure, Ui};
@@ -85,37 +85,45 @@ async fn run(cli: Cli) -> Result<i32> {
 
     // Only a remote scope claims a GitHub session — see `gh_session`. This is
     // deliberately unconditional over every subcommand a remote-scoped
-    // invocation might run, not just the shell: each SSH invocation is its
-    // own process, and bracketing this one's whole lifetime with open/close
-    // is what keeps the marker honest no matter which command runs inside it.
-    let gh = if scope.is_remote() {
+    // invocation might run, not just the shell — with one exception.
+    // `internal gh-sweep`/`internal seed-github` are short plumbing
+    // invocations the laptop runs *before* the interactive shell exists (see
+    // `holds_gh_session_marker`): if either claimed a marker the same way
+    // the shell does, its own exit would find no other marker yet and wipe
+    // the GitHub credential moments after `internal seed-github` wrote it —
+    // the exact "earlier draft got it backwards" bug `gh_session.rs`'s module
+    // doc warns about. Those two only `attach`, which never claims or
+    // releases anything.
+    let gh_dir: Option<std::path::PathBuf>;
+    let mut gh_marker: Option<gh_session::GhSession> = None;
+    if scope.is_remote() {
         let runtime = gh_session::choose_runtime_dir(
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             std::env::var("TMPDIR").ok().as_deref(),
         )?;
-        let member_id = paths
-            .root()
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Some(gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?)
+        let member_id = member_id_from_root(paths.as_ref())?;
+        if holds_gh_session_marker(&cli.command) {
+            let session =
+                gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?;
+            gh_dir = Some(session.config_dir());
+            gh_marker = Some(session);
+        } else {
+            gh_dir = Some(gh_session::GhSession::attach(&runtime, &member_id).await?);
+        }
     } else {
-        None
-    };
+        gh_dir = None;
+    }
 
     // Bound before the shadowing `match` below, which moves `runner` in both
     // arms. `base_runner` is the unwrapped `RealRunner`: `kill -0` (run by
     // `close`, via `sweep`) needs no namespace environment, and closing has
     // to work even once the scoped runner built below is gone.
     let base_runner = runner.clone();
-    let runner: Arc<dyn CommandRunner> = match &gh {
-        Some(session) => Arc::new(runner::ScopedRunner::new(
+    let runner: Arc<dyn CommandRunner> = match &gh_dir {
+        Some(dir) => Arc::new(runner::ScopedRunner::new(
             runner,
             vec![
-                (
-                    "GH_CONFIG_DIR".into(),
-                    session.config_dir().to_string_lossy().into_owned(),
-                ),
+                ("GH_CONFIG_DIR".into(), dir.to_string_lossy().into_owned()),
                 (
                     "GIT_CONFIG_GLOBAL".into(),
                     paths
@@ -142,7 +150,7 @@ async fn run(cli: Cli) -> Result<i32> {
 
     let code = run_inner(&cli, &mut ctx).await;
 
-    if let Some(session) = gh
+    if let Some(session) = gh_marker
         && let Err(error) = session.close(base_runner).await
     {
         // Not `let _`: a credential that failed to wipe is exactly the thing
@@ -153,6 +161,46 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 
     code
+}
+
+/// The member id a remote-scoped `RIABUILD_ROOT` is namespaced under — the
+/// last path component of `paths.root()`.
+///
+/// Never falls back to an empty string: `gh_session::open`/`attach` join this
+/// verbatim onto `riabuild-gh-`, so an empty id is exactly what would make
+/// every developer on a shared server collide onto one runtime directory —
+/// and share each other's GitHub credential. `paths::root_for` already
+/// refuses a `RIABUILD_ROOT` that isn't absolute (Task 6), so the only way
+/// `file_name()` comes back empty here is a root of `/` itself, which is
+/// worth a clear, actionable error rather than a silent collision.
+fn member_id_from_root(paths: &dyn Paths) -> Result<String> {
+    paths
+        .root()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            Failure::new(
+                "working out which developer this server session belongs to",
+                "This is a bug in riabuild — send your team lead the value of RIABUILD_ROOT on that server.",
+            )
+            .into()
+        })
+}
+
+/// Whether this invocation is allowed to claim (and later release) the
+/// GitHub-session marker `gh_session::open`/`close` guard.
+///
+/// Only the invocation that goes on to hold the interactive environment
+/// shell open should ever do that — see `gh_session.rs`'s module doc. The
+/// hidden `internal` subcommands (`gh-sweep`, `seed-github`) are short,
+/// separate SSH-invoked processes the laptop runs *before* that shell
+/// exists: if either claimed a marker the same way, its own `close` would
+/// find no other marker yet and wipe the GitHub credential moments after
+/// writing it. They call `attach` instead, which never claims or releases
+/// anything.
+fn holds_gh_session_marker(command: &Option<Command>) -> bool {
+    !matches!(command, Some(Command::Internal { .. }))
 }
 
 /// Everything `run` does after a remote scope's GitHub session (if any) is
@@ -182,6 +230,47 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             // action).await`. Until then this only needs to exist so the CLI
             // surface (Task 14) compiles and its own tests pass.
             return Ok(0);
+        }
+        Some(Command::Internal {
+            action: cli::InternalAction::GhSweep,
+        }) => {
+            // Run by the laptop before seeding, so a dead session's leftovers
+            // go before the new credential arrives rather than after.
+            let runtime = gh_session::choose_runtime_dir(
+                std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+                std::env::var("TMPDIR").ok().as_deref(),
+            )?;
+            let dir =
+                gh_session::GhSession::attach(&runtime, &member_id_from_root(ctx.paths.as_ref())?)
+                    .await?;
+            gh_session::sweep(&dir, ctx.runner.clone(), config::now_secs()).await?;
+            return Ok(0);
+        }
+        Some(Command::Internal {
+            action: cli::InternalAction::SeedGithub,
+        }) => {
+            // `tokio::io`, not `std::io`: a blocking read on the current-thread
+            // runtime stalls every other future on it, which is the invariant in
+            // riabuild-cli/CLAUDE.md.
+            use tokio::io::AsyncReadExt;
+            let mut token = String::new();
+            tokio::io::stdin().read_to_string(&mut token).await?;
+            // `gh` writes its own `hosts.yml`, with its own permissions, into
+            // the `GH_CONFIG_DIR` the scoped runner supplies — riabuild never
+            // hand-writes that file. The token reaches `gh` only on stdin,
+            // never in argv (`ps` is world-readable) and never logged.
+            let output = ctx
+                .runner
+                .run(
+                    "gh",
+                    &["auth", "login", "--with-token"],
+                    &RunOptions {
+                        stdin: Some(token.trim().as_bytes().to_vec()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            return Ok(if output.ok() { 0 } else { 1 });
         }
         Some(Command::Status) | None => {}
     }
@@ -453,5 +542,46 @@ mod tests {
         let scope = scope::Scope::read(None);
         let ctx = ctx_for(&scope);
         assert_eq!(ctx.server, None);
+    }
+
+    #[test]
+    fn member_id_comes_from_the_roots_last_component() {
+        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
+        assert_eq!(member_id_from_root(&paths).expect("id"), "550e8400");
+    }
+
+    #[test]
+    fn a_root_with_no_final_component_is_a_failure_not_an_empty_id() {
+        // An empty member id is what would make every developer on a shared
+        // server collide onto one runtime directory (and each other's
+        // GitHub credential) — this must hard-error, never fall back.
+        let paths = RealPaths::with_root("/", "/");
+        let error = member_id_from_root(&paths).expect_err("no component to read");
+        assert!(
+            error.downcast_ref::<Failure>().is_some(),
+            "must be the actionable Failure, not a generic error: {error}"
+        );
+    }
+
+    #[test]
+    fn internal_plumbing_never_claims_the_gh_session_marker() {
+        // This is the fix for the bug described in `gh_session.rs`'s module
+        // doc: if `internal seed-github` claimed a marker the same way the
+        // interactive shell does, its own exit would wipe the credential it
+        // had just written. Reverting `holds_gh_session_marker` to always
+        // return `true` reproduces that bug and fails this test.
+        assert!(!holds_gh_session_marker(&Some(Command::Internal {
+            action: cli::InternalAction::SeedGithub,
+        })));
+        assert!(!holds_gh_session_marker(&Some(Command::Internal {
+            action: cli::InternalAction::GhSweep,
+        })));
+    }
+
+    #[test]
+    fn every_other_command_still_claims_the_gh_session_marker() {
+        assert!(holds_gh_session_marker(&None));
+        assert!(holds_gh_session_marker(&Some(Command::Status)));
+        assert!(holds_gh_session_marker(&Some(Command::Shell)));
     }
 }

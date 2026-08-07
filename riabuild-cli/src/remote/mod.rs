@@ -10,6 +10,7 @@
 pub mod authorise;
 pub mod identity;
 pub mod install;
+pub mod seed;
 pub mod session;
 pub mod store;
 

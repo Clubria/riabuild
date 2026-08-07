@@ -84,6 +84,10 @@ tokio = { version = "1", default-features = false, features = [
     "process",
     "net",
     "io-util",
+    # `tokio::io::stdin()` — reads a piped secret off the internal
+    # `seed-github` command's stdin without blocking the current-thread
+    # runtime's only thread the way a `std::io::stdin()` read would.
+    "io-std",
     "time",
 ] }
 
