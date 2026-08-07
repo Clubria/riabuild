@@ -138,6 +138,15 @@ pub enum ChannelAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Open a link in the laptop's browser.
+    ///
+    /// Hidden: invoked by the generated `xdg-open` shim and by `$BROWSER`.
+    #[command(hide = true)]
+    Open {
+        /// The link, and any options the caller passed alongside it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Report whether the clipboard channel is up.
     Status,
 }
