@@ -295,13 +295,35 @@ async fn sign_in(ctx: &mut Ctx, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment `npm` has to run in for `-g` to mean riabuild's Node.
+///
+/// `bin/npm` in the Node tarball is a symlink to a script whose shebang is
+/// `#!/usr/bin/env node`, so the machine's own Node interprets it whenever one is
+/// on `PATH` — and npm derives its global prefix from `process.execPath`, which
+/// would then be a Node riabuild does not own. Putting riabuild's Node first both
+/// fixes that and removes the need for any system Node at all, which is the whole
+/// point of owning one.
+///
+/// Prepended rather than replacing `PATH`: npm shells out to `git` and `sh`, and
+/// a provisioner that broke `npm install` to fix a prefix would have traded one
+/// failure for a stranger one.
+fn npm_env(node_bin: &Path) -> Vec<(String, String)> {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    vec![(
+        "PATH".to_string(),
+        format!("{}:{ambient}", node_bin.display()),
+    )]
+}
+
 async fn install_claude(ctx: &mut Ctx) -> Result<()> {
     let node_version = match ctx.config.node_version.clone() {
         Some(pinned) => pinned,
         // Not `unwrap_or_else`: the fallback awaits, and a closure cannot.
         None => super::toolchain::desired_node(ctx.project_dir().as_deref()).await,
     };
-    let npm = ctx.paths.node_dir(&node_version).join("bin").join("npm");
+    let node_dir = ctx.paths.node_dir(&node_version);
+    let node_bin = node_dir.join("bin");
+    let npm = node_bin.join("npm");
 
     if !tokio::fs::try_exists(&npm).await.unwrap_or(false) {
         return Err(Failure::new(
@@ -313,12 +335,27 @@ async fn install_claude(ctx: &mut Ctx) -> Result<()> {
     }
 
     ctx.ui.note("Installing Claude Code…");
+    // `--prefix` names the tree `Ctx::claude()` reads, and names it on the
+    // command line so a `prefix` line in the developer's own `~/.npmrc` cannot
+    // redirect the install. Without it, `check()` reports Claude Code as missing
+    // on a machine that has just installed it — and keeps installing it, every
+    // run, forever.
+    let prefix = node_dir.to_string_lossy().into_owned();
     let output = ctx
         .runner
         .run(
             &npm.to_string_lossy(),
-            &["install", "-g", "@anthropic-ai/claude-code"],
-            &RunOptions::default(),
+            &[
+                "install",
+                "-g",
+                "--prefix",
+                &prefix,
+                "@anthropic-ai/claude-code",
+            ],
+            &RunOptions {
+                env: npm_env(&node_bin),
+                ..Default::default()
+            },
         )
         .await?;
     if !output.ok() {
@@ -434,6 +471,51 @@ mod tests {
             !runner.calls().iter().any(|call| call.contains(VERSION)),
             "{:?}",
             runner.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_is_installed_where_riabuild_looks_for_it() {
+        // `npm install -g` decides where a binary lands from the Node that
+        // *interprets* npm and from any `prefix` in the developer's own
+        // `~/.npmrc` — neither of which is riabuild's Node. Left to npm, Claude
+        // Code installs beside whatever Node is on `PATH`, and `check()`, which
+        // reads `Ctx::claude()` under riabuild's own Node, then reports Claude
+        // Code as not installed on a machine that has just installed it. The
+        // task can never satisfy, so every run installs it again.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.node_version = Some(NODE.into());
+        let node_dir = ctx.paths.node_dir(NODE);
+        write_file(&node_dir.join("bin").join("npm"), "#!/bin/sh\n").await;
+
+        let runner = Arc::new(FakeRunner::new().with("npm install", 0, "", ""));
+        ctx.runner = runner.clone();
+
+        install_claude(&mut ctx).await.expect("the install runs");
+
+        let call = runner
+            .calls()
+            .into_iter()
+            .find(|call| call.contains("install"))
+            .expect("npm was run");
+        assert!(
+            call.contains(&format!("--prefix {}", node_dir.display())),
+            "{call}"
+        );
+    }
+
+    #[test]
+    fn the_install_runs_npm_under_riabuilds_own_node() {
+        // The other half: `bin/npm` is a symlink to a script whose shebang is
+        // `#!/usr/bin/env node`, so without this the install needs a system Node
+        // to run at all — and uses it to decide the prefix.
+        let bin = std::path::Path::new("/Users/ada/.riabuild/node/22.23.1/bin");
+        let env = npm_env(bin);
+        let (key, value) = env.first().expect("npm gets an environment");
+        assert_eq!(key, "PATH");
+        assert!(
+            value.starts_with("/Users/ada/.riabuild/node/22.23.1/bin:"),
+            "{value}"
         );
     }
 
