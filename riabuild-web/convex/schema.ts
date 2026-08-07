@@ -30,7 +30,8 @@ export default defineSchema({
      * Immutable, ours, and independent of GitHub. Names a developer's
      * directory on a shared server, so it must outlive a GitHub rename.
      * Required — `members.backfillMemberIds` fills existing rows before this
-     * field is required in production; see that mutation's comment.
+     * field is required in production. See `docs/deploying.md` §7 for the
+     * deploy order this depends on.
      *
      * Not the same thing as `cliSessions.memberId` below: that one is a
      * document reference (`v.id("members")`); this one is a UUID string

@@ -235,7 +235,7 @@ export const byId = internalQuery({
  * step can be checked rather than assumed.
  *
  * Exists for exactly one production deploy — see the three-step sequence in
- * Task 2's brief (deploy optional, run this against `--prod`, deploy
+ * `docs/deploying.md` §7 (deploy optional, run this against `--prod`, deploy
  * required) — and is verified by that deploy's returned count rather than by
  * this suite: once `members.memberId` is required in the schema,
  * `convex-test` refuses to construct the memberId-less row this mutation
