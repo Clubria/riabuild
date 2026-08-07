@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // Written by riabuild's `claude_statusline` task — edits here are overwritten.
 
-// Marks the status line the way the environment shell marks `PS1`, in the same
-// bold blue: the Clubria settings are the reason this Claude Code session looks
-// the way it does, and the line should say so without being asked.
+// Marks the status line the way the environment shell marks `PS1` — same word,
+// same bold blue. The prompt and the status line are two renderers answering
+// one question, so a developer learns the marker once.
+//
+// Keep this in step with `shell::PROMPT_LABEL`; a test in
+// `tasks/claude_statusline.rs` fails if the two drift apart.
 //
 // Printed even when there is no context data to draw, for the same reason the
 // prompt label is unconditional — a marker that comes and goes marks nothing.
-const LABEL = '\x1b[1;34m(clubria)\x1b[0m';
+const LABEL = '\x1b[1;34m(riabuild)\x1b[0m';
 
 // How full the context window is: `█████░░░░░ 54%`, coloured green → yellow →
 // orange → blinking red 💀. Returns '' when Claude Code sends no window data.
