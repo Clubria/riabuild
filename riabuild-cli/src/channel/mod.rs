@@ -13,5 +13,6 @@
 //! session that still runs setup, still re-pulls rotated secrets, and still
 //! opens a shell. Only paste stops.
 
+pub mod clipboard;
 pub mod mime;
 pub mod protocol;
