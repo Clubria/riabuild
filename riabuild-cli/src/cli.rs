@@ -52,15 +52,6 @@ pub struct Cli {
     /// Set the machine up but do not open the environment shell.
     #[arg(long, global = true)]
     pub no_shell: bool,
-
-    /// The SSH host key fingerprint to trust without prompting, e.g.
-    /// `SHA256:qKqv...`. `riabuild remote` compares this verbatim against
-    /// what the server offers and fails on a mismatch rather than prompting —
-    /// it does not weaken the check, it just answers it non-interactively.
-    /// This is how an unattended run (CI, a container test) gets past a
-    /// prompt that has no terminal to show on.
-    #[arg(long, global = true, value_name = "FINGERPRINT")]
-    pub accept_host_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -80,9 +71,37 @@ pub enum Command {
         /// A saved server's name, or `[user@]host[:port]` to add one.
         #[arg(value_name = "SERVER")]
         target: Option<String>,
+
+        /// The SSH host key fingerprint to trust without prompting, e.g.
+        /// `SHA256:qKqv...`. Compared verbatim against what the server
+        /// offers, and fails on a mismatch rather than prompting — it does
+        /// not weaken the check, it just answers it non-interactively. This
+        /// is how an unattended run (CI, a container test) gets past a
+        /// prompt that has no terminal to show on. Only `riabuild remote`
+        /// ever reads a host key, so this flag lives here rather than as a
+        /// global: nothing about `status`, `login`, or the default flow can
+        /// use it.
+        #[arg(long, value_name = "FINGERPRINT", value_parser = accept_host_key_shape)]
+        accept_host_key: Option<String>,
+
         #[command(subcommand)]
         action: Option<RemoteAction>,
     },
+}
+
+/// `identity::fingerprint_of` (Task 15) only ever extracts a token starting
+/// with `SHA256:` out of `ssh-keygen -lf` output, so a value lacking that
+/// prefix can never match one — rejecting it here loses nothing that would
+/// otherwise have succeeded. Letting it through instead would surface as
+/// Task 15's mismatch message ("expected X, the server offered Y" under
+/// "trusting <host>"), wording meant for a possible man-in-the-middle. A
+/// typo or a truncated paste must not read as an attack.
+fn accept_host_key_shape(value: &str) -> Result<String, String> {
+    if value.starts_with("SHA256:") {
+        Ok(value.to_string())
+    } else {
+        Err("must look like a `ssh-keygen -lf` fingerprint, e.g. `SHA256:qKqv...`".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -145,7 +164,8 @@ mod tests {
             cli.command,
             Some(Command::Remote {
                 target: None,
-                action: None
+                action: None,
+                ..
             })
         ));
     }
@@ -203,10 +223,10 @@ mod tests {
 
     #[test]
     fn accept_host_key_feeds_the_flag_verbatim() {
-        // No shape validation here — `identity::trust_host` (Task 15) does an
-        // exact string comparison against what `ssh-keyscan` offers, so the
-        // CLI layer's job is only to carry the developer's text through
-        // unmodified, not to guess at what a valid fingerprint looks like.
+        // Beyond the `SHA256:` prefix, no further shape validation:
+        // `identity::trust_host` (Task 15) does an exact string comparison
+        // against what `ssh-keyscan` offers, so the CLI layer's job is only
+        // to carry the developer's text through unmodified from there.
         let cli = Cli::parse_from([
             "riabuild",
             "remote",
@@ -214,15 +234,59 @@ mod tests {
             "--accept-host-key",
             "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y",
         ]);
+        let Some(Command::Remote {
+            accept_host_key: Some(fingerprint),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected a fingerprint");
+        };
         assert_eq!(
-            cli.accept_host_key.as_deref(),
-            Some("SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y")
+            fingerprint,
+            "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y"
         );
     }
 
     #[test]
     fn accept_host_key_is_absent_by_default() {
         let cli = Cli::parse_from(["riabuild", "remote", "build-01"]);
-        assert_eq!(cli.accept_host_key, None);
+        let Some(Command::Remote {
+            accept_host_key, ..
+        }) = cli.command
+        else {
+            panic!("expected the remote command");
+        };
+        assert_eq!(accept_host_key, None);
+    }
+
+    #[test]
+    fn accept_host_key_is_scoped_to_remote_not_global() {
+        // R13: a global `Cli` field let this parse — and be silently
+        // discarded — on any other subcommand, or on a bare invocation.
+        // Scoped to `Command::Remote`, clap must reject both.
+        assert!(
+            Cli::try_parse_from(["riabuild", "--accept-host-key", "SHA256:aaaa", "status"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["riabuild", "--accept-host-key", "SHA256:aaaa"]).is_err());
+    }
+
+    #[test]
+    fn accept_host_key_must_look_like_a_sha256_fingerprint() {
+        // Task 15's `fingerprint_of` only ever extracts a `SHA256:`-prefixed
+        // token, so anything else can never match — and letting a typo or a
+        // truncated paste through would surface as Task 15's
+        // man-in-the-middle mismatch wording instead of a plain rejection
+        // here, while the developer can still see and fix what they typed.
+        assert!(
+            Cli::try_parse_from([
+                "riabuild",
+                "remote",
+                "build-01",
+                "--accept-host-key",
+                "qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y",
+            ])
+            .is_err()
+        );
     }
 }
