@@ -60,6 +60,38 @@ a task never records a success it has not verified.
 
 Then it drops you into your own shell with the environment applied.
 
+## Working on a server
+
+The same nine tasks, run over SSH against a Linux or macOS box instead of your laptop —
+for a build machine, a GPU box, or anything else with more resources than a laptop has.
+SSH is only the transport; the feature is **remote mode**.
+
+```sh
+riabuild remote                     # add or reconnect to a server, interactively
+riabuild remote build-01            # by the name you gave it last time
+riabuild remote ada@build-01.fly.dev:2222   # or spelled out, first time
+riabuild remote list                # every server this laptop knows about
+riabuild remote forget build-01     # undo everything below
+```
+
+The first connection generates an SSH key just for that server, shows you its host
+key fingerprint once, and asks you to confirm it — same as `ssh` would the first time,
+except riabuild remembers the answer in its own `known_hosts` rather than yours. From
+there it authorises the key, installs its own binary on the server, mints the server a
+session of its own (separate from your laptop's), lends it your GitHub sign-in for the
+one setup run that needs it, and runs the same nine tasks against a namespace of its
+own — `~/.riabuild-remote/<your-member-id>` — so several developers can share one Unix
+account on the box without colliding. It finishes by opening a shell there, over `mosh`
+where that is reachable and `ssh` otherwise, so a dropped connection or a laptop that
+goes to sleep does not end your session.
+
+`riabuild remote forget <name>` undoes all of it: it revokes the server's session on
+riabuild-web first (so a network hiccup never leaves a live token nobody has a record
+of), then removes what it left on the server — its namespace and its line in
+`authorized_keys` — and only then deletes your local key and the saved entry. A server
+riabuild cannot currently reach is still forgotten locally; what it could not clean up
+on the server is reported, not silently dropped.
+
 ## Two rules that shape everything
 
 **The server ships data, never logic.** Setup tasks live in the signed binary. A

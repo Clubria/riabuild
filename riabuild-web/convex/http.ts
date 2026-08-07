@@ -210,6 +210,12 @@ http.route({
 
       return jsonResponse({
         token,
+        // Additive field: `redeem` already computed this for the audit log,
+        // it was just never handed back before. `riabuild remote forget`
+        // needs it to name the exact `cliSessions` row a server's own
+        // session lives in when it calls `DELETE /api/v1/cli/sessions/<id>`
+        // — see convex/sessions.ts's `revokeById`.
+        sessionId: result.sessionId,
         expiresAt: result.expiresAt,
         member: memberPayload(result.member),
       });

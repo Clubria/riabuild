@@ -146,6 +146,54 @@ jobs:
           path: riabuild-web/e2e/__results__/
           if-no-files-found: ignore
 
+  remote-mode:
+    name: Remote mode against a container
+    runs-on: ubuntu-latest
+    # Skipped, visibly, rather than run without what it needs. Before it
+    # touches a server `riabuild remote` re-verifies Clubria org membership
+    # against real GitHub, and the built-in `github.token` is repo-scoped —
+    # it cannot answer `/user/memberships/orgs/*`. That needs a user token
+    # from a bot account in the org, stored as RIABUILD_E2E_GH_TOKEN.
+    #
+    # The secret is lifted to job-level `env` because the `secrets` context is
+    # not available in an `if:` — only `env` is, and only from job level. The
+    # steps below then gate on it, and say so when it is absent: a green tick
+    # from a run that never reached the container would be worse than no run.
+    env:
+      RIABUILD_E2E_GH_TOKEN: ${{ secrets.RIABUILD_E2E_GH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: riabuild-cli
+
+      - run: cargo build --release --locked
+        working-directory: riabuild-cli
+
+      # `run.sh` distinguishes a real regression (SSH, identity, host-key
+      # trust, authorising the key, riabuild-web) from the one known, tracked
+      # gap: no published release has a Linux/musl checksum yet, so
+      # `install::ensure_riabuild` cannot finish on this container today. That
+      # gap exits 0 with a clearly labelled banner — but only after asserting,
+      # against the container, that the earlier stages really ran. Anything
+      # else, including a hang, fails this step for real.
+      - run: bash e2e/remote/run.sh
+        if: env.RIABUILD_E2E_GH_TOKEN != ''
+        timeout-minutes: 20
+        env:
+          RIABUILD_BIN: ${{ github.workspace }}/riabuild-cli/target/release/riabuild
+
+      - name: Report that the container test was skipped
+        if: env.RIABUILD_E2E_GH_TOKEN == ''
+        run: |
+          echo "::warning title=Remote mode e2e skipped::\
+          RIABUILD_E2E_GH_TOKEN is not set, so the container test did not run. \
+          It needs a user token from an active Clubria org member; the built-in \
+          GITHUB_TOKEN cannot read /user/memberships/orgs/*."
+
   # The release workflow renders this template only after the GitHub release is
   # already published, so a template that does not parse would leave a released
   # version with a stale tap. Checking it on every pull request is what keeps

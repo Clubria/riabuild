@@ -140,6 +140,14 @@ describe("CLI login — loopback code exchange", () => {
     expect(body.member.githubLogin).toBe("ada");
     expect(typeof body.token).toBe("string");
 
+    // `riabuild remote forget` needs this to name the exact session it is
+    // revoking: it must be the real row id, not just present.
+    const sessionRowId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows[0]?._id;
+    });
+    expect(body.sessionId).toBe(sessionRowId);
+
     // The session is real: it authenticates the next request.
     const me = await t.fetch("/api/v1/me", { headers: bearer(body.token) });
     expect(me.status).toBe(200);

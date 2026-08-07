@@ -158,10 +158,8 @@ fn expires_soon(record: &super::store::Record) -> bool {
 /// session records its expiry there too, under the same entry, so a second
 /// `ensure` for the same server finds both without asking again.
 ///
-/// Not yet wired into `main.rs` — Task 21 orchestrates the whole `riabuild
-/// remote` flow and is this function's real caller. Until then it (and the
-/// helpers above it that only it uses) would be dead code from the binary's
-/// point of view, hence the allow.
+/// Called from `remote::flow::connect_and_setup`, which is `riabuild remote`'s
+/// real orchestration and the only production caller.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure(
     remote: &Remote,
@@ -209,14 +207,18 @@ pub async fn ensure(
             // Laptop's browser, server's hostname as the label: the dashboard
             // lists this session as its own revocable device, distinct from
             // the laptop's.
-            let (token, _member) =
+            let (token, _member, session_id) =
                 auth::login(api, runner.as_ref(), ui, web_url, version, &remote.host).await?;
             keychain.set(&token).await?;
             // Recorded so the check above can skip the round trip next time,
             // and so `riabuild remote list` can show it — which requires
             // actually saving the store, not just mutating it in memory.
+            // `session_id` is what lets `riabuild remote forget` name this
+            // exact session when it revokes it through
+            // `DELETE /api/v1/cli/sessions/<id>` — see `flow::forget_remote`.
             if let Some(saved) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
                 saved.session_expires_at = crate::config::now_millis() + SESSION_TTL_MS;
+                saved.session_id = session_id;
             }
             store.save(paths).await?;
             token

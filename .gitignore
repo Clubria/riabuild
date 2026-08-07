@@ -8,3 +8,7 @@ target/
 
 # OS
 .DS_Store
+
+# e2e/remote/run.sh writes this from a freshly generated key each run —
+# never a real credential, but never something to commit either.
+e2e/remote/authorized_keys

@@ -49,16 +49,42 @@ pub fn key_path(remote: &Remote, paths: &dyn Paths) -> PathBuf {
     paths.identity_dir().join(remote.hash())
 }
 
+/// The `-C` comment `ensure_key` puts on a freshly generated key.
+///
+/// `member_id` comes first and is what `remote::flow::forget_remote`'s
+/// server-side cleanup greps `authorized_keys` for via
+/// [`key_comment_marker`] — see `ensure_key`'s doc comment for why the member
+/// id, not the login target, has to be the unique part.
+pub fn key_comment(remote: &Remote, member_id: &str) -> String {
+    format!("riabuild {member_id} {}:{}", remote.target(), remote.port)
+}
+
+/// The substring `forget_remote` greps `authorized_keys` for — a prefix of
+/// [`key_comment`], shared so the two can never drift out of sync with each
+/// other.
+pub fn key_comment_marker(member_id: &str) -> String {
+    format!("riabuild {member_id}")
+}
+
 /// Generates the key pair if this server does not have one yet.
 ///
 /// Idempotent: a second call against the same `remote` finds the file
 /// `ssh-keygen` left behind and returns immediately, without shelling out
 /// again — `apply()` has to be safe to run twice, and this is the same rule.
+///
+/// `member_id` goes into the key's `-C` comment alongside the login target,
+/// because `riabuild remote forget`'s server-side cleanup greps
+/// `authorized_keys` for it. On a shared account every developer's comment
+/// would otherwise carry the identical `user@host:port` (Task 15's original
+/// shape), so forgetting one developer's key would delete everyone's line —
+/// the member id is the one part of the comment that is unique per developer
+/// rather than per server.
 pub async fn ensure_key(
     remote: &Remote,
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
+    member_id: &str,
 ) -> Result<PathBuf> {
     let path = key_path(remote, paths);
     // Repaired unconditionally, before the existence check — same order as
@@ -85,7 +111,7 @@ pub async fn ensure_key(
                 "-N",
                 "",
                 "-C",
-                &format!("riabuild {}:{}", remote.target(), remote.port),
+                &key_comment(remote, member_id),
                 "-f",
                 &path.to_string_lossy(),
             ],
@@ -390,6 +416,25 @@ mod tests {
         assert_eq!(fingerprint_of("nothing useful here").as_deref(), None);
     }
 
+    const MEMBER_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn the_key_comment_leads_with_the_member_id_not_just_the_login_target() {
+        // On a shared account every developer's login target (`ada@box:22`)
+        // is identical; the member id is what `forget_remote` can grep for
+        // without also deleting a co-tenant's line.
+        let comment = key_comment(&remote(), MEMBER_ID);
+        assert!(
+            comment.starts_with(&format!("riabuild {MEMBER_ID} ")),
+            "{comment}"
+        );
+        assert!(comment.contains(&remote().target()), "{comment}");
+        assert!(
+            comment.contains(&key_comment_marker(MEMBER_ID)),
+            "{comment}"
+        );
+    }
+
     #[tokio::test]
     async fn a_key_is_generated_once_and_reused() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -399,7 +444,7 @@ mod tests {
 
         // First call generates. The fake does not write files, so simulate what
         // ssh-keygen would leave behind before the second call.
-        let path = ensure_key(&remote(), &paths, fake.clone(), &ui)
+        let path = ensure_key(&remote(), &paths, fake.clone(), &ui, MEMBER_ID)
             .await
             .expect("generate");
         assert!(
@@ -413,10 +458,17 @@ mod tests {
             fake.calls().iter().any(|c| c.contains("-N ")),
             "the key must have no passphrase"
         );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| c.contains(&format!("riabuild {MEMBER_ID}"))),
+            "the key comment must carry the member id, for forget_remote to grep on: {:?}",
+            fake.calls()
+        );
 
         tokio::fs::write(&path, "PRIVATE").await.expect("write");
         let again = Arc::new(FakeRunner::new().with("ssh-keygen", 0, "", ""));
-        ensure_key(&remote(), &paths, again.clone(), &ui)
+        ensure_key(&remote(), &paths, again.clone(), &ui, MEMBER_ID)
             .await
             .expect("reuse");
         assert!(
@@ -445,7 +497,7 @@ mod tests {
             .expect("loosen");
 
         let fake = Arc::new(FakeRunner::new());
-        ensure_key(&remote(), &paths, fake, &ui)
+        ensure_key(&remote(), &paths, fake, &ui, MEMBER_ID)
             .await
             .expect("reuse");
 

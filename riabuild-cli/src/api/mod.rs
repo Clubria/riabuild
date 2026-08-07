@@ -195,6 +195,17 @@ impl ApiClient {
         .await
     }
 
+    /// `DELETE`, for `remote::flow::forget_remote`'s call to
+    /// `/api/v1/cli/sessions/<id>`. No body either direction: the id is in
+    /// the path, and the server replies with a small JSON envelope.
+    pub async fn delete_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        interpret(
+            self.request(reqwest::Method::DELETE, path).send().await,
+            path,
+        )
+        .await
+    }
+
     /// `GET /api/v1/me`
     ///
     /// Fetches the envelope untyped through `interpret`, then hands the

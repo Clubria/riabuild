@@ -94,8 +94,13 @@ src/
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
   keychain.rs  secret storage (trait)  runner.rs    CommandRunner — all subprocesses
   update.rs    version check, re-exec  ui.rs        output and prompts
+  scope.rs     laptop vs. server, from gh_session.rs  server-only GitHub config dir,
+               RIABUILD_REMOTE                        lives only as long as a session
   api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
+  remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
+               trust, authorising a key, installing the server's own binary, minting its
+               session, seeding a GitHub sign-in, and the mosh/ssh shell handoff
 ```
 
 One task per file. When a file passes roughly 300 lines, it is doing too much.

@@ -240,11 +240,21 @@ async fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     token: String,
+    /// The `cliSessions` row this token belongs to. `remote::session::ensure`
+    /// keeps it in `remotes.json` so `riabuild remote forget` knows exactly
+    /// which session to revoke through `DELETE /api/v1/cli/sessions/<id>`
+    /// rather than guessing from a device label.
+    #[serde(rename = "sessionId")]
+    session_id: String,
     member: Member,
 }
 
-/// Runs the whole flow and returns the session token. The caller stores it in
-/// the keychain; it is never written to `~/.riabuild`.
+/// Runs the whole flow and returns the session token, the member it belongs
+/// to, and the `cliSessions` row id behind it. The caller stores the token in
+/// the keychain; it is never written to `~/.riabuild`. The session id is not
+/// a secret — it names a row, not a credential — and `remote::session::ensure`
+/// is the one caller that keeps it, for `riabuild remote forget` to revoke by
+/// later.
 ///
 /// `label` is the caller's to choose, so the dashboard lists each session
 /// under the device it belongs to rather than always "this machine" — and
@@ -257,7 +267,7 @@ pub async fn login(
     web_url: &str,
     version: &str,
     label: &str,
-) -> Result<(String, Member)> {
+) -> Result<(String, Member, String)> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
         Failure::new(
             "opening a local port for the browser to come back to",
@@ -292,7 +302,7 @@ pub async fn login(
         )
         .await?;
 
-    Ok((response.token, response.member))
+    Ok((response.token, response.member, response.session_id))
 }
 
 #[cfg(test)]

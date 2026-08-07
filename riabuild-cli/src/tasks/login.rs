@@ -67,7 +67,11 @@ impl Task for Login {
         let version = ctx.cli_version.clone();
         let label = auth::device_label(ctx.runner.as_ref()).await;
         ctx.ui.heading("Signing this machine in to riabuild");
-        let (token, member) = auth::login(
+        // The session id `auth::login` also returns is only ever needed to
+        // revoke a *server's* session (`remote::session::ensure` keeps it for
+        // that); a laptop's own sign-in has no analogous "forget" command, so
+        // there is nothing here to keep it for.
+        let (token, member, _session_id) = auth::login(
             &ctx.api,
             ctx.runner.as_ref(),
             &ctx.ui,

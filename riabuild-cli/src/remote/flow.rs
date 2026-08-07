@@ -5,9 +5,11 @@
 //! orchestration in as well would have pushed that file well past the
 //! crate's ~300-line production budget.
 
-use super::{Remote, shell, ssh_once, store};
+use super::{Remote, shell, shell_command, shell_quote, ssh_once, store};
 use super::{authorise, env_command, env_prefix, identity, install, resolve_home, seed, session};
+use crate::api::{ApiClient, ApiError};
 use crate::cli::{Cli, Command, RemoteAction};
+use crate::keychain;
 use crate::paths::Paths;
 use crate::runner::CommandRunner;
 use crate::tasks::{Ctx, Status, Task};
@@ -27,18 +29,28 @@ pub async fn run(
     match action {
         Some(RemoteAction::List) => return store::list(ctx, &store),
         Some(RemoteAction::Forget { name }) => {
-            // `forget_remote` — the API session revocation, the key, and the
-            // server-side namespace and authorized_keys line — is Task 22's,
-            // not this task's: it needs Task 15's key-comment change (so the
-            // cleanup can find *this developer's* line and nobody else's)
-            // that no other part of Task 21 depends on. Rather than ship a
-            // partial deletion here that Task 22 would then have to unwind —
-            // R2's own lesson about a half-built interface being worse than
-            // an honest gap — this says plainly that it is not here yet.
-            ctx.ui.note(&format!(
-                "`riabuild remote forget {name}` is not implemented yet."
-            ));
-            return Ok(1);
+            // Needs `ctx.member`/`ctx.api`'s bearer token, both of which
+            // `connect` populates: the API revoke below authenticates as
+            // this laptop's own session, and the server-side cleanup needs
+            // to know whose namespace it is clearing. The default flow below
+            // also calls `connect`, but only after this match already
+            // returned for `list`/`forget`.
+            crate::connect(ctx).await?;
+            let member = ctx
+                .member
+                .clone()
+                .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
+            forget_remote(
+                ctx.paths.as_ref(),
+                ctx.runner.clone(),
+                &ctx.ui,
+                &ctx.api,
+                &member.member_id,
+                &mut store,
+                &name,
+            )
+            .await?;
+            return Ok(0);
         }
         None => {}
     }
@@ -91,16 +103,16 @@ async fn connect_and_setup(
         .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
     let version = ctx.org()?.latest_cli_version.clone();
 
-    let home = resolve_home(&remote, ctx.paths.as_ref(), ctx.runner.clone(), store).await?;
-    let prefix = env_prefix(&home, &member.member_id, &remote.name);
-    let prefix_refs: Vec<(&str, &str)> = prefix
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-
     ctx.ui
         .heading(&format!("Connecting to {}", remote.target()));
-    identity::ensure_key(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
+    identity::ensure_key(
+        &remote,
+        ctx.paths.as_ref(),
+        ctx.runner.clone(),
+        &ctx.ui,
+        &member.member_id,
+    )
+    .await?;
     // R12: the flag threaded here, not `None` — a `None` compiles, passes
     // every test that does not check for it, and silently reduces
     // `trust_host` to the interactive prompt, which errors out with no TTY
@@ -114,6 +126,26 @@ async fn connect_and_setup(
     )
     .await?;
     authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
+
+    // `resolve_home` runs its own command over `ssh_once`, which is refused
+    // outright — before any authentication is even attempted — by a host key
+    // `trust_host` has not pinned yet or a key `authorise` has not put in
+    // `authorized_keys` yet (`StrictHostKeyChecking=yes` fails the whole
+    // connection at the host-key step, before publickey auth is offered a
+    // chance). It has to come after both, or the very first `riabuild
+    // remote <new-server>` — the one case every unit test in this file
+    // sidesteps by pre-seeding `record.home` in its fixture — fails
+    // immediately with a confusing "asking … where your home directory is"
+    // error instead of ever reaching the host-key prompt. Found by actually
+    // running this flow against a fresh container in Task 22's e2e test,
+    // which is the one place a truly new remote is ever exercised.
+    let home = resolve_home(&remote, ctx.paths.as_ref(), ctx.runner.clone(), store).await?;
+    let prefix = env_prefix(&home, &member.member_id, &remote.name);
+    let prefix_refs: Vec<(&str, &str)> = prefix
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+
     let binary = install::ensure_riabuild(
         &remote,
         ctx.paths.as_ref(),
@@ -235,6 +267,153 @@ async fn sweep_then_seed(
     )
     .await?;
     seed::seed_github(remote, paths, runner, ui, remote_binary).await
+}
+
+/// `riabuild remote forget <name>` — the reverse of `connect_and_setup`, done
+/// in the one order that is safe to interrupt: revoke on riabuild-web, then
+/// best-effort clean up the server, then delete what is local.
+///
+/// **Why this order and no other.** An earlier draft deleted the local SSH
+/// key first. That left `ssh -o IdentitiesOnly=yes` unable to authenticate,
+/// so the server-side cleanup silently failed, and the store entry was gone
+/// too — nobody could retry, and the token stayed live on the server
+/// forever, unrecorded anywhere on this laptop. Revoking first means that if
+/// anything after it fails, the token is already dead: a live credential
+/// with no local record of it is the one state this function must never
+/// produce, but a dead credential whose local record briefly outlives it is
+/// harmless.
+///
+/// **What "unreachable" means at each step, and why they differ.** The API
+/// revoke talks to riabuild-web, which this laptop needs for everything else
+/// it does; a failure there stops this function outright; loudly, before
+/// anything local changes, because the token's fate is genuinely unknown.
+/// The SSH cleanup talks to the server being forgotten, which may be off,
+/// rebuilt, or simply unreachable from here right now — that failure is
+/// reported but never fatal, because a server that happens to be down must
+/// not become a server nobody can ever forget. The local delete (keychain
+/// item, key pair, `remotes.json` entry) always runs once the API step has
+/// succeeded, for the same reason: those are the developer's own records,
+/// not the server's, and there is nothing left that could make deleting them
+/// unsafe.
+pub async fn forget_remote(
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    ui: &Ui,
+    api: &ApiClient,
+    member_id: &str,
+    store: &mut store::Store,
+    name: &str,
+) -> Result<()> {
+    let Some(record) = store.find(name).cloned() else {
+        return Err(anyhow!("there is no saved server named \"{name}\""));
+    };
+    let remote: Remote = (&record).into();
+
+    // 1. Revoke first. An empty `session_id` means no session was ever
+    //    minted for this server (it was only ever added, never connected
+    //    to) — nothing to revoke, so this is not skipped as a failure.
+    if !record.session_id.is_empty() {
+        revoke_session(api, &record.session_id).await?;
+    }
+
+    // 2. Best-effort cleanup on the server itself.
+    cleanup_server_side(&remote, paths, runner.clone(), ui, &record, member_id).await;
+
+    // 3. Local delete: the keychain item, the key pair, and the store entry.
+    let account = keychain::for_account(runner, &keychain::remote_account(&remote.hash()), None);
+    account.delete().await?;
+
+    match tokio::fs::remove_file(identity::key_path(&remote, paths)).await {
+        Ok(()) => {}
+        // Nothing to remove is success here too — `ensure_key` never ran, or
+        // this is a second `forget` after a first one already got this far.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    store.remotes.retain(|r| r.name != name);
+    store.save(paths).await?;
+
+    ui.note(&format!("Forgot {name}."));
+    Ok(())
+}
+
+/// Step 1 of [`forget_remote`]: revoke this server's session through
+/// `DELETE /api/v1/cli/sessions/<id>` (Task 3b).
+async fn revoke_session(api: &ApiClient, session_id: &str) -> Result<()> {
+    match api
+        .delete_json::<serde_json::Value>(&format!("/api/v1/cli/sessions/{session_id}"))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if already_revoked(&error) => Ok(()),
+        Err(error) => Err(Failure::new(
+            "revoking this server's riabuild session",
+            "Check your network connection, then run `riabuild remote forget` again — \
+             until this succeeds, the token this laptop minted is still live on the server.",
+        )
+        .detail(error.to_string())
+        .into()),
+    }
+}
+
+/// Whether an error from [`revoke_session`]'s call means the session was
+/// already gone rather than that the call itself failed. "Already gone"
+/// reads as success — the goal ("no live token") already holds, whether this
+/// laptop revoked it or something else did (another laptop's `forget`, an
+/// admin, natural expiry) — so a retry after a half-finished `forget` must
+/// not get stuck here forever.
+fn already_revoked(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|api_error| api_error.code == "session_unknown")
+}
+
+/// Step 2 of [`forget_remote`]: the namespace and the `authorized_keys` line
+/// this developer's own key added, if either was ever created.
+///
+/// Never fails the caller: an unreachable server here is reported through
+/// `ui.warn` and left for a human to notice, not propagated as an error that
+/// would stop the local delete that follows it.
+async fn cleanup_server_side(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    ui: &Ui,
+    record: &store::Record,
+    member_id: &str,
+) {
+    if record.home.is_empty() {
+        // `resolve_home` never succeeded for this server — nothing was ever
+        // installed on it to clean up.
+        return;
+    }
+
+    let ns = session::namespace(&record.home, member_id);
+    let keys = format!("{}/.ssh/authorized_keys", record.home);
+    // Matched on the member id, as a fixed string via `grep -vF`. On a
+    // shared account every developer's key comment carries the same
+    // `user@host`, so matching on that would delete Bob's and Carla's lines
+    // too and lock them out of the box with no diagnostic anywhere. `sed`
+    // would also read the hostname's dots as wildcards, and `-i.bak` would
+    // leave the "removed" key sitting in a sibling file instead of gone.
+    let cleanup = shell_command(&format!(
+        "rm -rf {ns}; if [ -f {keys} ]; then grep -vF {marker} {keys} {redirect} {keys}.new \
+         && cat {keys}.new {redirect} {keys} && rm -f {keys}.new; fi",
+        ns = shell_quote(&ns),
+        keys = shell_quote(&keys),
+        marker = shell_quote(&identity::key_comment_marker(member_id)),
+        redirect = ">",
+    ));
+
+    let outcome = ssh_once(remote, paths, runner, &cleanup).await;
+    let succeeded = matches!(&outcome, Ok(output) if output.ok());
+    if !succeeded {
+        ui.warn(&format!(
+            "Could not reach {}. Its riabuild namespace and authorized_keys line are still there.",
+            remote.host
+        ));
+    }
 }
 
 /// The two tasks a laptop runs before it touches a server.
@@ -512,5 +691,168 @@ mod tests {
             "{:?}",
             fake.calls()
         );
+    }
+
+    /// `record_for` leaves `session_id` empty, the same as a server that was
+    /// only ever added, never connected to — nothing was ever minted, so the
+    /// API revoke step (which would otherwise need a real riabuild-web this
+    /// crate's test scaffolding has never stood up — see `session.rs`'s own
+    /// note on `auth::login`) is skipped entirely. What this test actually
+    /// pins is the ordering everything else in `forget_remote` cares about:
+    /// the server-side cleanup runs, and the key file and the store entry
+    /// both go.
+    #[tokio::test]
+    async fn forgetting_a_server_removes_the_key_the_entry_and_the_ssh_line() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let target = remote();
+        tokio::fs::create_dir_all(paths.identity_dir())
+            .await
+            .expect("mkdir");
+        tokio::fs::write(paths.identity_dir().join(target.hash()), "KEY")
+            .await
+            .expect("key");
+
+        let mut store = store::Store::default();
+        let mut record = store::record_for(&target);
+        record.home = "/home/dev".to_string();
+        store.remotes.push(record);
+
+        let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
+        let api = ApiClient::new("0.1.0");
+
+        forget_remote(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &api,
+            &member().member_id,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(store.find("build-01").is_none());
+        assert!(!paths.identity_dir().join(target.hash()).exists());
+        assert!(
+            fake.calls().iter().any(|call| call.contains("rm -rf")),
+            "the namespace on the server goes too: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_unreachable_server_says_what_it_left_behind() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let mut store = store::Store::default();
+        let mut record = store::record_for(&remote());
+        record.home = "/home/dev".to_string();
+        store.remotes.push(record);
+
+        let fake = Arc::new(FakeRunner::new().with("ssh", 255, "", "Connection refused"));
+        let api = ApiClient::new("0.1.0");
+
+        forget_remote(
+            &paths,
+            fake,
+            &Ui::new(true),
+            &api,
+            &member().member_id,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("must still forget locally");
+
+        // The local half always succeeds: a server you cannot reach must not
+        // be a server you cannot remove.
+        assert!(store.find("build-01").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_resolved_a_home_has_nothing_on_it_to_clean_up() {
+        // No `record.home` means `resolve_home` never succeeded — the server
+        // was added, maybe attempted, but riabuild never got far enough to
+        // install anything there. `cleanup_server_side` must not construct a
+        // namespace out of an empty home and must not touch `ssh` at all.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let mut store = store::Store::default();
+        store.remotes.push(store::record_for(&remote()));
+
+        let fake = Arc::new(FakeRunner::new());
+        let api = ApiClient::new("0.1.0");
+
+        forget_remote(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &api,
+            &member().member_id,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(
+            fake.calls().is_empty(),
+            "nothing was ever installed on this server: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_server_that_was_never_saved_is_an_error_not_a_silent_no_op() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let mut store = store::Store::default();
+        let api = ApiClient::new("0.1.0");
+
+        let error = forget_remote(
+            &paths,
+            Arc::new(FakeRunner::new()),
+            &Ui::new(true),
+            &api,
+            &member().member_id,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect_err("nothing named build-01 was ever saved");
+        assert!(error.to_string().contains("build-01"), "{error}");
+    }
+
+    #[test]
+    fn a_session_unknown_error_reads_as_already_revoked_not_a_failure() {
+        // Someone else already forgot this server — another laptop, an admin,
+        // natural expiry. The goal ("no live token") already holds, so this
+        // must not block a retry that would otherwise never find anything to
+        // revoke on the second attempt.
+        let error: anyhow::Error = ApiError {
+            status: 404,
+            code: "session_unknown".into(),
+            message: "x".into(),
+            action: "y".into(),
+        }
+        .into();
+        assert!(already_revoked(&error));
+    }
+
+    #[test]
+    fn any_other_failure_is_not_mistaken_for_already_revoked() {
+        let upstream: anyhow::Error = ApiError {
+            status: 503,
+            code: "upstream_error".into(),
+            message: "x".into(),
+            action: "y".into(),
+        }
+        .into();
+        assert!(!already_revoked(&upstream));
+
+        let transport = anyhow!("riabuild could not reach riabuild-web");
+        assert!(!already_revoked(&transport));
     }
 }

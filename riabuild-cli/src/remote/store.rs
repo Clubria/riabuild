@@ -33,6 +33,15 @@ pub struct Record {
     /// construction, so every literal in this file names it explicitly.
     #[serde(default)]
     pub home: String,
+    /// The `cliSessions` row id behind this server's own session, from
+    /// `TokenResponse::session_id`. Empty until `remote::session::ensure`
+    /// mints a session for the first time (or for a `remotes.json` written
+    /// before this field existed — `#[serde(default)]` again, not
+    /// struct-literal construction). `remote::flow::forget_remote` treats
+    /// empty as "nothing minted, nothing to revoke" and skips straight to
+    /// the SSH cleanup rather than calling the API with an empty id.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +139,7 @@ pub fn add(store: &mut Store, remote: &Remote) {
         session_expires_at: 0,
         last_seen_cli_version: String::new(),
         home: String::new(),
+        session_id: String::new(),
     });
 }
 
@@ -266,6 +276,7 @@ pub fn record_for(remote: &super::Remote) -> Record {
         session_expires_at: 0,
         last_seen_cli_version: String::new(),
         home: String::new(),
+        session_id: String::new(),
     }
 }
 
@@ -418,6 +429,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            session_id: String::new(),
         });
         store.save(&paths).await.expect("save");
 
@@ -445,6 +457,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            session_id: String::new(),
         });
         store.save(&paths).await.expect("save");
 
@@ -460,6 +473,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            session_id: String::new(),
         });
         reloaded.save(&paths).await.expect("save");
 
