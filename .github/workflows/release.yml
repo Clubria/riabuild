@@ -334,25 +334,33 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+          # Listings are captured before being searched, never piped into
+          # `grep -q`. grep exits at its first match and closes the pipe;
+          # dpkg-deb's tar subprocess then fails its next write, and `pipefail`
+          # turns that into a failed step. It is a race, so it stays invisible
+          # until the archive is long enough that tar is still writing when
+          # grep leaves — adding the copyright file was enough to cross that
+          # line, and the assertion that broke was not the one that changed.
           for deb in dist/*.deb; do
             dpkg-deb --info "$deb"
+            contents=$(dpkg-deb --contents "$deb")
             # A package that does not put the binary on PATH installs nothing
             # useful, and neither dpkg-deb nor apt would complain.
-            dpkg-deb --contents "$deb" | grep -q './usr/bin/riabuild'
-            dpkg-deb --field "$deb" Version | grep -qx "$VERSION"
-            test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
+            grep -q './usr/bin/riabuild' <<<"$contents"
             # MIT asks that the notice travel with every copy, including a
             # binary one. Debian looks for it under this exact name.
-            dpkg-deb --contents "$deb" | grep -q './usr/share/doc/riabuild/copyright'
+            grep -q './usr/share/doc/riabuild/copyright' <<<"$contents"
+            test "$(dpkg-deb --field "$deb" Version)" = "$VERSION"
+            test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
           done
           for rpm in dist/*.rpm; do
             rpm -qip "$rpm"
-            rpm -qlp "$rpm" | grep -qx '/usr/bin/riabuild'
+            grep -qx '/usr/bin/riabuild' <<<"$(rpm -qlp "$rpm")"
             test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$VERSION"
             test "$(rpm -qp --queryformat '%{ARCH}' "$rpm")" = "${{ matrix.arch }}"
             # `-qL` lists only what is marked %license, so this checks the
             # marking rather than that a file called LICENSE got swept in.
-            rpm -qLp "$rpm" | grep -q 'LICENSE'
+            grep -q 'LICENSE' <<<"$(rpm -qLp "$rpm")"
             test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
           done
 
