@@ -187,10 +187,26 @@ pub struct FakeRunner {
     sequenced: std::sync::Mutex<HashMap<String, VecDeque<CommandOutput>>>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
-    /// Invocation and the environment it was given, so a test can assert a task
-    /// ran against the right configuration directory and not merely that it ran.
-    #[allow(clippy::type_complexity)]
-    pub recorded: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>,
+    /// Invocation, the environment it was given, and the bytes it was given on
+    /// stdin — so a test can assert a task ran against the right configuration
+    /// directory and not merely that it ran, and can assert a piped secret
+    /// actually *arrived* rather than only that it was absent from argv.
+    ///
+    /// Recording stdin is not a convenience. Every "the secret travels on
+    /// stdin" test is otherwise half-blind: deleting the `stdin: Some(…)` from
+    /// the call site leaves the token absent from argv, which is all such a
+    /// test could see, so it stays green while the child receives an empty
+    /// pipe — an empty `session.token` written 0600 and reported as success.
+    pub recorded: std::sync::Mutex<Vec<Recorded>>,
+}
+
+/// One recorded invocation: what was run, with what environment, and what was
+/// piped to it.
+#[cfg(test)]
+pub struct Recorded {
+    pub invocation: String,
+    pub env: Vec<(String, String)>,
+    pub stdin: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -266,9 +282,32 @@ impl FakeRunner {
             .lock()
             .unwrap()
             .iter()
-            .find(|(invocation, _)| invocation.starts_with(prefix))
-            .map(|(_, env)| env.clone())
+            .find(|call| call.invocation.starts_with(prefix))
+            .map(|call| call.env.clone())
             .unwrap_or_default()
+    }
+
+    /// The bytes the first matching invocation was given on stdin, or `None`
+    /// if it was given none.
+    ///
+    /// The positive half of every "a secret travels on stdin, never in argv"
+    /// assertion: `calls()` can only ever show a secret's *absence* from the
+    /// command line, which a call site that pipes nothing at all satisfies
+    /// just as well as one that pipes correctly.
+    pub fn stdin_of(&self, prefix: &str) -> Option<Vec<u8>> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.invocation.starts_with(prefix))
+            .and_then(|call| call.stdin.clone())
+    }
+
+    /// [`Self::stdin_of`] decoded as UTF-8, for the common case where the
+    /// piped payload is a token rather than a binary.
+    pub fn stdin_text_of(&self, prefix: &str) -> Option<String> {
+        self.stdin_of(prefix)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Pops the next response queued by `then()` for the longest matching
@@ -340,10 +379,11 @@ impl CommandRunner for FakeRunner {
         let invocation = format!("{program} {}", args.join(" "));
         let invocation = invocation.trim_end().to_string();
         self.calls.lock().unwrap().push(invocation.clone());
-        self.recorded
-            .lock()
-            .unwrap()
-            .push((invocation.clone(), options.env.clone()));
+        self.recorded.lock().unwrap().push(Recorded {
+            invocation: invocation.clone(),
+            env: options.env.clone(),
+            stdin: options.stdin.clone(),
+        });
         Ok(self.lookup(&invocation))
     }
 
@@ -356,10 +396,11 @@ impl CommandRunner for FakeRunner {
         let invocation = format!("{program} {}", args.join(" "));
         let invocation = invocation.trim_end().to_string();
         self.calls.lock().unwrap().push(invocation.clone());
-        self.recorded
-            .lock()
-            .unwrap()
-            .push((invocation.clone(), options.env.clone()));
+        self.recorded.lock().unwrap().push(Recorded {
+            invocation: invocation.clone(),
+            env: options.env.clone(),
+            stdin: options.stdin.clone(),
+        });
         // A stub's exit code applies here too: interactive commands fail as
         // well — a developer who abandons a device-code prompt leaves `gh`
         // exiting non-zero — and a task that ignores that reports a sign-in
@@ -386,17 +427,26 @@ impl CommandRunner for FakeRunner {
 /// remembers to pass — the runner every task already holds carries them, so a
 /// task that forgets is not a thing anyone can write.
 ///
-/// The scope's own keys — `RIABUILD_ROOT`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL` —
-/// are applied *after* the caller's `RunOptions.env`, so they are not
-/// overridable: `std::process::Command::env()` (see `RealRunner::build`)
-/// overwrites on a repeated key, and the scope's entries are the ones applied
-/// last. A task cannot escape its namespace even by naming one of these keys
-/// itself — accidentally (a copy-pasted env vector from another task) or
-/// otherwise. Every other variable a caller sets — `env_local`'s
-/// `INFISICAL_TOKEN`, for instance — has nothing here to collide with, so it
-/// reaches the child untouched. See the precedence tests below, including one
-/// that pins the collision case: it is written to fail if the merge order were
-/// ever put back the other way around.
+/// Whatever keys the scope was constructed with are applied *after* the
+/// caller's `RunOptions.env`, so they are not overridable:
+/// `std::process::Command::env()` (see `RealRunner::build`) overwrites on a
+/// repeated key, and the scope's entries are the ones applied last. A task
+/// cannot escape its namespace even by naming one of these keys itself —
+/// accidentally (a copy-pasted env vector from another task) or otherwise.
+/// Every other variable a caller sets — `env_local`'s `INFISICAL_TOKEN`, for
+/// instance — has nothing here to collide with, so it reaches the child
+/// untouched. See the precedence tests below, including one that pins the
+/// collision case: it is written to fail if the merge order were ever put back
+/// the other way around.
+///
+/// The un-overridable set is exactly what `main.rs` puts in, and today that is
+/// **`GH_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` only**. `RIABUILD_ROOT` is *not*
+/// in it: it reaches children by ordinary process-environment inheritance
+/// instead, which the precedence rule above does not cover, so a task that put
+/// `RIABUILD_ROOT` in its own `RunOptions.env` would win over the inherited
+/// value. No task does that today. Do not read this comment as saying the
+/// namespace root is protected the way the two config paths are — if that
+/// protection is ever wanted, `main.rs` has to add the key here.
 pub struct ScopedRunner {
     inner: Arc<dyn CommandRunner>,
     env: Vec<(String, String)>,
@@ -622,6 +672,37 @@ mod tests {
             .await
             .expect("wc runs");
         assert_eq!(output.trimmed(), bytes.len().to_string());
+    }
+
+    #[tokio::test]
+    async fn the_fake_records_piped_bytes_and_reports_none_when_nothing_was_piped() {
+        // The accessor every "a secret travels on stdin" test now leans on. It
+        // has to distinguish the two cases, not merely return something: a
+        // `stdin_of` that answered `Some` unconditionally would make all four
+        // of those tests green again for exactly the reason they were written.
+        let fake = FakeRunner::new()
+            .with("security", 0, "", "")
+            .with("id", 0, "", "");
+        fake.run(
+            "security",
+            &["add-generic-password"],
+            &RunOptions {
+                stdin: Some(b"piped-secret".to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("runs");
+        fake.run("id", &[], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!(
+            fake.stdin_text_of("security").as_deref(),
+            Some("piped-secret")
+        );
+        assert_eq!(fake.stdin_of("id"), None);
+        assert_eq!(fake.stdin_of("never-run"), None);
     }
 
     #[tokio::test]

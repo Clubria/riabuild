@@ -66,6 +66,11 @@ The same nine tasks, run over SSH against a Linux or macOS box instead of your l
 for a build machine, a GPU box, or anything else with more resources than a laptop has.
 SSH is only the transport; the feature is **remote mode**.
 
+**macOS servers work today.** Linux servers are fully supported by the code and will work
+as soon as the release pipeline publishes a `linux-musl` asset — until then riabuild
+cannot install itself on one, and pointing `riabuild remote` at a Linux box fails at the
+install step.
+
 ```sh
 riabuild remote                     # add or reconnect to a server, interactively
 riabuild remote build-01            # by the name you gave it last time

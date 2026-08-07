@@ -121,6 +121,17 @@ mod tests {
             "{:?}",
             fake.calls()
         );
+        // "piped" is the half `calls()` cannot see. Without this, deleting
+        // `stdin: Some(…)` above still passes: the token is absent from argv
+        // and `internal seed-github` still runs — it just reads EOF from
+        // `tokio::io::stdin()` and hands `gh auth login --with-token` an empty
+        // token. Note the trailing newline from `gh auth token` must already
+        // be gone: `gh` rejects a token with one.
+        assert_eq!(
+            fake.stdin_text_of("ssh").as_deref(),
+            Some("gho_super_secret"),
+            "the token must actually be piped to the server's riabuild"
+        );
     }
 
     #[tokio::test]

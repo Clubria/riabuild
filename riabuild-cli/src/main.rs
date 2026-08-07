@@ -77,7 +77,7 @@ async fn run(cli: Cli) -> Result<i32> {
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
     // A server has no keyring an SSH session can unlock, so its own session
     // lives in a file in its namespace instead — see `scope.rs`.
-    let session_token_file = scope.is_remote().then(|| paths.session_token_file());
+    let session_token_file = server_session_token_file(&scope, paths.as_ref())?;
     let keychain: Arc<dyn keychain::Keychain> =
         Arc::from(keychain::for_platform(runner.clone(), session_token_file));
 
@@ -100,7 +100,8 @@ async fn run(cli: Cli) -> Result<i32> {
         let runtime = gh_session::choose_runtime_dir(
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             std::env::var("TMPDIR").ok().as_deref(),
-        )?;
+        )
+        .await?;
         let member_id = member_id_from_root(paths.as_ref())?;
         if holds_gh_session_marker(&cli) {
             let session =
@@ -163,20 +164,22 @@ async fn run(cli: Cli) -> Result<i32> {
     code
 }
 
-/// The member id a remote-scoped `RIABUILD_ROOT` is namespaced under — the
-/// last path component of `paths.root()`.
+/// The member id this root is namespaced under — and, by being `Ok` at all,
+/// the single source of truth for "this riabuild is running inside a server
+/// namespace", read off the path that *is* the namespace rather than off a
+/// separate variable that would have to agree with it (R14's lesson).
 ///
-/// Never falls back to an empty string: `gh_session::open`/`attach` join this
-/// verbatim onto `riabuild-gh-`, so an empty id is exactly what would make
-/// every developer on a shared server collide onto one runtime directory —
-/// and share each other's GitHub credential. `paths::root_for` already
-/// refuses a `RIABUILD_ROOT` that isn't absolute (Task 6), so the only way
-/// `file_name()` comes back empty here is a root of `/` itself, which is
-/// worth a clear, actionable error rather than a silent collision.
+/// Only the `<home>/.riabuild-remote/<member-id>` shape `remote::env_prefix`
+/// sets `RIABUILD_ROOT` to qualifies, and never with an empty id:
+/// `gh_session::open`/`attach` join the id verbatim onto `riabuild-gh-`, so an
+/// empty one would collide every developer on a shared server onto one runtime
+/// directory — and onto each other's GitHub credential.
 fn member_id_from_root(paths: &dyn Paths) -> Result<String> {
-    paths
-        .root()
-        .file_name()
+    let root = paths.root();
+    root.parent()
+        .and_then(std::path::Path::file_name)
+        .filter(|parent| *parent == ".riabuild-remote")
+        .and_then(|_| root.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
@@ -186,6 +189,45 @@ fn member_id_from_root(paths: &dyn Paths) -> Result<String> {
             )
             .into()
         })
+}
+
+/// Where a *server* keeps its own riabuild session; `None` on a laptop, where
+/// the platform keychain holds it.
+///
+/// The two facts that make a riabuild "a server" — `RIABUILD_REMOTE` naming
+/// one, and `RIABUILD_ROOT` pointing into `.riabuild-remote/<member-id>` — are
+/// set together by `remote::env_prefix` and mean nothing apart. Choosing off
+/// the variable alone is what let `RIABUILD_REMOTE=x riabuild login` on a
+/// laptop write a bearer token in cleartext to `~/.riabuild/session.token` —
+/// the exact path `riabuild-cli/CLAUDE.md`'s invariant forbids — while
+/// `describe()` called it "this server's riabuild namespace". So the
+/// file-backed store is derived from the namespace, the fact that is actually
+/// load-bearing, and a scope contradicting it is refused rather than quietly
+/// resolved either way.
+fn server_session_token_file(
+    scope: &scope::Scope,
+    paths: &dyn Paths,
+) -> Result<Option<std::path::PathBuf>> {
+    match (member_id_from_root(paths).is_ok(), scope.is_remote()) {
+        (true, true) => Ok(Some(paths.session_token_file())),
+        (false, false) => Ok(None),
+        (namespaced, _) => Err(Failure::new(
+            "working out whether this riabuild is running on a managed server",
+            "Run `riabuild remote <server>` from your laptop again — it sets RIABUILD_ROOT and \
+             RIABUILD_REMOTE together, and only one of them arrived here.",
+        )
+        .detail(format!(
+            "RIABUILD_ROOT={:?} {} a server namespace, but RIABUILD_REMOTE {}",
+            paths.root(),
+            if namespaced { "is" } else { "is not" },
+            if namespaced {
+                "is not set"
+            } else {
+                "names one"
+            },
+        ))
+        .into()),
+    }
 }
 
 /// Whether this invocation goes on to hold the interactive environment shell
@@ -234,11 +276,7 @@ fn holds_gh_session_marker(cli: &Cli) -> bool {
 /// including an error, not just the successful paths dotted through the
 /// match below.
 async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
-    if let Some(project) = &cli.project {
-        let expanded = expand_tilde(project, &ctx.paths.home());
-        ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
-        ctx.config.save(ctx.paths.as_ref()).await?;
-    }
+    remember_project(cli, ctx).await?;
 
     match &cli.command {
         Some(Command::Logout) => return logout(ctx).await,
@@ -262,7 +300,8 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             let runtime = gh_session::choose_runtime_dir(
                 std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
                 std::env::var("TMPDIR").ok().as_deref(),
-            )?;
+            )
+            .await?;
             let dir =
                 gh_session::GhSession::attach(&runtime, &member_id_from_root(ctx.paths.as_ref())?)
                     .await?;
@@ -299,6 +338,27 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
     }
 
     provision(ctx, cli).await
+}
+
+/// Remembers `--project`, unless the path names a directory on a *server*.
+///
+/// `riabuild remote --project /srv/checkout build-01` is asking for a checkout
+/// at `/srv/checkout` on `build-01`: `remote::flow` forwards the string
+/// unexpanded over SSH, and the server's own riabuild resolves it there.
+/// Writing it into this laptop's `config.json` as well — which this used to do
+/// unconditionally, before the `match` below ever dispatched `Command::Remote`
+/// — pointed the next plain `riabuild` here at a directory that only exists on
+/// the far side of the connection.
+async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
+    let Some(project) = &cli.project else {
+        return Ok(());
+    };
+    if matches!(cli.command, Some(Command::Remote { .. })) {
+        return Ok(());
+    }
+    let expanded = expand_tilde(project, &ctx.paths.home());
+    ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
+    ctx.config.save(ctx.paths.as_ref()).await
 }
 
 /// Assembles the `Ctx` a run works against.
@@ -532,12 +592,15 @@ mod tests {
     use crate::runner::FakeRunner;
     use tempfile::TempDir;
 
-    fn ctx_for(scope: &scope::Scope) -> Ctx {
+    /// Hands the `TempDir` back as well: dropping it deletes the tree the
+    /// `Ctx`'s `Paths` point at, so a test that writes anything (`config.save`)
+    /// needs it alive for the duration.
+    fn ctx_for(scope: &scope::Scope) -> (Ctx, TempDir) {
         let home = TempDir::new().expect("tempdir");
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
         let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
-        build_ctx(
+        let ctx = build_ctx(
             scope,
             paths,
             runner,
@@ -546,7 +609,8 @@ mod tests {
             UserConfig::default(),
             State::default(),
             false,
-        )
+        );
+        (ctx, home)
     }
 
     #[test]
@@ -556,21 +620,121 @@ mod tests {
         // wiring used to hardcode. Revert `build_ctx`'s `server:` line to
         // `None` and this fails.
         let scope = scope::Scope::read(Some("build-01"));
-        let ctx = ctx_for(&scope);
+        let (ctx, _home) = ctx_for(&scope);
         assert_eq!(ctx.server.as_deref(), Some("build-01"));
     }
 
     #[test]
     fn a_laptop_scope_leaves_ctx_server_empty() {
         let scope = scope::Scope::read(None);
-        let ctx = ctx_for(&scope);
+        let (ctx, _home) = ctx_for(&scope);
         assert_eq!(ctx.server, None);
+    }
+
+    #[tokio::test]
+    async fn a_remote_projects_path_belongs_to_the_server_not_this_laptop() {
+        // `riabuild remote --project /srv/checkout build-01` names a path on
+        // `build-01`. `remote::flow` forwards the raw string over SSH; writing
+        // it here as well pointed the next plain `riabuild` on this laptop at
+        // a directory that exists only on the server. Delete the
+        // `Command::Remote` guard in `remember_project` and this fails.
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from([
+            "riabuild",
+            "remote",
+            "build-01",
+            "--project",
+            "/srv/checkout",
+        ]);
+        assert_eq!(cli.project.as_deref(), Some("/srv/checkout"));
+
+        remember_project(&cli, &mut ctx)
+            .await
+            .expect("nothing to remember is not an error");
+
+        assert_eq!(
+            ctx.config.project_path, None,
+            "the laptop's own checkout path must be untouched"
+        );
+        assert!(
+            !ctx.paths.config_file().exists(),
+            "and config.json must not have been written at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_project_path_is_still_expanded_and_remembered() {
+        // The other direction, so the guard cannot be satisfied by never
+        // saving anything.
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from(["riabuild", "--project", "~/code/hub"]);
+        remember_project(&cli, &mut ctx).await.expect("remembers");
+        assert_eq!(
+            ctx.config.project_path,
+            Some(
+                ctx.paths
+                    .home()
+                    .join("code/hub")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(ctx.paths.config_file().exists());
     }
 
     #[test]
     fn member_id_comes_from_the_roots_last_component() {
         let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
         assert_eq!(member_id_from_root(&paths).expect("id"), "550e8400");
+    }
+
+    #[test]
+    fn a_server_writes_its_session_to_a_file_only_inside_a_real_namespace() {
+        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
+        assert_eq!(
+            server_session_token_file(&scope::Scope::read(Some("build-01")), &paths)
+                .expect("the sanctioned combination"),
+            Some(paths.session_token_file())
+        );
+    }
+
+    #[test]
+    fn a_laptop_never_reaches_the_file_backed_keychain() {
+        let paths = RealPaths::rooted_at("/Users/ada");
+        assert_eq!(
+            server_session_token_file(&scope::Scope::read(None), &paths).expect("a laptop"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_remote_scope_over_a_laptop_root_is_refused_not_written_to() {
+        // The whole of S2: `RIABUILD_REMOTE=x riabuild login` with no
+        // `RIABUILD_ROOT` used to write the session token in cleartext to
+        // `~/.riabuild/session.token` — the path CLAUDE.md's invariant
+        // forbids — because "server" was one environment variable rather
+        // than a namespace. Any process running as the developer could flip
+        // keychain-backed storage into a plaintext file read.
+        let paths = RealPaths::rooted_at("/Users/ada");
+        let error = server_session_token_file(&scope::Scope::read(Some("build-01")), &paths)
+            .expect_err("a laptop root is not a server namespace");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("must be the actionable Failure: {error}");
+        assert!(
+            failure.detail.contains("RIABUILD_ROOT"),
+            "{}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn a_namespaced_root_without_a_remote_scope_is_refused_too() {
+        // The mirror image, refused for the same reason: the two facts are
+        // set together by `remote::env_prefix`, so one without the other is a
+        // machine riabuild cannot describe honestly either way.
+        let paths = RealPaths::with_root("/home/dev", "/home/dev/.riabuild-remote/550e8400");
+        assert!(server_session_token_file(&scope::Scope::read(None), &paths).is_err());
     }
 
     #[test]

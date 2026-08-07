@@ -211,7 +211,9 @@ async fn ensure_riabuild_with(
     let target = download::rust_target(system, machine).map_err(|error| {
         Failure::new(
             format!("installing riabuild on {}", ctx.remote.host),
-            "Use a server riabuild publishes a build for: Linux or macOS, on x86_64 or arm64.",
+            "Use a server riabuild publishes a build for: macOS on x86_64 or arm64. Linux \
+             is supported by the code but has no published build yet, so a Linux server \
+             fails at the install step until one ships.",
         )
         .detail(error.to_string())
     })?;

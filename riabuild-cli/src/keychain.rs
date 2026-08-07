@@ -594,6 +594,14 @@ mod tests {
         // only ever sees `program` and `args`, never `RunOptions.stdin`, so
         // this is a faithful stand-in for what `ps` would show a real
         // co-tenant on the machine.
+        //
+        // Both halves are asserted. Absence from argv alone is satisfied just
+        // as well by a `set()` that pipes nothing at all — and `-w` with no
+        // trailing value and no stdin does not fail: on a real Mac it either
+        // blocks on `security`'s interactive prompt or stores an empty
+        // password. This is the only guard that could catch that, since no PR
+        // gate runs this suite on macOS (`ci.yml` pins the cli job to ubuntu;
+        // `release.yml`'s macOS `cargo test` is tag-triggered).
         let runner = Arc::new(FakeRunner::new().with("security add-generic-password", 0, "", ""));
         let keychain = SecurityCliKeychain::new(runner.clone());
         keychain.set("super-secret").await.unwrap();
@@ -602,6 +610,13 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|call| call.contains("super-secret"))
+        );
+        assert_eq!(
+            runner
+                .stdin_text_of("security add-generic-password")
+                .as_deref(),
+            Some("super-secret"),
+            "the token must actually reach `security` on stdin"
         );
     }
 
@@ -623,7 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_secret_never_appears_in_a_secret_tool_argument_list() {
-        // Arguments are world-readable through `ps`; stdin is not.
+        // Arguments are world-readable through `ps`; stdin is not. And the
+        // token has to be on that stdin: `secret-tool store` handed an empty
+        // pipe stores an empty password rather than failing, so asserting only
+        // its absence from argv would pass on a `set()` that pipes nothing.
         let runner = Arc::new(FakeRunner::new().with("secret-tool store", 0, "", ""));
         let keychain = SecretToolKeychain::new(runner.clone());
         keychain.set("super-secret").await.unwrap();
@@ -632,6 +650,11 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|call| call.contains("super-secret"))
+        );
+        assert_eq!(
+            runner.stdin_text_of("secret-tool store").as_deref(),
+            Some("super-secret"),
+            "the token must actually reach `secret-tool` on stdin"
         );
     }
 

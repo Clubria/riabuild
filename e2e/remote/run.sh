@@ -237,15 +237,19 @@ done
 # exist, and a silent wait is the one failure a CI log cannot diagnose. riabuild
 # now refuses that prompt outright when it has no terminal; this bounds anything
 # that learns the same trick next.
+# `env -u`, not `RIABUILD_ROOT=`. An empty value is not an absent one: it
+# reaches `paths::root_for` as `Some("")`, which is refused as "not an absolute
+# path", so every run would die at startup on a developer machine that happens
+# to export it — a worse failure than the inherited root this is here to stop.
 run_as() {                       # run_as <member-id> <login> <token>
-  HOME="$work/laptop-$2" \
-  RIABUILD_ROOT= \
-  GH_TOKEN="$token" \
-  RIABUILD_API_URL="http://127.0.0.1:$STUB_PORT" \
-  RIABUILD_WEB_URL="http://127.0.0.1:$STUB_PORT" \
-  RIABUILD_TOKEN="$3" \
-  timeout 300 "$RIABUILD_BIN" remote "shared@localhost:$CONTAINER_PORT" \
-    --accept-host-key "$fingerprint" --no-shell --quiet
+  env -u RIABUILD_ROOT \
+    HOME="$work/laptop-$2" \
+    GH_TOKEN="$token" \
+    RIABUILD_API_URL="http://127.0.0.1:$STUB_PORT" \
+    RIABUILD_WEB_URL="http://127.0.0.1:$STUB_PORT" \
+    RIABUILD_TOKEN="$3" \
+    timeout 300 "$RIABUILD_BIN" remote "shared@localhost:$CONTAINER_PORT" \
+      --accept-host-key "$fingerprint" --no-shell --quiet
 }
 
 in_container() { docker exec riabuild-e2e su - shared -c "$1"; }

@@ -125,7 +125,34 @@ async fn connect_and_setup(
         accept_host_key,
     )
     .await?;
-    authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
+    // Everywhere else in riabuild `--check` means *touch nothing*
+    // (`tasks::engine` skips every `apply`), and `authorise` is emphatically
+    // not a read: on a server riabuild's key has never reached, it prompts
+    // for that account's password and runs `ssh-copy-id`, which writes into
+    // the server's own `~/.ssh/authorized_keys`. So under `--check` the
+    // question is asked and never answered — "riabuild's key is not
+    // authorised there yet" is a check *result*, not something `--check`
+    // quietly fixes on its way past.
+    //
+    // Reported here rather than by moving the whole `--check` gate above
+    // this call, because that would also give up `resolve_home` and
+    // `install::ensure_riabuild` — and on an already-authorised server
+    // (where `authorise` is a single `can_sign_in` probe and a no-op) those
+    // are exactly what lets `--check` go on to run the real check on the
+    // server, which is the case the flag exists for. `ensure_key` and
+    // `trust_host` above stay put for the same reason: a key pair and a
+    // `known_hosts` line are this laptop's own files, not the server's.
+    if cli.check {
+        if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
+            ctx.ui.note(
+                "--check: riabuild's key is not authorised on that server yet, so there is \
+                 nothing here to check. Run `riabuild remote` without --check to install it.",
+            );
+            return Ok(0);
+        }
+    } else {
+        authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
+    }
 
     // `resolve_home` runs its own command over `ssh_once`, which is refused
     // outright — before any authentication is even attempted — by a host key
@@ -321,6 +348,26 @@ mod tests {
             role: "member".into(),
             status: "active".into(),
         }
+    }
+
+    /// The `.pub` file `identity::ensure_key` would have left behind. The
+    /// `FakeRunner`'s `ssh-keygen` stub writes no file, and `authorise`
+    /// refuses on a missing public key before it probes the server at all —
+    /// so a test asserting `ssh-copy-id` did not run needs this, or it
+    /// passes for the wrong reason.
+    async fn write_public_key(paths: &dyn Paths) {
+        tokio::fs::create_dir_all(paths.identity_dir())
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            paths
+                .identity_dir()
+                .join(remote().hash())
+                .with_extension("pub"),
+            "ssh-ed25519 AAAA riabuild",
+        )
+        .await
+        .expect("write pub");
     }
 
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
@@ -551,6 +598,144 @@ mod tests {
         assert_eq!(
             store.find("build-01").map(|record| record.home.as_str()),
             Some("/home/dev")
+        );
+    }
+
+    /// I2: `--check` against a server riabuild has never been authorised on
+    /// must not prompt for that account's password and must not write into
+    /// its `~/.ssh/authorized_keys`.
+    ///
+    /// The `--check` gate used to sit *after* `authorise`, so `riabuild
+    /// remote --check newbox` ran `ssh-copy-id` — while the note the
+    /// developer was shown mentioned only the session and the GitHub
+    /// sign-in. Restore that ordering and this fails: every stub the old
+    /// path needs is scripted below, including the `.pub` file `ensure_key`
+    /// would have produced (the `FakeRunner`'s `ssh-keygen` writes none, and
+    /// without it `authorise` fails on a missing key before it ever reaches
+    /// `ssh-copy-id`, which would make this test pass for the wrong reason).
+    #[tokio::test]
+    async fn check_against_a_new_server_never_runs_ssh_copy_id() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // riabuild's key does not work yet, and the account will take a
+            // password — precisely the state in which the old ordering ran
+            // `ssh-copy-id`.
+            .with(
+                "ssh -o BatchMode=yes",
+                255,
+                "",
+                "Permission denied (publickey,password).",
+            )
+            .with(
+                "ssh -o PreferredAuthentications=none",
+                255,
+                "",
+                "Permission denied (publickey,password).",
+            )
+            .with("ssh-copy-id", 0, "", "")
+            .with("ssh", 0, "", "")
+            .containing("printf %s", 0, "/home/dev", "");
+        let (mut ctx, _home, mut store, fake) = fresh_ctx(fake).await;
+        write_public_key(ctx.paths.as_ref()).await;
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "--check",
+            "remote",
+            "build-01",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        assert!(cli.check);
+        let result = connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("build-01".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await;
+
+        // What was *run* is asserted before what was returned, so restoring
+        // the old ordering fails on the `ssh-copy-id` line itself rather than
+        // on the error `authorise` happens to end up raising afterwards.
+        let calls = fake.calls();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("ssh-copy-id")),
+            "--check must never write into the server's authorized_keys: {calls:?}"
+        );
+        // …and it stopped before asking the server anything at all, so
+        // `resolve_home`'s `store.save` never wrote `remotes.json` either.
+        assert!(
+            !calls.iter().any(|call| call.contains("printf %s")),
+            "nothing should have been run on the server: {calls:?}"
+        );
+        assert!(
+            !ctx.paths.remotes_file().exists(),
+            "--check must not persist a new server to remotes.json"
+        );
+        assert_eq!(
+            result.expect("not being authorised yet is a check result, not an error"),
+            0
+        );
+    }
+
+    /// The over-correction guard: on a server riabuild's key *does* already
+    /// work, `authorise` is a no-op anyway, so `--check` must still go on to
+    /// install and run the real check rather than stopping at the probe.
+    #[tokio::test]
+    async fn check_on_an_authorised_server_still_reaches_the_install_step() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "");
+        let (mut ctx, _home, mut store) = ready_ctx(fake).await;
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "--check",
+            "remote",
+            "build-01",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        // `uname -sm` answers nothing a Rust target can be derived from, so
+        // the run stops inside `install::ensure_riabuild` — which is past
+        // the probe, and is what this asserts.
+        let error = connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("build-01".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect_err("the fake server reports no usable platform");
+        assert!(
+            !error.to_string().contains("not authorised"),
+            "an authorised server must not be reported as unauthorised: {error}"
         );
     }
 

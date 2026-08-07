@@ -361,6 +361,18 @@ mod tests {
             "{:?}",
             fake.calls()
         );
+        // The other half, and the half the two assertions above cannot see.
+        // Deleting `stdin: Some(contents)` from `write_into_namespace` leaves
+        // both of them green — the token is still absent from argv, `chmod
+        // 600` still runs, `ssh` still exits 0 — while the remote `cat` reads
+        // a closed pipe and the server gets a zero-byte `session.token`
+        // reported as a success. That regression happened on this branch once
+        // already; this assertion is what would have caught it.
+        assert_eq!(
+            fake.stdin_text_of("ssh").as_deref(),
+            Some("rb_live_secret_token"),
+            "the token must actually reach the remote `cat` on stdin"
+        );
     }
 
     #[tokio::test]
