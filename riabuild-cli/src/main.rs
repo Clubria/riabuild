@@ -102,7 +102,7 @@ async fn run(cli: Cli) -> Result<i32> {
             std::env::var("TMPDIR").ok().as_deref(),
         )?;
         let member_id = member_id_from_root(paths.as_ref())?;
-        if holds_gh_session_marker(&cli.command) {
+        if holds_gh_session_marker(&cli) {
             let session =
                 gh_session::GhSession::open(&runtime, &member_id, std::process::id()).await?;
             gh_dir = Some(session.config_dir());
@@ -188,19 +188,45 @@ fn member_id_from_root(paths: &dyn Paths) -> Result<String> {
         })
 }
 
+/// Whether this invocation goes on to hold the interactive environment shell
+/// open.
+///
+/// This is the single source of truth `holds_gh_session_marker` defers to,
+/// and it is also, deliberately, the exact condition `provision`'s own tail
+/// uses to decide whether to call `open_shell` — see the table in
+/// `task-19-brief.md:24-30`: `internal gh-sweep`, the seeding run, and the
+/// *setup* run (`riabuild --no-shell` on the server, which is what Task 21's
+/// `remote::flow::run` sends over its first SSH hop) all answer `false`; only
+/// the interactive shell run answers `true`. Getting this wrong the other
+/// way — granting a marker to a `--no-shell` run — is what would make the
+/// setup run's own exit sweep away a credential `seed_github` had just
+/// written on an earlier hop, before the shell ever sees it.
+fn opens_shell(cli: &Cli) -> bool {
+    match &cli.command {
+        Some(Command::Shell) => true,
+        Some(
+            Command::Internal { .. }
+            | Command::Login
+            | Command::Logout
+            | Command::Env
+            | Command::Remote { .. }
+            | Command::Status,
+        ) => false,
+        None => !cli.check && !cli.no_shell,
+    }
+}
+
 /// Whether this invocation is allowed to claim (and later release) the
 /// GitHub-session marker `gh_session::open`/`close` guard.
 ///
 /// Only the invocation that goes on to hold the interactive environment
-/// shell open should ever do that — see `gh_session.rs`'s module doc. The
-/// hidden `internal` subcommands (`gh-sweep`, `seed-github`) are short,
-/// separate SSH-invoked processes the laptop runs *before* that shell
-/// exists: if either claimed a marker the same way, its own `close` would
-/// find no other marker yet and wipe the GitHub credential moments after
-/// writing it. They call `attach` instead, which never claims or releases
-/// anything.
-fn holds_gh_session_marker(command: &Option<Command>) -> bool {
-    !matches!(command, Some(Command::Internal { .. }))
+/// shell open should ever do that — see `gh_session.rs`'s module doc. Every
+/// other invocation — the hidden `internal` subcommands (`gh-sweep`,
+/// `seed-github`), and just as importantly the *setup* run, which is an
+/// ordinary default-flow invocation with `--no-shell` set — calls `attach`
+/// instead, which never claims or releases anything.
+fn holds_gh_session_marker(cli: &Cli) -> bool {
+    opens_shell(cli)
 }
 
 /// Everything `run` does after a remote scope's GitHub session (if any) is
@@ -225,11 +251,8 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
-        Some(Command::Remote { .. }) => {
-            // Task 21 replaces this with `remote::run(ctx, cli, target,
-            // action).await`. Until then this only needs to exist so the CLI
-            // surface (Task 14) compiles and its own tests pass.
-            return Ok(0);
+        Some(Command::Remote { target, action, .. }) => {
+            return remote::run(ctx, cli, target.clone(), action.clone()).await;
         }
         Some(Command::Internal {
             action: cli::InternalAction::GhSweep,
@@ -325,7 +348,7 @@ fn build_ctx(
 /// A missing or expired session is not an error here — the `login` task exists
 /// to fix exactly that. Anything else (suspended, removed from the org) is
 /// surfaced immediately, because no amount of provisioning will help.
-async fn connect(ctx: &mut Ctx) -> Result<()> {
+pub(crate) async fn connect(ctx: &mut Ctx) -> Result<()> {
     let Some(token) = ctx.keychain.get().await? else {
         return Ok(());
     };
@@ -402,7 +425,7 @@ async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         return Ok(0);
     }
 
-    if cli.no_shell {
+    if !opens_shell(cli) {
         return Ok(0);
     }
     open_shell(ctx).await
@@ -563,6 +586,19 @@ mod tests {
         );
     }
 
+    /// A `Cli` with every field but `command`/`no_shell`/`check` at its
+    /// ordinary default, for the marker-predicate tests below — those three
+    /// are the only fields `opens_shell` reads.
+    fn cli_for(command: Option<Command>, no_shell: bool, check: bool) -> Cli {
+        Cli {
+            command,
+            project: None,
+            check,
+            quiet: false,
+            no_shell,
+        }
+    }
+
     #[test]
     fn internal_plumbing_never_claims_the_gh_session_marker() {
         // This is the fix for the bug described in `gh_session.rs`'s module
@@ -570,18 +606,48 @@ mod tests {
         // interactive shell does, its own exit would wipe the credential it
         // had just written. Reverting `holds_gh_session_marker` to always
         // return `true` reproduces that bug and fails this test.
-        assert!(!holds_gh_session_marker(&Some(Command::Internal {
-            action: cli::InternalAction::SeedGithub,
-        })));
-        assert!(!holds_gh_session_marker(&Some(Command::Internal {
-            action: cli::InternalAction::GhSweep,
-        })));
+        assert!(!holds_gh_session_marker(&cli_for(
+            Some(Command::Internal {
+                action: cli::InternalAction::SeedGithub,
+            }),
+            false,
+            false,
+        )));
+        assert!(!holds_gh_session_marker(&cli_for(
+            Some(Command::Internal {
+                action: cli::InternalAction::GhSweep,
+            }),
+            false,
+            false,
+        )));
+    }
+
+    #[test]
+    fn the_setup_run_never_claims_the_gh_session_marker_either() {
+        // The critical fix from Task 21's review: the *setup* run — an
+        // ordinary default-flow invocation with `--no-shell` set, exactly
+        // what `remote::flow::run` sends over its first SSH hop — used to be
+        // granted a marker by the old `Command`-only predicate. If it were,
+        // its own exit would sweep away the credential `seed_github` had
+        // just written on an earlier SSH hop, before the interactive shell
+        // (a third, later hop) ever saw it.
+        assert!(!holds_gh_session_marker(&cli_for(None, true, false)));
+        // `--check` never opens a shell either, for the same reason.
+        assert!(!holds_gh_session_marker(&cli_for(None, false, true)));
+        assert!(!holds_gh_session_marker(&cli_for(
+            Some(Command::Status),
+            false,
+            false
+        )));
     }
 
     #[test]
     fn every_other_command_still_claims_the_gh_session_marker() {
-        assert!(holds_gh_session_marker(&None));
-        assert!(holds_gh_session_marker(&Some(Command::Status)));
-        assert!(holds_gh_session_marker(&Some(Command::Shell)));
+        assert!(holds_gh_session_marker(&cli_for(None, false, false)));
+        assert!(holds_gh_session_marker(&cli_for(
+            Some(Command::Shell),
+            false,
+            false
+        )));
     }
 }

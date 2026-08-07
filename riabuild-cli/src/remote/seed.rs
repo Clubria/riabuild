@@ -32,7 +32,6 @@ use std::sync::Arc;
 /// before the setup run ever saw it. Sweeping first — rather than after —
 /// only ever clears a *dead* session's leftovers, never anything this write
 /// is about to depend on.
-#[allow(dead_code)] // consumed by Task 21
 pub async fn seed_github(
     remote: &Remote,
     paths: &dyn Paths,

@@ -5,12 +5,13 @@
 //! anywhere is a server's own session token, and that lives at
 //! `<namespace>/session.token` on the server itself — never here.
 
+use super::Remote;
 use crate::paths::Paths;
-use anyhow::Result;
+use crate::tasks::Ctx;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // consumed by Task 21
 #[serde(rename_all = "camelCase")]
 pub struct Record {
     pub name: String,
@@ -35,7 +36,6 @@ pub struct Record {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[allow(dead_code)] // consumed by Task 21
 #[serde(rename_all = "camelCase")]
 pub struct Store {
     #[serde(default)]
@@ -49,7 +49,6 @@ impl Store {
     /// write anything, so a corrupt file is left exactly as it was — a later
     /// `save` is the only thing that overwrites it, and only with a full
     /// `Store` a caller built deliberately, never a silent wipe.
-    #[allow(dead_code)] // consumed by Task 21
     pub async fn load(paths: &dyn Paths) -> Store {
         let Ok(text) = tokio::fs::read_to_string(paths.remotes_file()).await else {
             return Store::default();
@@ -57,24 +56,20 @@ impl Store {
         serde_json::from_str(&text).unwrap_or_default()
     }
 
-    #[allow(dead_code)] // consumed by Task 21
     pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
         crate::config::write_json(&paths.remotes_file(), self).await
     }
 
-    #[allow(dead_code)] // consumed by Task 21
     pub fn find(&self, name: &str) -> Option<&Record> {
         self.remotes.iter().find(|record| record.name == name)
     }
 
-    #[allow(dead_code)] // consumed by Task 21
     pub fn names(&self) -> Vec<String> {
         self.remotes.iter().map(|r| r.name.clone()).collect()
     }
 }
 
 /// A short local label, from the first label of the hostname.
-#[allow(dead_code)] // consumed by Task 21 (also called from Remote::parse for a first guess)
 pub fn allocate_name(host: &str, taken: &[String]) -> String {
     let base: String = host
         .split('.')
@@ -99,6 +94,159 @@ pub fn allocate_name(host: &str, taken: &[String]) -> String {
         }
     }
     base
+}
+
+impl From<&Record> for Remote {
+    fn from(record: &Record) -> Self {
+        Remote {
+            name: record.name.clone(),
+            host: record.host.clone(),
+            port: record.port,
+            user: record.user.clone(),
+        }
+    }
+}
+
+/// The local login, for a first guess at who is connecting: `$USER`, falling
+/// back to `$LOGNAME`, and finally to `"root"` — the account every image ships
+/// with, so this never comes back empty.
+pub fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
+/// Records a newly-chosen server, as if it had just been added and never
+/// connected to.
+pub fn add(store: &mut Store, remote: &Remote) {
+    store.remotes.push(Record {
+        name: remote.name.clone(),
+        hash: remote.hash(),
+        host: remote.host.clone(),
+        port: remote.port,
+        user: remote.user.clone(),
+        added_at: crate::config::now_secs(),
+        last_used_at: 0,
+        session_expires_at: 0,
+        last_seen_cli_version: String::new(),
+        home: String::new(),
+    });
+}
+
+/// Which server this invocation is about.
+///
+/// A `target` names a saved server or spells one out
+/// (`[user@]host[:port]`); with none, an empty store asks the three
+/// questions once, one saved server reconnects without asking, and several
+/// saved servers are offered as a numbered list.
+pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) -> Result<Remote> {
+    if let Some(target) = target {
+        if let Some(record) = store.find(&target) {
+            return Ok(record.into());
+        }
+        let user = whoami();
+        let mut remote = Remote::parse(&target, &user)?;
+        remote.name = allocate_name(&remote.host, &store.names());
+        add(store, &remote);
+        return Ok(remote);
+    }
+
+    match store.remotes.len() {
+        0 => {
+            let remote = ask_for_one(ctx, store).await?;
+            add(store, &remote);
+            Ok(remote)
+        }
+        1 => {
+            let record = &store.remotes[0];
+            ctx.ui.info(&format!(
+                "Reconnecting to {} · {}@{}",
+                record.name, record.user, record.host
+            ));
+            Ok(record.into())
+        }
+        _ => {
+            ctx.ui.heading("Which server?");
+            for (index, record) in store.remotes.iter().enumerate() {
+                ctx.ui.info(&format!(
+                    "  {}  {:<10} {}@{}{}   used {}",
+                    index + 1,
+                    record.name,
+                    record.user,
+                    record.host,
+                    if record.port == 22 {
+                        String::new()
+                    } else {
+                        format!(":{}", record.port)
+                    },
+                    crate::ui::duration_words(
+                        crate::config::now_secs().saturating_sub(record.last_used_at) / 60
+                    ),
+                ));
+            }
+            let answer = ctx.ui.ask("", Some("1"))?;
+            let index: usize = answer.trim().parse().unwrap_or(1);
+            let record = store
+                .remotes
+                .get(index.saturating_sub(1))
+                .ok_or_else(|| anyhow!("there is no server {index}"))?;
+            Ok(record.into())
+        }
+    }
+}
+
+/// The three questions, once, on a first run.
+async fn ask_for_one(ctx: &mut Ctx, store: &Store) -> Result<Remote> {
+    ctx.ui.heading("Adding a server");
+    let host = ctx.ui.ask("Hostname  ", None)?;
+    let port: u16 = ctx.ui.ask("Port      ", Some("22"))?.parse().unwrap_or(22);
+    let user = ctx.ui.ask("Username  ", Some(&whoami()))?;
+    let name = allocate_name(&host, &store.names());
+    ctx.ui
+        .note(&format!("This server will be known as {name}."));
+    Ok(Remote {
+        name,
+        host,
+        port,
+        user,
+    })
+}
+
+/// What a successful connect leaves behind: this server moves to the front of
+/// "recently used", and remembers the riabuild version it is now running.
+pub async fn remember(ctx: &Ctx, store: &mut Store, remote: &Remote, version: &str) -> Result<()> {
+    if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
+        record.last_used_at = crate::config::now_secs();
+        record.last_seen_cli_version = version.to_string();
+    }
+    store.save(ctx.paths.as_ref()).await
+}
+
+/// `riabuild remote list`.
+pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
+    if store.remotes.is_empty() {
+        ctx.ui
+            .info("No servers yet. Run `riabuild remote` to add one.");
+        return Ok(0);
+    }
+    for record in &store.remotes {
+        ctx.ui.info(&format!(
+            "  {:<10} {}@{}{}   used {}",
+            record.name,
+            record.user,
+            record.host,
+            if record.port == 22 {
+                String::new()
+            } else {
+                format!(":{}", record.port)
+            },
+            // `duration_words` takes minutes elapsed, not a timestamp.
+            crate::ui::duration_words(
+                crate::config::now_secs().saturating_sub(record.last_used_at) / 60
+            ),
+        ));
+    }
+    Ok(0)
 }
 
 /// A `Record` for `remote`, as if it had just been added and never connected
@@ -142,6 +290,76 @@ mod tests {
     fn a_hostname_with_nothing_usable_in_it_still_gets_a_name() {
         assert_eq!(allocate_name("", &[]), "server");
         assert_eq!(allocate_name("...", &[]), "server");
+    }
+
+    fn remote() -> Remote {
+        Remote {
+            name: "build-01".into(),
+            host: "build-01.fly.dev".into(),
+            port: 22,
+            user: "ada".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_saved_server_reconnects_without_asking() {
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+        store.remotes.push(record_for(&remote()));
+
+        // `Ui::ask` would fail outright without a TTY, so reaching a prompt here
+        // is itself the failure this asserts against.
+        let chosen = choose(&mut ctx, &mut store, None)
+            .await
+            .expect("reconnects");
+        assert_eq!(chosen.name, "build-01");
+    }
+
+    #[tokio::test]
+    async fn a_named_server_that_is_not_saved_is_parsed_and_added() {
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+
+        let chosen = choose(&mut ctx, &mut store, Some("ada@gpu.internal:2222".into()))
+            .await
+            .expect("parses");
+        assert_eq!(chosen.user, "ada");
+        assert_eq!(chosen.port, 2222);
+        assert_eq!(store.remotes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_server_named_on_the_command_line_is_reused_not_reparsed() {
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+        store.remotes.push(record_for(&remote()));
+
+        let chosen = choose(&mut ctx, &mut store, Some("build-01".into()))
+            .await
+            .expect("finds the saved one");
+        assert_eq!(chosen.host, "build-01.fly.dev");
+        assert_eq!(
+            store.remotes.len(),
+            1,
+            "a saved server must not be added a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_used_column_is_a_duration_not_a_timestamp() {
+        let (ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+        let mut record = record_for(&remote());
+        record.last_used_at = crate::config::now_secs().saturating_sub(3 * 3600);
+        store.remotes.push(record);
+        // Asserting the arithmetic rather than the wording: handing
+        // `duration_words` the raw epoch renders roughly "1236111 days".
+        assert_eq!(list(&ctx, &store).expect("lists"), 0);
+    }
+
+    #[test]
+    fn whoami_never_comes_back_empty() {
+        assert!(!whoami().is_empty());
     }
 
     #[tokio::test]

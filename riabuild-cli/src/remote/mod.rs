@@ -8,11 +8,15 @@
 //! and the shell handoff on top of this.
 
 pub mod authorise;
+pub mod flow;
 pub mod identity;
 pub mod install;
 pub mod seed;
 pub mod session;
+pub mod shell;
 pub mod store;
+
+pub use flow::run;
 
 use crate::paths::Paths;
 use crate::runner::{CommandOutput, CommandRunner, RunOptions};
@@ -21,7 +25,6 @@ use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Task 21 (`remote::run` builds and stores a Remote)
 pub struct Remote {
     /// A local label only. The server never sees it.
     pub name: String,
@@ -66,7 +69,6 @@ impl Remote {
     ///   machine; that is a feature, not a gap — predictable beats resolved.
     /// - The user is left exactly as typed. Unix usernames are case-sensitive,
     ///   and `ada` and `Ada` are two different accounts, not one.
-    #[allow(dead_code)] // consumed by Task 21
     pub fn hash(&self) -> String {
         let host = self.host.strip_suffix('.').unwrap_or(&self.host);
         let key = format!("{}@{}:{}", self.user, host.to_ascii_lowercase(), self.port);
@@ -75,13 +77,11 @@ impl Remote {
     }
 
     /// `user@host`, for `ssh`/`mosh`'s target argument.
-    #[allow(dead_code)] // consumed by Task 21
     pub fn target(&self) -> String {
         format!("{}@{}", self.user, self.host)
     }
 
     /// `[user@]host[:port]`, with the local login as the default user.
-    #[allow(dead_code)] // consumed by Task 21
     pub fn parse(spec: &str, default_user: &str) -> Result<Remote> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -157,7 +157,6 @@ pub fn shell_command(script: &str) -> String {
 /// uses — so this is what survives fish and csh (which reject a bare
 /// `VAR=value command` prefix as a syntax error) and mosh (which `execvp`s
 /// the command with no shell to expand or interpret anything).
-#[allow(dead_code)] // consumed by Task 17 (invokes the remote `riabuild` binary)
 pub fn env_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
     let mut parts = vec!["env".to_string()];
     for (key, value) in env {
@@ -169,7 +168,6 @@ pub fn env_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String
 }
 
 /// One command on the server, through the key riabuild owns for it.
-#[allow(dead_code)] // consumed by Tasks 17, 18, 20, 21
 pub async fn ssh_once(
     remote: &Remote,
     paths: &dyn Paths,
@@ -219,6 +217,24 @@ pub async fn resolve_home(
     }
     store.save(paths).await?;
     Ok(home)
+}
+
+/// The environment the server's own riabuild runs under, as `(key, value)`
+/// pairs ready for [`env_command`] — never a `VAR=x` prefix, which fish
+/// rejects outright and which mosh never gives a shell the chance to parse
+/// anyway.
+///
+/// `home` and `member_id` produce the absolute, tilde-free namespace
+/// (`session::namespace`); `name` is the local label so the server's riabuild
+/// can say which saved connection it is running under.
+pub fn env_prefix(home: &str, member_id: &str, name: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "RIABUILD_ROOT".to_string(),
+            session::namespace(home, member_id),
+        ),
+        ("RIABUILD_REMOTE".to_string(), name.to_string()),
+    ]
 }
 
 #[cfg(test)]
@@ -415,6 +431,30 @@ mod tests {
         // Multi-step scripts say which shell runs them.
         let script = shell_command("mkdir -p /tmp/x && cat > /tmp/x/y");
         assert!(script.starts_with("/bin/sh -c '"), "{script}");
+    }
+
+    #[test]
+    fn the_remote_invocation_carries_an_absolute_namespace_and_the_server_name() {
+        let env = env_prefix(
+            "/home/dev",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "build-01",
+        );
+        let command = env_command(
+            &env.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            "/home/dev/.riabuild/riabuild/2026.08.06/riabuild",
+            &["--no-shell"],
+        );
+        assert!(
+            command.contains("/home/dev/.riabuild-remote/550e8400"),
+            "{command}"
+        );
+        assert!(command.contains("RIABUILD_REMOTE=build-01"), "{command}");
+        // A tilde here is the bug: root_for refuses it, and before it did, every
+        // developer on the box silently shared one namespace.
+        assert!(!command.contains('~'), "{command}");
     }
 
     #[tokio::test]

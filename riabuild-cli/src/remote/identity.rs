@@ -54,7 +54,6 @@ pub fn key_path(remote: &Remote, paths: &dyn Paths) -> PathBuf {
 /// Idempotent: a second call against the same `remote` finds the file
 /// `ssh-keygen` left behind and returns immediately, without shelling out
 /// again — `apply()` has to be safe to run twice, and this is the same rule.
-#[allow(dead_code)] // consumed by Task 21, via authorise::authorise
 pub async fn ensure_key(
     remote: &Remote,
     paths: &dyn Paths,
@@ -118,7 +117,6 @@ pub async fn ensure_key(
     Ok(path)
 }
 
-#[allow(dead_code)] // consumed by Task 21, via ensure_key
 fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
@@ -126,7 +124,6 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 }
 
 /// `SHA256:…` out of `ssh-keygen -lf` output.
-#[allow(dead_code)] // consumed by Task 21, via trust_host
 pub fn fingerprint_of(stdout: &str) -> Option<String> {
     stdout
         .split_whitespace()
@@ -141,7 +138,6 @@ pub fn fingerprint_of(stdout: &str) -> Option<String> {
 /// When `Some`, it answers the trust question non-interactively: it must
 /// match the scanned key exactly, or this fails rather than falling back to
 /// a prompt with no terminal to show on. When `None`, a developer is asked.
-#[allow(dead_code)] // consumed by Task 21
 pub async fn trust_host(
     remote: &Remote,
     paths: &dyn Paths,
@@ -279,7 +275,6 @@ pub async fn trust_host(
 /// trailing `\n` (a hand-edited file) — guarded by leading with a newline
 /// when the file already has bytes. A race on that check costs at most one
 /// redundant blank line, which `ssh` ignores, never lost or corrupted data.
-#[allow(dead_code)] // consumed by Task 21, via trust_host
 async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
     tokio::fs::create_dir_all(paths.ssh_dir()).await?;
     set_private_dir(&paths.ssh_dir()).await?;
@@ -300,7 +295,6 @@ async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
 /// flushed before returning — `write_all` alone only queues the bytes for a
 /// blocking-pool task to actually write, the same gap `keychain.rs`'s
 /// `write_private_token` was fixed for.
-#[allow(dead_code)] // consumed by Task 21, via trust_host -> pin
 async fn append(path: &Path, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::OpenOptions::new()
@@ -313,7 +307,6 @@ async fn append(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)] // consumed by Task 16 (ensure_key) and Task 21 (trust_host, via pin)
 #[cfg(unix)]
 async fn set_private_dir(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -330,7 +323,6 @@ async fn set_private_dir(_path: &std::path::Path) -> Result<()> {
 /// Pins a private key file at `0600` regardless of its prior mode — the same
 /// "set explicitly, don't trust creation-time permissions" rule
 /// `keychain.rs`'s `write_private_token` documents.
-#[allow(dead_code)] // consumed by Task 16, via ensure_key
 #[cfg(unix)]
 async fn set_private_file(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

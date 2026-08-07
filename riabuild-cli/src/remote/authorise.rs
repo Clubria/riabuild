@@ -51,7 +51,6 @@ use std::sync::Arc;
 /// denied (publickey,password).` → `["publickey", "password"]`. Empty when
 /// the failure was not an authentication refusal at all (a timeout, a closed
 /// port) — there is no method list to read out of those.
-#[allow(dead_code)] // consumed by Task 21, via authorise
 pub fn offered_methods(stderr: &str) -> Vec<String> {
     let Some(start) = stderr.find("Permission denied (") else {
         return Vec::new();
@@ -69,7 +68,6 @@ pub fn offered_methods(stderr: &str) -> Vec<String> {
 
 /// Can riabuild's own key sign in, without a password and without falling
 /// back to the developer's own agent or default identities?
-#[allow(dead_code)] // consumed by Task 21, via authorise
 pub async fn can_sign_in(
     remote: &Remote,
     paths: &dyn Paths,
@@ -93,7 +91,6 @@ pub async fn can_sign_in(
 ///
 /// See the module doc for why a password, when one exists, never passes
 /// through riabuild's own hands.
-#[allow(dead_code)] // consumed by Task 21
 pub async fn authorise(
     remote: &Remote,
     paths: &dyn Paths,

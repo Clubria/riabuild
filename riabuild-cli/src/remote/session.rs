@@ -162,7 +162,6 @@ fn expires_soon(record: &super::store::Record) -> bool {
 /// remote` flow and is this function's real caller. Until then it (and the
 /// helpers above it that only it uses) would be dead code from the binary's
 /// point of view, hence the allow.
-#[allow(dead_code)] // consumed by Task 21
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure(
     remote: &Remote,

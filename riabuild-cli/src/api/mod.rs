@@ -82,7 +82,6 @@ pub struct Member {
     /// Deliberately not `#[serde(default)]`: an identifier that half the
     /// deployments might not send is not an identifier.
     #[serde(rename = "memberId", deserialize_with = "uuid_only")]
-    #[allow(dead_code)] // consumed by Task 18 (session::ensure names the server namespace)
     pub member_id: String,
     #[serde(rename = "firstName")]
     pub first_name: String,

@@ -170,7 +170,6 @@ fn verify_or_remove_command(path: &str, expected: &str) -> String {
 /// never a `~` (R1). Platform detection and checksum verification happen
 /// here, before anything is compared against the expected digest, so that
 /// digest always exists before its first use (R8(b) in `decisions.md`).
-#[allow(dead_code)] // consumed by Task 18, via session::ensure
 pub async fn ensure_riabuild(
     remote: &Remote,
     paths: &dyn Paths,
