@@ -87,8 +87,42 @@ pub fn host_key_failure(stderr: &str) -> bool {
         && !stderr.contains("Permission denied (")
 }
 
+/// The one wording for "`ssh` refused the *server's* identity, so this never
+/// reached authentication at all". Shared rather than written at each site
+/// that can observe it, so the remedy — which names riabuild's own
+/// `known_hosts`, invisible to the developer under `-F /dev/null` — cannot
+/// drift between them.
+fn stale_pin(remote: &Remote, paths: &dyn Paths, stderr: String) -> anyhow::Error {
+    Failure::new(
+        format!("verifying {}'s host key", remote.host),
+        format!(
+            "ssh refused the host key riabuild has pinned for {}, so this never got as \
+             far as authenticating — the key in `authorized_keys` is not the problem. If \
+             that server was rebuilt or replaced, confirm its new fingerprint with \
+             whoever runs it, then remove the {} line from {} and run `riabuild remote` \
+             again.",
+            remote.host,
+            entry_host(remote),
+            paths.known_hosts_file().display()
+        ),
+    )
+    .detail(stderr)
+    .into()
+}
+
 /// Can riabuild's own key sign in, without a password and without falling
 /// back to the developer's own agent or default identities?
+///
+/// `Err` is narrower than "no". A host key that no longer matches the pin
+/// aborts the connection at the host-key step, before any authentication
+/// method is offered, so the honest answer is not "riabuild's key is not
+/// authorised" but "that is not the server riabuild pinned" — and it is
+/// diagnosed here, in the probe every path shares, rather than at one
+/// caller. `riabuild remote --check` calls this *instead of* [`authorise`]
+/// (nothing may write to the server on that path), so a diagnosis living
+/// only inside `authorise` left `--check` against a rebuilt — or
+/// impersonated — box printing "riabuild's key is not authorised there yet"
+/// and exiting 0.
 pub async fn can_sign_in(
     remote: &Remote,
     paths: &dyn Paths,
@@ -100,7 +134,11 @@ pub async fn can_sign_in(
     args.push("true".to_string());
 
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    Ok(runner.run("ssh", &refs, &RunOptions::default()).await?.ok())
+    let probe = runner.run("ssh", &refs, &RunOptions::default()).await?;
+    if host_key_failure(&probe.stderr) {
+        return Err(stale_pin(remote, paths, probe.stderr));
+    }
+    Ok(probe.ok())
 }
 
 /// Installs riabuild's public key on the server, if it is not already there.
@@ -171,25 +209,12 @@ pub async fn authorise(
     let refusal = runner
         .run("ssh", &probe_refs, &RunOptions::default())
         .await?;
-    // Before `offered_methods`, never after: this is not an authorisation
-    // problem, and its empty method list would read as "publickey only".
-    if host_key_failure(&refusal.stderr) {
-        return Err(Failure::new(
-            format!("verifying {}'s host key", remote.host),
-            format!(
-                "ssh refused the host key riabuild has pinned for {}, so this never got as \
-                 far as authenticating — the key in `authorized_keys` is not the problem. If \
-                 that server was rebuilt or replaced, confirm its new fingerprint with \
-                 whoever runs it, then remove the {} line from {} and run `riabuild remote` \
-                 again.",
-                remote.host,
-                entry_host(remote),
-                paths.known_hosts_file().display()
-            ),
-        )
-        .detail(refusal.stderr)
-        .into());
-    }
+    // A stale pin never reaches this line: both probes talk to the same host
+    // through the same pinned `known_hosts`, so [`can_sign_in`] above has
+    // already returned [`stale_pin`] as an `Err` by the time this one runs.
+    // Deliberately not re-checked here — a second, unreachable copy of the
+    // diagnosis is a copy nothing can prove still works, and the one that
+    // matters now also covers `--check`, which never calls this function.
     let methods = offered_methods(&refusal.stderr);
 
     let interactive = methods
@@ -336,6 +361,51 @@ mod tests {
         assert!(!host_key_failure(
             "Host key verification failed.\nPermission denied (publickey,password)."
         ));
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_makes_the_probe_itself_fail_rather_than_answer_no() {
+        // `can_sign_in` is not only `authorise`'s first step: `riabuild remote
+        // --check` calls it *instead of* `authorise`, and reads `false` as
+        // "riabuild's key is not authorised on that server yet" — a note, and
+        // exit 0. So a probe that only reports `output.ok()` hands that
+        // sentence, and a success exit code, to a developer whose server's
+        // host key has changed under them.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake =
+            Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 255, "", HOST_KEY_CHANGED));
+
+        let error = can_sign_in(&remote(), &paths, fake)
+            .await
+            .expect_err("a refused host key is not an answer to `can this key sign in?`");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(
+            failure.attempting.contains("host key"),
+            "this has to read as a host-key problem: {}",
+            failure.attempting
+        );
+        assert!(
+            failure
+                .action
+                .contains(&paths.known_hosts_file().display().to_string()),
+            "the remedy must name the file holding the stale pin: {}",
+            failure.action
+        );
+
+        // The other direction, so this cannot pass by treating every failed
+        // probe as a host-key problem: an ordinary refusal is still `false`.
+        let denied = Arc::new(FakeRunner::new().with(
+            "ssh -o BatchMode=yes",
+            255,
+            "",
+            "Permission denied (publickey,password).",
+        ));
+        assert!(
+            !can_sign_in(&remote(), &paths, denied)
+                .await
+                .expect("an authentication refusal is an answer, not an error")
+        );
     }
 
     #[tokio::test]

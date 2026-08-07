@@ -81,7 +81,7 @@ impl Task for Toolchain {
         let pnpm_version = desired_pnpm(project.as_deref()).await;
 
         let node_bin = ctx.paths.node_dir(&node_version).join("bin").join("node");
-        match reported_version(ctx, &node_bin).await {
+        match reported_version(ctx, &node_bin).await? {
             None => {
                 return Ok(Status::needs(format!(
                     "Node {node_version} is not installed yet"
@@ -96,7 +96,7 @@ impl Task for Toolchain {
         }
 
         let pnpm_bin = ctx.paths.bin_dir().join("pnpm");
-        match reported_version(ctx, &pnpm_bin).await {
+        match reported_version(ctx, &pnpm_bin).await? {
             None => Ok(Status::needs("pnpm is not installed yet")),
             Some(found) if !version::same(&found, &pnpm_version) => Ok(Status::needs(format!(
                 "pnpm reports {found} but the repo asks for {pnpm_version}"
@@ -110,8 +110,8 @@ impl Task for Toolchain {
     }
 }
 
-/// What the tool at `bin` answers `-v` with, or `None` when there is nothing
-/// runnable there.
+/// What the tool at `bin` answers `-v` with, `Ok(None)` when there is nothing
+/// runnable there, and an error when riabuild could not find out.
 ///
 /// The single definition of "is this the version the repo asks for": `check()`
 /// turns the answer into a message and `apply()` turns it into a decision, and
@@ -119,20 +119,31 @@ impl Task for Toolchain {
 /// worse on a shared server — re-installs a tree nothing was wrong with. The
 /// binary is asked rather than the layout trusted: a directory that exists is
 /// not evidence of a working install.
-async fn reported_version(ctx: &Ctx, bin: &Path) -> Option<String> {
+///
+/// The three-way answer is the point. A `CommandRunner` error means riabuild
+/// could not even *start* the binary — `EAGAIN` or `ENOMEM` under the process
+/// and memory pressure a small shared box with several developers on it lives
+/// in, or `ETXTBSY` — and that is no evidence at all about the tree. Folding it
+/// into `None` made it read as "absent", and absent means replace: one
+/// developer's transient spawn failure downloaded ~130 MB and swapped out the
+/// Node a colleague's `pnpm dev` was executing from, then hard-errored anyway
+/// when `check()` re-ran. A command that *did* run and answered badly — a
+/// non-zero exit (`NODE_OPTIONS=--bogus node -v` exits 9 with empty stdout), or
+/// output that is not a version — is real evidence about the tree, and still
+/// means replace.
+async fn reported_version(ctx: &Ctx, bin: &Path) -> Result<Option<String>> {
     if !tokio::fs::try_exists(bin).await.unwrap_or(false) {
-        return None;
+        return Ok(None);
     }
     let output = ctx
         .runner
         .run(&bin.to_string_lossy(), &["-v"], &RunOptions::default())
-        .await
-        .ok()?;
-    output.ok().then(|| output.trimmed().to_string())
+        .await?;
+    Ok(output.ok().then(|| output.trimmed().to_string()))
 }
 
-async fn is_current(ctx: &Ctx, bin: &Path, wanted: &str) -> bool {
-    matches!(reported_version(ctx, bin).await, Some(found) if version::same(&found, wanted))
+async fn is_current(ctx: &Ctx, bin: &Path, wanted: &str) -> Result<bool> {
+    Ok(matches!(reported_version(ctx, bin).await?, Some(found) if version::same(&found, wanted)))
 }
 
 /// The two archives this task fetches, behind a trait so that what `apply()`
@@ -209,7 +220,7 @@ async fn apply_with(ctx: &mut Ctx, downloads: &dyn Downloads) -> Result<()> {
 /// unconditionally because it was asked to do anything at all.
 async fn ensure_node(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Result<()> {
     let tree = ctx.paths.node_dir(version);
-    if is_current(ctx, &tree.join("bin").join("node"), version).await {
+    if is_current(ctx, &tree.join("bin").join("node"), version).await? {
         return Ok(());
     }
     ctx.ui.note(&format!("Downloading Node {version}…"));
@@ -242,7 +253,7 @@ async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
 
     let tree = ctx.paths.pnpm_dir(version);
     let launcher = tree.join("pnpm");
-    if !is_current(ctx, &launcher, version).await {
+    if !is_current(ctx, &launcher, version).await? {
         ctx.ui.note(&format!("Downloading pnpm {version}…"));
         let bytes = downloads.pnpm(version, &asset).await?;
         download::extract_pnpm_tarball(&bytes, &tree)?;
@@ -545,6 +556,121 @@ mod tests {
         )
         .await
         .expect("replaces the wrong tree");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "the right node\n"
+        );
+    }
+
+    /// A `CommandRunner` that cannot start anything — `EAGAIN` under a process
+    /// limit, `ENOMEM`, `ETXTBSY`. `FakeRunner` cannot express this: every
+    /// stub, and every unstubbed call, returns `Ok` with an exit code.
+    struct CannotSpawn;
+
+    #[async_trait]
+    impl crate::runner::CommandRunner for CannotSpawn {
+        async fn run(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<crate::runner::CommandOutput> {
+            Err(anyhow::anyhow!(
+                "could not start `{program}`: Resource temporarily unavailable (os error 11)"
+            ))
+        }
+        async fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task never runs anything interactively")
+        }
+        fn which(&self, _program: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_will_not_start_is_not_evidence_that_it_is_missing() {
+        // A small shared box under process or memory pressure fails `spawn`
+        // with EAGAIN/ENOMEM while every tree on it is perfectly fine. Read as
+        // "not installed", that fetched ~130 MB and swapped out the Node a
+        // colleague's live session was executing from — and then hard-errored
+        // anyway when `check()` re-ran. `UnreachableDownloads` makes
+        // "downloads nothing" a property of the path, and the byte-for-byte
+        // assertion makes "touches nothing" one too.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = co_tenant_paths(server.path(), "bob-member-id");
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        write_file(&node_bin, "ada's node\n").await;
+
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+        ctx.runner = std::sync::Arc::new(CannotSpawn);
+
+        let error = ensure_node(&ctx, FALLBACK_NODE, &UnreachableDownloads)
+            .await
+            .expect_err("riabuild could not start the binary, which says nothing about the tree");
+        assert!(
+            error.to_string().contains("could not start"),
+            "the spawn failure is what should surface: {error}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "ada's node\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_start_node_is_an_error_not_a_missing_node() {
+        // The same distinction on the reporting side: `check()` reporting
+        // "Node is not installed yet" is what sends `apply()` at the shared
+        // tree in the first place, so it must not say that about a machine it
+        // failed to ask.
+        let (ctx, home) = ctx_with(FakeRunner::new()).await;
+        let node_bin = ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        write_file(&node_bin, "#!/bin/sh\n").await;
+
+        let (mut ctx, _home2) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
+        ctx.runner = std::sync::Arc::new(CannotSpawn);
+
+        Toolchain
+            .check(&ctx)
+            .await
+            .expect_err("a machine riabuild could not ask is not a machine without Node");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_runs_and_exits_non_zero_is_still_replaced() {
+        // The behaviour the three-way answer must not lose: a binary that
+        // *did* start and answered badly — `NODE_OPTIONS=--bogus node -v`
+        // exits 9 with empty stdout — is real evidence about the tree, and
+        // still means reinstall.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::RealPaths::rooted_at(server.path());
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        write_file(&node_bin, "a node that will not run\n").await;
+
+        let runner = FakeRunner::new().with(
+            &format!("{} -v", node_bin.to_string_lossy()),
+            9,
+            "",
+            "node: --bogus is not allowed in NODE_OPTIONS",
+        );
+        let (mut ctx, _laptop) = ctx_with(runner).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        ensure_node(
+            &ctx,
+            FALLBACK_NODE,
+            &FixedNode(node_archive(b"the right node\n")),
+        )
+        .await
+        .expect("replaces a tree that cannot answer for itself");
 
         assert_eq!(
             tokio::fs::read_to_string(&node_bin).await.unwrap(),

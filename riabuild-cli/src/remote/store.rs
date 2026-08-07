@@ -168,6 +168,15 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
         // so `forget build-01` leaves `build-01-2` with neither a session nor
         // a key. `Remote::hash()` is the documented identity of a server; this
         // is the code matching the documentation.
+        // Matched on `Remote::hash()`, which covers the whole login target —
+        // user, host, port — so what this reunites is a respelt *host*
+        // (`Build-01.Fly.Dev`, an FQDN's trailing dot), not every spelling of
+        // the same machine. A spec with no `user@` falls back to `whoami()`,
+        // so a bare host typed for a server that was added under some other
+        // username hashes differently and still forks a second record. That
+        // one is left alone deliberately: riabuild cannot tell it apart from a
+        // genuine second account on the same box, and the run that follows
+        // fails at authentication, which announces itself.
         if let Some(record) = store.remotes.iter_mut().find(|r| r.hash == remote.hash()) {
             // The freshly typed spelling wins. `Build-01.Fly.Dev` and
             // `build-01.fly.dev.` already hash to this same record, so this

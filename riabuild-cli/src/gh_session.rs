@@ -44,16 +44,28 @@ const STALE_AFTER_SECS: u64 = 24 * 60 * 60;
 ///
 /// Returning the first non-empty *string* was not the check the design asks
 /// for, and the difference is the whole point of this module: `ensure_private_dir`
-/// creates with `recursive(true)`, so a stale `XDG_RUNTIME_DIR` inherited from
-/// a dead login session — naming a path on persistent disk — was silently
+/// used to create with `recursive(true)`, so a stale `XDG_RUNTIME_DIR` inherited
+/// from a dead login session — naming a path on persistent disk — was silently
 /// *created* rather than skipped, and the GitHub OAuth token landed at rest on
-/// a disk while this file's own module doc promised the opposite.
+/// a disk while this file's own module doc promised the opposite. It now creates
+/// non-recursively, so the check made here also holds at the moment it is used
+/// rather than only when it was made.
 ///
 /// If none of the three qualifies riabuild stops, rather than inventing a
 /// fourth answer: there is nowhere left to put a credential that the promise
 /// above can be honoured for.
 pub async fn choose_runtime_dir(xdg: Option<&str>, tmpdir: Option<&str>) -> Result<PathBuf> {
-    for candidate in [xdg, tmpdir, Some("/tmp")] {
+    first_writable(&[xdg, tmpdir, Some("/tmp")]).await
+}
+
+/// The search itself, split out so its failure is reachable.
+///
+/// With `/tmp` hard-coded as the last candidate above, the "nothing qualified"
+/// arm is dead on every machine riabuild targets — and an error nobody can
+/// reach is an error nobody has read. This seam is what lets a test run the
+/// list to the end.
+async fn first_writable(candidates: &[Option<&str>]) -> Result<PathBuf> {
+    for candidate in candidates {
         let Some(value) = candidate.filter(|value| !value.is_empty()) else {
             continue;
         };
@@ -209,19 +221,35 @@ pub async fn sweep(dir: &Path, runner: Arc<dyn CommandRunner>, now: u64) -> Resu
 /// window for a fresh directory; the ownership check and mode repair below
 /// close it for one that already existed.
 ///
-/// `tokio::fs::DirBuilder::create` with `recursive(true)` does not error when
-/// the directory is already there — but it also does not re-apply `mode` in
-/// that case, so a directory a previous run (or another local user) left at a
-/// looser mode would otherwise sit here holding a GitHub credential. So every
-/// call, not just the ones that create something, verifies ownership and
-/// repairs the mode before returning.
+/// The create is **not** recursive, and that is `choose_runtime_dir`'s check
+/// surviving to the moment it is used. `recursive(true)` creates missing
+/// parents, so a runtime directory that went away between `writable_dir`'s
+/// `access(2)` and this call — a `/run/user/1000` torn down when the last login
+/// session ended, a `TMPDIR` cleaned — was silently *conjured* here instead,
+/// which is the "GitHub OAuth token at rest on persistent disk" failure that
+/// whole function exists to prevent, through a smaller window. Non-recursive
+/// makes the parent's absence `ENOENT`, which is the truth.
+///
+/// An already-existing directory is `EEXIST` rather than the silent success
+/// `recursive(true)` gave, and is accepted for the same reason it was before —
+/// but `mode` is not re-applied to one, so a directory a previous run (or
+/// another local user) left at a looser mode would otherwise sit here holding a
+/// GitHub credential. So every call, not just the ones that create something,
+/// verifies ownership and repairs the mode before returning.
 #[cfg(unix)]
 async fn ensure_private_dir(path: &Path) -> Result<()> {
-    tokio::fs::DirBuilder::new()
+    match tokio::fs::DirBuilder::new()
         .mode(0o700)
-        .recursive(true)
+        .recursive(false)
         .create(path)
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {}", path.display()));
+        }
+    }
 
     let owned = path.to_path_buf();
     // Blocking, not async: opening by descriptor and `fstat`/`fchmod`-ing it
@@ -439,14 +467,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nowhere_writable_at_all_is_an_actionable_failure() {
+    async fn two_unusable_candidates_fall_through_to_the_tmp_floor() {
+        // What this pins is the ordering: `/tmp` is the third candidate and
+        // does exist, so a missing XDG_RUNTIME_DIR and a missing TMPDIR land
+        // there rather than failing. (It used to be named for the failure it
+        // never reached — the error arm is unreachable through this entry
+        // point on any machine with a writable /tmp, which is every machine
+        // riabuild targets. `first_writable` below is where that arm is
+        // covered.)
         let base = tempfile::TempDir::new().expect("tempdir");
         let missing = base.path().join("gone");
-        // `/tmp` is the third candidate and does exist here, so the "none
-        // qualified" arm is reached by way of the two that do not — the
-        // ordering, rather than the error, is what this pins. The error arm
-        // itself is unreachable on any machine with a writable /tmp, which is
-        // every machine riabuild targets.
         assert_eq!(
             choose_runtime_dir(
                 Some(&missing.to_string_lossy()),
@@ -455,6 +485,47 @@ mod tests {
             .await
             .expect("falls through to /tmp"),
             PathBuf::from("/tmp")
+        );
+    }
+
+    #[tokio::test]
+    async fn nowhere_writable_at_all_is_an_actionable_failure() {
+        // The arm that had no coverage anywhere in the suite. Reached through
+        // `first_writable` rather than `choose_runtime_dir`, because the
+        // latter appends `/tmp`, which qualifies on every machine riabuild
+        // runs on — the alternative would be pretending to test it. What
+        // matters is that it is a `Failure` with somewhere to go, not an
+        // anonymous IO error: there is nowhere left to put a GitHub credential
+        // that this module's promise can be honoured for, and the developer is
+        // the only one who can change that.
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let missing = base.path().join("gone").to_string_lossy().into_owned();
+        let error = first_writable(&[Some(&missing), None, Some("")])
+            .await
+            .expect_err("nothing qualified");
+        let failure = error
+            .downcast_ref::<crate::ui::Failure>()
+            .unwrap_or_else(|| panic!("must be the actionable Failure: {error}"));
+        assert!(failure.action.contains("TMPDIR"), "{}", failure.action);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_directory_that_vanished_is_not_conjured_back() {
+        // `choose_runtime_dir` checks that the directory exists and is
+        // writable; `ensure_private_dir` is where that check is *used*, and
+        // `recursive(true)` silently recreated whatever had gone away in
+        // between — on persistent disk, holding a GitHub OAuth token, which is
+        // the exact failure the check exists to prevent.
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let runtime = base.path().join("run").join("user").join("1000");
+
+        GhSession::attach(&runtime, "550e8400")
+            .await
+            .expect_err("the runtime directory is gone");
+
+        assert!(
+            !runtime.exists(),
+            "a credential directory must never be what creates its own parents"
         );
     }
 

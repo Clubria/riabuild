@@ -151,6 +151,14 @@ async fn connect_and_setup(
             return Ok(0);
         }
     } else {
+        // Persisted *before* `authorise`, not after it succeeds: `ssh-copy-id`
+        // can append riabuild's key to the server's `authorized_keys` and the
+        // sign-in probe after it still fail, which returns `Err`. With no
+        // record on disk, `remote forget build-01` then refuses — "there is no
+        // saved server named build-01" — and that key line, this laptop's
+        // host-key pin, and its key pair are removable by hand only. A record
+        // for a server that never authorised at all is the cheaper mistake.
+        store.save(ctx.paths.as_ref()).await?;
         authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
     }
 
@@ -167,6 +175,17 @@ async fn connect_and_setup(
     // running this flow against a fresh container in Task 22's e2e test,
     // which is the one place a truly new remote is ever exercised.
     let home = resolve_home(&remote, ctx.paths.as_ref(), ctx.runner.clone(), store).await?;
+    // The second checkpoint: `forget`'s server-side cleanup builds its paths
+    // out of `record.home` and skips entirely when that is empty, and the very
+    // next step (`install::ensure_riabuild`) currently fails on every Linux
+    // server — no published musl asset — so without this the common failure
+    // leaves a key line on the server that `forget` can no longer reach in to
+    // remove. Conditional because this is the one step `--check` runs against
+    // the server, and saving here unconditionally is what made a read-only
+    // probe show up in `remote list` as a server the developer had set up.
+    if !cli.check {
+        store.save(ctx.paths.as_ref()).await?;
+    }
     let prefix = env_prefix(&home, &member.member_id, &remote.name);
     let prefix_refs: Vec<(&str, &str)> = prefix
         .iter()
@@ -379,14 +398,16 @@ mod tests {
     /// existing home cached (so `resolve_home` needs no round trip either), and
     /// riabuild already believed installed, so the run reaches `trust_host` in
     /// a handful of scripted SSH calls.
-    async fn ready_ctx(fake: FakeRunner) -> (Ctx, tempfile::TempDir, store::Store) {
-        let (mut ctx, home) = crate::testing::ctx_with(fake).await;
+    async fn ready_ctx(
+        fake: FakeRunner,
+    ) -> (Ctx, tempfile::TempDir, store::Store, Arc<FakeRunner>) {
+        let (mut ctx, home, fake) = crate::testing::ctx_and_runner(fake).await;
         ctx.member = Some(member());
         let mut store = store::Store::default();
         let mut record = store::record_for(&remote());
         record.home = "/home/dev".to_string();
         store.remotes.push(record);
-        (ctx, home, store)
+        (ctx, home, store, fake)
     }
 
     /// `ready_ctx`'s opposite: the state a genuinely *new* server is in, with
@@ -445,7 +466,7 @@ mod tests {
             )
             .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
             .with("ssh-keygen -t ed25519", 0, "", "");
-        let (mut ctx, _home, mut store) = ready_ctx(fake).await;
+        let (mut ctx, _home, mut store, _fake) = ready_ctx(fake).await;
 
         let cli = Cli::parse_from([
             "riabuild",
@@ -784,7 +805,7 @@ mod tests {
             .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
             .with("ssh -o BatchMode=yes", 0, "", "")
             .with("ssh", 0, "", "");
-        let (mut ctx, _home, mut store) = ready_ctx(fake).await;
+        let (mut ctx, _home, mut store, fake) = ready_ctx(fake).await;
 
         let cli = Cli::parse_from([
             "riabuild",
@@ -797,7 +818,7 @@ mod tests {
         // `uname -sm` answers nothing a Rust target can be derived from, so
         // the run stops inside `install::ensure_riabuild` — which is past
         // the probe, and is what this asserts.
-        let error = connect_and_setup(
+        connect_and_setup(
             &mut ctx,
             &cli,
             &mut store,
@@ -806,9 +827,249 @@ mod tests {
         )
         .await
         .expect_err("the fake server reports no usable platform");
+        // Asserted on what ran, not on the wording of the error: stopping at
+        // the probe returns `Ok(0)` rather than an `Err`, so an assertion
+        // about the *error* can only ever fire for some other reason.
+        // `uname -sm` is `install::ensure_riabuild`'s first question, three
+        // steps past the probe.
+        let calls = fake.calls();
         assert!(
-            !error.to_string().contains("not authorised"),
-            "an authorised server must not be reported as unauthorised: {error}"
+            calls.iter().any(|call| call.contains("uname -sm")),
+            "an authorised server must run on into the install step rather than \
+             stopping at the probe: {calls:?}"
+        );
+    }
+
+    /// What `ssh` prints when the pinned key no longer matches — a rebuilt VM,
+    /// or a box recreated after `remote forget`, which leaves the pin on
+    /// purpose.
+    const HOST_KEY_CHANGED: &str = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+         Host key verification failed.";
+
+    /// The composition bug: `--check` routes past `authorise` — where the
+    /// stale-pin diagnosis used to live — straight to the `can_sign_in` probe.
+    ///
+    /// With the pin already in `known_hosts` and no `--accept-host-key`,
+    /// `trust_host` returns without looking at it, so `ssh` is the first thing
+    /// to notice the key changed. A probe that reports only its exit status
+    /// then answers "no", and `--check` prints "riabuild's key is not
+    /// authorised on that server yet" and **exits 0** — the exact
+    /// misdiagnosis, and a success code, for a box that may not be the
+    /// developer's at all.
+    #[tokio::test]
+    async fn check_reports_a_changed_host_key_as_one_rather_than_as_an_unauthorised_key() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with("ssh -o BatchMode=yes", 255, "", HOST_KEY_CHANGED);
+        let (mut ctx, _home, mut store, fake) = ready_ctx(fake).await;
+        // Pinned by an earlier run, exactly as `trust_host` would have left
+        // it. No `ssh-keyscan` stub: re-scanning is not this path's behaviour.
+        tokio::fs::create_dir_all(ctx.paths.ssh_dir())
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            ctx.paths.known_hosts_file(),
+            format!(
+                "{} ssh-ed25519 OLDSTALEKEYDATA\n",
+                host_key::entry_host(&remote())
+            ),
+        )
+        .await
+        .expect("write");
+
+        let cli = Cli::parse_from(["riabuild", "--check", "remote", "build-01"]);
+        assert!(cli.check);
+        let error = connect_and_setup(&mut ctx, &cli, &mut store, Some("build-01".into()), None)
+            .await
+            .expect_err("a server answering with a different host key is not a clean check");
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("must be the actionable host-key Failure");
+        assert!(
+            failure.attempting.contains("host key"),
+            "the developer has to be told which key is the problem: {}",
+            failure.attempting
+        );
+        assert!(
+            failure
+                .action
+                .contains(&ctx.paths.known_hosts_file().display().to_string()),
+            "and where the pin that caused it lives: {}",
+            failure.action
+        );
+        assert!(
+            !fake.calls().iter().any(|call| call.contains("uname")),
+            "nothing may be run on a server whose identity did not check out: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// The other half of the `--check` persistence fix: a *real* run that gets
+    /// past `authorise` — which may already have written riabuild's key into
+    /// the server's `authorized_keys` — and then dies at the install step must
+    /// leave a record behind, or `remote forget` has nothing to act on.
+    ///
+    /// This is today's default outcome rather than a corner case:
+    /// `install::ensure_riabuild` fails on every Linux server, because no
+    /// `x86_64-unknown-linux-musl` asset is published yet.
+    #[tokio::test]
+    async fn a_run_that_touched_the_server_and_then_failed_can_still_be_forgotten() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // riabuild's key works, so `authorise` is a no-op — the run gets
+            // as far as `install::ensure_riabuild`, where `uname -sm` answers
+            // nothing a Rust target can be derived from.
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "")
+            .containing("printf %s", 0, "/home/dev", "")
+            // Whichever keychain CLI this platform uses, for the `forget` below.
+            .with("security", 0, "", "")
+            .with("secret-tool", 0, "", "");
+        let (mut ctx, _home, fake) = crate::testing::ctx_and_runner(fake).await;
+        ctx.member = Some(member());
+        // Empty: a server named as a spec is one riabuild has never saved,
+        // which is the state in which nothing was left behind to forget.
+        let mut store = store::Store::default();
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "remote",
+            "ada@build-01.fly.dev",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        assert!(!cli.check);
+        connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("ada@build-01.fly.dev".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect_err("the fake server reports no usable platform");
+
+        // Read back from disk, not from the in-memory store: `forget` runs in
+        // a later process and sees only what `remotes.json` holds.
+        let mut saved = store::Store::load(ctx.paths.as_ref()).await;
+        let record = saved
+            .find("build-01")
+            .expect("a run that authorised itself on the server must be forgettable");
+        assert_eq!(
+            record.home, "/home/dev",
+            "forget's server-side cleanup builds its paths from `home` and skips \
+             entirely when it is empty, so the resolved home has to be there too"
+        );
+
+        forget::forget_remote(
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &ctx.ui,
+            &ctx.api,
+            &member().member_id,
+            &mut saved,
+            "build-01",
+        )
+        .await
+        .expect("`remote forget build-01` must find it");
+        assert!(saved.find("build-01").is_none());
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.contains("authorized_keys")),
+            "the key line riabuild added to the server has to be reachable by \
+             forget's cleanup: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// Why the first save sits *before* `authorise` rather than after it
+    /// returns `Ok`: `ssh-copy-id` can append riabuild's key to the server's
+    /// `authorized_keys` and the sign-in probe that follows still fail, at
+    /// which point `authorise` returns `Err` — a run that modified the server
+    /// and reported failure. Saving only on success would leave that key line
+    /// with no local record naming the server it is on.
+    #[tokio::test]
+    async fn a_key_copied_onto_a_server_that_then_failed_is_still_recorded() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // The same refusal before and after the copy: `ssh-copy-id`
+            // succeeds, the recheck does not, so `authorise` fails *after*
+            // having written to the server.
+            .with(
+                "ssh -o BatchMode=yes",
+                255,
+                "",
+                "Permission denied (publickey,password).",
+            )
+            .with(
+                "ssh -o PreferredAuthentications=none",
+                255,
+                "",
+                "Permission denied (publickey,password).",
+            )
+            .with("ssh-copy-id", 0, "", "");
+        let (mut ctx, _home, fake) = crate::testing::ctx_and_runner(fake).await;
+        ctx.member = Some(member());
+        write_public_key(ctx.paths.as_ref()).await;
+        let mut store = store::Store::default();
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "remote",
+            "ada@build-01.fly.dev",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("ada@build-01.fly.dev".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect_err("a key that still cannot sign in is not success");
+
+        // Only meaningful if the server really was written to.
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("ssh-copy-id")),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            store::Store::load(ctx.paths.as_ref())
+                .await
+                .find("build-01")
+                .is_some(),
+            "the server holds riabuild's key now; `remote forget` has to be able to \
+             name it"
         );
     }
 

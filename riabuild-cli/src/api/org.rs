@@ -42,12 +42,30 @@ pub struct OrgConfig {
 /// it is the same kind of value from the same field of the same reply, and a
 /// floor that could be any string at all is a floor `version::` comparisons
 /// silently mis-read.
+///
+/// Surrounding whitespace is **trimmed rather than refused**, because
+/// `org.update` on the server tests its regex against `value.trim()` and then
+/// stores `args.minCliVersion` untrimmed — so `" 1.0.0"` is a value riabuild-web
+/// accepts and serves. Refusing it here would not protect anything: `fetch_config`
+/// is reached through `main::connect` with `?`, so a config the CLI cannot
+/// deserialize fails `provision`, `riabuild remote` and `riabuild remote forget`
+/// alike — every developer blocked by a stray space, rather than a version floor
+/// quietly not applying. What is trimmed is then *gone*: the trimmed value is
+/// what is stored, so no whitespace reaches the release URL either way.
 fn version_only<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
-    let value = String::deserialize(deserializer)?;
+    let raw = String::deserialize(deserializer)?;
+    // ECMAScript's `String.prototype.trim` — the one the server's own check
+    // runs — strips U+FEFF as whitespace and Rust's `str::trim` does not, so
+    // the one character the two disagree about is named here. Anything else
+    // Rust trims and JS does not is a value the server's regex already refused
+    // to store.
+    let value = raw
+        .trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}')
+        .to_string();
     // `split('.')` on "" yields one empty component, so an empty string is
     // refused by the same rule that refuses "1..2" and a leading/trailing dot.
     let shaped = value
@@ -57,7 +75,7 @@ where
         Ok(value)
     } else {
         Err(D::Error::custom(format!(
-            "{value:?} is not a riabuild version"
+            "{raw:?} is not a riabuild version"
         )))
     }
 }
@@ -185,8 +203,7 @@ mod tests {
             "1.0/..",
             "1.0.0-rc1",
             "latest",
-            " 1.0.0",
-            "1.0.0 ",
+            "1. 0.0",
             "1..0",
             ".1.0",
             "1.0.",
@@ -201,6 +218,55 @@ mod tests {
                     "{field}={bad:?} produced {error}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_the_server_stores_is_trimmed_rather_than_refused() {
+        // `org.update` validates `value.trim()` against its regex and then
+        // stores `args.minCliVersion` untrimmed, so these are values
+        // riabuild-web accepts and serves. Refusing them here blocks every
+        // developer, not just the version floor: `fetch_config` is called from
+        // `main::connect` with `?`, so a config the CLI cannot deserialize
+        // fails `provision`, `riabuild remote` and `riabuild remote forget`
+        // alike.
+        // Written as the JSON escapes the server would send, not as Rust
+        // escapes: a raw tab inside a JSON string is a parse error long
+        // before `version_only` sees it.
+        for (raw, expected) in [
+            (" 1.0.0", "1.0.0"),
+            ("1.0.0 ", "1.0.0"),
+            (r"\t2026.08.06\n", "2026.08.06"),
+            ("\u{feff}1.0.0", "1.0.0"),
+        ] {
+            let config: OrgConfig = serde_json::from_str(&payload("latestCliVersion", raw))
+                .unwrap_or_else(|error| panic!("{raw:?} must decode: {error}"));
+            // Trimmed, not merely accepted: this value is formatted straight
+            // into a release URL.
+            assert_eq!(config.latest_cli_version, expected);
+        }
+    }
+
+    #[test]
+    fn a_version_field_that_is_absent_or_null_is_refused() {
+        // Unpinned until now, and the safe behaviour is the current one. A
+        // later `#[serde(default)]` — the obvious tidy-up — would turn a
+        // missing `minCliVersion` into `""` *without* passing it through
+        // `version_only` at all, so the floor would silently become a string
+        // no `version::` comparison can read, and nothing else in the suite
+        // would notice.
+        for body in [
+            // absent
+            r#"{"repoSlug":"Clubria/x","latestCliVersion":"1.0.0","secretsUpdatedAt":0}"#,
+            r#"{"repoSlug":"Clubria/x","minCliVersion":"1.0.0","secretsUpdatedAt":0}"#,
+            // null
+            r#"{"repoSlug":"Clubria/x","minCliVersion":null,"latestCliVersion":"1.0.0"}"#,
+            r#"{"repoSlug":"Clubria/x","minCliVersion":"1.0.0","latestCliVersion":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<OrgConfig>(body).is_err(),
+                "must not decode: {body}"
+            );
         }
     }
 

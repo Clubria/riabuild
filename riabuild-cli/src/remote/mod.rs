@@ -203,11 +203,11 @@ pub async fn ssh_once(
 /// `store.save` here made a read-only probe persist a full record — name,
 /// host, port, user — for a machine the developer had only asked riabuild to
 /// look at, which then read back from `riabuild remote list` as a server they
-/// had set up. Persisting is left to the callers that mean it:
-/// `session::ensure` when it mints a session, and `store::remember` when a
-/// connect succeeds. The cost is that a run dying between here and either of
-/// those re-asks `$HOME` next time — one `printf` over an SSH connection that
-/// is being opened anyway.
+/// had set up. Persisting is left to the callers that know whether this run is
+/// read-only: `flow::connect_and_setup` saves either side of this call on the
+/// non-`--check` path — before `authorise`, which can modify the server, and
+/// again here, because `forget`'s server-side cleanup needs the home this
+/// resolved — and `session::ensure` and `store::remember` save again later.
 pub async fn resolve_home(
     remote: &Remote,
     paths: &dyn Paths,

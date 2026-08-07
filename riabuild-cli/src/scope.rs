@@ -178,9 +178,10 @@ mod tests {
         let error = Scope::read(Some("build-01"))
             .server_session_token_file(&paths)
             .expect_err("a laptop root is not a server namespace");
-        let failure = error
-            .downcast_ref::<Failure>()
-            .expect("must be the actionable Failure: {error}");
+        // `expect` takes a `&str`, so a `{error}` in it prints literally.
+        let failure = error.downcast_ref::<Failure>().unwrap_or_else(|| {
+            panic!("must be the actionable Failure, not a generic error: {error}")
+        });
         assert!(
             failure.detail.contains("RIABUILD_ROOT"),
             "{}",

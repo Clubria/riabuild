@@ -30,11 +30,24 @@ pub fn fingerprint_of(stdout: &str) -> Option<String> {
 /// The first field of this server's `known_hosts` line — bare for port 22,
 /// `[host]:port` otherwise. Shared with `authorise`, which has to name the
 /// exact line to remove when `ssh` refuses a stale pin.
+///
+/// Case-folded, like [`Remote::hash`] and like `ssh` itself: OpenSSH matches
+/// `known_hosts` host patterns case-insensitively (verified against OpenSSH
+/// 9.6 — `ssh-keygen -F Build-01.Fly.Dev` finds a `build-01.fly.dev` line and
+/// vice versa), so one server typed two ways is one pinned line to `ssh` and
+/// has to be one here too. `store::choose` lets the newest spelling win, so
+/// typing `Build-01.Fly.Dev` once rewrites `record.host` permanently; a
+/// case-sensitive first field then missed the line already in the file on
+/// every later run — a re-scan, a fresh trust prompt, and another duplicate
+/// entry appended each time.
 pub fn entry_host(remote: &Remote) -> String {
+    // ASCII-only, the same choice `Remote::hash` documents: hostnames are
+    // ASCII or punycode, so there is no Unicode case-folding to get wrong.
+    let host = remote.host.to_ascii_lowercase();
     if remote.port == 22 {
-        remote.host.clone()
+        host
     } else {
-        format!("[{}]:{}", remote.host, remote.port)
+        format!("[{host}]:{}", remote.port)
     }
 }
 
@@ -99,14 +112,20 @@ pub async fn trust_host(
         .await
         .unwrap_or_default();
     let host_field = entry_host(remote);
-    // Exact first field, not a prefix: `starts_with` would treat two
+    // Whole first field, not a prefix: `starts_with` would treat two
     // genuinely different servers as already trusted and skip the prompt.
+    // Compared case-insensitively, as `ssh` compares it — the line already in
+    // the file carries the host spelled the way it was typed on the run that
+    // pinned it, because that is what `ssh-keyscan` echoes back, so folding
+    // only one side would still miss a match in the other direction.
     let pinned: Vec<&str> = existing
         .lines()
         .filter(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|field| field.split(',').any(|name| name == host_field))
+            line.split_whitespace().next().is_some_and(|field| {
+                field
+                    .split(',')
+                    .any(|name| name.eq_ignore_ascii_case(&host_field))
+            })
         })
         .collect();
     if !pinned.is_empty() {
@@ -322,6 +341,76 @@ mod tests {
         )
         .await
         .expect("write");
+    }
+
+    #[test]
+    fn the_known_hosts_field_is_case_folded_the_way_ssh_matches_it() {
+        let mixed = Remote {
+            host: "Build-01.Fly.Dev".into(),
+            ..remote()
+        };
+        assert_eq!(entry_host(&mixed), "[build-01.fly.dev]:2222");
+        assert_eq!(
+            entry_host(&Remote {
+                port: 22,
+                ..mixed.clone()
+            }),
+            "build-01.fly.dev"
+        );
+        // Unchanged for a host already typed in lower case, which is what
+        // every other test here and `authorise`'s remedy message rely on.
+        assert_eq!(entry_host(&remote()), "[build-01.fly.dev]:2222");
+    }
+
+    #[tokio::test]
+    async fn a_host_pinned_in_one_spelling_is_not_re_pinned_when_typed_in_another() {
+        // DNS is case-insensitive and so is `ssh`'s own `known_hosts` lookup,
+        // but `store::choose` lets the newest spelling win — so one capitalised
+        // hostname used to fork the pin: re-scanned, re-prompted, and appended
+        // beside the line that was already there, on every later run.
+        //
+        // Both directions, because folding only `entry_host` fixes just one:
+        // the file may hold either spelling, since `ssh-keyscan` echoes back
+        // whatever host it was given.
+        for (pinned_as, typed_as) in [
+            ("build-01.fly.dev", "Build-01.Fly.Dev"),
+            ("Build-01.Fly.Dev", "build-01.fly.dev"),
+        ] {
+            let home = tempfile::TempDir::new().expect("tempdir");
+            let paths = RealPaths::rooted_at(home.path());
+            let remote = Remote {
+                host: typed_as.into(),
+                port: 22,
+                ..remote()
+            };
+            tokio::fs::create_dir_all(paths.ssh_dir())
+                .await
+                .expect("mkdir");
+            tokio::fs::write(
+                paths.known_hosts_file(),
+                format!("{pinned_as} ssh-ed25519 AAAAstubkeydata\n"),
+            )
+            .await
+            .expect("write");
+
+            // No stubs at all: reaching for `ssh-keyscan` — or for the prompt
+            // that follows it, on a test process with no TTY — fails outright.
+            let fake = Arc::new(FakeRunner::new());
+            trust_host(&remote, &paths, fake.clone(), &Ui::new(true), None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{typed_as} is already pinned as {pinned_as}: {error}")
+                });
+
+            let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+                .await
+                .expect("read");
+            assert_eq!(
+                contents.lines().count(),
+                1,
+                "one server must not accumulate a pin per spelling: {contents}"
+            );
+        }
     }
 
     #[tokio::test]

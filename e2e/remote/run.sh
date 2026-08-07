@@ -313,10 +313,34 @@ assert_reached_the_server() {
   grep -q "\[localhost\]:$CONTAINER_PORT" \
     "$work/laptop-ada/.riabuild/ssh/known_hosts" 2>/dev/null \
     || failed="$failed\n  - the container host key was never pinned"
-  # riabuild's own key, added to the account it must reach (authorise).
-  if [ "$(in_container 'wc -l < ~/.ssh/authorized_keys')" -lt 2 ]; then
-    failed="$failed\n  - riabuild never authorised its key on the container"
-  fi
+  # riabuild's own key, added to the account it must reach (authorise). The
+  # container starts with exactly one line, the e2e seed key, so a second one
+  # is riabuild's.
+  #
+  # This was `[ "$(… wc -l < ~/.ssh/authorized_keys)" -lt 2 ]`, which could not
+  # fail on the input that matters most. With no `authorized_keys` at all the
+  # redirect fails, the substitution is empty, and `[ "" -lt 2 ]` is not a
+  # false condition — it is a malformed one: `test` writes "integer expression
+  # expected" and exits 2. `if` cannot tell those apart, so the branch was
+  # skipped and the assertion passed. The worse the input, the more certainly
+  # it succeeded — inside the very function whose job is to stop a non-start
+  # being forgiven as a known gap.
+  #
+  # `grep -c .` answers 0 for a missing file instead of erroring, and the
+  # `case` demands an actual number, so an unreadable count is a failure
+  # rather than a pass. The `|| true` guards only the assignment (a bare
+  # command substitution that fails would end the script under `set -e`); it
+  # suppresses nothing, because the `case` below does all the asserting.
+  keys="$(in_container 'grep -c . ~/.ssh/authorized_keys 2>/dev/null' || true)"
+  case "$keys" in
+    '' | *[!0-9]*)
+      failed="$failed\n  - could not count the container's authorized_keys (got '$keys')"
+      ;;
+    *)
+      [ "$keys" -ge 2 ] \
+        || failed="$failed\n  - riabuild never authorised its key on the container"
+      ;;
+  esac
   if [ -n "$failed" ]; then
     echo "The run did not reach the install step at all:" >&2
     printf "%b\n" "$failed" >&2
@@ -389,6 +413,20 @@ in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
 # `gh_session.rs::opening_a_session_makes_a_private_directory_and_a_marker`
 # and `::two_sessions_share_one_sign_in_and_the_last_one_out_wipes_it`.
 # This file asserts the half a black box really can see: nothing survives.
+#
+# Read this one as one-sided, because it is: "no hosts.yml is left" is just as
+# true of a run where `gh` was never signed in at all, or where seeding it
+# silently did nothing — a failure this branch has actually had. Nothing in
+# this script asserts a GitHub credential ever *reached* the container, and
+# there is nowhere to look for one: the credential lives in the ephemeral
+# runtime directory for the life of the process and is reaped with it, which
+# is the property being tested. So this catches a leak and cannot catch an
+# absence; the four assertions above it are what establish the run did real
+# work.
 test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
 
-echo "remote mode e2e: all five isolation assertions passed"
+# Names what was checked rather than claiming "all assertions passed", which
+# is how this script once reported a run that never reached the server.
+echo "remote mode e2e: five assertions passed — separate namespaces, separate"
+echo "git identities, one shared toolchain, per-developer checkouts, and no"
+echo "gh credential left behind."
