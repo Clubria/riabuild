@@ -46,13 +46,17 @@ fn new_project_entry() -> Value {
 
 /// Every path Claude Code might key the checkout under.
 ///
+/// `pub(crate)` alongside `trust_one`, so `riabuild claude new` can trust the
+/// account it just created rather than leaving it for the next `riabuild` run —
+/// see the call site for why that window matters.
+///
 /// It derives the key from the real path of its working directory, but probes
 /// the literal path too. A symlinked checkout — or a home directory that is
 /// itself a symlink — makes those two different strings, and trust written
 /// under one is invisible under the other. Writing both costs a few bytes and
 /// removes the failure where riabuild reports a trusted checkout and the
 /// developer still gets the dialog.
-async fn trust_keys(dir: &Path) -> Vec<String> {
+pub(crate) async fn trust_keys(dir: &Path) -> Vec<String> {
     let mut keys = vec![dir.to_string_lossy().into_owned()];
     if let Ok(real) = tokio::fs::canonicalize(dir).await {
         let real = real.to_string_lossy().into_owned();
@@ -160,7 +164,12 @@ impl Task for ClaudeTrust {
 /// Writes the trust key into one account's config, preserving every key it does
 /// not own. Claude Code may be running against this file right now, so the new
 /// content lands whole or not at all.
-async fn trust_one(ctx: &mut Ctx, id: &str, keys: &[String]) -> Result<()> {
+///
+/// Per-account rather than per-run so that `riabuild claude new` can reach it:
+/// an account created between two `riabuild` runs would otherwise meet the trust
+/// dialog on its first launch, which is precisely when the developer is about to
+/// use it.
+pub(crate) async fn trust_one(ctx: &mut Ctx, id: &str, keys: &[String]) -> Result<()> {
     let file = config_file(ctx, id);
     if let Some(parent) = file.parent() {
         tokio::fs::create_dir_all(parent).await?;

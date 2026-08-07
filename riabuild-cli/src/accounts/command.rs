@@ -8,6 +8,7 @@ use crate::paths::contract_tilde;
 use crate::runner::RunOptions;
 use crate::shims;
 use crate::tasks::Ctx;
+use crate::tasks::claude_trust;
 use crate::ui::Failure;
 use anyhow::Result;
 use std::path::Path;
@@ -112,7 +113,36 @@ async fn new(ctx: &mut Ctx) -> Result<i32> {
         .into());
     }
 
+    trust(ctx, &id, number).await;
     list(ctx).await
+}
+
+/// Trusts the checkout for one freshly created account.
+///
+/// `claude_trust` only runs inside the task engine, so without this the
+/// developer's very next `claude-<n>` in the checkout opens Claude Code's trust
+/// modal and holds the org's settings back as untrusted — the one dialog this
+/// product exists to keep them from meeting. The next `riabuild` run repairs it,
+/// which is why a failure here is a note and not a refusal: the account was
+/// created and signed in, and saying otherwise would be a worse lie than the
+/// dialog. But the window is exactly the minute the developer is about to use
+/// the account, so it is closed here.
+///
+/// Both outcomes are said out loud. Silence is the one wrong answer: an
+/// unexplained trust dialog reads as riabuild not having worked.
+async fn trust(ctx: &mut Ctx, id: &str, number: usize) {
+    let Some(dir) = ctx.project_dir() else {
+        ctx.ui.note(&format!(
+            "No checkout has been chosen yet, so account {number} will ask you to trust one — run `riabuild` and it is done for you"
+        ));
+        return;
+    };
+    let keys = claude_trust::trust_keys(&dir).await;
+    if let Err(error) = claude_trust::trust_one(ctx, id, &keys).await {
+        ctx.ui.note(&format!(
+            "Account {number} could not be given the checkout's trust ({error:#}) — run `riabuild` to finish it"
+        ));
+    }
 }
 
 /// Undoes everything `new` did, so a sign-in that did not happen leaves nothing.
@@ -645,6 +675,54 @@ mod tests {
             .await
             .unwrap();
         assert!(script.contains(ids[2].as_str()), "{script}");
+    }
+
+    #[tokio::test]
+    async fn a_new_account_trusts_the_checkout_before_it_is_ever_launched() {
+        // Without this the developer's very next `claude-2` in the checkout
+        // opens Claude Code's trust modal and holds the org's settings back as
+        // untrusted. The next `riabuild` run repairs it — but the moment they
+        // are about to run the launcher is exactly the moment it is broken.
+        let (mut ctx, home, _ids) = with_accounts(1).await;
+        let checkout = home.path().join("code/hub");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+        ctx.config.project_path = Some(checkout.to_string_lossy().into_owned());
+
+        assert_eq!(new(&mut ctx).await.unwrap(), 0);
+
+        let added = ctx.config.claude_accounts[1].clone();
+        let text = tokio::fs::read_to_string(ctx.paths.claude_config_file(&added))
+            .await
+            .expect("the new account has a Claude Code config");
+        let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let key = checkout.to_string_lossy().into_owned();
+        assert_eq!(
+            root["projects"][&key]["hasTrustDialogAccepted"],
+            serde_json::json!(true),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_account_with_no_checkout_yet_is_told_so() {
+        // There is nothing to trust, and the developer will meet the dialog.
+        // Saying nothing would leave that reading as riabuild not having
+        // worked.
+        let (mut ctx, _home, _ids) = with_accounts(1).await;
+        ctx.ui = Ui::scripted([]);
+        assert!(ctx.project_dir().is_none(), "this test needs no checkout");
+
+        assert_eq!(new(&mut ctx).await.unwrap(), 0);
+
+        let notes = ctx.ui.noted();
+        assert!(
+            notes.iter().any(|note| note.contains("trust")),
+            "the trust dialog they are about to meet went unmentioned: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("riabuild")),
+            "the note has to name what fixes it: {notes:?}"
+        );
     }
 
     #[tokio::test]
