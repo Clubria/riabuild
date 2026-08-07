@@ -79,7 +79,7 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"\'"))
 }
 
-pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx, prelude: &str) -> Result<super::ShellLaunch> {
     let root = ctx.paths.shell_dir("fish");
     let fish_dir = root.join("fish");
     tokio::fs::create_dir_all(&fish_dir).await?;
@@ -93,7 +93,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         fish_dir.join("config.fish"),
         config(
             &user_config_dir,
-            &banner_command(&super::banner(colour)),
+            &banner_command(prelude),
             &prompt_command(colour),
         ),
     )

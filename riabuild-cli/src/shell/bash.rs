@@ -70,7 +70,7 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx, prelude: &str) -> Result<super::ShellLaunch> {
     let dir = ctx.paths.shell_dir("bash");
     tokio::fs::create_dir_all(&dir).await?;
     let rc = dir.join("rc");
@@ -79,7 +79,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         &rc,
         rcfile(
             &ctx.paths.home(),
-            &banner_command(&super::banner(colour)),
+            &banner_command(prelude),
             &prompt_command(colour),
         ),
     )

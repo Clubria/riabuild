@@ -75,7 +75,7 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
+pub async fn prepare(ctx: &Ctx, prelude: &str) -> Result<super::ShellLaunch> {
     let dir = ctx.paths.shell_dir("zsh");
     tokio::fs::create_dir_all(&dir).await?;
 
@@ -89,7 +89,7 @@ pub async fn prepare(ctx: &Ctx) -> Result<super::ShellLaunch> {
         dir.join(".zshrc"),
         rcfile(
             &user_zdotdir,
-            &banner_command(&super::banner(colour)),
+            &banner_command(prelude),
             &prompt_command(colour),
         ),
     )
