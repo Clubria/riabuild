@@ -71,7 +71,10 @@ async fn run(cli: Cli) -> Result<i32> {
     let ui = Ui::new(cli.quiet);
     let paths: Arc<dyn Paths> = Arc::new(RealPaths::new()?);
     let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
-    let keychain: Arc<dyn keychain::Keychain> = Arc::from(keychain::for_platform(runner.clone()));
+    // `None` here: Task 10 supplies a server's session token path when riabuild
+    // is running on a server rather than a developer's laptop.
+    let keychain: Arc<dyn keychain::Keychain> =
+        Arc::from(keychain::for_platform(runner.clone(), None));
 
     tokio::fs::create_dir_all(paths.root()).await?;
 
