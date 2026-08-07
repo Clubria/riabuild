@@ -10,12 +10,7 @@
 //! as well as the settings — on macOS the keychain item is named for a hash of
 //! the directory's path — so two accounts really are two independent sign-ins.
 
-// Nothing outside this module's own tests calls these yet — the identity
-// lookup, the rendered box, the shims, and the `claude` subcommands are later
-// tasks in this plan that wire them in. Remove this once one does; `dead_code`
-// finding a real gap again is the point of not leaving it broader than needed.
-#![allow(dead_code)]
-
+pub mod command;
 pub mod render;
 pub mod status;
 

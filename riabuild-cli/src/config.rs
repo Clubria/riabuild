@@ -122,18 +122,6 @@ impl UserConfig {
         write_json(&paths.config_file(), self).await
     }
 
-    /// The account `claude` runs.
-    ///
-    /// Task 10 folded `claude_trust` into a loop over every account, which was
-    /// this method's last caller — `shims` already indexed `claude_accounts`
-    /// directly rather than going through it. Left in place and allowed rather
-    /// than deleted: removing a Task 1 interface is a call for whoever owns
-    /// this plan, not a side effect of this task.
-    #[allow(dead_code)]
-    pub fn primary_account(&self) -> Option<&str> {
-        self.claude_accounts.first().map(String::as_str)
-    }
-
     /// Folds the single profile of an older riabuild into the account list.
     ///
     /// Takes the field rather than copying it, so no caller can read a value
@@ -312,8 +300,10 @@ mod tests {
         );
         // Folded in on load, so nothing downstream ever sees the old field.
         assert_eq!(config.claude_profile, None);
+        // The folded profile is the *primary* account, which is what position 1
+        // means — read off the list, because that list is the only record of it.
         assert_eq!(
-            config.primary_account(),
+            config.claude_accounts.first().map(String::as_str),
             Some("11111111-2222-4333-8444-555555555555")
         );
     }

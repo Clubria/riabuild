@@ -128,6 +128,12 @@ async fn run(cli: Cli) -> Result<i32> {
         Some(Command::MoveProject { path }) => {
             return move_project::run(&mut ctx, path.as_deref()).await;
         }
+        // Deliberately not behind `connect`: this manages local directories and
+        // talks only to Claude Code, so it must work with no riabuild session,
+        // no network, and a machine nothing has provisioned.
+        Some(Command::Claude { action }) => {
+            return accounts::command::run(&mut ctx, action).await;
+        }
         Some(Command::Login) => {
             use tasks::Task;
             connect(&mut ctx).await?;
