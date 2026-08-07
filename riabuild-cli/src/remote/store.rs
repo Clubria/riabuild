@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // consumed by Task 21
+#[serde(rename_all = "camelCase")]
 pub struct Record {
     pub name: String,
     pub hash: String,
@@ -23,10 +24,20 @@ pub struct Record {
     /// When the session minted for this server runs out.
     pub session_expires_at: u64,
     pub last_seen_cli_version: String,
+    /// The server's own absolute home directory, as reported by the server
+    /// itself — never `~`. Asked for once by `remote::resolve_home` and kept
+    /// here so every later command can use an absolute path without asking
+    /// again. `#[serde(default)]` lets a `remotes.json` written before this
+    /// field existed still deserialize (as `""`, which `resolve_home` treats
+    /// as "not yet known" and re-asks for); it does not help struct-literal
+    /// construction, so every literal in this file names it explicitly.
+    #[serde(default)]
+    pub home: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(dead_code)] // consumed by Task 21
+#[serde(rename_all = "camelCase")]
 pub struct Store {
     #[serde(default)]
     pub remotes: Vec<Record>,
@@ -102,6 +113,26 @@ pub fn allocate_name(host: &str, taken: &[String]) -> String {
         }
     }
     base
+}
+
+/// A `Record` for `remote`, as if it had just been added and never connected
+/// to. Shared across the remote test modules (13b, 17, 20, 21, 22) so there is
+/// one definition of "a store entry that matches this `Remote`" instead of
+/// each task's tests drifting from the next.
+#[cfg(test)]
+pub fn record_for(remote: &super::Remote) -> Record {
+    Record {
+        name: remote.name.clone(),
+        hash: remote.hash(),
+        host: remote.host.clone(),
+        port: remote.port,
+        user: remote.user.clone(),
+        added_at: 0,
+        last_used_at: 0,
+        session_expires_at: 0,
+        last_seen_cli_version: String::new(),
+        home: String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +213,7 @@ mod tests {
             last_used_at: 2,
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
+            home: "/home/ada".into(),
         });
         store.save(&paths).await.expect("save");
 
@@ -208,6 +240,7 @@ mod tests {
             last_used_at: 1,
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
+            home: "/home/ada".into(),
         });
         store.save(&paths).await.expect("save");
 
@@ -222,6 +255,7 @@ mod tests {
             last_used_at: 2,
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
+            home: "/home/ada".into(),
         });
         reloaded.save(&paths).await.expect("save");
 
