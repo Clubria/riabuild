@@ -85,8 +85,9 @@ impl Task for Project {
             Some(path) => expand_tilde(&path, &home),
             None => {
                 // Where this lands is riabuild's decision, and it differs per
-                // platform — see `paths::default_project_dir`.
-                let default = crate::paths::default_project_dir(&home, org.repo_name());
+                // platform, and per machine when several developers share one
+                // Unix account — see `Ctx::default_checkout`.
+                let default = ctx.default_checkout().await;
                 ctx.ui.note(&format!(
                     "Using {} for the checkout",
                     contract_tilde(&default, &home)
@@ -140,6 +141,18 @@ impl Task for Project {
                 .detail(output.stderr)
                 .into());
             }
+            // Marks this checkout as this namespace's own, so a re-run of
+            // `Ctx::default_checkout` recognises its own tree instead of
+            // claiming the next suffix beside it every time. `create_dir_all`
+            // is a no-op after a real clone (the directory already exists);
+            // it exists here mainly so a faked `gh repo clone` in tests has
+            // somewhere to write the marker.
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(
+                dir.join(".riabuild-owner"),
+                ctx.paths.root().to_string_lossy().as_bytes(),
+            )
+            .await?;
         }
 
         ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
@@ -151,9 +164,98 @@ impl Task for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Member;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
     use std::sync::Arc;
+
+    fn member_named(login: &str) -> Member {
+        Member {
+            github_login: login.into(),
+            member_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            email: "ada@clubria.dev".into(),
+            role: "developer".into(),
+            status: "active".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_laptop_checkout_is_unchanged() {
+        let (ctx, home) = ctx_with(FakeRunner::new()).await;
+        assert_eq!(
+            ctx.default_checkout().await,
+            crate::paths::default_project_dir(home.path(), "ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_checkout_is_grouped_by_developer() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+
+        assert_eq!(
+            ctx.default_checkout().await,
+            home.path()
+                .join("Clubria")
+                .join("ada")
+                .join("ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taken_default_is_claimed_beside_rather_than_shared() {
+        // Two developers, one Unix account, and a login that already has a tree —
+        // a reused GitHub login, or somebody who set it up by hand. Sharing it
+        // would put two people's branches and one .env.local in one checkout.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let taken = home.path().join("Clubria").join("ada");
+        tokio::fs::create_dir_all(taken.join("ai-builders-hub"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            taken.join("ai-builders-hub/.riabuild-owner"),
+            "someone-else",
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(
+            ctx.default_checkout().await,
+            home.path()
+                .join("Clubria")
+                .join("ada-2")
+                .join("ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_run_recognises_its_own_checkout_by_the_owner_marker() {
+        // The claiming loop must not push a developer's own tree to `-2` on a
+        // second run — apply() writes `.riabuild-owner`, and this is what makes
+        // that marker mean something.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        let own = home
+            .path()
+            .join("Clubria")
+            .join("ada")
+            .join("ai-builders-hub");
+        tokio::fs::create_dir_all(&own).await.expect("mkdir");
+        tokio::fs::write(
+            own.join(".riabuild-owner"),
+            ctx.paths.root().to_string_lossy().as_bytes(),
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(ctx.default_checkout().await, own);
+    }
 
     #[tokio::test]
     async fn an_unchosen_project_needs_setting_up() {
@@ -177,6 +279,33 @@ mod tests {
         );
         // Named after the repository, not the whole owner/repo slug.
         assert!(expected.ends_with("ai-builders-hub"), "{expected:?}");
+    }
+
+    #[tokio::test]
+    async fn a_server_run_clones_into_the_developer_grouped_path_and_marks_it() {
+        // Proves the actual wiring, not just `default_checkout` in isolation:
+        // `apply()` on a server must land the clone under the developer's own
+        // directory, and leave the marker that keeps a re-run from claiming a
+        // `-2` beside it.
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("gh repo clone", 0, "", "")).await;
+        ctx.server = Some("build-01".into());
+        ctx.member = Some(member_named("ada"));
+        Project.apply(&mut ctx).await.unwrap();
+
+        let expected = home
+            .path()
+            .join("Clubria")
+            .join("ada")
+            .join("ai-builders-hub");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(expected.to_string_lossy().as_ref()),
+            "a server checkout must be grouped under the developer, not the platform default"
+        );
+        let marker = tokio::fs::read_to_string(expected.join(".riabuild-owner"))
+            .await
+            .expect("apply() must leave an owner marker");
+        assert_eq!(marker, ctx.paths.root().to_string_lossy());
     }
 
     #[tokio::test]

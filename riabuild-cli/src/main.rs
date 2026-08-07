@@ -85,6 +85,10 @@ async fn run(cli: Cli) -> Result<i32> {
         state: State::load(paths.as_ref()).await,
         org: None,
         member: None,
+        // No `Scope` yet to read this from — `riabuild remote` (Task 10) is the
+        // task that turns this into `Some(name)` when riabuild is running on a
+        // server rather than a developer's laptop.
+        server: None,
         cli_version: cli::VERSION.to_string(),
         web_url: api::web_url(),
         env: Vec::new(),

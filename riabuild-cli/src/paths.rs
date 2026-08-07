@@ -201,7 +201,6 @@ fn default_project_dir_on(os: &str, home: &Path, repo_name: &str) -> PathBuf {
 /// Never `~/Documents`, on any platform: macOS protects it from SSH sessions,
 /// returning "Operation not permitted" unless sshd has Full Disk Access, and
 /// one answer on every platform is one less branch to be wrong in.
-#[allow(dead_code)] // consumed by Task 7b
 pub fn remote_project_dir(home: &Path, login: &str, repo_name: &str) -> PathBuf {
     home.join(ORG_DIR).join(login).join(repo_name)
 }
