@@ -296,7 +296,14 @@ async fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
         .open(&path)
         .await
     {
-        let _ = file.write_all(line.as_bytes()).await;
+        // write_all reporting success only means the bytes reached
+        // tokio::fs::File's internal buffer, not that the background
+        // write() syscall ran — flush is what waits for that.
+        let _ = async {
+            file.write_all(line.as_bytes()).await?;
+            file.flush().await
+        }
+        .await;
     }
 }
 

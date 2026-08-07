@@ -302,6 +302,13 @@ async fn write_private_token(path: &Path, contents: &str) -> Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .await?;
     file.write_all(contents.as_bytes()).await?;
+    // tokio::fs::File::poll_write copies into an internal buffer and hands the
+    // real write() off to a blocking-pool task, returning Ready before that
+    // syscall has actually run. Without this flush, `write_all` completing is
+    // not proof the token landed on disk — a caller that returns success right
+    // after can race a reader against a write still in flight on another
+    // thread. flush() blocks until the background write is done.
+    file.flush().await?;
     Ok(())
 }
 
