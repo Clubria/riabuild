@@ -110,6 +110,12 @@ async fn run(cli: Cli) -> Result<i32> {
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
+        Some(Command::Remote { .. }) => {
+            // Task 21 replaces this with `remote::run(&mut ctx, &cli, target,
+            // action).await`. Until then this only needs to exist so the CLI
+            // surface (Task 14) compiles and its own tests pass.
+            return Ok(0);
+        }
         Some(Command::Status) | None => {}
     }
 
