@@ -262,32 +262,54 @@ pub async fn trust_host(
 /// creating its directory (`0700`) if needed. Shared by the `accept` and
 /// interactive paths so there is exactly one place that writes this file.
 ///
-/// Re-reads `known_hosts` itself, right before composing what it writes,
-/// rather than trusting a snapshot the caller captured earlier: `trust_host`
-/// reads it once at entry, and an `ssh-keyscan` round trip plus, on the
-/// interactive path, an unbounded human prompt sit between that read and
-/// this call — long enough for a second `trust_host`, pinning a different
-/// host, to finish first. A stale snapshot's full rewrite would silently
-/// drop what that other call had just pinned. The write is also atomic (temp
-/// file, then `rename`), so a concurrent reader never sees a partial file.
+/// **Append-only, no read-modify-write.** A prior version re-read
+/// `known_hosts` right before composing a full rewrite, which closed the
+/// original stale-snapshot window but still let two genuinely concurrent
+/// `pin` calls each read before either wrote (and its temp-file name,
+/// process-id-only, collided between them regardless). `trust_host` only
+/// ever calls this for a host with no existing entry — its `already` check
+/// returns earlier otherwise — so there is nothing here to *replace*, only
+/// to add, and `O_APPEND` has no read step to go stale: the kernel
+/// atomically extends the file and places the write at the new end, so two
+/// concurrent appenders on one local filesystem cannot overwrite each
+/// other's bytes. (This assumes a local filesystem, true here under
+/// `~/.riabuild`; `O_APPEND` is not atomic across clients on NFS.)
+///
+/// The one thing append can get wrong is gluing onto a line missing its
+/// trailing `\n` (a hand-edited file) — guarded by leading with a newline
+/// when the file already has bytes. A race on that check costs at most one
+/// redundant blank line, which `ssh` ignores, never lost or corrupted data.
 #[allow(dead_code)] // consumed by Task 21, via trust_host
 async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
     tokio::fs::create_dir_all(paths.ssh_dir()).await?;
     set_private_dir(&paths.ssh_dir()).await?;
-    let mut contents = tokio::fs::read_to_string(known_hosts)
+    let has_content = tokio::fs::metadata(known_hosts)
         .await
-        .unwrap_or_default();
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false);
+    let mut entry = String::new();
+    if has_content {
+        entry.push('\n');
     }
-    contents.push_str(keys);
-    contents.push('\n');
-    // Same-directory temp file plus `rename`, which POSIX guarantees is
-    // atomic on one filesystem: a reader sees the old file whole or the new
-    // one whole, never a half-written one in between.
-    let tmp = known_hosts.with_extension(format!("tmp.{}", std::process::id()));
-    tokio::fs::write(&tmp, contents).await?;
-    tokio::fs::rename(&tmp, known_hosts).await?;
+    entry.push_str(keys);
+    entry.push('\n');
+    append(known_hosts, entry.as_bytes()).await
+}
+
+/// Opens `path` for append (creating it if needed) and writes `bytes`,
+/// flushed before returning — `write_all` alone only queues the bytes for a
+/// blocking-pool task to actually write, the same gap `keychain.rs`'s
+/// `write_private_token` was fixed for.
+#[allow(dead_code)] // consumed by Task 21, via trust_host -> pin
+async fn append(path: &Path, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
     Ok(())
 }
 
@@ -649,6 +671,36 @@ mod tests {
             contents.contains("ssh-ed25519 AAAAstubkeydata"),
             "{contents}"
         );
+    }
+
+    #[tokio::test]
+    async fn two_pins_for_different_hosts_running_concurrently_both_survive() {
+        // Round-2 finding: a temp-file-plus-rename `pin` needs a name unique
+        // per *call*, not merely per process — two concurrent `pin`s in one
+        // process computed the identical temp path (keyed on
+        // `std::process::id()` alone), so whichever `rename` landed second
+        // silently discarded the first. `pin` was restructured to an
+        // append-only write instead (see its doc comment) rather than
+        // patched with a counter: there is no temp file, and no read, for a
+        // second call to race against. Proven here with real concurrency —
+        // `tokio::join!`, not a simulated interleave — because correctness no
+        // longer depends on which one the scheduler happens to run first.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let known_hosts = paths.known_hosts_file();
+
+        let (a, b) = tokio::join!(
+            pin(&paths, &known_hosts, "hostA ssh-ed25519 AAAA"),
+            pin(&paths, &known_hosts, "hostB ssh-ed25519 BBBB"),
+        );
+        a.expect("pin a");
+        b.expect("pin b");
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("read");
+        assert!(contents.contains("hostA ssh-ed25519 AAAA"), "{contents}");
+        assert!(contents.contains("hostB ssh-ed25519 BBBB"), "{contents}");
     }
 
     #[tokio::test]
