@@ -1,21 +1,15 @@
-//! The laptop side: answer requests, decide what to serve.
+//! The laptop side: decide what to serve.
 //!
-//! One connection carries one request and one response. The socket is
-//! request-scoped rather than session-scoped so a wedged reader cannot hold the
-//! channel, and so the supervisor's ping is a real end-to-end probe rather than
-//! a check on a socket that is merely still open.
+//! This file answers requests; `server` carries the answers over a socket. The
+//! split is what lets every dispatch decision — the snapshot, the size cap, the
+//! empty-versus-raced distinction — be tested without a socket anywhere.
+
+mod server;
 
 use crate::channel::clipboard::Clipboard;
-use crate::channel::protocol::{
-    ErrorCode, MAX_PAYLOAD, Request, Response, decode_request, encode_response,
-};
+use crate::channel::protocol::{ErrorCode, MAX_PAYLOAD, Request, Response};
 use crate::channel::resize;
-use anyhow::{Context, Result};
-use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 /// How long a `TARGETS` answer stays good for the read that follows it.
@@ -121,62 +115,6 @@ impl Agent {
 
         payload(mime, bytes)
     }
-
-    /// Accepts connections until cancelled. One request per connection.
-    pub async fn serve(self: Arc<Self>, socket: &Path) -> Result<()> {
-        if let Some(parent) = socket.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("could not create {}", parent.display()))?;
-        }
-        // A socket left by a killed agent blocks the bind, and the channel
-        // comes up permanently dead. This is our own end, on the laptop; the
-        // server end is where a socket owned by another uid is refused.
-        let _ = tokio::fs::remove_file(socket).await;
-
-        let listener = UnixListener::bind(socket)
-            .with_context(|| format!("could not listen on {}", socket.display()))?;
-
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .context("the channel socket stopped accepting connections")?;
-            let agent = Arc::clone(&self);
-            // Serving inline would let one slow clipboard read block every
-            // other shell into the same server.
-            tokio::spawn(async move {
-                let _ = agent.serve_one(stream).await;
-            });
-        }
-    }
-
-    async fn serve_one(&self, stream: UnixStream) -> Result<()> {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-
-        let (header, body) = match decode_request(&line) {
-            Ok(request) => self.handle(&request, Instant::now()).await,
-            Err(error) => (
-                Response::Error {
-                    code: ErrorCode::BadRequest,
-                    message: error.to_string(),
-                },
-                None,
-            ),
-        };
-
-        let stream = reader.get_mut();
-        stream
-            .write_all(encode_response(&header).as_bytes())
-            .await?;
-        if let Some(bytes) = body {
-            stream.write_all(&bytes).await?;
-        }
-        stream.flush().await?;
-        Ok(())
-    }
 }
 
 fn internal(error: anyhow::Error) -> Response {
@@ -206,10 +144,9 @@ fn payload(mime: &str, bytes: Vec<u8>) -> (Response, Option<Vec<u8>>) {
 mod tests {
     use super::*;
     use crate::channel::mime::{PNG, TEXT};
-    // Only the socket test needs these, so they are imported here rather than
-    // at module level, where they would be unused in the shipped build.
-    use crate::channel::protocol::{decode_response, encode_request};
+    use anyhow::Result;
     use async_trait::async_trait;
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
     /// A clipboard whose contents the test can change between calls, which is
@@ -263,6 +200,12 @@ mod tests {
 
     fn agent(clipboard: Arc<FakeClipboard>) -> Agent {
         Agent::new(Box::new(Handle(clipboard)))
+    }
+
+    /// An agent over a fixed clipboard, for the socket tests in `server`, which
+    /// only need something that answers.
+    pub(super) fn agent_holding(types: &[&str], bytes: &[u8]) -> Agent {
+        agent(FakeClipboard::holding(types, bytes))
     }
 
     #[tokio::test]
@@ -377,89 +320,5 @@ mod tests {
         assert_eq!(code, ErrorCode::TooLarge);
         assert!(message.contains(TEXT), "{message}");
         assert!(body.is_none());
-    }
-
-    /// End to end over a real socket, which is the only way to know the framing
-    /// and the socket layer agree.
-    #[tokio::test]
-    async fn the_agent_answers_over_a_real_unix_socket() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let socket = dir.path().join("channel.sock");
-
-        let agent = Arc::new(agent(FakeClipboard::holding(&[TEXT], b"hello")));
-        let serving = tokio::spawn({
-            let socket = socket.clone();
-            async move { agent.serve(&socket).await }
-        });
-
-        // Wait for the listener rather than sleeping a fixed interval.
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let mut stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .expect("connect");
-        stream
-            .write_all(encode_request(&Request::ClipboardTargets).as_bytes())
-            .await
-            .expect("write");
-
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read");
-        assert_eq!(
-            decode_response(&line).expect("decode"),
-            Response::Targets(vec![TEXT.to_string()])
-        );
-
-        serving.abort();
-    }
-
-    /// An unparseable line must not take the agent down: the next shell into
-    /// the same server still needs it.
-    #[tokio::test]
-    async fn a_malformed_request_is_answered_rather_than_fatal() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let socket = dir.path().join("channel.sock");
-
-        let agent = Arc::new(agent(FakeClipboard::holding(&[TEXT], b"hello")));
-        let serving = tokio::spawn({
-            let socket = socket.clone();
-            async move { agent.serve(&socket).await }
-        });
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let mut stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .expect("connect");
-        stream.write_all(b"not json\n").await.expect("write");
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read");
-        assert!(line.contains("bad_request"), "{line}");
-
-        // Still serving.
-        let mut second = tokio::net::UnixStream::connect(&socket)
-            .await
-            .expect("second connect");
-        second
-            .write_all(encode_request(&Request::ChannelPing).as_bytes())
-            .await
-            .expect("write");
-        let mut reader = BufReader::new(second);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read");
-        assert_eq!(decode_response(&line).expect("decode"), Response::Pong);
-
-        serving.abort();
     }
 }
