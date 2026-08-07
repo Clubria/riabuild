@@ -81,107 +81,174 @@ impl Task for Toolchain {
         let pnpm_version = desired_pnpm(project.as_deref()).await;
 
         let node_bin = ctx.paths.node_dir(&node_version).join("bin").join("node");
-        if !tokio::fs::try_exists(&node_bin).await.unwrap_or(false) {
-            return Ok(Status::needs(format!(
-                "Node {node_version} is not installed yet"
-            )));
-        }
-
-        let reported = ctx
-            .runner
-            .run(&node_bin.to_string_lossy(), &["-v"], &RunOptions::default())
-            .await?;
-        if !version::same(reported.trimmed(), &node_version) {
-            return Ok(Status::needs(format!(
-                "the Node in ~/.riabuild reports {} but the repo asks for {node_version}",
-                reported.trimmed()
-            )));
+        match reported_version(ctx, &node_bin).await {
+            None => {
+                return Ok(Status::needs(format!(
+                    "Node {node_version} is not installed yet"
+                )));
+            }
+            Some(found) if !version::same(&found, &node_version) => {
+                return Ok(Status::needs(format!(
+                    "the Node in ~/.riabuild reports {found} but the repo asks for {node_version}"
+                )));
+            }
+            Some(_) => {}
         }
 
         let pnpm_bin = ctx.paths.bin_dir().join("pnpm");
-        if !tokio::fs::try_exists(&pnpm_bin).await.unwrap_or(false) {
-            return Ok(Status::needs("pnpm is not installed yet"));
+        match reported_version(ctx, &pnpm_bin).await {
+            None => Ok(Status::needs("pnpm is not installed yet")),
+            Some(found) if !version::same(&found, &pnpm_version) => Ok(Status::needs(format!(
+                "pnpm reports {found} but the repo asks for {pnpm_version}"
+            ))),
+            Some(_) => Ok(Status::Satisfied),
         }
-        let reported = ctx
-            .runner
-            .run(&pnpm_bin.to_string_lossy(), &["-v"], &RunOptions::default())
-            .await?;
-        if !version::same(reported.trimmed(), &pnpm_version) {
-            return Ok(Status::needs(format!(
-                "pnpm reports {} but the repo asks for {pnpm_version}",
-                reported.trimmed()
-            )));
-        }
-
-        Ok(Status::Satisfied)
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let project = ctx.project_dir();
-        let node_version = desired_node(project.as_deref()).await;
-        let pnpm_version = desired_pnpm(project.as_deref()).await;
-
-        install_node(ctx, &node_version).await?;
-        install_pnpm(ctx, &pnpm_version).await?;
-
-        ctx.config.node_version = Some(node_version);
-        ctx.config.pnpm_version = Some(pnpm_version);
-        ctx.config.save(ctx.paths.as_ref()).await?;
-        Ok(())
+        apply_with(ctx, &RealDownloads).await
     }
 }
 
-async fn install_node(ctx: &mut Ctx, node_version: &str) -> Result<()> {
-    let platform = download::node_platform()?;
-    let filename = download::node_tarball_name(node_version, &platform);
+/// What the tool at `bin` answers `-v` with, or `None` when there is nothing
+/// runnable there.
+///
+/// The single definition of "is this the version the repo asks for": `check()`
+/// turns the answer into a message and `apply()` turns it into a decision, and
+/// the two must judge a tree identically or `apply()` re-runs forever, or —
+/// worse on a shared server — re-installs a tree nothing was wrong with. The
+/// binary is asked rather than the layout trusted: a directory that exists is
+/// not evidence of a working install.
+async fn reported_version(ctx: &Ctx, bin: &Path) -> Option<String> {
+    if !tokio::fs::try_exists(bin).await.unwrap_or(false) {
+        return None;
+    }
+    let output = ctx
+        .runner
+        .run(&bin.to_string_lossy(), &["-v"], &RunOptions::default())
+        .await
+        .ok()?;
+    output.ok().then(|| output.trimmed().to_string())
+}
 
-    ctx.ui.note(&format!("Downloading Node {node_version}…"));
-    let shasums = download::fetch_text(&download::node_shasums_url(node_version)).await?;
-    let expected = download::digest_for(&shasums, &filename).ok_or_else(|| {
-        Failure::new(
-            format!("downloading Node {node_version}"),
-            "Ask your team lead to check the Node version pinned in the repo's .nvmrc.",
-        )
-        .detail(format!("nodejs.org does not publish {filename}"))
-    })?;
+async fn is_current(ctx: &Ctx, bin: &Path, wanted: &str) -> bool {
+    matches!(reported_version(ctx, bin).await, Some(found) if version::same(&found, wanted))
+}
 
-    let bytes = download::fetch_bytes(&download::node_tarball_url(node_version, &platform)).await?;
-    let actual = download::sha256_hex(&bytes);
-    if actual != expected {
-        // Never unpack an archive that is not the one nodejs.org published.
-        return Err(Failure::new(
-            format!("verifying the Node {node_version} download"),
-            "Run `riabuild` again on a trusted network. If it keeps failing, tell your team lead.",
-        )
-        .detail(format!("expected sha256 {expected}, got {actual}"))
-        .into());
+/// The two archives this task fetches, behind a trait so that what `apply()`
+/// decides *not* to download is testable without pulling 50 MB over the
+/// network — the same seam `remote::install` puts in front of the riabuild
+/// release. Each returns bytes already checked against whatever the publisher
+/// publishes, so nothing below this line has to remember to verify.
+#[async_trait]
+trait Downloads: Send + Sync {
+    async fn node(&self, version: &str) -> Result<Vec<u8>>;
+    async fn pnpm(&self, version: &str, asset: &str) -> Result<Vec<u8>>;
+}
+
+struct RealDownloads;
+
+#[async_trait]
+impl Downloads for RealDownloads {
+    async fn node(&self, version: &str) -> Result<Vec<u8>> {
+        let platform = download::node_platform()?;
+        let filename = download::node_tarball_name(version, &platform);
+        let shasums = download::fetch_text(&download::node_shasums_url(version)).await?;
+        let expected = download::digest_for(&shasums, &filename).ok_or_else(|| {
+            Failure::new(
+                format!("downloading Node {version}"),
+                "Ask your team lead to check the Node version pinned in the repo's .nvmrc.",
+            )
+            .detail(format!("nodejs.org does not publish {filename}"))
+        })?;
+
+        let bytes = download::fetch_bytes(&download::node_tarball_url(version, &platform)).await?;
+        let actual = download::sha256_hex(&bytes);
+        if actual != expected {
+            // Never unpack an archive that is not the one nodejs.org published.
+            return Err(Failure::new(
+                format!("verifying the Node {version} download"),
+                "Run `riabuild` again on a trusted network. If it keeps failing, tell your team lead.",
+            )
+            .detail(format!("expected sha256 {expected}, got {actual}"))
+            .into());
+        }
+        Ok(bytes)
     }
 
-    download::extract_node_tarball(&bytes, &ctx.paths.node_dir(node_version))?;
+    /// Unlike Node, pnpm publishes no checksums file, so there is no digest to
+    /// verify this against — HTTPS to github.com is the whole trust anchor.
+    /// Do not invent one; an unpublished digest checks nothing.
+    async fn pnpm(&self, version: &str, asset: &str) -> Result<Vec<u8>> {
+        download::fetch_bytes(&download::pnpm_url(version, asset)).await
+    }
+}
+
+async fn apply_with(ctx: &mut Ctx, downloads: &dyn Downloads) -> Result<()> {
+    let project = ctx.project_dir();
+    let node_version = desired_node(project.as_deref()).await;
+    let pnpm_version = desired_pnpm(project.as_deref()).await;
+
+    ensure_node(ctx, &node_version, downloads).await?;
+    ensure_pnpm(ctx, &pnpm_version, downloads).await?;
+
+    ctx.config.node_version = Some(node_version);
+    ctx.config.pnpm_version = Some(pnpm_version);
+    ctx.config.save(ctx.paths.as_ref()).await?;
     Ok(())
 }
 
-async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
-    let asset = download::pnpm_asset(pnpm_version)?;
-    ctx.ui.note(&format!("Downloading pnpm {pnpm_version}…"));
-    // Unlike Node, pnpm publishes no checksums file, so there is no digest to
-    // verify this against — HTTPS to github.com is the whole trust anchor.
-    // Do not invent one; an unpublished digest checks nothing.
-    let bytes = download::fetch_bytes(&download::pnpm_url(pnpm_version, &asset)).await?;
+/// Node, fetched only when the shared tree is not already the one the repo asks
+/// for.
+///
+/// `paths::tools_root()` is shared by everyone with an account on a server,
+/// while `bin_dir()` is one developer's alone — so `check()` can report drift
+/// that has nothing to do with Node, and re-downloading it anyway would extract
+/// over the tree a colleague's live session is running out of. That is why the
+/// decision is made here, per tool, rather than by `apply()` doing both halves
+/// unconditionally because it was asked to do anything at all.
+async fn ensure_node(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Result<()> {
+    let tree = ctx.paths.node_dir(version);
+    if is_current(ctx, &tree.join("bin").join("node"), version).await {
+        return Ok(());
+    }
+    ctx.ui.note(&format!("Downloading Node {version}…"));
+    let bytes = downloads.node(version).await?;
+    download::extract_node_tarball(&bytes, &tree)
+}
 
+/// pnpm, in the two halves it actually has.
+///
+/// The launcher and the `dist/` tree it loads from beside itself are shared
+/// under `tools_root()`; the shim that starts them is this developer's own,
+/// under `bin_dir()`. A co-tenant's first run on a server has exactly the
+/// second missing and the first perfectly fine — writing the shim from the
+/// launcher already there is the whole repair, and re-extracting 50 MB over a
+/// tree a colleague is running out of is not.
+async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Result<()> {
     let bin_dir = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin_dir).await?;
     let target = bin_dir.join("pnpm");
+    let asset = download::pnpm_asset(version)?;
 
-    if download::pnpm_ships_a_tarball(pnpm_version) {
-        // pnpm 11 is a launcher plus the `dist/` tree it loads from beside
-        // itself, so it is installed as a tree and reached through a shim.
-        let home = ctx.paths.pnpm_dir(pnpm_version);
-        download::extract_pnpm_tarball(&bytes, &home)?;
-        let launcher = home.join("pnpm");
+    if !download::pnpm_ships_a_tarball(version) {
+        // pnpm 10 and older are a single executable, and it goes straight into
+        // this developer's own bin/ — there is no shared tree to be careful
+        // with, and rewriting a file nobody else can see costs nothing.
+        ctx.ui.note(&format!("Downloading pnpm {version}…"));
+        let bytes = downloads.pnpm(version, &asset).await?;
+        return write_executable(&target, &bytes).await;
+    }
+
+    let tree = ctx.paths.pnpm_dir(version);
+    let launcher = tree.join("pnpm");
+    if !is_current(ctx, &launcher, version).await {
+        ctx.ui.note(&format!("Downloading pnpm {version}…"));
+        let bytes = downloads.pnpm(version, &asset).await?;
+        download::extract_pnpm_tarball(&bytes, &tree)?;
         if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
             return Err(Failure::new(
-                format!("installing pnpm {pnpm_version}"),
+                format!("installing pnpm {version}"),
                 "Ask your team lead to check the pnpm version pinned in the repo's package.json.",
             )
             .detail(format!(
@@ -190,11 +257,8 @@ async fn install_pnpm(ctx: &mut Ctx, pnpm_version: &str) -> Result<()> {
             .into());
         }
         download::make_executable(&launcher).await?;
-        write_executable(&target, shims::pnpm_shim(&launcher).as_bytes()).await?;
-    } else {
-        write_executable(&target, &bytes).await?;
     }
-    Ok(())
+    write_executable(&target, shims::pnpm_shim(&launcher).as_bytes()).await
 }
 
 /// Writes an executable via a staging file, so an interrupted run cannot leave
@@ -210,6 +274,7 @@ async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::Paths;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
 
@@ -306,6 +371,185 @@ mod tests {
         ctx.paths = std::sync::Arc::new(crate::paths::RealPaths::rooted_at(home.path()));
         let status = Toolchain.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("22.23.1"), "{status:?}");
+    }
+
+    /// A `Downloads` that panics if called — for proving a path fetches
+    /// nothing at all, rather than merely happening not to under this stub.
+    /// The same device `remote::install`'s tests use.
+    struct UnreachableDownloads;
+
+    #[async_trait]
+    impl Downloads for UnreachableDownloads {
+        async fn node(&self, _version: &str) -> Result<Vec<u8>> {
+            panic!("must not download Node on this path");
+        }
+        async fn pnpm(&self, _version: &str, _asset: &str) -> Result<Vec<u8>> {
+            panic!("must not download pnpm on this path");
+        }
+    }
+
+    /// One fixed Node archive, and a pnpm that must never be asked for.
+    struct FixedNode(Vec<u8>);
+
+    #[async_trait]
+    impl Downloads for FixedNode {
+        async fn node(&self, _version: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+        async fn pnpm(&self, _version: &str, _asset: &str) -> Result<Vec<u8>> {
+            panic!("must not download pnpm on this path");
+        }
+    }
+
+    /// A `node-v*.tar.gz` in memory: one wrapper directory, as nodejs.org
+    /// publishes, so `extract_node_tarball`'s strip is exercised too.
+    fn node_archive(contents: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        builder
+            .append_data(
+                &mut header,
+                format!("node-v{FALLBACK_NODE}-darwin-arm64/bin/node"),
+                contents,
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A server's `Paths`: state under this developer's own namespace, tools
+    /// under the `~/.riabuild` every account on the box shares — the shape
+    /// Task 6 introduced and the shape this whole hazard lives in.
+    fn co_tenant_paths(server: &std::path::Path, member: &str) -> crate::paths::RealPaths {
+        crate::paths::RealPaths::with_root(server, crate::paths::remote_namespace(server, member))
+    }
+
+    #[tokio::test]
+    async fn a_co_tenants_missing_shim_is_repaired_without_touching_the_shared_trees() {
+        // Ada is logged into a server with a live session running `pnpm dev`.
+        // Bob runs `riabuild remote <that same server>`: the shared Node and
+        // pnpm are exactly where Ada left them, and the only thing missing is
+        // the `pnpm` shim in Bob's own namespace, which never existed. An
+        // `apply()` that reinstalls both tools because *something* was missing
+        // extracts over the trees Ada's session is running out of — and that
+        // is deterministic, not a race.
+        //
+        // `UnreachableDownloads` makes "fetches nothing" a property of the
+        // path rather than a coincidence of this stub.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = co_tenant_paths(server.path(), "bob-member-id");
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        let launcher = paths.pnpm_dir(FALLBACK_PNPM).join("pnpm");
+        write_file(&node_bin, "ada's node\n").await;
+        write_file(&launcher, "ada's pnpm\n").await;
+
+        let runner = FakeRunner::new()
+            .with(
+                &format!("{} -v", node_bin.to_string_lossy()),
+                0,
+                &format!("v{FALLBACK_NODE}"),
+                "",
+            )
+            .with(
+                &format!("{} -v", launcher.to_string_lossy()),
+                0,
+                FALLBACK_PNPM,
+                "",
+            );
+        let (mut ctx, _laptop) = ctx_with(runner).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        apply_with(&mut ctx, &UnreachableDownloads)
+            .await
+            .expect("writes the shim from what is already there");
+
+        assert!(
+            tokio::fs::try_exists(ctx.paths.bin_dir().join("pnpm"))
+                .await
+                .unwrap_or(false),
+            "the missing shim is what apply() was for"
+        );
+        // Byte for byte: a re-extract would have replaced both of these, and
+        // Ada's session would have died mid-command.
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "ada's node\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&launcher).await.unwrap(),
+            "ada's pnpm\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_tree_that_is_already_the_pinned_version_is_left_alone() {
+        // Narrower than the co-tenant case above and stated on its own,
+        // because it is the property the whole shared `tools_root()` rests on:
+        // a Node that already answers for the version the repo pins is not
+        // re-fetched and not re-extracted, whatever else `apply()` was called
+        // to fix.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = co_tenant_paths(server.path(), "bob-member-id");
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        write_file(&node_bin, "ada's node\n").await;
+
+        let runner = FakeRunner::new().with(
+            &format!("{} -v", node_bin.to_string_lossy()),
+            0,
+            &format!("v{FALLBACK_NODE}"),
+            "",
+        );
+        let (mut ctx, _laptop) = ctx_with(runner).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        ensure_node(&ctx, FALLBACK_NODE, &UnreachableDownloads)
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "ada's node\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_reports_the_wrong_version_is_still_replaced() {
+        // The other side of the same fix, and the reason the skip asks the
+        // binary rather than statting the directory: drift `check()` reports
+        // has to be something `apply()` can actually repair. Skipping on mere
+        // existence would trade a destructive bug for a machine that can never
+        // be fixed, since `check()` runs again straight afterwards and its
+        // failure is a hard error.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::RealPaths::rooted_at(server.path());
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        write_file(&node_bin, "the wrong node\n").await;
+
+        let runner = FakeRunner::new().with(
+            &format!("{} -v", node_bin.to_string_lossy()),
+            0,
+            "v20.11.0",
+            "",
+        );
+        let (mut ctx, _laptop) = ctx_with(runner).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        ensure_node(
+            &ctx,
+            FALLBACK_NODE,
+            &FixedNode(node_archive(b"the right node\n")),
+        )
+        .await
+        .expect("replaces the wrong tree");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "the right node\n"
+        );
     }
 
     #[tokio::test]

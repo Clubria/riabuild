@@ -156,7 +156,32 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
         }
         let user = whoami();
         let mut remote = Remote::parse(&target, &user)?;
+
+        // `remotes.json` is looked up by local *name*, but a developer who set
+        // a server up by typing its spec was never told it acquired one — the
+        // "will be known as" note only fires on `ask_for_one`'s interactive
+        // path. So they retype last week's working command, `find` misses, and
+        // without this a second record called `build-01-2` is created for one
+        // machine: a browser sign-in on every run, a fresh `cliSessions` row
+        // each time, and one keychain item — keyed on `Remote::hash()`, which
+        // is identical for both records — that each overwrites from the other,
+        // so `forget build-01` leaves `build-01-2` with neither a session nor
+        // a key. `Remote::hash()` is the documented identity of a server; this
+        // is the code matching the documentation.
+        if let Some(record) = store.remotes.iter_mut().find(|r| r.hash == remote.hash()) {
+            // The freshly typed spelling wins. `Build-01.Fly.Dev` and
+            // `build-01.fly.dev.` already hash to this same record, so this
+            // changes only how the record reads back in `remote list`, never
+            // which server it is or which key it uses.
+            record.host = remote.host.clone();
+            record.port = remote.port;
+            record.user = remote.user.clone();
+            return Ok(Remote::from(&*record));
+        }
+
         remote.name = allocate_name(&remote.host, &store.names());
+        ctx.ui
+            .note(&format!("This server will be known as {}.", remote.name));
         add(store, &remote);
         return Ok(remote);
     }
@@ -354,6 +379,73 @@ mod tests {
             1,
             "a saved server must not be added a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn the_same_spec_twice_is_one_server_rather_than_two_records() {
+        // Last week's working command, retyped. The record it created is named
+        // `build-01`, so `find("build-01.fly.dev")` misses and `allocate_name`
+        // sees `build-01` taken — and a second record for one machine means a
+        // browser sign-in every run and two records fighting over one keychain
+        // item, since `Remote::hash()` is identical for both.
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+
+        let first = choose(&mut ctx, &mut store, Some("ada@build-01.fly.dev".into()))
+            .await
+            .expect("adds it");
+        let second = choose(&mut ctx, &mut store, Some("ada@build-01.fly.dev".into()))
+            .await
+            .expect("finds it again");
+
+        assert_eq!(
+            store.remotes.len(),
+            1,
+            "one server, typed twice, is one record: {:?}",
+            store.names()
+        );
+        assert_eq!(first.name, second.name);
+        assert_eq!(first.hash(), second.hash());
+    }
+
+    #[tokio::test]
+    async fn a_respelt_server_updates_its_record_rather_than_forking_it() {
+        // `Remote::hash()` already normalises hostname case and the trailing
+        // dot of an FQDN, so these are one server by definition. The record
+        // follows the spelling in front of the developer rather than drifting
+        // from it.
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+
+        choose(&mut ctx, &mut store, Some("ada@Build-01.Fly.Dev.".into()))
+            .await
+            .expect("adds it");
+        let again = choose(&mut ctx, &mut store, Some("ada@build-01.fly.dev".into()))
+            .await
+            .expect("same server");
+
+        assert_eq!(store.remotes.len(), 1, "{:?}", store.names());
+        assert_eq!(store.remotes[0].host, "build-01.fly.dev");
+        assert_eq!(again.host, "build-01.fly.dev");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_different_server_still_gets_a_record_of_its_own() {
+        // The over-correction to guard against: matching on identity must not
+        // collapse two machines that merely share a first hostname label.
+        let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+
+        let one = choose(&mut ctx, &mut store, Some("ada@build-01.fly.dev".into()))
+            .await
+            .expect("adds the first");
+        let two = choose(&mut ctx, &mut store, Some("ada@build-01.other.dev".into()))
+            .await
+            .expect("adds the second");
+
+        assert_eq!(store.remotes.len(), 2, "{:?}", store.names());
+        assert_ne!(one.name, two.name);
+        assert_eq!(store.names(), vec!["build-01", "build-01-2"]);
     }
 
     #[tokio::test]

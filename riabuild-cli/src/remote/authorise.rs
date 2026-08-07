@@ -40,7 +40,7 @@
 //! to paste by hand instead.
 
 use super::Remote;
-use super::identity::{key_path, ssh_options};
+use super::identity::{entry_host, key_path, ssh_options};
 use crate::paths::Paths;
 use crate::runner::{CommandRunner, RunOptions};
 use crate::ui::{Failure, Ui};
@@ -64,6 +64,26 @@ pub fn offered_methods(stderr: &str) -> Vec<String> {
         .map(|method| method.trim().to_string())
         .filter(|method| !method.is_empty())
         .collect()
+}
+
+/// Did `ssh` refuse over the *server's* identity rather than ours?
+///
+/// A host-key failure aborts the connection before any authentication method
+/// is offered, so its stderr names none — and [`offered_methods`] reads an
+/// empty list as "publickey only". Left to fall through, a stale pin (a VM
+/// rebuilt with a new key, or a box recreated after `remote forget`, which
+/// leaves the pin behind on purpose) is reported as a server that wants a key
+/// pasted into `authorized_keys`. The developer pastes it, nothing changes,
+/// and no riabuild command clears the pin that actually caused it.
+///
+/// Deliberately narrow: OpenSSH's two literals, and only when the stderr does
+/// not also carry an authentication refusal — so a genuine `Permission denied
+/// (publickey,password)` can never be swallowed by, say, a login banner that
+/// quotes the phrase back at us.
+pub fn host_key_failure(stderr: &str) -> bool {
+    (stderr.contains("Host key verification failed")
+        || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"))
+        && !stderr.contains("Permission denied (")
 }
 
 /// Can riabuild's own key sign in, without a password and without falling
@@ -150,6 +170,25 @@ pub async fn authorise(
     let refusal = runner
         .run("ssh", &probe_refs, &RunOptions::default())
         .await?;
+    // Before `offered_methods`, never after: this is not an authorisation
+    // problem, and its empty method list would read as "publickey only".
+    if host_key_failure(&refusal.stderr) {
+        return Err(Failure::new(
+            format!("verifying {}'s host key", remote.host),
+            format!(
+                "ssh refused the host key riabuild has pinned for {}, so this never got as \
+                 far as authenticating — the key in `authorized_keys` is not the problem. If \
+                 that server was rebuilt or replaced, confirm its new fingerprint with \
+                 whoever runs it, then remove the {} line from {} and run `riabuild remote` \
+                 again.",
+                remote.host,
+                entry_host(remote),
+                paths.known_hosts_file().display()
+            ),
+        )
+        .detail(refusal.stderr)
+        .into());
+    }
     let methods = offered_methods(&refusal.stderr);
 
     let interactive = methods
@@ -265,6 +304,90 @@ mod tests {
             vec!["publickey".to_string()]
         );
         assert!(offered_methods("ssh: connect to host box port 22: Connection refused").is_empty());
+    }
+
+    /// What `ssh` really prints when the pinned key no longer matches.
+    const HOST_KEY_CHANGED: &str = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+         IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n\
+         Host key verification failed.";
+
+    #[test]
+    fn a_host_key_failure_is_told_apart_from_an_authentication_refusal() {
+        assert!(host_key_failure(HOST_KEY_CHANGED));
+        // A first-connection refusal under StrictHostKeyChecking=yes prints
+        // only the second literal.
+        assert!(host_key_failure(
+            "No ED25519 host key is known for box and you have requested strict checking.\n\
+             Host key verification failed."
+        ));
+        assert!(!host_key_failure(
+            "ada@box: Permission denied (publickey,password)."
+        ));
+        assert!(!host_key_failure(
+            "ssh: connect to host box port 22: Connection refused"
+        ));
+        assert!(!host_key_failure(
+            "Warning: Permanently added 'box' to the list of known hosts."
+        ));
+        // Narrow on purpose: a real refusal wins even where the phrase also
+        // appears, so nothing chatty on stderr can mask a method list.
+        assert!(!host_key_failure(
+            "Host key verification failed.\nPermission denied (publickey,password)."
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stale_host_key_pin_is_reported_as_one_not_as_a_keys_only_server() {
+        // C3: the probe's stderr names no methods because ssh never got as far
+        // as offering any, and an empty list used to read as "publickey only".
+        // The developer was then told to paste a key into `authorized_keys` —
+        // which changes nothing, because the key was never the problem, and
+        // riabuild's own known_hosts is invisible to them (`-F /dev/null`).
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh -o BatchMode=yes", 255, "", HOST_KEY_CHANGED)
+                .with(
+                    "ssh -o PreferredAuthentications=none",
+                    255,
+                    "",
+                    HOST_KEY_CHANGED,
+                ),
+        );
+
+        let error = authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
+            .await
+            .expect_err("a refused host key is not success");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+
+        assert!(
+            failure.attempting.contains("host key"),
+            "this has to read as a host-key problem: {}",
+            failure.attempting
+        );
+        assert!(
+            !failure.detail.contains("keys only"),
+            "the old misdiagnosis: {}",
+            failure.detail
+        );
+        assert!(
+            failure
+                .action
+                .contains(&paths.known_hosts_file().display().to_string())
+                && failure.action.contains(&entry_host(&remote())),
+            "the remedy must name the file and the line to clear: {}",
+            failure.action
+        );
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("ssh-copy-id")),
+            "ssh-copy-id cannot help across a refused host key"
+        );
     }
 
     #[tokio::test]

@@ -149,12 +149,65 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// `SHA256:…` out of `ssh-keygen -lf` output.
+/// `SHA256:…` out of one line of `ssh-keygen -lf` output.
 pub fn fingerprint_of(stdout: &str) -> Option<String> {
     stdout
         .split_whitespace()
         .find(|word| word.starts_with("SHA256:"))
         .map(str::to_string)
+}
+
+/// The first field of this server's `known_hosts` line — bare for port 22,
+/// `[host]:port` otherwise. Shared with `authorise`, which has to name the
+/// exact line to remove when `ssh` refuses a stale pin.
+pub fn entry_host(remote: &Remote) -> String {
+    if remote.port == 22 {
+        remote.host.clone()
+    } else {
+        format!("[{}]:{}", remote.host, remote.port)
+    }
+}
+
+const UNREADABLE: &str = "an unreadable fingerprint";
+
+/// Every fingerprint `ssh-keygen -lf -` reports for `keys`, which may be a
+/// freshly scanned key or the lines already in `known_hosts`.
+async fn fingerprints(runner: &dyn CommandRunner, keys: &str) -> Result<Vec<String>> {
+    let shown = runner
+        .run(
+            "ssh-keygen",
+            &["-lf", "-"],
+            &RunOptions {
+                stdin: Some(keys.as_bytes().to_vec()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(shown.stdout.lines().filter_map(fingerprint_of).collect())
+}
+
+/// The alarming case: a fingerprint named in advance did not match. That is
+/// what a man-in-the-middle looks like, not a typo — R13's `SHA256:` prefix
+/// check at the CLI layer already ruled a mistyped paste out.
+///
+/// The action names riabuild's own `known_hosts`, which is otherwise
+/// invisible to the developer (`-F /dev/null`, a file under `~/.riabuild` no
+/// command prints). Without it a server genuinely rebuilt with a new key is a
+/// dead end nothing riabuild offers can clear.
+fn mismatch(remote: &Remote, paths: &dyn Paths, detail: String) -> anyhow::Error {
+    Failure::new(
+        format!("verifying {}'s host key", remote.host),
+        format!(
+            "That does not match the fingerprint riabuild was given. This can mean the \
+             server was rebuilt — or that something else is answering at that address. \
+             Confirm the new fingerprint with whoever runs the server, and only once they \
+             have, remove the {} line from {} and run `riabuild remote` again.",
+            entry_host(remote),
+            paths.known_hosts_file().display()
+        ),
+    )
+    .detail(detail)
+    .into()
 }
 
 /// Shows the server's host key and pins it once the developer agrees.
@@ -175,19 +228,41 @@ pub async fn trust_host(
     let existing = tokio::fs::read_to_string(&known_hosts)
         .await
         .unwrap_or_default();
-    let entry_host = if remote.port == 22 {
-        remote.host.clone()
-    } else {
-        format!("[{}]:{}", remote.host, remote.port)
-    };
+    let host_field = entry_host(remote);
     // Exact first field, not a prefix: `starts_with` would treat two
     // genuinely different servers as already trusted and skip the prompt.
-    let already = existing.lines().any(|line| {
-        line.split_whitespace()
-            .next()
-            .is_some_and(|field| field.split(',').any(|name| name == entry_host))
-    });
-    if already {
+    let pinned: Vec<&str> = existing
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|field| field.split(',').any(|name| name == host_field))
+        })
+        .collect();
+    if !pinned.is_empty() {
+        // An already-trusted host is not re-scanned on an ordinary run. But a
+        // fingerprint named on the command line has to be compared against
+        // *something*, and returning here regardless is how a stale pin — a
+        // VM rebuilt with a new host key, or a box recreated after `remote
+        // forget`, which deliberately leaves the pin behind — silently
+        // disabled `--accept-host-key`: the flag was never read, `ssh` failed
+        // at the host-key step three steps later, and nothing connected the
+        // two.
+        let Some(expected) = accept else {
+            return Ok(());
+        };
+        let found = fingerprints(runner.as_ref(), &pinned.join("\n")).await?;
+        if !found.iter().any(|seen| seen == expected) {
+            let shown = found.join(", ");
+            return Err(mismatch(
+                remote,
+                paths,
+                format!(
+                    "expected {expected}, but {host_field} is already pinned as {}",
+                    if shown.is_empty() { UNREADABLE } else { &shown }
+                ),
+            ));
+        }
         return Ok(());
     }
 
@@ -228,38 +303,22 @@ pub async fn trust_host(
         .into());
     }
 
-    let shown = runner
-        .run(
-            "ssh-keygen",
-            &["-lf", "-"],
-            &RunOptions {
-                stdin: Some(keys.clone().into_bytes()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    let fingerprint =
-        fingerprint_of(&shown.stdout).unwrap_or_else(|| "an unreadable fingerprint".to_string());
+    let found = fingerprints(runner.as_ref(), &keys).await?;
+    let fingerprint = found
+        .first()
+        .cloned()
+        .unwrap_or_else(|| UNREADABLE.to_string());
 
     // A supplied fingerprint answers the prompt without weakening it: it has to
     // match exactly, or this fails rather than prompting on a terminal that
     // may not exist (CI, a container test). There is no "accept anything" flag.
     if let Some(expected) = accept {
         if expected != fingerprint {
-            // The alarming case: a fingerprint named in advance didn't match
-            // what the server offered — what a man-in-the-middle looks like,
-            // not a typo (the CLI's `SHA256:` prefix check ruled that out).
-            return Err(Failure::new(
-                format!("verifying {}'s host key", remote.host),
-                "That does not match the fingerprint riabuild was given. This can mean the \
-                 server was rebuilt — or that something else is answering at that address. \
-                 Confirm the new fingerprint with whoever runs the server before trusting it \
-                 again.",
-            )
-            .detail(format!(
-                "expected {expected}, the server offered {fingerprint}"
-            ))
-            .into());
+            return Err(mismatch(
+                remote,
+                paths,
+                format!("expected {expected}, the server offered {fingerprint}"),
+            ));
         }
         pin(paths, &known_hosts, &keys).await?;
         return Ok(());
@@ -538,32 +597,134 @@ mod tests {
     const GOOD_FINGERPRINT_LINE: &str =
         "256 SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y host (ED25519)";
 
-    #[tokio::test]
-    async fn an_already_trusted_host_is_not_scanned_again() {
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        let ui = Ui::new(true);
-        let remote = remote();
-
+    /// Puts `remote` in riabuild's `known_hosts` the way an earlier run would
+    /// have left it — including after `remote forget`, which deliberately
+    /// leaves the pin behind.
+    async fn pin_existing(paths: &RealPaths, remote: &Remote, key: &str) {
         tokio::fs::create_dir_all(paths.ssh_dir())
             .await
             .expect("mkdir");
         tokio::fs::write(
             paths.known_hosts_file(),
-            format!(
-                "[{}]:{} ssh-ed25519 AAAAstubkeydata\n",
-                remote.host, remote.port
-            ),
+            format!("{} ssh-ed25519 {key}\n", entry_host(remote)),
         )
         .await
         .expect("write");
+    }
+
+    #[tokio::test]
+    async fn an_already_trusted_host_is_not_scanned_again() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        pin_existing(&paths, &remote, "AAAAstubkeydata").await;
 
         // No stubs at all: any call to ssh-keyscan or ssh-keygen would fail
-        // with "no stub for", proving neither ran.
+        // with "no stub for", proving neither ran. With no `--accept-host-key`
+        // there is nothing to compare the pin against, so the short-circuit is
+        // the whole behaviour — an ordinary run must stay offline.
         let fake = Arc::new(FakeRunner::new());
-        trust_host(&remote, &paths, fake, &ui, None)
+        trust_host(&remote, &paths, fake, &Ui::new(true), None)
             .await
             .expect("already trusted");
+    }
+
+    #[tokio::test]
+    async fn an_already_pinned_host_matching_the_accepted_fingerprint_is_not_rescanned() {
+        // The pin has to be *consulted*, not merely counted. The old
+        // short-circuit returned before `accept` was read at all, so this
+        // fails against it on the `ssh-keygen -lf -` assertion — and it is
+        // also what stops the fix over-correcting into a re-scan of every
+        // already-trusted host.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        pin_existing(&paths, &remote, "AAAAstubkeydata").await;
+
+        // No `ssh-keyscan` stub: reaching for the network would fail with "no
+        // stub for".
+        let fake =
+            Arc::new(FakeRunner::new().with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""));
+        trust_host(
+            &remote,
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect("the pinned key is the one named on the command line");
+
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("ssh-keygen -lf -")),
+            "the pinned entry must actually be fingerprinted: {:?}",
+            fake.calls()
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.starts_with("ssh-keyscan")),
+            "an already-trusted host must not be re-scanned: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_pin_disagreeing_with_the_accepted_fingerprint_is_refused() {
+        // The C3 regression. `trust_host` used to return `Ok(())` for any
+        // pinned host before reading `accept`, so the real new fingerprint of
+        // a rebuilt server was compared against nothing at all; the run then
+        // died in `authorise` looking like an authentication problem, and no
+        // riabuild command clears the pin that caused it.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        pin_existing(&paths, &remote, "OLDSTALEKEYDATA").await;
+        let fake =
+            Arc::new(FakeRunner::new().with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""));
+
+        let err = trust_host(
+            &remote,
+            &paths,
+            fake,
+            &Ui::new(true),
+            Some("SHA256:0000000000000000000000000000000000000000"),
+        )
+        .await
+        .expect_err("a fingerprint that disagrees with the pin must not report success");
+
+        let failure = err.downcast_ref::<Failure>().expect("a Failure");
+        assert!(
+            failure.attempting.contains("verifying"),
+            "the mismatch wording, not some other failure: {}",
+            failure.attempting
+        );
+        assert!(
+            failure.detail.contains("expected") && failure.detail.contains(GOOD_FINGERPRINT),
+            "both fingerprints have to be shown: {}",
+            failure.detail
+        );
+        assert!(
+            failure
+                .action
+                .contains(&paths.known_hosts_file().display().to_string()),
+            "the file holding the stale pin is invisible unless named: {}",
+            failure.action
+        );
+        assert!(
+            failure.action.contains(&entry_host(&remote)),
+            "and so is the line inside it: {}",
+            failure.action
+        );
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("read");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "a mismatch must neither pin nor rewrite: {contents}"
+        );
     }
 
     #[tokio::test]

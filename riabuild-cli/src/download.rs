@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
@@ -193,16 +193,88 @@ pub fn extract_pnpm_tarball(bytes: &[u8], target: &Path) -> Result<()> {
     extract_tarball(bytes, target, 0)
 }
 
+/// Unpacks into `target` without ever clearing it where it stands.
+///
+/// `target` lives under `paths::tools_root()`, **shared** by every developer
+/// with an account on a server — so it is not ours to delete. This used to open
+/// with `remove_dir_all(target)` on the strength of "`apply()` starts from
+/// nothing", which held while `tools_root()` and `root()` were one directory on
+/// one laptop and became a way to delete the Node a colleague's `pnpm dev` is
+/// running out of the moment they stopped being.
+///
+/// So the archive is unpacked into a sibling directory carrying this process's
+/// pid and `rename`d into place — `remote::install::write_binary`'s idiom, for
+/// its reason: two developers installing one version at once is the ordinary
+/// case on a shared box, not the exotic one. A reader sees a complete tree or
+/// none, and an interrupted run leaves its mess where nothing looks.
+///
+/// Judging whether what is already at `target` is any good is the *caller's*
+/// job (`tasks::toolchain` asks the binary its version); a `target` that is
+/// there is replaced by moving it aside, never by emptying it in place.
 fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
+    let staging = staging_beside(target, "part");
+    // Only ever this pid's own leftovers from an interrupted earlier run —
+    // never another developer's staging directory, and never `target`.
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("could not clear {}", staging.display()))?;
+    }
+    if let Err(error) = unpack(bytes, &staging, strip_components) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    swap_into_place(&staging, target)
+}
+
+/// `…/node/.22.23.1.4171.part`, beside the tree it is about to become: the same
+/// directory, so the same filesystem, so the `rename` that installs it is
+/// atomic rather than a copy.
+fn staging_beside(target: &Path, tag: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.{}.{tag}", std::process::id()))
+}
+
+/// Installs a finished staging tree at `target` with a `rename`, so nothing
+/// ever observes a partial one.
+fn swap_into_place(staging: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        // Something is there and the caller judged it unusable. It still gets
+        // moved aside rather than emptied where it stands: a process that
+        // already holds files open under it keeps reading a whole, consistent
+        // tree, which `remove_dir_all` in place cannot promise.
+        let stale = staging_beside(target, "stale");
+        let _ = std::fs::remove_dir_all(&stale);
+        std::fs::rename(target, &stale)
+            .with_context(|| format!("could not move {} aside", target.display()))?;
+        if let Err(error) = std::fs::rename(staging, target) {
+            // Put back what was there rather than leaving the shared path empty.
+            let _ = std::fs::rename(&stale, target);
+            return Err(error).with_context(|| format!("could not install {}", target.display()));
+        }
+        let _ = std::fs::remove_dir_all(&stale);
+        return Ok(());
+    }
+
+    match std::fs::rename(staging, target) {
+        Ok(()) => Ok(()),
+        // A co-tenant installing the same version won the race between that
+        // check and this rename. Their tree arrived the same way ours would
+        // have, so it is as good as ours — and ours is the one that goes.
+        Err(_) if target.exists() => {
+            let _ = std::fs::remove_dir_all(staging);
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("could not install {}", target.display())),
+    }
+}
+
+fn unpack(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
 
-    if target.exists() {
-        // A half-extracted directory from an interrupted run must not be
-        // mistaken for a working install — `apply()` starts from nothing.
-        std::fs::remove_dir_all(target)
-            .with_context(|| format!("could not clear {}", target.display()))?;
-    }
     std::fs::create_dir_all(target)?;
 
     for entry in archive.entries()? {
@@ -347,6 +419,72 @@ mod tests {
         extract_pnpm_tarball(&bytes, &target).unwrap();
         assert!(target.join("pnpm").exists());
         assert!(target.join("dist/pnpm.mjs").exists());
+    }
+
+    #[test]
+    fn a_failed_extraction_leaves_a_tree_another_developer_is_using_alone() {
+        // `tools_root()` is shared by every developer on a server, so the tree
+        // being unpacked over is one a co-tenant's `pnpm dev` may be running
+        // out of. This used to open with `remove_dir_all(target)` and extract
+        // afterwards, so a truncated archive — or a process killed between the
+        // two — left the colleague with nothing at all. Unpacking into a
+        // pid-suffixed staging directory first costs a failure that directory
+        // and nothing else.
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("22.23.1");
+        std::fs::create_dir_all(target.join("bin")).unwrap();
+        std::fs::write(target.join("bin/node"), b"the node ada is running").unwrap();
+
+        extract_node_tarball(b"not a gzip stream at all", &target).expect_err("corrupt archive");
+
+        assert_eq!(
+            std::fs::read(target.join("bin/node")).unwrap(),
+            b"the node ada is running"
+        );
+        assert_eq!(
+            leftovers_beside(home.path(), "22.23.1"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn replacing_a_tree_swaps_the_whole_thing_rather_than_unpacking_over_it() {
+        // The other half: when the caller *has* judged what is there unusable,
+        // the new tree arrives whole. A file the archive does not carry cannot
+        // survive as a leftover from the old one, which is what unpacking into
+        // a live directory would leave behind — and no staging directory is
+        // left lying beside it either.
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("22.23.1");
+        std::fs::create_dir_all(target.join("bin")).unwrap();
+        std::fs::write(target.join("bin/node"), b"a broken node").unwrap();
+        std::fs::write(target.join("bin/leftover"), b"from the old tree").unwrap();
+
+        let bytes = tarball(&[("node-v22.23.1-darwin-arm64/bin/node", b"a working node")]);
+        extract_node_tarball(&bytes, &target).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("bin/node")).unwrap(),
+            b"a working node"
+        );
+        assert!(!target.join("bin/leftover").exists());
+        assert_eq!(
+            leftovers_beside(home.path(), "22.23.1"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Everything in `dir` other than `keep` — the staging and set-aside
+    /// directories, if any survived.
+    fn leftovers_beside(dir: &std::path::Path, keep: &str) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != keep)
+            .collect();
+        found.sort();
+        found
     }
 
     #[test]
