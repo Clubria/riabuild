@@ -485,8 +485,13 @@ mod tests {
     /// the same way for a session belonging to somebody else. `forget` still
     /// completes (a retry must not be stuck forever), but it must not do so
     /// silently.
+    // Named for what it asserts, not for what the code also does. The warning
+    // `revoke_session` emits here is the substance of the change, but `Ui` has
+    // no capture seam, so nothing below can check it — and a test name is not
+    // an assertion. Reword or delete that warning and this test stays green;
+    // giving `Ui` a test sink is what would close it.
     #[tokio::test]
-    async fn an_unrecognised_session_forgets_anyway_but_warns_that_it_may_still_be_live() {
+    async fn an_unrecognised_session_is_forgotten_rather_than_left_behind() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(home.path());
         let mut store = store_with(SESSION_ID);

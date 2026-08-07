@@ -239,6 +239,7 @@ done
 # that learns the same trick next.
 run_as() {                       # run_as <member-id> <login> <token>
   HOME="$work/laptop-$2" \
+  RIABUILD_ROOT= \
   GH_TOKEN="$token" \
   RIABUILD_API_URL="http://127.0.0.1:$STUB_PORT" \
   RIABUILD_WEB_URL="http://127.0.0.1:$STUB_PORT" \
@@ -266,7 +267,13 @@ cat "$work/ada.log"
 # `x86_64-unknown-linux-musl` — the target riabuild actually resolved for
 # this container — to appear in the message.
 known_gap() {
-  # The asset itself is not published: the URL on that line carries the target.
+  # Branch 1 is precisely "the asset URL 404s", NOT "the asset is unpublished"
+  # — the two are indistinguishable from here, because the URL the CLI asks
+  # for and the name this pattern expects are both built from
+  # `riabuild_asset_url`. So once a musl asset ships under a name that
+  # disagrees with release.yml's packaging step, that mismatch is forgiven as
+  # "not published yet". Narrow (the run stops at the keyring gap and fails
+  # anyway), but it is the one real bug this branch can absorb.
   grep -qE "could not download.*x86_64-unknown-linux-musl" "$work/ada.log" && return 0
   # Or it is published without a checksum. `Failure` prints its action and
   # its detail on separate lines, so this is two greps rather than one
