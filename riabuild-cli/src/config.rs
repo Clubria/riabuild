@@ -18,6 +18,14 @@ pub struct TaskRecord {
     pub last_reason: String,
 }
 
+/// Task ids riabuild used to record and no longer has.
+///
+/// A rename leaves the old record orphaned under the old key. Nothing reads it,
+/// but `state.json` is where a developer looks to find out what riabuild thinks
+/// it has done, and a key naming a task that no longer exists answers that
+/// question wrongly. Dropping it on load means the next save omits it.
+const RETIRED_TASKS: &[&str] = &["claude_profiles"];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -29,11 +37,13 @@ impl State {
         // Deliberately infallible: a state file we cannot read means we do not
         // know what has been done, and the correct response to that is to check
         // everything again.
-        tokio::fs::read_to_string(paths.state_file())
+        let mut state: State = tokio::fs::read_to_string(paths.state_file())
             .await
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.forget_retired();
+        state
     }
 
     pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
@@ -53,6 +63,13 @@ impl State {
 
     pub fn forget(&mut self, id: &str) {
         self.tasks.remove(id);
+    }
+
+    /// Forgets records belonging to tasks riabuild no longer has.
+    fn forget_retired(&mut self) {
+        for id in RETIRED_TASKS {
+            self.forget(id);
+        }
     }
 }
 
@@ -194,6 +211,62 @@ mod tests {
 
         // Not an error: a machine we cannot describe is a machine we re-check.
         assert!(State::load(&paths).await.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_for_a_task_riabuild_no_longer_has_is_dropped() {
+        let home = TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("create ~/.riabuild");
+        tokio::fs::write(
+            paths.state_file(),
+            r#"{"tasks":{
+                "claude_profiles":{"version":1,"last_ok_at":1,"last_reason":"never_run"},
+                "toolchain":{"version":2,"last_ok_at":2,"last_reason":"never_run"}
+            }}"#,
+        )
+        .await
+        .expect("write state");
+
+        let state = State::load(&paths).await;
+
+        assert!(
+            !state.tasks.contains_key("claude_profiles"),
+            "the retired record should be gone: {:?}",
+            state.tasks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state.tasks.contains_key("toolchain"),
+            "a live task's record must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_record_does_not_come_back_on_the_next_save() {
+        let home = TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("create ~/.riabuild");
+        tokio::fs::write(
+            paths.state_file(),
+            r#"{"tasks":{"claude_profiles":{"version":1,"last_ok_at":1,"last_reason":"never_run"}}}"#,
+        )
+        .await
+        .expect("write state");
+
+        let state = State::load(&paths).await;
+        state.save(&paths).await.expect("save state");
+
+        let written = tokio::fs::read_to_string(paths.state_file())
+            .await
+            .expect("read state");
+        assert!(
+            !written.contains("claude_profiles"),
+            "the retired key must not be written back: {written}"
+        );
     }
 
     #[tokio::test]
