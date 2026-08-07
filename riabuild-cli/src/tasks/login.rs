@@ -95,6 +95,7 @@ mod tests {
     fn member(status: &str) -> Member {
         Member {
             github_login: "ada".into(),
+            member_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             first_name: "Ada".into(),
             last_name: "Lovelace".into(),
             email: "ada@clubria.dev".into(),
