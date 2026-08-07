@@ -172,8 +172,9 @@ struct Stub {
 #[cfg(test)]
 /// Scripted `CommandRunner` for tests.
 ///
-/// Keys are `"program arg1 arg2"` prefixes; the longest matching prefix wins, so
-/// a test can stub `gh auth status` and `gh --version` independently.
+/// Each `Stub` is matched by `"program arg1 arg2"` prefix; the longest matching
+/// prefix wins, so a test can stub `gh auth status` and `gh --version`
+/// independently.
 ///
 /// A stub can also require environment entries. `claude auth status --json` is
 /// the same command string for every Claude Code account — only
@@ -276,6 +277,15 @@ impl FakeRunner {
             // environment entries. `max_by_key` keeps the last of equal
             // candidates, so a later identical stub replaces an earlier one —
             // which is what the map this replaced did.
+            //
+            // Command length is compared before env-pair count, so a longer
+            // env-less stub outranks a shorter env-scoped one: `with("claude
+            // auth status --json")` beats `with_env("claude auth", &[("CLAUDE_
+            // CONFIG_DIR", "/one")])` for `claude auth status --json` run in
+            // `/one`. That is fine for the account use case, where every
+            // account is asked the identical command string, but it means env
+            // specificity only breaks ties between stubs that already match on
+            // the same invocation length.
             .max_by_key(|stub| (stub.invocation.len(), stub.env.len()))
             .map(|stub| stub.output.clone())
     }
@@ -423,6 +433,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn an_invocation_naming_no_account_matches_no_account_specific_stub() {
+        // Pins the direction of the match: requiring an env pair is a real
+        // requirement, not merely a tie-breaker. A caller that names no
+        // `CLAUDE_CONFIG_DIR` at all must come away empty-handed even though
+        // two stubs exist for this exact command — each scoped to a different
+        // account. If this ever passed, the account-lookup feature could go
+        // green in its own tests while the production code never actually
+        // threaded `CLAUDE_CONFIG_DIR` through to `claude auth status --json`
+        // — every account would silently be answered by whichever stub ranks
+        // first.
+        let runner = FakeRunner::new()
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/one")],
+                0,
+                r#"{"loggedIn":true,"email":"first@example.com"}"#,
+                "",
+            )
+            .with_env(
+                "claude auth status --json",
+                &[("CLAUDE_CONFIG_DIR", "/two")],
+                1,
+                r#"{"loggedIn":false}"#,
+                "",
+            );
+
+        let unscoped = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unscoped.code, Some(127), "{unscoped:?}");
+        assert!(
+            unscoped
+                .stderr
+                .contains("fake runner: no stub for `claude auth status --json`"),
+            "{unscoped:?}"
+        );
     }
 
     #[tokio::test]
