@@ -1,6 +1,13 @@
 # Rust
 target/
 
+# Machine-local cargo config, used to point every worktree at one shared
+# target/. It must stay untracked: a tracked config is copied into every
+# worktree by git, cargo then reads the worktree's own copy, and each worktree
+# gets a private target/ again — the exact thing it exists to prevent. See
+# riabuild-cli/CLAUDE.md.
+/.cargo/
+
 # Secrets — never commit
 .env
 .env.*
