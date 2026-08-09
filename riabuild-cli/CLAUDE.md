@@ -16,6 +16,48 @@ cargo test
 cargo run
 ```
 
+## One shared `target/` across worktrees
+
+A debug `target/` for this crate runs to roughly 1.8G, most of it a dependency graph
+identical on every branch. Half a dozen worktrees each building their own copy is the
+fastest way to fill a disk, so they all compile into one directory instead.
+
+Setup is a single **untracked** file at the *repository root* — not in a worktree.
+`.claude/hooks/ensure-shared-cargo-target.sh` writes it from a `SessionStart` hook, so a
+fresh clone is configured before anyone builds twice. It never overwrites an existing
+config, so pointing `target-dir` at another disk survives. To do it by hand:
+
+```sh
+mkdir -p .cargo
+printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
+```
+
+Deleting the file opts this machine out until the next session start.
+
+Cargo finds `.cargo/config.toml` by walking up from the current directory to the
+filesystem root, and resolves a relative `target-dir` against the directory holding
+`.cargo` — not against the package or the cwd. Worktrees live under `.claude/worktrees/`,
+physically inside the repository root, so they inherit that one file and every build,
+main checkout and worktree alike, lands in `<repo>/target`.
+
+**It cannot be committed.** Git copies tracked files into every worktree, cargo reads the
+nearest config, and each worktree would then resolve `target-dir` against itself — handing
+back the private `target/` directories this exists to remove. No relative path serves both
+either, since a worktree sits three levels below the main checkout. The `.gitignore` entry
+for `/.cargo/` is what keeps a well-meaning `git add` from breaking it.
+
+Two consequences:
+
+- **Concurrent builds serialise.** Cargo takes an exclusive lock on the build directory,
+  so a second worktree building at the same time prints `Blocking waiting for file lock`
+  and waits. This trades wall-clock for disk.
+- **CI is unaffected.** It never sees the untracked file, so `target/` there stays at
+  `riabuild-cli/target` and the `Swatinem/rust-cache` setup in `.github/workflows/ci.yml`
+  needs no change.
+
+Once it is in place the old per-worktree `riabuild-cli/target` directories are orphaned,
+and deleting them is what actually reclaims the space.
+
 ## Invariants
 
 These are not style preferences. Breaking any of them produces a class of bug that is
