@@ -139,6 +139,11 @@ jobs:
           set -euo pipefail
           mkdir -p dist
 
+          # The digests go to `$GITHUB_OUTPUT` for the formula and nowhere
+          # else. The published `riabuild-$VERSION-checksums.txt` is assembled
+          # in `publish`, once every architecture's tarball is in one
+          # directory — see the step that builds it for why it cannot be
+          # appended to here.
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             arch="${target%%-*}"
             tarball="riabuild-$VERSION-$target.tar.gz"
@@ -147,10 +152,8 @@ jobs:
             tar -czf "dist/$tarball" -C "target/$target/release" riabuild
             sha=$(shasum -a 256 "dist/$tarball" | cut -d' ' -f1)
             echo "sha256_$arch=$sha" >> "$GITHUB_OUTPUT"
-            echo "$sha  $tarball" >> "dist/riabuild-$VERSION-checksums.txt"
+            echo "$sha  $tarball"
           done
-
-          cat "dist/riabuild-$VERSION-checksums.txt"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -418,6 +421,46 @@ jobs:
           pattern: riabuild-*
           path: dist
           merge-multiple: true
+
+      # `riabuild remote` fetches this file *before* the tarball and refuses to
+      # install a binary it has no digest for. That is the right way round, and
+      # it means a missing line here is not a cosmetic gap: it is a platform
+      # riabuild cannot provision at all. It was built in the macOS job until
+      # now, so the published file listed the two darwin tarballs and neither
+      # musl one, and `riabuild remote <a linux server>` failed closed on every
+      # release since Linux packaging landed.
+      #
+      # It has to be assembled here rather than appended to per-job: the three
+      # build jobs upload into one merged directory (`merge-multiple: true`),
+      # so three of them writing one file is a race whose winner is whichever
+      # artifact unpacked last.
+      #
+      # The expected set is spelled out rather than inferred from what happens
+      # to be in `dist/`, because the failure being fixed is *a missing entry* —
+      # and a check that only counts what it finds agrees with itself no matter
+      # how little that is.
+      - name: Assemble the checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          checksums="riabuild-$VERSION-checksums.txt"
+          rm -f "$checksums"
+
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-musl \
+            x86_64-unknown-linux-musl
+          do
+            tarball="riabuild-$VERSION-$target.tar.gz"
+            if [ ! -f "$tarball" ]; then
+              echo "::error::$tarball is missing — riabuild could not install itself on $target."
+              exit 1
+            fi
+            sha256sum "$tarball" >> "$checksums"
+          done
+
+          cat "$checksums"
 
       - name: Publish
         run: |
