@@ -509,13 +509,21 @@ done
 # `Ctx::env` — the channel up, the socket right, and every unit test green.
 # Single-quoted on purpose: these are the *server's* variables, and expanding
 # them here would send the shell a line of constants and assert nothing.
+# The marker is split across a string concatenation so that the *command* the
+# shell echoes back contains `PRO""BE` and only the *output* ever contains
+# `PROBE`. That is what lets the match below ignore where on the line it lands.
+#
+# An earlier version anchored `^PROBE ` instead, reasoning that the echo is
+# preceded by a prompt and the output is not. That is true only when the pty
+# happens to flush the prompt, the echo and the output in that order — and it
+# does not always: a failing run showed
+# `(riabuild) shared@…:/$ PROBE RIABUILD_SHELL=1 …`, the right answer on the
+# wrong column, with the echoed line half-overwritten behind it. Position on a
+# pty is a race; the presence of a marker the input cannot contain is not.
 # shellcheck disable=SC2016
-shell_probe='echo PROBE RIABUILD_SHELL=$RIABUILD_SHELL PATH_HEAD=${PATH%%:*} BROWSER=[$BROWSER]; exit'
-# The shell echoes its own input back after the prompt, so the probe's *output*
-# is the line that begins at column one. Matching anywhere would find the echo,
-# which contains the unexpanded `$BROWSER` and would pass whatever happened.
+shell_probe='echo "PRO""BE RIABUILD_SHELL=$RIABUILD_SHELL PATH_HEAD=${PATH%%:*} BROWSER=[$BROWSER]"; exit'
 probe_line() {                    # probe_line <log file>
-  tr -d '\r' < "$1" | grep -m1 '^PROBE ' || true
+  tr -d '\r' < "$1" | grep -m1 -o 'PROBE .*' || true
 }
 rc=0
 printf '%s\n' "$shell_probe" | timeout 120 docker exec -i "${server_env[@]}" \
