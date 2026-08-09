@@ -639,6 +639,15 @@ mod tests {
             self.inner.run_forking(program, args, options).await
         }
 
+        async fn spawn(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<Box<dyn crate::runner::ChildHandle>> {
+            self.inner.spawn(program, args, options).await
+        }
+
         async fn run_interactive(
             &self,
             program: &str,

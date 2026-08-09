@@ -606,6 +606,16 @@ mod tests {
                 "could not start `{program}`: Resource temporarily unavailable (os error 11)"
             ))
         }
+        async fn spawn(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<Box<dyn crate::runner::ChildHandle>> {
+            Err(anyhow::anyhow!(
+                "could not start `{program}`: Resource temporarily unavailable (os error 11)"
+            ))
+        }
         async fn run_interactive(
             &self,
             _program: &str,

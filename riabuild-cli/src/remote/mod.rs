@@ -14,6 +14,7 @@
 //! a box that isn't theirs.
 
 pub mod authorise;
+pub mod channel;
 pub mod flow;
 pub mod forget;
 pub mod host_key;
@@ -245,13 +246,24 @@ pub async fn resolve_home(
 /// `home` and `member_id` produce the absolute, tilde-free namespace
 /// (`session::namespace`); `name` is the local label so the server's riabuild
 /// can say which saved connection it is running under.
+///
+/// The channel socket is named here rather than left for the server to resolve,
+/// and that is load-bearing rather than tidiness: several developers share one
+/// Unix account on a server, so they share one uid and therefore one
+/// `$XDG_RUNTIME_DIR`. A server working the path out for itself would give
+/// every developer on the box the same `…/riabuild/channel.sock`, and Ada's
+/// `xclip` would read Ben's laptop. Naming it also switches on
+/// `shell::browser_for`, which exports `BROWSER` only where a channel exists to
+/// open a link on.
 pub fn env_prefix(home: &str, member_id: &str, name: &str) -> Vec<(String, String)> {
+    let namespace = session::namespace(home, member_id);
     vec![
-        (
-            "RIABUILD_ROOT".to_string(),
-            session::namespace(home, member_id),
-        ),
+        ("RIABUILD_ROOT".to_string(), namespace.clone()),
         ("RIABUILD_REMOTE".to_string(), name.to_string()),
+        (
+            crate::channel::SOCKET_ENV.to_string(),
+            channel::remote_socket(&namespace),
+        ),
     ]
 }
 
@@ -473,6 +485,34 @@ mod tests {
         // A tilde here is the bug: root_for refuses it, and before it did, every
         // developer on the box silently shared one namespace.
         assert!(!command.contains('~'), "{command}");
+    }
+
+    #[test]
+    fn the_channel_socket_is_named_inside_the_namespace_not_left_to_the_server() {
+        // The shared-uid failure: developers on one account share one
+        // `$XDG_RUNTIME_DIR`, so a server resolving its own path puts all of
+        // them on one socket and one developer's paste reads another's laptop.
+        let env = env_prefix(
+            "/home/dev",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "build-01",
+        );
+        let socket = env
+            .iter()
+            .find(|(key, _)| key == crate::channel::SOCKET_ENV)
+            .map(|(_, value)| value.as_str())
+            .expect("every remote invocation carries the socket");
+        assert_eq!(
+            socket,
+            "/home/dev/.riabuild-remote/550e8400-e29b-41d4-a716-446655440000/channel.sock"
+        );
+        // The same namespace RIABUILD_ROOT gets, not a second spelling of it.
+        let root = env
+            .iter()
+            .find(|(key, _)| key == "RIABUILD_ROOT")
+            .map(|(_, value)| value.as_str())
+            .expect("root");
+        assert!(socket.starts_with(root), "{socket} is not under {root}");
     }
 
     #[tokio::test]

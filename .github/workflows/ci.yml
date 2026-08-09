@@ -199,6 +199,35 @@ jobs:
           It needs a user token from an active Clubria org member; the built-in \
           GITHUB_TOKEN cannot read /user/memberships/orgs/*."
 
+      # `channel.sh` needs no GitHub token: it never runs `riabuild remote`, so
+      # nothing re-verifies org membership. It is therefore ungated — this job
+      # does real work on a fork's pull request instead of only warning.
+      #
+      # Three packages, and each earns its place. `xvfb` and `xclip` give the
+      # laptop side a real clipboard to serve rather than a scripted stand-in
+      # (the header explains that trade); `musl-tools` is for the *server*
+      # binary, because the container's glibc is older than this runner's and
+      # musl is what release.yml ships for Linux anyway.
+      - name: Install what the clipboard channel test drives
+        run: sudo apt-get update && sudo apt-get install -y xvfb xclip musl-tools
+
+      # `ring` builds C, and cc-rs looks for a compiler named after the target;
+      # Ubuntu's musl-tools ships `musl-gcc` under that one name. release.yml
+      # sets the same two variables for the same reason.
+      - name: Build the server's riabuild
+        working-directory: riabuild-cli
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc \
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - run: bash e2e/remote/channel.sh
+        timeout-minutes: 20
+        env:
+          RIABUILD_BIN: ${{ github.workspace }}/riabuild-cli/target/release/riabuild
+          RIABUILD_SERVER_BIN: ${{ github.workspace }}/riabuild-cli/target/x86_64-unknown-linux-musl/release/riabuild
+
   # The release workflow renders these templates only after the GitHub release
   # is already published, so one that does not parse would leave a released
   # version with a stale tap or an empty apt repository. Checking them on every

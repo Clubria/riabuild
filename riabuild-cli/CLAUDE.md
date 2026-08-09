@@ -153,7 +153,9 @@ src/
   archive/     unpacking what download fetched: tar and zip, one member or a whole
                tree, and `staging` for landing that tree atomically
   shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
-  channel/     the laptop channel: clipboard and browser over the SSH reverse-forward
+  channel/     the laptop channel: clipboard and browser over the SSH reverse-forward.
+               `socket.rs` decides where that socket lives and refuses one that is not
+               ours; `supervisor/` keeps the forward up and proves it carries traffic
   accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
   remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
                trust, authorising a key, installing the server's own binary, minting its
@@ -164,6 +166,22 @@ src/
 `archive/` only ever sees a buffer that already matched a digest. Keep that split — it
 is what makes "verified before anything is written" a property of the code rather than a
 convention.
+
+**The clipboard channel's socket is namespaced, and never unlinked.** It lives at
+`<namespace>/channel.sock`, not in the runtime directory `socket_path()` would otherwise
+pick. Developers on a server share one Unix account, so they share one uid and one
+`$XDG_RUNTIME_DIR` — leaving the server to resolve its own path would hand every
+developer on the box the same socket, and one developer's `xclip` would read another's
+laptop. Its parent is created **at** mode 0700 rather than created and then chmod'd, so
+it never exists at the umask even briefly, and a path that is a symlink or owned by
+another uid is refused rather than removed: unlinking is how you take over someone
+else's channel, not how you recover from a stale one.
+
+The health probe runs **on the server**, not against the laptop's own socket. The forward
+runs server-to-laptop, so only a probe originating there can see it wedged — and a wedged
+forward is precisely what SSH's own keepalives cannot detect, because they run below it.
+A local socket check would test the agent's liveness, report a dead tunnel as healthy, and
+look like a tidy optimisation while deleting the guarantee.
 
 Inside `archive/`, `staging.rs` owns *how* a tree lands: unpack into a sibling
 directory and `rename` it into place, never `remove_dir_all` the target first.

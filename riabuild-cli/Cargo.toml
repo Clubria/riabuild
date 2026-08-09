@@ -99,3 +99,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` is what lets the supervisor's suite advance a paused clock instead
+# of waiting on it: its ping interval is thirty seconds and its backoff ceiling
+# thirty more, and a suite that sat through those is a suite people stop
+# running. `default-features = false` for the same reason as above — a
+# dev-dependency's features are unified into the test build, so leaving the
+# defaults on would quietly hand the tests the multi-threaded runtime this
+# binary deliberately does not have.
+tokio = { version = "1", default-features = false, features = ["test-util"] }

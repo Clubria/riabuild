@@ -125,7 +125,16 @@ pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
         ("RIABUILD_SHELL".to_string(), "1".to_string()),
     ];
     env.extend(ctx.env.iter().cloned());
-    if let Some(browser) = browser_for(ctx, &env) {
+    // The inherited value is the one that matters in practice. On a server the
+    // shell is started as `env 'RIABUILD_CHANNEL_SOCKET=…' '/abs/riabuild' shell`,
+    // so the socket arrives in this process's *own* environment and never
+    // through `ctx.env`, which nothing in production writes it to. Reading only
+    // `ctx.env` left `BROWSER` unset on every real session while both the
+    // clipboard shims and every test went on working — the channel was up, the
+    // socket was right, and links still opened in a terminal browser on the
+    // server.
+    let inherited = std::env::var(crate::channel::SOCKET_ENV).ok();
+    if let Some(browser) = browser_for(ctx, &env, inherited.as_deref()) {
         env.push(("BROWSER".to_string(), browser));
     }
     env
@@ -142,10 +151,15 @@ pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
 /// A local session opens browsers perfectly well on its own, and exporting this
 /// there would turn a working sign-in into an exit 1 — so the variable appears
 /// exactly where the channel it depends on does.
-fn browser_for(ctx: &Ctx, env: &[(String, String)]) -> Option<String> {
+///
+/// `inherited` is this process's own `RIABUILD_CHANNEL_SOCKET`, taken as a
+/// parameter rather than read here so a test can drive both sources without
+/// mutating the environment of a suite that runs its tests in one process.
+fn browser_for(ctx: &Ctx, env: &[(String, String)], inherited: Option<&str>) -> Option<String> {
     let configured = env
         .iter()
-        .any(|(name, value)| name == crate::channel::SOCKET_ENV && !value.is_empty());
+        .any(|(name, value)| name == crate::channel::SOCKET_ENV && !value.is_empty())
+        || inherited.is_some_and(|value| !value.is_empty());
     if !configured {
         return None;
     }
@@ -261,6 +275,40 @@ mod tests {
                 .join(crate::shims::BROWSER_TOOL)
                 .to_string_lossy()
         );
+    }
+
+    /// The path every real remote session takes, and the one no test covered.
+    /// A server's shell is started as `env 'RIABUILD_CHANNEL_SOCKET=…'
+    /// '/abs/riabuild' shell`, so the socket is in the process's own
+    /// environment and never in `ctx.env`. While `browser_for` read only
+    /// `ctx.env`, `BROWSER` went unset on every server — with the tunnel up,
+    /// the socket correct, and the clipboard shims working — so a login URL
+    /// still rendered in a terminal browser over the session.
+    #[tokio::test]
+    async fn a_socket_inherited_from_the_remote_prefix_still_points_browser_at_the_shim() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let browser = browser_for(
+            &ctx,
+            &[],
+            Some("/home/dev/.riabuild-remote/m1/channel.sock"),
+        )
+        .expect("BROWSER should be set when the socket is inherited");
+        assert_eq!(
+            browser,
+            ctx.paths
+                .bin_dir()
+                .join(crate::shims::BROWSER_TOOL)
+                .to_string_lossy()
+        );
+    }
+
+    /// Neither source present, and an inherited empty string, are both "no
+    /// channel" — the same rule `ctx.env` already followed.
+    #[tokio::test]
+    async fn an_empty_inherited_socket_is_not_a_channel() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        assert!(browser_for(&ctx, &[], Some("")).is_none());
+        assert!(browser_for(&ctx, &[], None).is_none());
     }
 
     /// An empty socket variable is not a channel. Treating it as one would set

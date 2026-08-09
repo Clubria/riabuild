@@ -151,10 +151,9 @@ pub const CLIPBOARD_TOOLS: &[&str] = &["xclip", "wl-paste", "wl-copy"];
 /// binary. They are written on the *server*, where `~/.riabuild/bin` leads
 /// `PATH` and Claude Code's probe finds them first.
 ///
-/// Not yet called from the setup flow: the shims only make sense on a server
-/// that has a channel, and that is remote mode's `src/remote/` wiring. Written
-/// and tested here so landing it is one call site rather than a new feature.
-#[allow(dead_code)]
+/// Written by `provision::write_launchers`, under the same condition
+/// `shell::browser_for` uses to export `BROWSER` — see the note there for why
+/// the two must not drift apart.
 pub async fn write_clipboard_shims(ctx: &Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin).await?;
@@ -193,10 +192,10 @@ pub const BROWSER_TOOL: &str = "xdg-open";
 /// Claude Code needs `BROWSER` pointing here as well — see `shims::browser` for
 /// why `PATH` alone does not reach it.
 ///
-/// Not yet called from the setup flow, for the same reason
-/// `write_clipboard_shims` is not: the shim only makes sense on a server that
-/// has a channel, and that is remote mode's wiring.
-#[allow(dead_code)]
+/// Written beside `write_clipboard_shims` and under the same condition. It has
+/// to be: `BROWSER` is exported by exactly that condition, and a `BROWSER`
+/// pointing at a shim nobody wrote fails a sign-in outright instead of falling
+/// back to printing the URL.
 pub async fn write_browser_shim(ctx: &Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin).await?;

@@ -14,6 +14,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 
+mod child;
+
+pub use child::ChildHandle;
+
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
     pub code: Option<i32>,
@@ -101,6 +105,23 @@ pub trait CommandRunner: Send + Sync {
     /// The cost is that stderr is unavailable: the fork holds that pipe too, so
     /// the only diagnostic a write can carry is its exit status.
     async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32>;
+
+    /// Starts a child and hands back a handle to it instead of waiting for it.
+    ///
+    /// Every other method here finishes by waiting for exit, which is the one
+    /// thing the clipboard channel's `ssh -N -R` must not do: the supervisor
+    /// has to ping *through* the forward while the forward is up, and a tunnel
+    /// run through `run` would only return once it had already failed.
+    ///
+    /// `options.stdin` is ignored. A held child is not something anything
+    /// writes to — `ssh -N` reads none — and a pipe left open for nobody is one
+    /// more handle keeping a dead tunnel from being noticed.
+    async fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn ChildHandle>>;
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
@@ -250,6 +271,16 @@ impl CommandRunner for RealRunner {
         Ok(status.code().unwrap_or(1))
     }
 
+    async fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn ChildHandle>> {
+        let command = RealRunner::build(program, args, options);
+        Ok(Box::new(child::RealChild::spawn(command, program)?))
+    }
+
     async fn run_interactive(
         &self,
         program: &str,
@@ -342,6 +373,67 @@ pub struct FakeRunner {
     /// *only* its stdin, so without this a test could assert the invocation and
     /// still not know whether the bytes survived.
     pub recorded: std::sync::Mutex<Vec<Recorded>>,
+    /// Scripted children, queued per key and consumed in spawn order. A
+    /// standing stub cannot express what the supervisor is judged on: the
+    /// backoff schedule is a property of the *sequence* of failures, and a stub
+    /// answering every spawn identically cannot tell the first attempt from the
+    /// fourth.
+    children: std::sync::Mutex<HashMap<String, VecDeque<Ending>>>,
+    /// Every child started, in order, each still reachable so a test can ask
+    /// afterwards whether it was killed.
+    spawned: std::sync::Mutex<Vec<Arc<FakeChild>>>,
+}
+
+/// How a scripted child ends.
+#[cfg(test)]
+enum Ending {
+    /// It exits on its own, with this status and stderr.
+    Alone(CommandOutput),
+    /// It stays up until something kills it — the tunnel that is *working*.
+    /// Without this a ping-timeout test could never reach the teardown it is
+    /// about: the child would exit first and the supervisor would be rebuilding
+    /// after a clean exit rather than tearing down a wedged forward.
+    OnlyWhenKilled,
+}
+
+/// One child the fake started.
+#[cfg(test)]
+struct FakeChild {
+    invocation: String,
+    /// `None` for a child scripted to stay up: `wait` then resolves only once
+    /// `kill` has been called.
+    exit: Option<CommandOutput>,
+    killed: std::sync::Mutex<bool>,
+    /// Wakes a pending `wait`. `notify_one` rather than `notify_waiters`
+    /// because it stores a permit when nobody is waiting yet — a kill that
+    /// lands between `wait` reading the flag and registering itself would
+    /// otherwise leave the waiter parked on a child that is already dead.
+    stopped: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ChildHandle for Arc<FakeChild> {
+    async fn wait(&self) -> Result<CommandOutput> {
+        if let Some(output) = &self.exit {
+            return Ok(output.clone());
+        }
+        while !*self.killed.lock().unwrap() {
+            self.stopped.notified().await;
+        }
+        // No code, the way a real process killed by a signal reports itself.
+        Ok(CommandOutput {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    async fn kill(&self) -> Result<()> {
+        *self.killed.lock().unwrap() = true;
+        self.stopped.notify_one();
+        Ok(())
+    }
 }
 
 /// One recorded invocation: what was run, with what environment, and what was
@@ -441,6 +533,42 @@ impl FakeRunner {
         self
     }
 
+    /// Scripts a child that starts and then exits on its own.
+    ///
+    /// Queued per invocation and consumed in spawn order, the way `then` queues
+    /// responses, so successive calls script successive attempts — which is
+    /// what an assertion about the backoff schedule needs, since the delay
+    /// after the first failure is not the delay after the fourth.
+    pub fn spawning(mut self, invocation: &str, code: i32, stderr: &str) -> Self {
+        self.queue_child(
+            invocation,
+            Ending::Alone(CommandOutput {
+                code: Some(code),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            }),
+        );
+        self
+    }
+
+    /// Scripts a child that stays up until it is killed — the tunnel that came
+    /// up fine and then went quiet. Queued alongside `spawning`, so a test can
+    /// script a live child, then the one that replaces it after teardown.
+    pub fn spawning_until_killed(mut self, invocation: &str) -> Self {
+        self.queue_child(invocation, Ending::OnlyWhenKilled);
+        self
+    }
+
+    fn queue_child(&mut self, invocation: &str, ending: Ending) {
+        self.children
+            .get_mut()
+            .unwrap()
+            .entry(invocation.to_string())
+            .or_default()
+            .push_back(ending);
+        self.make_available(invocation);
+    }
+
     /// Marks the program a stub names as resolvable by `which`, so scripting a
     /// command is also what makes it look installed.
     fn make_available(&mut self, invocation: &str) {
@@ -452,6 +580,34 @@ impl FakeRunner {
 
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Every child started, in spawn order.
+    pub fn spawns(&self) -> Vec<String> {
+        self.spawned
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|child| child.invocation.clone())
+            .collect()
+    }
+
+    /// The children whose handles were killed, in spawn order.
+    ///
+    /// The teardown half of the supervisor's contract, and the half `calls()`
+    /// structurally cannot show — a kill is not an invocation. A ping-timeout
+    /// test asserting only that a second tunnel was spawned passes just as well
+    /// against a supervisor that leaks every wedged ssh it replaces, which on a
+    /// laptop that suspends and resumes all day is a process per resume, each
+    /// still holding a forward.
+    pub fn killed(&self) -> Vec<String> {
+        self.spawned
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|child| *child.killed.lock().unwrap())
+            .map(|child| child.invocation.clone())
+            .collect()
     }
 
     /// The environment the first matching invocation was run with.
@@ -557,6 +713,20 @@ impl FakeRunner {
             .max_by_key(|key| key.len())
             .cloned()?;
         sequenced.get_mut(&key).and_then(VecDeque::pop_front)
+    }
+
+    /// Pops the next child queued for the longest matching key, by the same
+    /// prefix rule the response stubs use — `spawning("ssh", …)` answers for
+    /// the whole `ssh -N -R … ada@box` command line the supervisor builds,
+    /// which no test should have to spell out to script an exit.
+    fn next_child(&self, invocation: &str) -> Option<Ending> {
+        let mut children = self.children.lock().unwrap();
+        let key = children
+            .keys()
+            .filter(|key| invocation == key.as_str() || invocation.starts_with(&format!("{key} ")))
+            .max_by_key(|key| key.len())
+            .cloned()?;
+        children.get_mut(&key).and_then(VecDeque::pop_front)
     }
 
     /// Finds a stub for an invocation, by full program path or by file name.
@@ -702,6 +872,43 @@ impl CommandRunner for FakeRunner {
         Ok(self.lookup(program, args, options).code.unwrap_or(0))
     }
 
+    async fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn ChildHandle>> {
+        let invocation = self.record(program, args, options);
+        let key = FakeRunner::stub_key(program, args);
+        // Unscripted spawns end the way unstubbed commands do, rather than
+        // hanging: a test that forgot to script the second attempt should read
+        // "no stub" in a failed assertion, not time out.
+        let ending = self
+            .next_child(&invocation)
+            .or_else(|| self.next_child(&key))
+            .unwrap_or_else(|| {
+                Ending::Alone(CommandOutput {
+                    code: Some(127),
+                    stdout: String::new(),
+                    stderr: format!("fake runner: no stub for `{key}`"),
+                })
+            });
+
+        let child = Arc::new(FakeChild {
+            invocation,
+            exit: match ending {
+                Ending::Alone(output) => Some(output),
+                Ending::OnlyWhenKilled => None,
+            },
+            killed: std::sync::Mutex::new(false),
+            stopped: tokio::sync::Notify::new(),
+        });
+        // Kept here as well as handed out, so `killed()` can answer after the
+        // code under test has dropped its handle.
+        self.spawned.lock().unwrap().push(child.clone());
+        Ok(Box::new(child))
+    }
+
     async fn run_interactive(
         &self,
         program: &str,
@@ -757,9 +964,12 @@ impl CommandRunner for FakeRunner {
 /// protection is ever wanted, `main.rs` has to add the key here.
 ///
 /// Every method scopes, including the ones the laptop channel added: a
-/// clipboard read through `run_bytes` and a clipboard write through
-/// `run_forking` reach the child with the same environment `run` would have
-/// given it, so no route through this trait is an unscoped one.
+/// clipboard read through `run_bytes`, a clipboard write through
+/// `run_forking`, and the tunnel held open by `spawn` all reach the child with
+/// the same environment `run` would have given it, so no route through this
+/// trait is an unscoped one. `spawn` matters most of the three — it is the
+/// longest-lived child riabuild starts, so an unscoped one would keep pointing
+/// at the wrong developer's configuration for the whole session.
 pub struct ScopedRunner {
     inner: Arc<dyn CommandRunner>,
     env: Vec<(String, String)>,
@@ -805,6 +1015,15 @@ impl CommandRunner for ScopedRunner {
         self.inner
             .run_forking(program, args, &self.merge(options))
             .await
+    }
+
+    async fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn ChildHandle>> {
+        self.inner.spawn(program, args, &self.merge(options)).await
     }
 
     async fn run_interactive(
@@ -905,6 +1124,203 @@ mod bytes_tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, [0x89u8, b'P', b'N', b'G', 0xFF]);
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The whole reason `spawn` exists: the call returns while the child is
+    /// still running, and stderr is still there to be read when it finally
+    /// exits — which is all `supervisor::diagnose` has to work from.
+    #[tokio::test]
+    async fn a_spawned_child_is_handed_back_before_it_has_finished() {
+        let handle = RealRunner
+            .spawn(
+                "sh",
+                &["-c", "printf 'refused the forward' >&2; exit 3"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("spawns");
+
+        let output = handle.wait().await.expect("waits");
+        assert_eq!(output.code, Some(3));
+        assert_eq!(output.stderr, "refused the forward");
+    }
+
+    /// The teardown path, and the reason `wait` takes `&self`: the handle is
+    /// still usable while a wait on it is outstanding, which is what lets the
+    /// supervisor kill a tunnel that has gone quiet instead of waiting out an
+    /// exit that is never coming.
+    #[tokio::test]
+    async fn a_child_can_be_killed_while_a_wait_on_it_is_outstanding() {
+        let handle = RealRunner
+            .spawn("sleep", &["30"], &RunOptions::default())
+            .await
+            .expect("spawns");
+
+        tokio::select! {
+            _ = handle.wait() => panic!("`sleep 30` should still be running"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        handle.kill().await.expect("kills");
+        let output = handle.wait().await.expect("waits");
+        assert_eq!(output.code, None, "a killed process exits by signal");
+    }
+
+    /// A ping timeout fires without knowing whether ssh has meanwhile exited
+    /// on its own, so a second kill has to be a no-op rather than an error the
+    /// supervisor has to special-case.
+    #[tokio::test]
+    async fn killing_a_child_that_has_already_gone_is_not_an_error() {
+        let handle = RealRunner
+            .spawn("true", &[], &RunOptions::default())
+            .await
+            .expect("spawns");
+
+        handle.wait().await.expect("waits");
+        handle.kill().await.expect("first kill");
+        handle.kill().await.expect("second kill");
+    }
+
+    /// Without `kill_on_drop`, a handle dropped anywhere above the supervisor
+    /// leaves an ssh alive holding the remote socket, the next attempt cannot
+    /// bind it, and the channel comes up permanently dead. Asserted through a
+    /// file the child only creates if it outlived the handle.
+    #[tokio::test]
+    async fn a_dropped_handle_does_not_leave_the_child_running() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let marker = dir.path().join("still-running");
+        let script = format!("sleep 0.3; : > {}", marker.display());
+
+        let handle = RealRunner
+            .spawn("sh", &["-c", &script], &RunOptions::default())
+            .await
+            .expect("spawns");
+        drop(handle);
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            tokio::fs::metadata(&marker).await.is_err(),
+            "the child outlived its handle"
+        );
+    }
+
+    /// A spawned child is as much a namespaced process as any other, and the
+    /// longest-lived one riabuild starts — an unscoped tunnel would point at
+    /// the wrong developer's configuration for the whole session.
+    #[tokio::test]
+    async fn a_spawned_child_is_scoped_too() {
+        let fake = Arc::new(FakeRunner::new().spawning("ssh", 0, ""));
+        let scoped = ScopedRunner::new(
+            fake.clone(),
+            vec![("GH_CONFIG_DIR".into(), "/tmp/gh".into())],
+        );
+
+        scoped
+            .spawn("ssh", &["-N"], &RunOptions::default())
+            .await
+            .expect("spawns");
+
+        assert_eq!(
+            fake.env_of("ssh -N"),
+            vec![("GH_CONFIG_DIR".to_string(), "/tmp/gh".to_string())]
+        );
+    }
+
+    /// The backoff schedule is a property of the *sequence* of failures, so
+    /// the fake has to be able to tell the first attempt from the third.
+    #[tokio::test]
+    async fn successive_spawns_get_successive_scripted_endings() {
+        let fake = FakeRunner::new()
+            .spawning("ssh", 255, "Connection refused")
+            .spawning("ssh", 255, "Bad remote forwarding specification")
+            .spawning("ssh", 0, "");
+        let args = ["-N", "-R", "/run/sock:/tmp/sock", "ada@box"];
+
+        let mut endings = Vec::new();
+        for _ in 0..3 {
+            let handle = fake
+                .spawn("ssh", &args, &RunOptions::default())
+                .await
+                .expect("spawns");
+            let output = handle.wait().await.expect("waits");
+            endings.push((output.code, output.stderr));
+        }
+
+        assert_eq!(endings[0], (Some(255), "Connection refused".to_string()));
+        assert_eq!(
+            endings[1],
+            (Some(255), "Bad remote forwarding specification".to_string())
+        );
+        assert_eq!(endings[2], (Some(0), String::new()));
+    }
+
+    /// The tunnel that came up fine and then went quiet. A ping-timeout test
+    /// needs a child that is still there to be torn down; one that exits on
+    /// its own puts the supervisor on the rebuild-after-clean-exit path
+    /// instead, which is a different behaviour entirely.
+    #[tokio::test]
+    async fn a_child_scripted_to_stay_up_resolves_only_once_it_is_killed() {
+        let fake = FakeRunner::new().spawning_until_killed("ssh");
+        let handle = fake
+            .spawn("ssh", &["-N"], &RunOptions::default())
+            .await
+            .expect("spawns");
+
+        tokio::select! {
+            _ = handle.wait() => panic!("a live child must not resolve on its own"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        handle.kill().await.expect("kills");
+        let output = handle.wait().await.expect("waits");
+        assert_eq!(output.code, None);
+    }
+
+    /// `calls()` can never show a teardown, because a kill is not an
+    /// invocation — so without `killed()` a supervisor that leaked every
+    /// wedged ssh it replaced would pass a rebuild test unchanged.
+    #[tokio::test]
+    async fn the_fake_records_which_children_were_started_and_which_were_killed() {
+        let fake = FakeRunner::new()
+            .spawning_until_killed("ssh")
+            .spawning_until_killed("ssh");
+
+        let first = fake
+            .spawn("ssh", &["-N", "one"], &RunOptions::default())
+            .await
+            .expect("spawns");
+        let second = fake
+            .spawn("ssh", &["-N", "two"], &RunOptions::default())
+            .await
+            .expect("spawns");
+        first.kill().await.expect("kills");
+        drop(first);
+        drop(second);
+
+        assert_eq!(fake.spawns(), vec!["ssh -N one", "ssh -N two"]);
+        assert_eq!(fake.killed(), vec!["ssh -N one"]);
+    }
+
+    /// A test that forgot to script an attempt should read "no stub" in a
+    /// failed assertion rather than time out waiting on a child nobody ever
+    /// told how to end.
+    #[tokio::test]
+    async fn an_unscripted_spawn_ends_the_way_an_unstubbed_command_does() {
+        let fake = FakeRunner::new();
+        let handle = fake
+            .spawn("ssh", &["-N"], &RunOptions::default())
+            .await
+            .expect("spawns");
+        let output = handle.wait().await.expect("waits");
+
+        assert_eq!(output.code, Some(127));
+        assert!(output.stderr.contains("no stub"), "{}", output.stderr);
     }
 }
 
