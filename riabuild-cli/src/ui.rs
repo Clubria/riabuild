@@ -8,10 +8,24 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// `Ui::ask`, `Ui::confirm`, their must-be-answered counterparts, and the pure
+/// rules behind them — the interactive half of this module, split out because
+/// it and the status/failure rendering below it are two different concerns
+/// that both happened to fit under 300 lines only while one of them didn't
+/// exist yet.
+mod prompt;
+
 pub struct Ui {
     colour: bool,
     quiet: bool,
     /// Whether there is a developer on the other end to answer a question.
+    ///
+    /// riabuild's own prompts are not the only thing this gates. `gh auth
+    /// login --web` runs a device-code flow: it prints a code and waits for a
+    /// human to finish in a browser. Handed no terminal it does not fail — it
+    /// waits, silently, forever. Every command riabuild hands the terminal to
+    /// has to read the same flag riabuild's own prompts do, or the two answers
+    /// disagree and one of them is wrong.
     interactive: bool,
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
@@ -130,6 +144,20 @@ impl Ui {
         }
     }
 
+    /// Overrides terminal detection.
+    ///
+    /// Tests model a developer sitting at a terminal, but `cargo test` hands
+    /// them no tty — and `interactive` is hard-false under `cfg!(test)` anyway
+    /// — so without this every test would silently take the unattended path and
+    /// stop covering the interactive one. Test-only on purpose: production must
+    /// read the real terminal, never be told.
+    #[cfg(test)]
+    #[must_use]
+    pub fn assume_prompts_work(mut self, yes: bool) -> Self {
+        self.interactive = yes;
+        self
+    }
+
     /// Claims the pending status line, so it is only covered once.
     fn take_pending(&self) -> usize {
         self.pending.swap(0, Ordering::Relaxed)
@@ -151,6 +179,11 @@ impl Ui {
     /// subcommand needs that distinction: an empty answer at a real prompt is a
     /// deliberate no, while no terminal at all means the choice was never
     /// offered and should be refused rather than silently taken either way.
+    ///
+    /// Read it before delegating to anything that waits on a person, too — `gh
+    /// auth login --web` and the rest. A `false` here is not a reason to prompt
+    /// more quietly: it means the answer can never arrive, so the only honest
+    /// move is to say so and stop.
     pub fn interactive(&self) -> bool {
         self.interactive
     }
@@ -232,66 +265,6 @@ impl Ui {
         #[cfg(test)]
         self.noted.lock().unwrap().push(text.to_string());
         println!("    {}", self.paint("2", text));
-    }
-
-    /// Reads one line from the developer.
-    ///
-    /// `None` means there is no answer — they pressed Enter or ^D, or there is
-    /// no terminal to ask. Callers must therefore always have a default:
-    /// asking is how riabuild offers a choice, never how it obtains a value it
-    /// cannot otherwise get.
-    pub fn ask(&self, question: &str) -> Option<String> {
-        if !self.interactive {
-            return None;
-        }
-        // The question is written on its own line rather than on the end of
-        // any pending status line, which is already long enough to carry the
-        // reason a task is running.
-        self.take_pending();
-        let answer = self.read_answer(question)?;
-        let answer = answer.trim().to_string();
-        (!answer.is_empty()).then_some(answer)
-    }
-
-    #[cfg(not(test))]
-    fn read_answer(&self, question: &str) -> Option<String> {
-        println!();
-        print!("    {} ", self.paint("1", question));
-        let _ = std::io::stdout().flush();
-
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            // Zero bytes is ^D, which reads as "just use the default".
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line),
-        }
-    }
-
-    #[cfg(test)]
-    fn read_answer(&self, question: &str) -> Option<String> {
-        self.asked.lock().unwrap().push(question.to_string());
-        self.answers.lock().unwrap().pop_front()
-    }
-
-    /// Asks a yes/no question, defaulting to yes.
-    ///
-    /// `None` means the question could not be put — `--quiet`, or nobody on the
-    /// other end — which is a different answer from "no" and has to stay
-    /// distinguishable: a caller that treats it as a refusal silently skips
-    /// work, and one that treats it as consent runs `sudo` in a CI job.
-    ///
-    /// Built on `read_answer` rather than reading stdin directly, so it obeys
-    /// the same `interactive` rule as `ask` and can be driven by `scripted` in
-    /// a test. ^D reads as "could not ask" rather than as no: it is the absence
-    /// of an answer, and the caller already knows what to do without one.
-    pub fn confirm(&self, question: &str) -> Option<bool> {
-        if self.quiet || !self.interactive {
-            return None;
-        }
-        self.take_pending();
-        let answer = self.read_answer(&format!("{question} [Y/n]"))?;
-        let answer = answer.trim().to_lowercase();
-        Some(answer.is_empty() || answer == "y" || answer == "yes")
     }
 
     pub fn warn(&self, text: &str) {
@@ -444,74 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn no_terminal_means_no_answer() {
-        // Every caller must have a default: riabuild runs in CI and over pipes,
-        // where a blocking read would hang until something times out.
-        assert_eq!(Ui::new(false).ask("Where should this live?"), None);
-    }
-
-    #[test]
-    fn an_answer_is_returned_trimmed() {
-        let ui = Ui::scripted(["  ~/work/hub \n"]);
-        assert_eq!(ui.ask("Where?").as_deref(), Some("~/work/hub"));
-    }
-
-    #[test]
-    fn an_empty_answer_means_the_default() {
-        // Enter accepts whatever was offered.
-        assert_eq!(Ui::scripted([""]).ask("Where?"), None);
-    }
-
-    #[test]
-    fn running_out_of_answers_means_no_answer() {
-        // Stands in for the developer pressing ^D.
-        assert_eq!(Ui::scripted([] as [&str; 0]).ask("Where?"), None);
-    }
-
-    #[test]
-    fn a_question_ends_the_status_line_it_was_asked_under() {
-        let ui = Ui::scripted(["~/work/hub"]);
-        ui.working("Project checkout", "first run");
-        ui.ask("Where?");
-        assert_eq!(ui.take_pending(), 0);
-    }
-
-    #[test]
-    fn enter_accepts_a_confirmation() {
-        // The prompt says [Y/n], so Enter has to mean yes. Getting this
-        // backwards makes riabuild refuse its own upgrade for anyone who
-        // answers the way the prompt tells them to.
-        assert_eq!(Ui::scripted([""]).confirm("Upgrade?"), Some(true));
-        assert_eq!(Ui::scripted(["y"]).confirm("Upgrade?"), Some(true));
-        assert_eq!(Ui::scripted(["YES\n"]).confirm("Upgrade?"), Some(true));
-    }
-
-    #[test]
-    fn anything_else_declines() {
-        for answer in ["n", "no", "nope", "later"] {
-            assert_eq!(
-                Ui::scripted([answer]).confirm("Upgrade?"),
-                Some(false),
-                "{answer}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_question_that_cannot_be_put_is_not_a_no() {
-        // `None` is what tells update.rs to print the command instead of
-        // running sudo. Collapsing it into `Some(false)` would silently skip a
-        // mandatory upgrade; collapsing it into `Some(true)` would run sudo in
-        // a CI job with nobody there to type a password.
-        assert_eq!(Ui::new(false).confirm("Upgrade?"), None);
-        // --quiet, even with someone there and an answer waiting.
-        let quiet = Ui {
-            quiet: true,
-            ..Ui::scripted(["y"])
-        };
-        assert_eq!(quiet.confirm("Upgrade?"), None);
-        // ^D is the absence of an answer, not a refusal.
-        assert_eq!(Ui::scripted([] as [&str; 0]).confirm("Upgrade?"), None);
+    fn there_is_one_answer_to_whether_a_person_is_here() {
+        // Two flags — one for riabuild's own prompts, one for commands riabuild
+        // hands the terminal to — is the bug this collapse fixes: they
+        // disagreed, and the disagreement compiled. `assume_prompts_work` is
+        // the only thing that may move it, and only in a test.
+        assert!(!Ui::new(false).interactive());
+        assert!(Ui::new(false).assume_prompts_work(true).interactive());
+        assert!(!Ui::new(false).assume_prompts_work(false).interactive());
+        // `scripted` models a developer answering, so it is interactive too.
+        assert!(Ui::scripted(["y"]).interactive());
     }
 
     #[test]

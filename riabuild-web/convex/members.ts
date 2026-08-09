@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import {
+  internalMutation,
   internalQuery,
   mutation,
   query,
@@ -12,6 +13,7 @@ import { roleValidator, statusValidator } from "./schema";
 
 export const memberView = v.object({
   _id: v.id("members"),
+  memberId: v.string(),
   githubLogin: v.string(),
   githubId: v.string(),
   firstName: v.string(),
@@ -22,9 +24,10 @@ export const memberView = v.object({
   joinedAt: v.number(),
 });
 
-function toView(member: Doc<"members">) {
+export function toView(member: Doc<"members">) {
   return {
     _id: member._id,
+    memberId: member.memberId,
     githubLogin: member.githubLogin,
     githubId: member.githubId,
     firstName: member.firstName,
@@ -223,6 +226,34 @@ export const byId = internalQuery({
   handler: async (ctx, args) => {
     const member = await ctx.db.get("members", args.memberId);
     return member === null ? null : toView(member);
+  },
+});
+
+/**
+ * One-shot: gives every member row a `memberId` so the field can be made
+ * required. Idempotent, and returns how many rows it changed so the deploy
+ * step can be checked rather than assumed.
+ *
+ * Exists for exactly one production deploy — see the three-step sequence in
+ * `docs/deploying.md` §7 (deploy optional, run this against `--prod`, deploy
+ * required) — and is verified by that deploy's returned count rather than by
+ * this suite: once `members.memberId` is required in the schema,
+ * `convex-test` refuses to construct the memberId-less row this mutation
+ * exists to fix, so there is no way to exercise it here without a fixture
+ * that lies about the schema it is testing against.
+ */
+export const backfillMemberIds = internalMutation({
+  args: {},
+  returns: v.number(),
+  handler: async (ctx) => {
+    const members = await ctx.db.query("members").collect();
+    let filled = 0;
+    for (const member of members) {
+      if (member.memberId !== undefined) continue;
+      await ctx.db.patch("members", member._id, { memberId: crypto.randomUUID() });
+      filled += 1;
+    }
+    return filled;
   },
 });
 

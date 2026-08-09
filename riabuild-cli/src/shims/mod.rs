@@ -591,25 +591,82 @@ mod tests {
         );
     }
 
-    /// Pins the behaviour every account depends on: `CLAUDE_CONFIG_DIR` scopes
-    /// the *login*, not just the settings. If this stops holding, two accounts
-    /// share one sign-in and the whole feature is a lie.
+    /// Does `CLAUDE_CONFIG_DIR` isolate *credentials*, or only configuration?
     ///
-    /// Deliberately `#[ignore]`d rather than deleted: it is a record of an
+    /// This is the property every account rests on: if it stops holding, two
+    /// accounts share one sign-in and the whole feature is a lie. Kept
+    /// `#[ignore]`d rather than deleted because it is a record of an
     /// undocumented upstream property, and it needs a real Claude Code install
-    /// to say anything at all. Run it by hand before every version bump.
+    /// to say anything at all.
+    ///
+    /// The profile model assumes the former. Tested directly on macOS:
+    /// `CLAUDE_CONFIG_DIR=/tmp/asd claude` prompts for a fresh login, so the
+    /// credential is keyed to the config directory, not to the Unix account.
+    /// Two riabuild profiles on one Mac — or two developers sharing a Unix
+    /// account on a Mac server — get separate Claude sign-ins. See
+    /// `docs/superpowers/specs/2026-08-06-remote-mode-design.md`, "Claude Code
+    /// needs no special handling here".
+    ///
+    /// `claude auth status --json` is the non-interactive probe: it reports
+    /// `loggedIn` without opening a prompt and, for a signed-out directory,
+    /// without printing anything credential-shaped. A fresh `CLAUDE_CONFIG_DIR`
+    /// must report `loggedIn: false` — if a future Claude Code release instead
+    /// inherits a login from outside the config directory, this fails instead
+    /// of silently merging two developers' sign-ins.
+    ///
+    /// Ignored by default: it needs a real Claude Code install, **and** an
+    /// ambient sign-in already sitting in the default config directory (run
+    /// `claude auth login` first if `claude auth status` there says
+    /// `loggedIn: false`). Without that ambient sign-in the test is vacuous —
+    /// if isolation broke completely and every config dir now shared one
+    /// global (signed-out) login, a fresh temp dir would still report
+    /// `loggedIn: false` and the test would pass for the wrong reason. The
+    /// two probes together are the evidence: the ambient directory must be
+    /// signed in, and the fresh one must not be.
+    ///
+    /// To confirm credentials (not just configuration) are isolated,
+    /// additionally sign in under two different `CLAUDE_CONFIG_DIR`s by hand
+    /// and check `claude auth status` disagrees between them — that step
+    /// cannot be scripted, so it isn't asserted here. Run with
+    /// `cargo test -- --ignored` before every Claude Code version bump, the
+    /// way `claude_config_dir_smoke` already is.
     #[tokio::test]
-    #[ignore = "needs a real Claude Code install; records the per-config-directory login scoping this feature rests on"]
-    async fn auth_status_is_scoped_to_the_config_dir() {
+    #[ignore = "requires Claude Code installed and already signed in to the \
+                default config directory; pins undocumented behaviour"]
+    async fn claude_credentials_follow_the_config_dir() {
         use crate::runner::{CommandRunner, RealRunner, RunOptions};
         let runner = RealRunner;
         let Some(_) = runner.which("claude") else {
             panic!("claude is not installed; this test needs it");
         };
 
+        // Probe 1: the ambient config directory must already be signed in, or
+        // this test cannot distinguish "isolated" from "broken" — a machine
+        // with no sign-in anywhere would pass either way. Never surface any
+        // field but `loggedIn`: the signed-in probe's JSON also carries
+        // `email`, `orgId`, `orgName`, and `subscriptionType`.
+        let ambient = runner
+            .run(
+                "claude",
+                &["auth", "status", "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude auth status --json (ambient)");
+        let ambient_status: serde_json::Value = serde_json::from_str(ambient.trimmed())
+            .expect("claude auth status --json must print JSON");
+        let Some(&serde_json::Value::Bool(true)) = ambient_status.get("loggedIn") else {
+            panic!(
+                "the default Claude config directory is not signed in \
+                 (loggedIn: false); this test needs an ambient sign-in to \
+                 prove anything — run `claude auth login` first"
+            );
+        };
+
+        // Probe 2: a brand-new config directory must report signed out.
         let home = tempfile::TempDir::new().unwrap();
-        let fresh = home.path().join("fresh");
-        tokio::fs::create_dir_all(&fresh).await.unwrap();
+        let profile = home.path().join("profile");
+        tokio::fs::create_dir_all(&profile).await.unwrap();
 
         let output = runner
             .run(
@@ -618,18 +675,25 @@ mod tests {
                 &RunOptions {
                     env: vec![(
                         "CLAUDE_CONFIG_DIR".into(),
-                        fresh.to_string_lossy().into_owned(),
+                        profile.to_string_lossy().into_owned(),
                     )],
                     ..Default::default()
                 },
             )
             .await
-            .expect("claude auth status");
+            .expect("claude auth status --json (fresh)");
 
-        assert!(
-            output.stdout.contains(r#""loggedIn": false"#)
-                || output.stdout.contains(r#""loggedIn":false"#),
-            "a fresh config dir reported a sign-in: {output:?}"
+        // Parsed rather than substring-matched: `"loggedIn": false` and
+        // `"loggedIn":false` are the same JSON and differ as text, and a
+        // two-spelling `contains` check silently starts passing for the wrong
+        // reason the day upstream reformats its output.
+        let status: serde_json::Value = serde_json::from_str(output.trimmed())
+            .expect("claude auth status --json must print JSON");
+        assert_eq!(
+            status.get("loggedIn"),
+            Some(&serde_json::Value::Bool(false)),
+            "a fresh CLAUDE_CONFIG_DIR was already authenticated: credentials \
+             are not isolated per config directory"
         );
     }
 

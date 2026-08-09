@@ -6,7 +6,7 @@ import {
   MutationCtx,
 } from "./_generated/server";
 import { Doc, Id } from "./_generated/dataModel";
-import { memberView, viewerMember, writeAudit } from "./members";
+import { memberView, toView, viewerMember, writeAudit } from "./members";
 
 export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -73,6 +73,53 @@ export const revoke = mutation({
 });
 
 /**
+ * Revokes a session on behalf of an authenticated `/api/v1` caller (the CLI's
+ * `riabuild remote forget`, not the dashboard's self-service `revoke` above).
+ *
+ * A member may revoke their own session. A lead may revoke anyone's — the
+ * same power `members.setStatus` already grants indirectly by suspending, so
+ * this is not a new capability, just a more targeted one for pulling a single
+ * compromised or orphaned remote-server credential without suspending the
+ * whole account.
+ *
+ * "not_found" and "forbidden" are deliberately distinct return values here —
+ * useful for a test to tell apart — but `http.ts` must map both to the same
+ * 404 response. A session id that exists but belongs to somebody else must
+ * read identically to one that does not exist at all, or this endpoint
+ * becomes an oracle for probing which session ids are live.
+ */
+export const revokeById = internalMutation({
+  args: {
+    sessionId: v.string(),
+    actorId: v.id("members"),
+    isLead: v.boolean(),
+  },
+  returns: v.union(
+    v.literal("ok"),
+    v.literal("not_found"),
+    v.literal("forbidden"),
+  ),
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("cliSessions", args.sessionId);
+    if (id === null) return "not_found";
+    const session = await ctx.db.get("cliSessions", id);
+    if (session === null) return "not_found";
+    if (session.memberId !== args.actorId && !args.isLead) return "forbidden";
+
+    if (session.revokedAt === undefined) {
+      await ctx.db.patch("cliSessions", session._id, { revokedAt: Date.now() });
+      await writeAudit(ctx, {
+        actorId: args.actorId,
+        subjectId: session.memberId,
+        action: "session.revoked",
+        meta: { deviceLabel: session.deviceLabel },
+      });
+    }
+    return "ok";
+  },
+});
+
+/**
  * The authentication step every `/api/v1` request starts with.
  *
  * A mutation rather than a query because it updates `lastUsedAt` — the dashboard
@@ -117,17 +164,7 @@ export const authenticate = internalMutation({
     return {
       status: "ok" as const,
       sessionId: session._id,
-      member: {
-        _id: member._id,
-        githubLogin: member.githubLogin,
-        githubId: member.githubId,
-        firstName: member.firstName,
-        lastName: member.lastName,
-        email: member.email,
-        role: member.role,
-        status: member.status,
-        joinedAt: member._creationTime,
-      },
+      member: toView(member),
     };
   },
 });

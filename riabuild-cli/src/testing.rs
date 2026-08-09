@@ -83,11 +83,24 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         runner,
         keychain,
         api: ApiClient::new("0.1.0"),
+        // Deliberately *not* interactive. `cargo test` gives the process no
+        // tty, and this models that honestly — which is also what a CI job
+        // has. An earlier version of this file called
+        // `.assume_prompts_work(true)` here so that tests of the interactive
+        // path would exercise it; the cost was that every other test silently
+        // became interactive too, including the ones asserting that riabuild
+        // refuses rather than assumes when there is nobody to ask.
+        //
+        // So the default is the unattended machine, and a test that wants a
+        // developer at the keyboard says so: `ctx.ui =
+        // Ui::new(true).assume_prompts_work(true);`, or `Ui::scripted([...])`
+        // to supply the answers as well.
         ui: Ui::new(true),
         config: UserConfig::default(),
         state: State::default(),
         org: Some(org_config()),
         member: None,
+        server: None,
         cli_version: "0.1.0".into(),
         env: Vec::new(),
         notes: Vec::new(),

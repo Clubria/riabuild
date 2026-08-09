@@ -54,6 +54,12 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
 flate2 = "1.0"
+# `gh_session`'s directory-mode repair opens by descriptor with `O_NOFOLLOW |
+# O_DIRECTORY` and `fchmod`s the fd, so a symlink cannot be swapped in between
+# the check and the chmod. Those flag values differ across Linux and macOS, so
+# they come from `libc` rather than being hand-picked — it is already resolved
+# in Cargo.lock as a transitive dependency of several crates above.
+libc = "0.2"
 # PNG and TIFF decode, PNG encode, for the clipboard channel's MAX_LONG_EDGE
 # ceiling. Default features pull in a dozen codecs that never appear on a
 # pasteboard, and this binary is downloaded over a laptop connection.
@@ -83,6 +89,10 @@ tokio = { version = "1", default-features = false, features = [
     "process",
     "net",
     "io-util",
+    # `tokio::io::stdin()` — reads a piped secret off the internal
+    # `seed-github` command's stdin without blocking the current-thread
+    # runtime's only thread the way a `std::io::stdin()` read would.
+    "io-std",
     "time",
 ] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

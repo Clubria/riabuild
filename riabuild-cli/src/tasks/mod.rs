@@ -96,6 +96,12 @@ pub struct Ctx {
     pub state: State,
     pub org: Option<OrgConfig>,
     pub member: Option<Member>,
+    /// The server this riabuild is managed from, when it is on one.
+    ///
+    /// The only remote-mode fact a task is allowed to branch on. Everything else
+    /// arrives through `ScopedRunner` and `Paths`, precisely so tasks do not
+    /// grow remote-mode branches.
+    pub server: Option<String>,
     pub cli_version: String,
     /// Environment the shell will be spawned with.
     pub env: Vec<(String, String)>,
@@ -122,6 +128,59 @@ impl Ctx {
             .project_path
             .as_deref()
             .map(|path| crate::paths::expand_tilde(path, &self.paths.home()))
+    }
+
+    /// Where a checkout goes when the developer has not chosen a place.
+    ///
+    /// On a laptop this is simply the platform default. On a server several
+    /// developers share one Unix account, so the checkout is grouped under the
+    /// developer's own GitHub login instead — never the shared default — so one
+    /// developer's branches, uncommitted work, and `.env.local` never land in
+    /// another's session. See `paths::remote_project_dir`.
+    pub async fn default_checkout(&self) -> std::path::PathBuf {
+        let repo = self
+            .org
+            .as_ref()
+            .map(|org| org.repo_name())
+            .unwrap_or("repo");
+        let home = self.paths.home();
+        let Some(login) = self
+            .server
+            .as_ref()
+            .and(self.member.as_ref())
+            .map(|member| member.github_login.clone())
+        else {
+            return crate::paths::default_project_dir(&home, repo);
+        };
+
+        // A GitHub login can be freed and taken by somebody else, and a
+        // directory can predate riabuild. Claim beside it rather than into it.
+        for suffix in 1.. {
+            let name = if suffix == 1 {
+                login.clone()
+            } else {
+                format!("{login}-{suffix}")
+            };
+            let candidate = crate::paths::remote_project_dir(&home, &name, repo);
+            let taken = tokio::fs::try_exists(&candidate).await.unwrap_or(false);
+            if !taken || self.owned_by_this_namespace(&candidate).await {
+                return candidate;
+            }
+        }
+        unreachable!("suffix range 1.. never ends")
+    }
+
+    /// Whether a checkout candidate carries this namespace's own `.riabuild-owner`
+    /// marker, so a re-run recognises its own tree rather than claiming the next
+    /// suffix every time. A missing or unreadable marker is treated as "somebody
+    /// else's" — the safe direction, since claiming a directory nobody marked as
+    /// ours is exactly the sharing this exists to prevent.
+    async fn owned_by_this_namespace(&self, candidate: &std::path::Path) -> bool {
+        let marker = candidate.join(".riabuild-owner");
+        tokio::fs::read_to_string(&marker)
+            .await
+            .map(|contents| contents.trim() == self.paths.root().to_string_lossy())
+            .unwrap_or(false)
     }
 
     /// The `gh` riabuild owns.

@@ -114,7 +114,7 @@ mod tests {
             id: "id-1".into(),
             identity: Identity::LoggedIn("clubria@proton.me".into()),
         }];
-        let prelude = crate::shell::prelude(&accounts, false);
+        let prelude = crate::shell::prelude(&accounts, false, None);
 
         prepare(&ctx, &prelude).await.unwrap();
 

@@ -7,8 +7,11 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -54,12 +57,14 @@ pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// Fed to the child's stdin. Used to pipe brokered secrets without them ever
-    /// appearing in a process argument list, where `ps` would show them, and to
-    /// hand a clipboard write to `xclip -i`.
+    /// appearing in a process argument list, where `ps` would show them — and on
+    /// a shared server `ps` shows other developers' processes — and to hand a
+    /// clipboard write to `xclip -i`.
     ///
-    /// Bytes rather than a `String` for the same reason `run_bytes` exists: a
-    /// `String` cannot represent a PNG at all, so an image write would not be
-    /// merely lossy, it would be unconstructible.
+    /// Bytes rather than a `String`, for the same reason `run_bytes` exists:
+    /// nothing piped through here (a tarball, a token, a PNG) is guaranteed to
+    /// be UTF-8, and a `String` cannot represent a PNG at all — so an image
+    /// write would not be merely lossy, it would be unconstructible.
     pub stdin: Option<Vec<u8>>,
 }
 
@@ -291,6 +296,11 @@ struct Stub {
     /// `output.stdout`, so a test that only cares about the exit code can stub
     /// with `with` and still be read through `run_bytes`.
     bytes: Option<Vec<u8>>,
+    /// Matched anywhere in the invocation rather than only at its front — what
+    /// `containing` produces. For `ssh <options…> host <the real command>` the
+    /// part that distinguishes one remote invocation from another is the tail,
+    /// not the program name every one of them shares.
+    fragment: bool,
 }
 
 #[cfg(test)]
@@ -298,7 +308,8 @@ struct Stub {
 ///
 /// Each `Stub` is matched by `"program arg1 arg2"` prefix; the longest matching
 /// prefix wins, so a test can stub `gh auth status` and `gh --version`
-/// independently.
+/// independently. `containing` relaxes that to a fragment anywhere in the
+/// invocation, for the remote commands whose distinguishing part is the tail.
 ///
 /// A stub can also require environment entries. `claude auth status --json` is
 /// the same command string for every Claude Code account — only
@@ -307,12 +318,39 @@ struct Stub {
 #[derive(Default)]
 pub struct FakeRunner {
     responses: Vec<Stub>,
+    /// Queued stubs: each call matching a key pops the next response queued
+    /// for it by `then()`, in order, before falling through to `responses`
+    /// once that key's queue is empty. This is the "first call fails, second
+    /// succeeds" shape a single `with()` stub cannot express, since every call
+    /// to it returns the same fixed response — needed for a probe that's run
+    /// before and after some action the test is asserting changed the server's
+    /// state.
+    sequenced: std::sync::Mutex<HashMap<String, VecDeque<CommandOutput>>>,
     available: Vec<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
-    /// What each call was given on stdin. A clipboard write is *only* its
-    /// stdin, so without this a test could assert the invocation and still not
-    /// know whether the bytes survived.
-    inputs: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Invocation, the environment it was given, and the bytes it was given on
+    /// stdin — so a test can assert a task ran against the right configuration
+    /// directory and not merely that it ran, and can assert a piped payload
+    /// actually *arrived* rather than only that it was absent from argv.
+    ///
+    /// Recording stdin is not a convenience. Every "the secret travels on
+    /// stdin" test is otherwise half-blind: deleting the `stdin: Some(…)` from
+    /// the call site leaves the token absent from argv, which is all such a
+    /// test could see, so it stays green while the child receives an empty
+    /// pipe — an empty `session.token` written 0600 and reported as success.
+    /// The clipboard channel has no argv half at all: a clipboard write is
+    /// *only* its stdin, so without this a test could assert the invocation and
+    /// still not know whether the bytes survived.
+    pub recorded: std::sync::Mutex<Vec<Recorded>>,
+}
+
+/// One recorded invocation: what was run, with what environment, and what was
+/// piped to it.
+#[cfg(test)]
+pub struct Recorded {
+    pub invocation: String,
+    pub env: Vec<(String, String)>,
+    pub stdin: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -346,11 +384,9 @@ impl FakeRunner {
                 stderr: stderr.to_string(),
             },
             bytes: None,
+            fragment: false,
         });
-        let program = invocation.split_whitespace().next().unwrap_or_default();
-        if !self.available.iter().any(|p| p == program) {
-            self.available.push(program.to_string());
-        }
+        self.make_available(invocation);
         self
     }
 
@@ -367,16 +403,110 @@ impl FakeRunner {
         self
     }
 
+    /// Stubs on a fragment appearing anywhere in the invocation, for commands
+    /// whose distinguishing part is not at the front — `ssh … host uname -sm`.
+    pub fn containing(mut self, fragment: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.responses.push(Stub {
+            invocation: fragment.to_string(),
+            env: Vec::new(),
+            output: CommandOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            },
+            bytes: None,
+            fragment: true,
+        });
+        self.make_available(fragment);
+        self
+    }
+
+    /// Queues a response after any already queued for this key, consumed in
+    /// call order and ahead of `with`/`containing`. Additive: once the queue
+    /// for a key empties, a later matching call falls through to those as
+    /// before, so existing stubs are unaffected by a test that never calls
+    /// this.
+    pub fn then(mut self, invocation: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.sequenced
+            .get_mut()
+            .unwrap()
+            .entry(invocation.to_string())
+            .or_default()
+            .push_back(CommandOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            });
+        self.make_available(invocation);
+        self
+    }
+
+    /// Marks the program a stub names as resolvable by `which`, so scripting a
+    /// command is also what makes it look installed.
+    fn make_available(&mut self, invocation: &str) {
+        let program = invocation.split_whitespace().next().unwrap_or_default();
+        if !program.is_empty() && !self.available.iter().any(|p| p == program) {
+            self.available.push(program.to_string());
+        }
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 
-    /// The stdin every call was given, as `(invocation, bytes)`.
+    /// The environment the first matching invocation was run with.
+    pub fn env_of(&self, prefix: &str) -> Vec<(String, String)> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.invocation.starts_with(prefix))
+            .map(|call| call.env.clone())
+            .unwrap_or_default()
+    }
+
+    /// The bytes the first matching invocation was given on stdin, or `None`
+    /// if it was given none.
+    ///
+    /// The positive half of every "a secret travels on stdin, never in argv"
+    /// assertion: `calls()` can only ever show a secret's *absence* from the
+    /// command line, which a call site that pipes nothing at all satisfies
+    /// just as well as one that pipes correctly.
+    pub fn stdin_of(&self, prefix: &str) -> Option<Vec<u8>> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.invocation.starts_with(prefix))
+            .and_then(|call| call.stdin.clone())
+    }
+
+    /// [`Self::stdin_of`] decoded as UTF-8, for the common case where the
+    /// piped payload is a token rather than a binary.
+    pub fn stdin_text_of(&self, prefix: &str) -> Option<String> {
+        self.stdin_of(prefix)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The stdin every call was given, as `(invocation, bytes)`. Calls that
+    /// were piped nothing are left out, so this is the list of writes.
     pub fn inputs(&self) -> Vec<(String, Vec<u8>)> {
-        self.inputs.lock().unwrap().clone()
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| {
+                call.stdin
+                    .clone()
+                    .map(|bytes| (call.invocation.clone(), bytes))
+            })
+            .collect()
     }
 
     /// The bytes piped into the first call whose invocation contains `needle`.
+    ///
+    /// The fragment-matching twin of [`Self::stdin_of`], for a call whose
+    /// distinguishing part is not at the front of the command line.
     pub fn input_for(&self, needle: &str) -> Option<Vec<u8>> {
         self.inputs()
             .into_iter()
@@ -389,12 +519,11 @@ impl FakeRunner {
             .trim_end()
             .to_string();
         self.calls.lock().unwrap().push(invocation.clone());
-        if let Some(input) = &options.stdin {
-            self.inputs
-                .lock()
-                .unwrap()
-                .push((invocation.clone(), input.clone()));
-        }
+        self.recorded.lock().unwrap().push(Recorded {
+            invocation: invocation.clone(),
+            env: options.env.clone(),
+            stdin: options.stdin.clone(),
+        });
         invocation
     }
 
@@ -416,18 +545,43 @@ impl FakeRunner {
         format!("{name} {}", args.join(" ")).trim_end().to_string()
     }
 
+    /// Pops the next response queued by `then()` for the longest matching
+    /// key (same prefix rule as `responses`), leaving an exhausted queue in
+    /// place so a later call matching the same key falls through to the
+    /// ordinary stubs instead of finding nothing.
+    fn next_queued(&self, invocation: &str) -> Option<CommandOutput> {
+        let mut sequenced = self.sequenced.lock().unwrap();
+        let key = sequenced
+            .keys()
+            .filter(|key| invocation == key.as_str() || invocation.starts_with(&format!("{key} ")))
+            .max_by_key(|key| key.len())
+            .cloned()?;
+        sequenced.get_mut(&key).and_then(VecDeque::pop_front)
+    }
+
     /// Finds a stub for an invocation, by full program path or by file name.
     ///
     /// Both, because tasks run some binaries by absolute path and others by
     /// name, and a test should be able to say whichever it means. `toolchain`
     /// stubs the exact `~/.riabuild/node/<version>/bin/node` it is asserting
     /// about; `github_cli` says `gh --version` and does not care where gh is.
+    ///
+    /// A response queued by `then()` is consumed first, and consumed exactly
+    /// once per call: the queue lookup that finds nothing pops nothing, so
+    /// trying the file-name key after the full one cannot eat a second entry.
     fn resolve(&self, program: &str, args: &[&str], options: &RunOptions) -> Option<CommandOutput> {
         let full = format!("{program} {}", args.join(" "))
             .trim_end()
             .to_string();
+        let key = FakeRunner::stub_key(program, args);
+        if let Some(output) = self
+            .next_queued(&full)
+            .or_else(|| self.next_queued(key.as_str()))
+        {
+            return Some(output);
+        }
         self.stubbed(&full, options)
-            .or_else(|| self.stubbed(&FakeRunner::stub_key(program, args), options))
+            .or_else(|| self.stubbed(&key, options))
     }
 
     fn stubbed(&self, invocation: &str, options: &RunOptions) -> Option<CommandOutput> {
@@ -443,8 +597,12 @@ impl FakeRunner {
         self.responses
             .iter()
             .filter(|stub| {
-                let name_matches = invocation == stub.invocation
-                    || invocation.starts_with(&format!("{} ", stub.invocation));
+                let name_matches = if stub.fragment {
+                    invocation.contains(stub.invocation.as_str())
+                } else {
+                    invocation == stub.invocation
+                        || invocation.starts_with(&format!("{} ", stub.invocation))
+                };
                 name_matches
                     && stub
                         .env
@@ -464,7 +622,20 @@ impl FakeRunner {
             // account is asked the identical command string, but it means env
             // specificity only breaks ties between stubs that already match on
             // the same invocation length.
-            .max_by_key(|stub| (stub.invocation.len(), stub.env.len()))
+            //
+            // Length is also what settles a fragment against a prefix: a longer
+            // match is a more specific stub, so a prefix stub on `"ssh"` cannot
+            // silently answer for every remote invocation a fragment stub
+            // scripts. The last tuple element keeps a prefix stub ahead of a
+            // fragment of the identical length, which is the direction the
+            // fragment rule was originally written with.
+            .max_by_key(|stub| {
+                (
+                    stub.invocation.len(),
+                    stub.env.len(),
+                    u8::from(!stub.fragment),
+                )
+            })
     }
 
     /// The byte-stub twin of `resolve`, matched by exactly the same rules so a
@@ -554,6 +725,101 @@ impl CommandRunner for FakeRunner {
             .iter()
             .any(|p| p == program)
             .then(|| PathBuf::from(format!("/usr/bin/{program}")))
+    }
+}
+
+/// A `CommandRunner` that adds a fixed environment to every command.
+///
+/// This is why `github_cli` cannot authenticate the wrong developer on a shared
+/// server. `GH_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` are not something each task
+/// remembers to pass — the runner every task already holds carries them, so a
+/// task that forgets is not a thing anyone can write.
+///
+/// Whatever keys the scope was constructed with are applied *after* the
+/// caller's `RunOptions.env`, so they are not overridable:
+/// `std::process::Command::env()` (see `RealRunner::build`) overwrites on a
+/// repeated key, and the scope's entries are the ones applied last. A task
+/// cannot escape its namespace even by naming one of these keys itself —
+/// accidentally (a copy-pasted env vector from another task) or otherwise.
+/// Every other variable a caller sets — `env_local`'s `INFISICAL_TOKEN`, for
+/// instance — has nothing here to collide with, so it reaches the child
+/// untouched. See the precedence tests below, including one that pins the
+/// collision case: it is written to fail if the merge order were ever put back
+/// the other way around.
+///
+/// The un-overridable set is exactly what `main.rs` puts in, and today that is
+/// **`GH_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` only**. `RIABUILD_ROOT` is *not*
+/// in it: it reaches children by ordinary process-environment inheritance
+/// instead, which the precedence rule above does not cover, so a task that put
+/// `RIABUILD_ROOT` in its own `RunOptions.env` would win over the inherited
+/// value. No task does that today. Do not read this comment as saying the
+/// namespace root is protected the way the two config paths are — if that
+/// protection is ever wanted, `main.rs` has to add the key here.
+///
+/// Every method scopes, including the ones the laptop channel added: a
+/// clipboard read through `run_bytes` and a clipboard write through
+/// `run_forking` reach the child with the same environment `run` would have
+/// given it, so no route through this trait is an unscoped one.
+pub struct ScopedRunner {
+    inner: Arc<dyn CommandRunner>,
+    env: Vec<(String, String)>,
+}
+
+impl ScopedRunner {
+    pub fn new(inner: Arc<dyn CommandRunner>, env: Vec<(String, String)>) -> Self {
+        Self { inner, env }
+    }
+
+    fn merge(&self, options: &RunOptions) -> RunOptions {
+        let mut merged = options.clone();
+        let mut env = options.env.clone();
+        env.extend(self.env.iter().cloned());
+        merged.env = env;
+        merged
+    }
+}
+
+#[async_trait]
+impl CommandRunner for ScopedRunner {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<CommandOutput> {
+        self.inner.run(program, args, &self.merge(options)).await
+    }
+
+    async fn run_bytes(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<BytesOutput> {
+        self.inner
+            .run_bytes(program, args, &self.merge(options))
+            .await
+    }
+
+    async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
+        self.inner
+            .run_forking(program, args, &self.merge(options))
+            .await
+    }
+
+    async fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
+        self.inner
+            .run_interactive(program, args, &self.merge(options))
+            .await
+    }
+
+    fn which(&self, program: &str) -> Option<PathBuf> {
+        self.inner.which(program)
     }
 }
 
@@ -651,6 +917,330 @@ mod tests {
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())],
             ..Default::default()
         }
+    }
+
+    fn in_env(key: &str, value: &str) -> RunOptions {
+        RunOptions {
+            env: vec![(key.to_string(), value.to_string())],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scoped_runner_puts_its_environment_on_every_command() {
+        let fake = Arc::new(FakeRunner::new().with("gh auth status", 0, "", ""));
+        let scoped = ScopedRunner::new(
+            fake.clone(),
+            vec![("GH_CONFIG_DIR".into(), "/run/user/1000/riabuild-gh".into())],
+        );
+
+        scoped
+            .run("gh", &["auth", "status"], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!(
+            fake.env_of("gh auth status"),
+            vec![(
+                "GH_CONFIG_DIR".to_string(),
+                "/run/user/1000/riabuild-gh".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_still_add_its_own_environment() {
+        // `env_local` passes INFISICAL_TOKEN this way. The scope adds to that,
+        // never replaces it.
+        let fake = Arc::new(FakeRunner::new().with("infisical export", 0, "A=b\n", ""));
+        let scoped = ScopedRunner::new(
+            fake.clone(),
+            vec![("GH_CONFIG_DIR".into(), "/tmp/gh".into())],
+        );
+
+        scoped
+            .run(
+                "infisical",
+                &["export"],
+                &RunOptions {
+                    env: vec![("INFISICAL_TOKEN".into(), "st.secret".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("runs");
+
+        let env = fake.env_of("infisical export");
+        assert!(env.contains(&("GH_CONFIG_DIR".to_string(), "/tmp/gh".to_string())));
+        assert!(env.contains(&("INFISICAL_TOKEN".to_string(), "st.secret".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_interactive_command_is_scoped_too() {
+        // `gh auth login` is interactive, and it is exactly the command that must
+        // not write into another developer's configuration directory.
+        let fake = Arc::new(FakeRunner::new().with("gh auth login", 0, "", ""));
+        let scoped = ScopedRunner::new(
+            fake.clone(),
+            vec![("GH_CONFIG_DIR".into(), "/tmp/gh".into())],
+        );
+
+        scoped
+            .run_interactive("gh", &["auth", "login"], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!(
+            fake.env_of("gh auth login"),
+            vec![("GH_CONFIG_DIR".to_string(), "/tmp/gh".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_and_forking_commands_are_scoped_too() {
+        // The two methods the laptop channel added. A clipboard read and a
+        // clipboard write are ordinary children of a namespaced session, so a
+        // route through the trait that skipped `merge()` would be an unscoped
+        // command nobody would notice until two developers shared a server.
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with_bytes("xclip -o", 0, b"copied", "")
+                .with("xclip -i", 0, "", ""),
+        );
+        let scoped = ScopedRunner::new(fake.clone(), vec![("DISPLAY".into(), ":17".into())]);
+
+        scoped
+            .run_bytes("xclip", &["-o"], &RunOptions::default())
+            .await
+            .expect("runs");
+        scoped
+            .run_forking("xclip", &["-i"], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!(
+            fake.env_of("xclip -o"),
+            vec![("DISPLAY".to_string(), ":17".to_string())]
+        );
+        assert_eq!(
+            fake.env_of("xclip -i"),
+            vec![("DISPLAY".to_string(), ":17".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_override_a_namespace_key() {
+        // A task cannot escape its namespace even by naming one of the scope's
+        // own keys itself — accidentally (a copy-pasted env vector from another
+        // task) or otherwise. Both entries still reach the inner runner (this
+        // type does not deduplicate), but `std::process::Command::env` (see
+        // `RealRunner::build`) overwrites on a repeated key with whichever call
+        // came last, and the scope's entry is appended after the caller's in
+        // `merge()` — so it is the scope's value the real child process sees.
+        // This is written to fail if that merge order were ever put back the
+        // other way around: see "Prove it bites" in the Task 8 report.
+        let fake = Arc::new(FakeRunner::new().with("gh auth status", 0, "", ""));
+        let scoped = ScopedRunner::new(
+            fake.clone(),
+            vec![("GH_CONFIG_DIR".into(), "/run/user/1000/riabuild-gh".into())],
+        );
+
+        scoped
+            .run(
+                "gh",
+                &["auth", "status"],
+                &RunOptions {
+                    env: vec![("GH_CONFIG_DIR".into(), "/tmp/some-other-place".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("runs");
+
+        let env = fake.env_of("gh auth status");
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "GH_CONFIG_DIR".to_string(),
+                    "/tmp/some-other-place".to_string()
+                ),
+                (
+                    "GH_CONFIG_DIR".to_string(),
+                    "/run/user/1000/riabuild-gh".to_string()
+                ),
+            ],
+            "the scope's entry must be last, since std::process::Command::env() lets the last call for a key win"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scoped_environment_reaches_a_real_child_process_not_just_the_struct() {
+        // Everything above goes through `FakeRunner`, which proves the merged
+        // environment is threaded through the call, not merely stored on
+        // `ScopedRunner`. This test closes the last gap by running a real
+        // process and reading its actual environment back out of its stdout.
+        let scoped = ScopedRunner::new(
+            Arc::new(RealRunner),
+            vec![(
+                "RIABUILD_SCOPED_RUNNER_TEST".into(),
+                "namespaced-value".into(),
+            )],
+        );
+
+        let output = scoped
+            .run("env", &[], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert!(
+            output
+                .stdout
+                .lines()
+                .any(|line| line == "RIABUILD_SCOPED_RUNNER_TEST=namespaced-value"),
+            "child environment did not contain the scoped variable:\n{}",
+            output.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_receives_bytes_that_are_not_valid_utf8() {
+        // A gzip header is not valid UTF-8, and Task 17 streams a whole binary
+        // through here. Asserting a field returns what was just assigned to
+        // it would prove nothing about the code that could get
+        // bytes-versus-UTF-8 wrong; this runs a real child instead.
+        //
+        // The check goes through `wc -c` rather than `cat` + a byte-length
+        // comparison on `stdout`: `CommandOutput::stdout` is a lossy-decoded
+        // `String` (`String::from_utf8_lossy`), and every invalid byte in
+        // these six becomes a 3-byte U+FFFD replacement on the way back out
+        // — echoing the input and measuring the echo would be measuring the
+        // lossy decoder, not what the child actually received on stdin.
+        // `wc -c` reports the byte count as plain ASCII digits, which round-
+        // trips through that same lossy decoding unchanged, so it proves the
+        // six raw bytes reached the child intact without depending on stdout
+        // being representable as UTF-8 at all.
+        let bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe];
+        let output = RealRunner
+            .run(
+                "wc",
+                &["-c"],
+                &RunOptions {
+                    stdin: Some(bytes.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("wc runs");
+        assert_eq!(output.trimmed(), bytes.len().to_string());
+    }
+
+    #[tokio::test]
+    async fn the_fake_records_piped_bytes_and_reports_none_when_nothing_was_piped() {
+        // The accessor every "a secret travels on stdin" test now leans on. It
+        // has to distinguish the two cases, not merely return something: a
+        // `stdin_of` that answered `Some` unconditionally would make all four
+        // of those tests green again for exactly the reason they were written.
+        let fake = FakeRunner::new()
+            .with("security", 0, "", "")
+            .with("id", 0, "", "");
+        fake.run(
+            "security",
+            &["add-generic-password"],
+            &RunOptions {
+                stdin: Some(b"piped-secret".to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("runs");
+        fake.run("id", &[], &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!(
+            fake.stdin_text_of("security").as_deref(),
+            Some("piped-secret")
+        );
+        assert_eq!(fake.stdin_of("id"), None);
+        assert_eq!(fake.stdin_of("never-run"), None);
+    }
+
+    #[tokio::test]
+    async fn the_stdin_of_a_call_is_also_reachable_by_fragment() {
+        // `input_for` is the clipboard channel's reader: `wl-copy` is invoked
+        // with the payload's type in front of nothing the test can predict, so
+        // it looks the call up by a fragment rather than by a prefix. Both
+        // accessors read the one recording, so neither can go stale while the
+        // other still works.
+        let fake = FakeRunner::new().with("wl-copy", 0, "", "");
+        fake.run_forking(
+            "wl-copy",
+            &["--type", "image/png"],
+            &RunOptions {
+                stdin: Some(vec![0x89, b'P', b'N', b'G']),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("runs");
+
+        assert_eq!(
+            fake.input_for("image/png"),
+            Some(vec![0x89, b'P', b'N', b'G'])
+        );
+        assert_eq!(fake.inputs().len(), 1);
+        assert_eq!(fake.input_for("xclip"), None);
+    }
+
+    #[tokio::test]
+    async fn a_fragment_stub_can_answer_for_the_end_of_a_command() {
+        let fake = FakeRunner::new()
+            .with("ssh", 1, "", "unmatched")
+            .containing("uname -sm", 0, "Linux x86_64\n", "");
+
+        let output = fake
+            .run(
+                "ssh",
+                &["-p", "22", "ada@box", "uname -sm"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("runs");
+        assert_eq!(output.trimmed(), "Linux x86_64");
+    }
+
+    #[tokio::test]
+    async fn a_queued_response_is_consumed_before_the_standing_stub() {
+        // The "first call fails, second succeeds" shape: a probe run before and
+        // after the action a test is asserting changed the server's state. Once
+        // the queue empties, the standing stub answers again.
+        let fake = FakeRunner::new()
+            .with("ssh box cat /token", 0, "standing", "")
+            .then("ssh box cat /token", 1, "before", "")
+            .then("ssh box cat /token", 0, "after", "");
+        let args = ["box", "cat", "/token"];
+
+        let first = fake
+            .run("ssh", &args, &RunOptions::default())
+            .await
+            .expect("runs");
+        let second = fake
+            .run("ssh", &args, &RunOptions::default())
+            .await
+            .expect("runs");
+        let third = fake
+            .run("ssh", &args, &RunOptions::default())
+            .await
+            .expect("runs");
+
+        assert_eq!((first.trimmed(), first.code), ("before", Some(1)));
+        assert_eq!((second.trimmed(), second.code), ("after", Some(0)));
+        assert_eq!(
+            third.trimmed(),
+            "standing",
+            "an exhausted queue falls through to the standing stub"
+        );
     }
 
     #[tokio::test]
@@ -802,12 +1392,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plain.stdout, b"\x89PNG\xFF");
-    }
-
-    fn in_env(key: &str, value: &str) -> RunOptions {
-        RunOptions {
-            env: vec![(key.to_string(), value.to_string())],
-            ..Default::default()
-        }
     }
 }

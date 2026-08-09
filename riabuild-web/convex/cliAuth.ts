@@ -15,7 +15,7 @@ import { v } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server";
 import { Doc, Id } from "./_generated/dataModel";
 import { MutationCtx, QueryCtx } from "./_generated/server";
-import { memberView, viewerMember, writeAudit } from "./members";
+import { memberView, toView, viewerMember, writeAudit } from "./members";
 import { createSession } from "./sessions";
 import { normaliseUserCode } from "./lib/crypto";
 
@@ -232,6 +232,10 @@ export const startDevice = internalMutation({
 /**
  * One poll from the CLI. Called only by `POST /api/v1/cli/token`, which does
  * the hashing and maps the result onto the wire.
+ *
+ * `sessionId` travels back with the token on purpose: it is the only handle
+ * `riabuild remote forget` has on the row it must revoke, and a shared server
+ * that cannot name its own session leaves a live 90-day credential behind.
  */
 export const redeem = internalMutation({
   args: { deviceCodeHash: v.string(), tokenHash: v.string(), now: v.number() },
@@ -299,17 +303,7 @@ export const redeem = internalMutation({
       status: "ok" as const,
       sessionId,
       expiresAt: session?.expiresAt ?? args.now,
-      member: {
-        _id: member._id,
-        githubLogin: member.githubLogin,
-        githubId: member.githubId,
-        firstName: member.firstName,
-        lastName: member.lastName,
-        email: member.email,
-        role: member.role,
-        status: member.status,
-        joinedAt: member._creationTime,
-      },
+      member: toView(member),
     };
   },
 });

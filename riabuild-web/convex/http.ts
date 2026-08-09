@@ -21,6 +21,7 @@ auth.addHttpRoutes(http);
 
 type MemberView = {
   _id: Id<"members">;
+  memberId: string;
   githubLogin: string;
   githubId: string;
   firstName: string;
@@ -170,6 +171,7 @@ async function requireOrgMembership(login: string): Promise<void> {
 
 function memberPayload(member: MemberView) {
   return {
+    memberId: member.memberId,
     githubLogin: member.githubLogin,
     githubId: member.githubId,
     firstName: member.firstName,
@@ -329,6 +331,12 @@ http.route({
       return jsonResponse({
         status: "ok",
         token,
+        // Additive field: `redeem` already computed this for the audit log,
+        // it was just never handed back before. `riabuild remote forget`
+        // needs it to name the exact `cliSessions` row a server's own
+        // session lives in when it calls `DELETE /api/v1/cli/sessions/<id>`
+        // — see convex/sessions.ts's `revokeById`.
+        sessionId: result.sessionId,
         expiresAt: result.expiresAt,
         member: memberPayload(result.member),
       });
@@ -466,6 +474,44 @@ http.route({
         siteUrl: broker.siteUrl,
         secretsUpdatedAt: config.secretsUpdatedAt,
       });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
+/* DELETE /api/v1/cli/sessions/<id> — revoke a session                        */
+/* -------------------------------------------------------------------------- */
+
+http.route({
+  pathPrefix: "/api/v1/cli/sessions/",
+  method: "DELETE",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const { member } = await authenticate(ctx, req);
+      // The non-negotiable one, same as /secrets/token: a Convex row cannot
+      // outvote GitHub. Revocation changes access, so it re-verifies too.
+      await requireOrgMembership(member.githubLogin);
+
+      const id = new URL(req.url).pathname.split("/").pop() ?? "";
+      const result = await ctx.runMutation(internal.sessions.revokeById, {
+        sessionId: id,
+        actorId: member._id,
+        isLead: member.role === "lead",
+      });
+
+      // "not_found" and "forbidden" collapse into the identical response: a
+      // session id that belongs to somebody else must be indistinguishable
+      // from one that never existed, or this endpoint becomes a way to probe
+      // for live session ids one guess at a time.
+      if (result === "not_found" || result === "forbidden") {
+        fail(
+          404,
+          "session_unknown",
+          "That session no longer exists.",
+          "Run `riabuild remote list` to see what is left.",
+        );
+      }
+      return jsonResponse({ revoked: true });
     }),
   ),
 });

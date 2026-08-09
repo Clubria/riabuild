@@ -14,6 +14,7 @@ export { Field } from "./Field";
 export { TextArea } from "./TextArea";
 export { Select } from "./Select";
 export { Command } from "./Command";
+export { Copyable } from "./Copyable";
 export { KeyValue } from "./KeyValue";
 export type { KeyValueRow } from "./KeyValue";
 export { DataTable } from "./DataTable";

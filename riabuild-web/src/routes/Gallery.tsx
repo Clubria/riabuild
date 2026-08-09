@@ -5,6 +5,7 @@ import {
   Button,
   Column,
   Command,
+  Copyable,
   DataTable,
   Dot,
   Empty,
@@ -156,6 +157,26 @@ export function Gallery() {
         <Command command="brew install clubria/tap/riabuild" />
         <Command command={`riabuild --flag ${"x".repeat(200)}`} />
         <Command command={"line one\nline two\nline three"} prompt=">" />
+      </Section>
+
+      <Section name="Copyable">
+        <Row label="uuid">
+          <Copyable
+            value="550e8400-e29b-41d4-a716-446655440000"
+            label="member id"
+          />
+        </Row>
+        <Row label="no dashes">
+          <Copyable value="nodashesatall" label="value" />
+        </Row>
+        <Row label="long, no dashes">
+          {/* The hostile case: no dash to truncate at, and long enough that
+              an unbounded prefix would overflow the row. */}
+          <Copyable value={"unbrokentoken".repeat(6)} label="long value" />
+        </Row>
+        <Row label="empty">
+          <Copyable value="" label="empty value" />
+        </Row>
       </Section>
 
       {/* All three, forced, because the live panel only ever shows the one it

@@ -18,6 +18,7 @@ export type Loadable<T> =
 
 export type Member = {
   _id: string;
+  memberId: string;
   githubLogin: string;
   githubId: string;
   firstName: string;

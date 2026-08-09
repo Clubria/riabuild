@@ -27,17 +27,20 @@ async function seedMember(
       name: "Ada Lovelace",
       email: "ada@clubria.dev",
     });
-    const memberId = await ctx.db.insert("members", {
+    // `rowId` — not `memberId` — because `members.memberId` is now a distinct
+    // UUID field on the row itself; see the schema comment.
+    const rowId = await ctx.db.insert("members", {
       userId,
       githubLogin: overrides.login ?? "ada",
       githubId: "1234",
+      memberId: crypto.randomUUID(),
       firstName: "Ada",
       lastName: "Lovelace",
       email: "ada@clubria.dev",
       role: overrides.role ?? "developer",
       status: overrides.status ?? "active",
     });
-    return { userId, memberId };
+    return { userId, rowId };
   });
 }
 
@@ -45,7 +48,11 @@ async function seedMember(
 async function issueSession(
   t: ReturnType<typeof setup>,
   memberId: Id<"members">,
-  options: { expiresAt?: number; revoked?: boolean } = {},
+  options: {
+    expiresAt?: number;
+    revoked?: boolean;
+    deviceLabel?: string;
+  } = {},
 ) {
   const token = randomToken(32);
   const tokenHash = await sha256Hex(token);
@@ -53,7 +60,7 @@ async function issueSession(
     await ctx.db.insert("cliSessions", {
       memberId,
       tokenHash,
-      deviceLabel: "ada-mbp",
+      deviceLabel: options.deviceLabel ?? "ada-mbp",
       cliVersion: "0.1.0",
       lastUsedAt: 0,
       expiresAt: options.expiresAt ?? Date.now() + 60_000,
@@ -68,6 +75,47 @@ function bearer(token: string, version?: string): HeadersInit {
   if (version !== undefined) headers["x-riabuild-cli-version"] = version;
   return headers;
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+describe("member ids", () => {
+  test("a freshly inserted member row has a UUID-shaped member id", async () => {
+    // NOTE: this goes through the `seedMember` fixture, not `auth.ts`'s
+    // `upsertMember` — it does not exercise the `memberId: crypto.randomUUID()`
+    // line in auth.ts at all. Deleting that line would not fail this test,
+    // because `seedMember` mints its own id independently. Covering the real
+    // auth.ts minting path means driving a sign-in through convex-test —
+    // stubbing GitHub's token/user endpoints the way `stubUpstreams` does
+    // below for Infisical — which is out of scope here.
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const member = await t.run(async (ctx) => await ctx.db.get("members", rowId));
+    expect(member?.memberId).toMatch(UUID);
+  });
+
+  // The backfill's own idempotency tests (which inserted a member row with no
+  // `memberId`) were deleted in Task 2, when the schema field became
+  // required: `convex-test` now rejects that fixture outright, and a row
+  // without the field was its entire subject. `backfillMemberIds` is covered
+  // by its one production deploy's returned count instead — see the comment
+  // on the mutation in members.ts.
+});
+
+describe("member payloads", () => {
+  test("every member payload carries the member id", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
+
+    const response = await t.fetch("/api/v1/me", {
+      headers: bearer(token),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.member.memberId).toMatch(UUID);
+  });
+});
 
 describe("CLI login — device authorisation", () => {
   /** What the CLI does first: ask for a pair of codes. */
@@ -128,6 +176,16 @@ describe("CLI login — device authorisation", () => {
     expect(granted.response.status).toBe(200);
     expect(granted.body.status).toBe("ok");
     expect(granted.body.member.githubLogin).toBe("ada");
+    expect(typeof granted.body.token).toBe("string");
+    expect(granted.body.member.memberId).toMatch(UUID);
+
+    // `riabuild remote forget` needs this to name the exact session it is
+    // revoking: it must be the real row id, not just present.
+    const sessionRowId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows[0]?._id;
+    });
+    expect(granted.body.sessionId).toBe(sessionRowId);
 
     // The session is real: it authenticates the next request.
     const me = await t.fetch("/api/v1/me", {
@@ -135,6 +193,15 @@ describe("CLI login — device authorisation", () => {
     });
     expect(me.status).toBe(200);
     expect((await me.json()).member.role).toBe("developer");
+
+    // And it was stored hashed, not raw.
+    const stored = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.map((row) => row.tokenHash);
+    });
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).not.toBe(granted.body.token);
+    expect(stored[0]).toBe(await sha256Hex(granted.body.token));
   });
 
   test("the device code is stored hashed and the user code is not", async () => {
@@ -247,7 +314,7 @@ describe("CLI login — device authorisation", () => {
 
   test("suspension between approval and the next poll is a 403", async () => {
     const t = setup();
-    const { userId, memberId } = await seedMember(t);
+    const { userId, rowId } = await seedMember(t);
     const { body: device } = await startDevice(t);
     const asAda = t.withIdentity({ subject: `${userId}|session` });
     await asAda.mutation(api.cliAuth.approve, { userCode: device.userCode });
@@ -256,7 +323,7 @@ describe("CLI login — device authorisation", () => {
     // session comes into existence at the poll — so that is where status has
     // to be checked, not only at approval.
     await t.run(async (ctx) => {
-      await ctx.db.patch("members", memberId, { status: "suspended" });
+      await ctx.db.patch("members", rowId, { status: "suspended" });
     });
 
     const blocked = await poll(t, device.deviceCode);
@@ -396,8 +463,8 @@ describe("session authentication", () => {
 
   test("a revoked session says so, so the CLI can re-login", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId, { revoked: true });
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId, { revoked: true });
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("session_revoked");
@@ -405,8 +472,8 @@ describe("session authentication", () => {
 
   test("an expired session says so", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId, { expiresAt: 1 });
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId, { expiresAt: 1 });
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("session_expired");
@@ -414,8 +481,8 @@ describe("session authentication", () => {
 
   test("a suspended member is 403, never 401", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { status: "suspended" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { status: "suspended" });
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/me", { headers: bearer(token) });
     // 401 would make the CLI re-authenticate, succeed, and loop forever.
     expect(response.status).toBe(403);
@@ -424,8 +491,8 @@ describe("session authentication", () => {
 
   test("a successful request records when the machine was last seen", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.fetch("/api/v1/me", { headers: bearer(token) });
     const lastUsed = await t.run(async (ctx) => {
       const session = await ctx.db.query("cliSessions").first();
@@ -438,8 +505,8 @@ describe("session authentication", () => {
 describe("version floors", () => {
   test("an outdated CLI is turned away with 409", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: "{}",
@@ -461,8 +528,8 @@ describe("version floors", () => {
 
   test("org config still answers an outdated CLI — it is how it learns", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: "{}",
@@ -488,8 +555,8 @@ describe("version floors", () => {
 describe("org config and claude settings", () => {
   test("a fresh deployment serves defaults rather than an error", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/org/config", {
       headers: bearer(token),
     });
@@ -499,8 +566,8 @@ describe("org config and claude settings", () => {
 
   test("the retired checkout path is still sent, so older CLIs can parse this", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/org/config", {
       headers: bearer(token),
     });
@@ -542,8 +609,8 @@ describe("org config and claude settings", () => {
 
   test("claude settings come back parsed, with their timestamp", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     await t.run(async (ctx) => {
       await ctx.db.insert("orgConfig", {
         claudeSettings: JSON.stringify({ env: { CLUBRIA: "1" } }),
@@ -566,8 +633,8 @@ describe("org config and claude settings", () => {
 
   test("the default settings ask for bypass mode and pre-accept its disclaimer", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     const response = await t.fetch("/api/v1/org/claude-settings", {
       headers: bearer(token),
     });
@@ -584,8 +651,8 @@ describe("org config and claude settings", () => {
 
   test("the default settings carry the context-window status line", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
 
     const response = await t.fetch("/api/v1/org/claude-settings", {
       headers: bearer(token),
@@ -754,8 +821,8 @@ describe("secret brokering", () => {
 
   test("an org member gets a short-lived token and an audit entry", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { role: "developer" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
     let loginBody: unknown = null;
     stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
 
@@ -782,8 +849,8 @@ describe("secret brokering", () => {
 
   test("a candidate is brokered through the narrower identity", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t, { role: "candidate" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
     let loginBody: unknown = null;
     stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
 
@@ -800,8 +867,8 @@ describe("secret brokering", () => {
   test("leaving the GitHub org ends access, whatever Convex says", async () => {
     const t = setup();
     // Still `developer` and still `active` in Convex — GitHub is the gate.
-    const { memberId } = await seedMember(t, { role: "developer" });
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
     stubUpstreams({ membership: 404 });
 
     const response = await t.fetch("/api/v1/secrets/token", {
@@ -814,8 +881,8 @@ describe("secret brokering", () => {
 
   test("an unusable org token fails closed, and says it could not check", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     vi.stubEnv("GITHUB_ORG_TOKEN", "");
     stubUpstreams({ membership: 204 });
 
@@ -830,8 +897,8 @@ describe("secret brokering", () => {
 
   test("an Infisical outage is translated, not forwarded", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const token = await issueSession(t, memberId);
+    const { rowId } = await seedMember(t);
+    const token = await issueSession(t, rowId);
     stubUpstreams({
       membership: 204,
       infisical: { status: 500, body: { message: "identity mi-developer" } },
@@ -857,7 +924,7 @@ describe("member administration", () => {
 
     await expect(
       asDeveloper.mutation(api.members.setRole, {
-        memberId: other.memberId,
+        memberId: other.rowId,
         role: "lead",
       }),
     ).rejects.toThrow(/team leads/i);
@@ -870,7 +937,7 @@ describe("member administration", () => {
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
 
     await asLead.mutation(api.members.setRole, {
-      memberId: subject.memberId,
+      memberId: subject.rowId,
       role: "developer",
     });
 
@@ -889,7 +956,7 @@ describe("member administration", () => {
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
     await expect(
       asLead.mutation(api.members.setRole, {
-        memberId: lead.memberId,
+        memberId: lead.rowId,
         role: "candidate",
       }),
     ).rejects.toThrow(/another lead/i);
@@ -899,11 +966,11 @@ describe("member administration", () => {
     const t = setup();
     const lead = await seedMember(t, { login: "lead", role: "lead" });
     const subject = await seedMember(t, { login: "grace" });
-    const token = await issueSession(t, subject.memberId);
+    const token = await issueSession(t, subject.rowId);
     const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
 
     await asLead.mutation(api.members.setStatus, {
-      memberId: subject.memberId,
+      memberId: subject.rowId,
       status: "suspended",
     });
 
@@ -1032,8 +1099,211 @@ describe("member administration", () => {
 
   test("internal member lookup returns the stored profile", async () => {
     const t = setup();
-    const { memberId } = await seedMember(t);
-    const member = await t.query(internal.members.byId, { memberId });
+    const { rowId } = await seedMember(t);
+    const member = await t.query(internal.members.byId, { memberId: rowId });
     expect(member?.githubLogin).toBe("ada");
+  });
+});
+
+describe("revoking a session", () => {
+  const realFetch = globalThis.fetch;
+
+  // This endpoint re-verifies GitHub org membership same as /secrets/token —
+  // revocation changes access, so the Convex row is never the sole gate here
+  // either. Stub GitHub as reachable and membership as current.
+  beforeEach(() => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.includes("api.github.com")) return new Response(null, { status: 204 });
+      throw new Error(`unexpected fetch to ${url}`);
+    };
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  test("a member can revoke their own session", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const victim = await issueSession(t, rowId, {
+      deviceLabel: "build-01.fly.dev",
+    });
+    const victimId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      const found = rows.find((row) => row.deviceLabel === "build-01.fly.dev");
+      return found?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${victimId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ revoked: true });
+
+    const revoked = await t.run(async (ctx) => await ctx.db.get("cliSessions", victimId!));
+    expect(revoked?.revokedAt).toBeTruthy();
+
+    // The revoked token is dead everywhere, not just on the laptop that held it.
+    const after = await t.fetch("/api/v1/me", { headers: bearer(victim) });
+    expect(after.status).toBe(401);
+
+    const actions = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).map((row) => row.action),
+    );
+    expect(actions).toContain("session.revoked");
+  });
+
+  // A session id that belongs to somebody else must read identically to one
+  // that never existed at all — see the next test. If revoking somebody
+  // else's session returned a distinct status (e.g. 403), a caller could
+  // enumerate live session ids one guess at a time by watching which ones
+  // come back "forbidden" instead of "not found". So this is 404, not 403,
+  // and the two tests below assert the response bodies are indistinguishable.
+  test("a developer cannot revoke somebody else's session, and it looks the same as not existing", async () => {
+    const t = setup();
+    const { rowId: mine } = await seedMember(t);
+    const { rowId: theirs } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, mine);
+    const other = await issueSession(t, theirs);
+    const otherId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === theirs)?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${otherId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("session_unknown");
+    expect(
+      await t.run(async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt),
+    ).toBeFalsy();
+
+    // The victim's session survives untouched — the failed attempt didn't
+    // revoke it, and it still authenticates.
+    const stillLive = await t.fetch("/api/v1/me", { headers: bearer(other) });
+    expect(stillLive.status).toBe(200);
+  });
+
+  test("an unknown session id gets the identical 404 as somebody else's session", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/cli/sessions/not-a-real-id", {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "session_unknown",
+        message: "That session no longer exists.",
+        action: "Run `riabuild remote list` to see what is left.",
+      },
+    });
+  });
+
+  test("an org lead can revoke somebody else's session", async () => {
+    const t = setup();
+    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: devRow } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, leadRow);
+    const victim = await issueSession(t, devRow);
+    const victimId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === devRow)?._id;
+    });
+
+    const response = await t.fetch(`/api/v1/cli/sessions/${victimId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(response.status).toBe(200);
+
+    const after = await t.fetch("/api/v1/me", { headers: bearer(victim) });
+    expect(after.status).toBe(401);
+
+    const revocation = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).find(
+        (row) => row.action === "session.revoked",
+      ),
+    );
+    expect(revocation?.actorId).toBe(leadRow);
+    expect(revocation?.subjectId).toBe(devRow);
+  });
+
+  test("revoking your own currently-authenticating session is not an error, and kills it for real", async () => {
+    // `apply()` runs twice; so does `forget` after a half-finished one.
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const caller = await issueSession(t, rowId);
+    const target = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows[0]?._id;
+    });
+
+    const once = await t.fetch(`/api/v1/cli/sessions/${target}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(once.status).toBe(200);
+
+    // The caller just revoked the session it is calling with, so a second
+    // attempt authenticates as nobody — 401, not a 500. It never reaches the
+    // idempotency check inside the mutation, because it never reaches the
+    // mutation at all.
+    const twice = await t.fetch(`/api/v1/cli/sessions/${target}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(twice.status).toBe(401);
+  });
+
+  test("revoking an already-revoked session through a live caller is a no-op, not an error", async () => {
+    // Exercises the mutation's own idempotency, using a caller (a lead) whose
+    // token survives the first call — unlike the self-revoke case above,
+    // where the second call never reaches the mutation.
+    const t = setup();
+    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: devRow } = await seedMember(t, { login: "bob" });
+    const caller = await issueSession(t, leadRow);
+    await issueSession(t, devRow);
+    const targetId = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("cliSessions").collect();
+      return rows.find((row) => row.memberId === devRow)?._id;
+    });
+
+    const once = await t.fetch(`/api/v1/cli/sessions/${targetId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(once.status).toBe(200);
+    const revokedAtFirst = await t.run(
+      async (ctx) => (await ctx.db.get("cliSessions", targetId!))?.revokedAt,
+    );
+
+    const twice = await t.fetch(`/api/v1/cli/sessions/${targetId}`, {
+      method: "DELETE",
+      headers: bearer(caller),
+    });
+    expect(twice.status).toBe(200);
+    const revokedAtSecond = await t.run(
+      async (ctx) => (await ctx.db.get("cliSessions", targetId!))?.revokedAt,
+    );
+    // Not re-stamped with a later timestamp — a no-op, not a second write.
+    expect(revokedAtSecond).toBe(revokedAtFirst);
+
+    const revocations = await t.run(async (ctx) =>
+      (await ctx.db.query("auditLog").collect()).filter(
+        (row) => row.action === "session.revoked",
+      ),
+    );
+    expect(revocations).toHaveLength(1);
   });
 });

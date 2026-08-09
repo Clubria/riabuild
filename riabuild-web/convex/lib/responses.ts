@@ -16,7 +16,8 @@ export type ApiErrorCode =
   | "bad_request"
   | "not_configured"
   | "org_check_unavailable"
-  | "upstream_error";
+  | "upstream_error"
+  | "session_unknown";
 
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
