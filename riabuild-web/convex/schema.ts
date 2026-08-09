@@ -37,7 +37,7 @@ export default defineSchema({
      * document reference (`v.id("members")`); this one is a UUID string
      * stored on the row itself. Same name, unrelated types — do not unify.
      */
-    memberId: v.string(),
+    memberId: v.optional(v.string()),
     firstName: v.string(),
     lastName: v.string(),
     email: v.string(),
