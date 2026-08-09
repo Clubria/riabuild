@@ -8,22 +8,28 @@
 //! |---|---|
 //! | `ssh -N -R` as a supervised child, rebuilt with jittered backoff | clean exits — the connection died and said so |
 //! | `ServerAliveInterval`/`ServerAliveCountMax` | black-hole networks: converts silence into an exit, in ~45 s |
-//! | `channel.ping` every 30 s, teardown after two misses | half-open sockets — SSH believes the connection is fine while the forward is wedged. Keepalives run below the forward and cannot see this |
+//! | a health probe run *on the server* every 30 s, teardown after two misses | half-open sockets — SSH believes the connection is fine while the forward is wedged. Keepalives run below the forward and cannot see this |
 //!
 //! The supervisor lives on the laptop, because the laptop holds the identity
 //! and is the side that comes and goes. The server end is entirely passive.
 //!
-//! The run loop that drives these is deferred until remote mode supplies a
-//! host, a port and an identity. It also needs a `CommandRunner` that can hold
-//! a long-lived child while the ping runs concurrently, which `run` cannot
-//! express. Everything the loop has to *decide* is here and tested.
+//! The probe is the one that has to originate on the *other* end, and
+//! `probe_args` is where that is enforced: the forward runs server→laptop, so a
+//! probe made from here would test the agent rather than the forward and call a
+//! wedged tunnel healthy. It costs a second short-lived SSH connection every
+//! interval, deliberately — see `run::probe`.
+//!
+//! This file holds what the supervisor *decides*: the argv that encodes two of
+//! the three mechanisms, the retry schedule, and the diagnosis of a refused
+//! forward. `run` holds the plumbing that drives them — the held child, the
+//! interval, and the rebuild.
 
-// Every item here is exercised by this module's tests and by nothing else yet:
-// the run loop that would call them is deferred until remote mode supplies a
-// host, a port and an identity. Removing them to satisfy the lint would mean
-// deleting the decisions this module exists to pin down, so the allow is
-// narrower than that and carries its own expiry — delete it with the wiring.
-#![allow(dead_code)]
+mod run;
+
+// `supervisor::supervise`, not `supervisor::run::supervise`: which file the
+// loop lives in is this module's business, and a caller that had to know would
+// have to be edited the next time it moves.
+pub use run::{Stop, supervise};
 
 use crate::ui::Failure;
 use rand::Rng;
@@ -47,6 +53,17 @@ pub struct Tunnel {
     pub remote_socket: PathBuf,
     /// Where the agent is listening on the laptop.
     pub local_socket: PathBuf,
+    /// The command that proves the forward carries traffic, run **on the
+    /// server** — in production the server's own `riabuild channel status`,
+    /// which connects to `remote_socket` and exits non-zero when nothing
+    /// answers.
+    ///
+    /// A string the caller composes rather than something assembled here.
+    /// Remote mode owns the namespace, the server's binary path and
+    /// `env_command`; a supervisor that reached for any of them would stop
+    /// being testable without a server, which is most of why the loop below
+    /// can be unit-tested at all.
+    pub probe: String,
 }
 
 pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
@@ -82,6 +99,36 @@ pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
         "-o".into(),
         "BatchMode=yes".into(),
         format!("{}@{}", tunnel.user, tunnel.host),
+    ]
+}
+
+/// The second, short-lived ssh that carries one health probe.
+///
+/// It runs `tunnel.probe` **on the server**, and that is the whole design.
+/// The forward runs server→laptop, so a probe only proves anything if it
+/// originates on the server: opening `tunnel.local_socket` from here would
+/// test the agent's own liveness and nothing else, and would call a wedged
+/// forward healthy — the exact failure the ping exists to catch.
+///
+/// See `run::probe` for the cost this pays, which is deliberate.
+pub fn probe_args(tunnel: &Tunnel) -> Vec<String> {
+    vec![
+        "-i".into(),
+        tunnel.identity.display().to_string(),
+        "-p".into(),
+        tunnel.port.to_string(),
+        // Same reason as the tunnel's: this runs unattended beside the mosh
+        // session, and a password prompt nobody can see would hang the probe
+        // until its timeout every single interval.
+        "-o".into(),
+        "BatchMode=yes".into(),
+        // A probe is a measurement, so it must not outlast the thing it
+        // measures. Without a bound, a laptop on a black-hole network spends
+        // the whole interval in connect() and the supervisor learns nothing.
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        format!("{}@{}", tunnel.user, tunnel.host),
+        tunnel.probe.clone(),
     ]
 }
 
@@ -132,7 +179,7 @@ pub fn diagnose(stderr: &str) -> Option<Failure> {
 mod tests {
     use super::*;
 
-    fn tunnel() -> Tunnel {
+    pub(super) fn tunnel() -> Tunnel {
         Tunnel {
             host: "build-01.clubria.dev".into(),
             user: "ada".into(),
@@ -140,6 +187,7 @@ mod tests {
             identity: PathBuf::from("/home/ada/.riabuild/ssh/id_ed25519"),
             remote_socket: PathBuf::from("/run/user/1000/riabuild/channel.sock"),
             local_socket: PathBuf::from("/tmp/riabuild/agent.sock"),
+            probe: "riabuild channel status".into(),
         }
     }
 
@@ -191,6 +239,31 @@ mod tests {
     #[test]
     fn the_tunnel_never_prompts() {
         assert!(ssh_args(&tunnel()).join(" ").contains("BatchMode=yes"));
+    }
+
+    /// The regression this file is most likely to suffer: someone notices the
+    /// probe costs an SSH connection and points it at the laptop's own socket
+    /// instead. That tests the agent, not the forward, and reports a wedged
+    /// tunnel as healthy — deleting the one mechanism that catches a half-open
+    /// socket while leaving every other test green.
+    #[test]
+    fn the_probe_runs_on_the_server_rather_than_against_the_laptops_own_socket() {
+        let args = probe_args(&tunnel()).join(" ");
+        assert!(args.contains("ada@build-01.clubria.dev"), "{args}");
+        assert!(args.ends_with("riabuild channel status"), "{args}");
+        assert!(
+            !args.contains("/tmp/riabuild/agent.sock"),
+            "the probe reached for the laptop's own socket: {args}"
+        );
+    }
+
+    /// A probe that outlives the interval it measures reports nothing, every
+    /// interval, forever.
+    #[test]
+    fn the_probe_never_prompts_and_never_hangs_on_connect() {
+        let args = probe_args(&tunnel()).join(" ");
+        assert!(args.contains("BatchMode=yes"), "{args}");
+        assert!(args.contains("ConnectTimeout=10"), "{args}");
     }
 
     /// A tight loop against a server that refuses the forward is a denial of

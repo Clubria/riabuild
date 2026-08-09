@@ -15,8 +15,8 @@
 use crate::cli::Cli;
 use crate::paths::Paths;
 use crate::remote::{
-    Remote, authorise, env_command, env_prefix, host_key, identity, install, resolve_home, seed,
-    session, shell, ssh_once, store,
+    Remote, authorise, channel, env_command, env_prefix, host_key, identity, install, resolve_home,
+    seed, session, shell, ssh_once, store,
 };
 use crate::runner::CommandRunner;
 use crate::tasks::Ctx;
@@ -207,14 +207,23 @@ pub(super) async fn connect_and_setup(
     if cli.no_shell {
         return Ok(0);
     }
-    let shell_invocation = env_command(&prefix_refs, &binary, &["shell"]);
-    shell::open(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        &ctx.ui,
-        &shell_invocation,
-    )
+    // The clipboard channel comes up with the shell and goes down with it, and
+    // nothing about it may cost the developer that shell — `channel::open_shell`
+    // owns both halves of that. `--check` and `--no-shell` have already
+    // returned above, so neither starts anything.
+    channel::open_shell(channel::Plan {
+        remote: &remote,
+        paths: ctx.paths.as_ref(),
+        runner: ctx.runner.clone(),
+        ui: &ctx.ui,
+        quiet: cli.quiet,
+        remote_socket: channel::remote_socket(&session::namespace(&home, &member.member_id)),
+        // The probe carries the same environment every other remote invocation
+        // does, so it looks for the socket where the forward actually lands
+        // rather than where the server would have guessed.
+        probe: env_command(&prefix_refs, &binary, &["channel", "status"]),
+        shell: env_command(&prefix_refs, &binary, &["shell"]),
+    })
     .await
 }
 

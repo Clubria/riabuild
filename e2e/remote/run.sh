@@ -72,6 +72,16 @@
 # will get *further* than it does today and then stop at (a) — which the
 # `known_gap` check below will correctly refuse to forgive, and that failure
 # is the reminder.
+#
+# THE CLIPBOARD CHANNEL IS NOT TESTED HERE. `channel.sh`, beside this file,
+# covers it — and runs to the end, because it copies a musl binary onto the
+# container instead of installing one and so begins where this script stops.
+# What neither script *observes* is remote mode's own channel wiring
+# (`src/remote/channel.rs`): the supervisor holding the tunnel up,
+# `RIABUILD_CHANNEL_SOCKET` in the `env 'K=V' … '/abs/riabuild'` prefix, and
+# the banner line. `channel.sh` stands all three up by hand, so it proves the
+# channel works and not that remote mode builds one. That assertion belongs in
+# this file, below, once a provisioned server exists to make it against.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
@@ -369,6 +379,10 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "# they need an installed server binary, which does not exist"
   echo "# yet. This is expected until release.yml publishes the"
   echo "# musl digests alongside the musl tarballs."
+  echo "#"
+  echo "# The clipboard channel is NOT among what went untested here:"
+  echo "# channel.sh covers it against this same container and runs to"
+  echo "# the end. Remote mode's channel wiring still is."
   echo "############################################################"
   exit 0
 fi

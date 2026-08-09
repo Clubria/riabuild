@@ -140,6 +140,56 @@ The test therefore asserts the part that would mislead the next run — a dry ru
 must never record a task as *satisfied* — rather than the literal claim. If the
 dry run is ever tightened up, tighten this assertion with it.
 
+## `e2e/remote/`: the second suite
+
+A different pair of machines. `run.sh` above provisions *this* machine; the two
+scripts in `e2e/remote/` provision a Debian container over a real SSH
+connection, which is the shape `riabuild remote` exists for. Both run in
+`ci.yml`'s "Remote mode against a container" job rather than in `e2e.yml`.
+
+| | | |
+|---|---|---|
+| `run.sh` | `riabuild remote` end to end: SSH keys, host-key trust, authorising a key onto a shared account, two developers in separate namespaces | needs `RIABUILD_E2E_GH_TOKEN` |
+| `channel.sh` | the clipboard channel end to end: a real `xclip` on a real X display, a real reverse forward, a real shim on the server | needs no token |
+
+`run.sh` stops at the binary-install step today — no published release carries
+an `x86_64-unknown-linux-musl` checksum — and says so under a banner, after
+asserting against the container that the stages before it really ran. Its own
+header is the authority on that gap.
+
+`channel.sh` runs to the end. It sidesteps the install by copying a locally
+built musl binary in, which is the same target a real install downloads, and so
+covers everything after the step `run.sh` stops at. Two properties:
+
+- a PNG and a UTF-8 string put on the laptop's clipboard paste on the server
+  byte for byte, and a copy made on the server lands back on the laptop
+- the tunnel is killed mid-session and **only** the clipboard fails: setup
+  re-runs and still reaches riabuild-web, the environment shell still opens
+  with riabuild's `PATH`, a paste degrades to an empty clipboard rather than
+  hanging, and a copy fails loudly rather than losing what was copied
+
+The laptop side runs under `Xvfb` with a real `xclip` rather than a scripted
+stand-in, because a stand-in is what `clipboard/linux.rs`'s unit tests already
+use — only the real tool can prove riabuild's argv is one xclip accepts and
+that a PNG survives X11's atoms in both directions. It costs two packages on
+the runner and about a second.
+
+Neither script *observes* remote mode's own channel wiring — the supervisor
+holding the tunnel up, `RIABUILD_CHANNEL_SOCKET` arriving in the environment
+prefix, the banner line — nor a real secrets re-pull. `channel.sh` stands the
+first three up by hand, and owns its tunnel deliberately: a supervisor that
+rebuilds a killed tunnel is correct behaviour and the wrong thing to test a
+degradation against.
+
+```sh
+RIABUILD_BIN=… RIABUILD_SERVER_BIN=… e2e/remote/channel.sh
+```
+
+Both binaries are checked up front and named with the exact `cargo` line that
+builds them. Docker, `ssh`, `Xvfb`, `xclip` and `python3` are checked the same
+way, each with a sentence saying what it is for — a missing one otherwise
+surfaces mid-run as something that reads like a product bug.
+
 ## Running it locally
 
 Works on macOS and on Linux, with nothing to stage first — `gh` and `infisical`

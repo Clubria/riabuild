@@ -404,10 +404,20 @@ platform it is not.
 
 ## The assets already exist
 
-`release.yml` writes `riabuild-<version>-<target>.tar.gz` for each target and appends each
-digest to `riabuild-<version>-checksums.txt`, in the `<digest>  <filename>` format
-`download::digest_for` already parses for Node's `SHASUMS256.txt`. All of it is attached to
-the GitHub release.
+`release.yml` writes `riabuild-<version>-<target>.tar.gz` for each target, and
+`riabuild-<version>-checksums.txt` carries a digest for each, in the `<digest>  <filename>`
+format `download::digest_for` already parses for Node's `SHASUMS256.txt`. All of it is
+attached to the GitHub release.
+
+This paragraph described an intention rather than the workflow for longer than it should
+have. The checksums file was built in the **macOS** job, so it listed the two darwin
+tarballs and neither musl one, and because `ensure_riabuild` fetches checksums before the
+tarball and refuses without a digest, every Linux server failed closed at the install step.
+It is now assembled in `publish`, where all three build jobs' artifacts are already merged
+into one directory — the reason it cannot simply be appended to per-job is that
+`merge-multiple: true` makes three writers a race — and it names the four expected targets
+rather than globbing, because the failure being fixed is a *missing* entry and a check that
+only hashes what it finds agrees with itself no matter how little that is.
 
 So macOS servers need **no release-pipeline change at all**. The only dependency is that
 the Linux design's musl targets are added to the same loop, producing
@@ -510,6 +520,60 @@ sharp edge, and it is worth knowing that the digest check is what dulls it.
 A box shared by people who should not be able to impersonate each other gets separate Unix
 accounts instead. That needs no riabuild support: the identity hash already keys on
 username, so `alice@box` and `bob@box` are two servers with two keys and two namespaces.
+
+## The direction this opens, and what keeps it shut
+
+Everything above describes traffic in one direction: the laptop reaches into the server.
+The clipboard channel
+(`docs/superpowers/specs/2026-08-07-clipboard-channel-design.md`) opens the other one — an
+`ssh -N -R` forward carrying a unix socket from the server back to the laptop, so that a
+paste inside a remote Claude Code session reads the developer's own clipboard and a link
+opens in their own browser.
+
+**What makes a reverse tunnel defensible is that the server can only ask.** The operation
+set is compiled into the laptop's binary. A server can request `clipboard.read`,
+`clipboard.write`, `browser.open` and `channel.ping`, and nothing else: it cannot push work,
+extend the operation set, or execute anything. That is *the server ships data, never logic*
+applied to the one direction remote mode had not opened, and it is the same argument as the
+task manifest — a channel whose operation list the server chose would be the manifest again
+under another name.
+
+**The socket is namespaced, for the reason the root is.** It lives at
+`<namespace>/channel.sock`, not in the shared runtime directory. Without that, every
+developer on the box resolves the same `$XDG_RUNTIME_DIR/riabuild/channel.sock` — they
+share one Unix account, so they share one uid and one runtime directory — and Alice's
+`xclip` would read Ben's laptop. Its parent is created **at** mode 0700 rather than created
+and then chmod'd, so there is no window in which it exists at the umask.
+
+**And the honest limit, which is the same limit as everything else in this section.** Mode
+bits buy nothing between developers sharing a uid. Alice cannot reach Ben's socket by
+accident, but she can reach it on purpose, and what that gets her is a genuine step past
+reading his files: his laptop's clipboard, in both directions, and a URL opened on his
+laptop. The answer is unchanged: people who should not impersonate each other get separate
+Unix accounts.
+
+"Refused rather than unlinked" is worth stating precisely, because it is **one side's rule,
+not a property of the channel**. It is the *laptop's* create path — `socket_path_for_create`
+refuses a path that is a symlink or owned by another uid, so a different account cannot
+squat the name and be handed the channel. The server end does the opposite on purpose: the
+forward carries `StreamLocalBindUnlink=yes`, without which a socket left by a killed
+session blocks the rebind and the channel comes up permanently dead. Inside a per-developer
+namespace the only thing that could be squatting is a same-uid co-tenant, which is the
+limit conceded above — but a reader who takes the phrase as a global guarantee will believe
+this design defends against something it does not.
+
+**Two terminals into one server share one channel**, refcounted by `<pid>` markers on the
+laptop with a `kill -0` sweep, the way the server's gh sessions already are. One caveat is
+worth writing down rather than discovering: the supervisor is a task *inside* the owning
+process, so "the last to exit tears down" holds only when the owner is last. An owner that
+exits first takes the tunnel with it and a sibling terminal's paste stops — recovered by
+reconnecting, and not otherwise, because the alternative is a daemon outliving the shell
+and remote mode does not have one.
+
+**The channel is optional, and its failure is not the session's failure.** A laptop that
+closes its lid leaves a session that still runs setup, still re-pulls rotated secrets, and
+still opens a shell. Only paste stops. Nothing in the connect flow may treat a tunnel that
+would not start as a reason to withhold a shell.
 
 ## `owner.json`
 

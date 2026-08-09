@@ -20,45 +20,17 @@ pub mod mime;
 pub mod opener;
 pub mod protocol;
 pub mod resize;
+pub mod socket;
 pub mod supervisor;
-
-use std::path::PathBuf;
-
-/// The environment variable the shim reads to find the channel.
-///
-/// Set by remote mode in the environment shell. Its absence is how a local
-/// session — where the clipboard is already the developer's own — leaves the
-/// real tools alone.
-pub const SOCKET_ENV: &str = "RIABUILD_CHANNEL_SOCKET";
 
 /// Where the shim records why paste stopped working.
 pub const LOG_ENV: &str = "RIABUILD_CHANNEL_LOG";
 
-/// Where the shim should look for the channel.
-///
-/// Explicit configuration wins. Otherwise the runtime directory, resolved the
-/// way remote mode already resolves it: `$XDG_RUNTIME_DIR`, then `$TMPDIR`,
-/// then `/tmp`.
-///
-/// When remote mode lands, this should defer to its runtime-directory helper,
-/// which additionally enforces the 0700, ownership, and symlink rules. Until
-/// then it computes the same path without those checks — safe here because this
-/// function only ever *reads* a path the supervisor created.
-pub fn socket_path() -> PathBuf {
-    if let Ok(explicit) = std::env::var(SOCKET_ENV)
-        && !explicit.is_empty()
-    {
-        return PathBuf::from(explicit);
-    }
-
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|dir| !dir.is_empty())
-        .or_else(|| std::env::var("TMPDIR").ok().filter(|dir| !dir.is_empty()))
-        .unwrap_or_else(|| "/tmp".to_string());
-
-    PathBuf::from(runtime).join("riabuild").join("channel.sock")
-}
+/// The socket's name and owner, from `socket`. Re-exported so callers name the
+/// channel rather than a file inside it — and so the two answers stay one
+/// import apart, since which of them a caller wants is the whole distinction
+/// that module exists to draw.
+pub use socket::{SOCKET_ENV, socket_path, socket_path_for_create};
 
 use crate::cli::ChannelAction;
 // `bin_dir` is a trait method, so the trait has to be in scope even though only
@@ -68,7 +40,41 @@ use crate::runner::{CommandRunner, RealRunner};
 use crate::shims::clipboard::Tool;
 use crate::ui::{Failure, Ui};
 use anyhow::Result;
+use std::path::Path;
 use std::sync::Arc;
+
+/// What this laptop can answer with: its own clipboard, and its own browser.
+///
+/// One construction, shared by `riabuild channel agent` below and by remote
+/// mode, which serves the same agent in-process beside the shell it opened
+/// (`remote::channel`). Two constructions would be two answers to "what can
+/// this laptop do", and the one that drifted would be the one no developer
+/// ever runs by hand.
+///
+/// Fails only when the laptop has no clipboard tool at all. Remote mode turns
+/// that into a warning and carries on without a channel; `agent` reports it,
+/// because a developer who asked for the agent asked for exactly this.
+pub fn laptop_agent(runner: Arc<dyn CommandRunner>, bin: &Path) -> Result<Arc<agent::Agent>> {
+    // The only platform decision here is supplying the real value; the
+    // decision itself lives in `clipboard::detect`, which takes the OS as a
+    // parameter and is tested for every platform. Same shape as
+    // `paths::default_project_dir` wrapping `default_project_dir_on`.
+    let os = std::env::consts::OS;
+    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+
+    let Some(session) = clipboard::detect(&runner, os, wayland.as_deref()) else {
+        return Err(Failure::new(
+            "This laptop has no clipboard tool riabuild can read",
+            clipboard::install_hint(wayland.is_some()),
+        )
+        .into());
+    };
+
+    Ok(Arc::new(agent::Agent::new(
+        clipboard::backend(runner.clone(), session),
+        Box::new(opener::SystemOpener::new(runner, os, bin)),
+    )))
+}
 
 /// Handled before the setup flow: the shim runs on every Ctrl+V and must not
 /// check the machine or talk to the API.
@@ -87,32 +93,12 @@ pub async fn dispatch(action: &ChannelAction, quiet: bool) -> Result<i32> {
         }
 
         ChannelAction::Agent { socket } => {
-            let socket = socket
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(socket_path);
-
-            // The only platform decision here is supplying the real value; the
-            // decision itself lives in `clipboard::detect`, which takes the OS
-            // as a parameter and is tested for every platform. Same shape as
-            // `paths::default_project_dir` wrapping `default_project_dir_on`.
-            let os = std::env::consts::OS;
-            let wayland = std::env::var("WAYLAND_DISPLAY").ok();
-
-            let Some(session) = clipboard::detect(&runner, os, wayland.as_deref()) else {
-                return Err(Failure::new(
-                    "This laptop has no clipboard tool riabuild can read",
-                    clipboard::install_hint(wayland.is_some()),
-                )
-                .into());
-            };
-
+            // The creating side, so the checked resolver: this is the one call
+            // that can still refuse a socket belonging to somebody else, before
+            // `serve` unlinks whatever is in the way and binds.
+            let socket = socket_path_for_create(socket.as_deref()).await?;
             let bin = RealPaths::new()?.bin_dir();
-            let agent = Arc::new(agent::Agent::new(
-                clipboard::backend(runner.clone(), session),
-                Box::new(opener::SystemOpener::new(runner, os, &bin)),
-            ));
-            agent.serve(&socket).await?;
+            laptop_agent(runner, &bin)?.serve(&socket).await?;
             Ok(0)
         }
 

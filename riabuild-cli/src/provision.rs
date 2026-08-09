@@ -89,11 +89,34 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
 /// Nothing under `--check` consumes the launchers — `provision` returns before
 /// the environment shell is spawned — so skipping them costs the dry run
 /// nothing.
+///
+/// The clipboard and browser shims come with them, on a session that has a
+/// channel. The condition is deliberately the *same* one `shell::browser_for`
+/// uses to export `BROWSER`, because the two have to move together: a server
+/// where `BROWSER` points at `~/.riabuild/bin/xdg-open` and that file was never
+/// written is worse off than one with no `BROWSER` at all. Unset, Claude Code
+/// falls back to printing the URL; set and dangling, it execs a missing file and
+/// the sign-in simply fails. Left unwired, this is a channel that comes up, pins
+/// its socket, exports its variable — and shadows nothing, so every Ctrl+V
+/// quietly reaches the server's own clipboard instead of the laptop's.
 async fn write_launchers(ctx: &Ctx) -> Result<()> {
+    let socket = std::env::var(crate::channel::SOCKET_ENV).ok();
+    write_launchers_with(ctx, socket.as_deref()).await
+}
+
+/// The body, with the channel socket as a parameter rather than read from the
+/// environment — so a test can drive both answers without mutating the
+/// environment of a suite that runs every test in one process.
+async fn write_launchers_with(ctx: &Ctx, socket: Option<&str>) -> Result<()> {
     if ctx.dry_run {
         return Ok(());
     }
-    shims::write_all(ctx).await
+    shims::write_all(ctx).await?;
+    if socket.is_some_and(|socket| !socket.is_empty()) {
+        shims::write_clipboard_shims(ctx).await?;
+        shims::write_browser_shim(ctx).await?;
+    }
+    Ok(())
 }
 
 /// Who riabuild thinks this machine belongs to, and where the token lives.
@@ -172,6 +195,55 @@ mod tests {
     use crate::accounts;
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
+
+    /// The last mile of the clipboard channel, and the one nothing else covers.
+    /// Everything upstream can be correct — tunnel up, socket namespaced,
+    /// `RIABUILD_CHANNEL_SOCKET` exported — and a developer still gets the
+    /// server's own clipboard on every Ctrl+V, because `~/.riabuild/bin` shadows
+    /// nothing until these are written. `BROWSER` is the sharper half: it is
+    /// exported under this same condition, so a shim that is missing turns a
+    /// sign-in that would have printed its URL into one that execs a file that
+    /// is not there.
+    #[tokio::test]
+    async fn a_session_with_a_channel_gets_the_shims_that_channel_needs() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_launchers_with(&ctx, Some("/home/dev/.riabuild-remote/m1/channel.sock"))
+            .await
+            .unwrap();
+
+        let bin = ctx.paths.bin_dir();
+        for tool in shims::CLIPBOARD_TOOLS {
+            assert!(
+                tokio::fs::try_exists(bin.join(tool)).await.unwrap(),
+                "{tool} must be shadowed where there is a channel to carry it"
+            );
+        }
+        assert!(
+            tokio::fs::try_exists(bin.join(shims::BROWSER_TOOL))
+                .await
+                .unwrap(),
+            "BROWSER points here, so it has to exist"
+        );
+    }
+
+    /// A laptop shadows neither: its clipboard and its browser are already the
+    /// developer's own, and a shim pointing down a channel that does not exist
+    /// would break both.
+    #[tokio::test]
+    async fn a_session_with_no_channel_shadows_neither_clipboard_nor_browser() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_launchers_with(&ctx, None).await.unwrap();
+        let bin = ctx.paths.bin_dir();
+        assert!(!tokio::fs::try_exists(bin.join("xclip")).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(bin.join(shims::BROWSER_TOOL))
+                .await
+                .unwrap()
+        );
+        // An empty variable is not a channel — the same rule `browser_for` uses.
+        write_launchers_with(&ctx, Some("")).await.unwrap();
+        assert!(!tokio::fs::try_exists(bin.join("xclip")).await.unwrap());
+    }
 
     #[tokio::test]
     async fn a_dry_run_writes_launchers_for_the_accounts_it_found() {

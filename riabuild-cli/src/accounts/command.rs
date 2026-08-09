@@ -388,6 +388,15 @@ mod tests {
             Err(anyhow::anyhow!("could not start `{program}`"))
         }
 
+        async fn spawn(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<Box<dyn crate::runner::ChildHandle>> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+
         async fn run_interactive(
             &self,
             program: &str,
