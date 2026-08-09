@@ -22,12 +22,17 @@ A debug `target/` for this crate runs to roughly 1.8G, most of it a dependency g
 identical on every branch. Half a dozen worktrees each building their own copy is the
 fastest way to fill a disk, so they all compile into one directory instead.
 
-Setup is a single **untracked** file at the *repository root* — not in a worktree:
+Setup is a single **untracked** file at the *repository root* — not in a worktree.
+`.claude/hooks/ensure-shared-cargo-target.sh` writes it from a `SessionStart` hook, so a
+fresh clone is configured before anyone builds twice. It never overwrites an existing
+config, so pointing `target-dir` at another disk survives. To do it by hand:
 
 ```sh
 mkdir -p .cargo
 printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
 ```
+
+Deleting the file opts this machine out until the next session start.
 
 Cargo finds `.cargo/config.toml` by walking up from the current directory to the
 filesystem root, and resolves a relative `target-dir` against the directory holding
