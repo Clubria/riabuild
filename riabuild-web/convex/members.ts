@@ -27,17 +27,7 @@ export const memberView = v.object({
 export function toView(member: Doc<"members">) {
   return {
     _id: member._id,
-    // `?? ""` holds the widening to a single line. The schema field is
-    // temporarily optional so that `backfillMemberIds` can reach production at
-    // all (`docs/deploying.md` §7), and Convex derives `Doc<"members">` from
-    // the schema — so without this the `string | undefined` propagates through
-    // `memberView`, `http.ts`'s `MemberView`, the dashboard's `Member`, and on
-    // into `Copyable` and two component tests. Six files widened and then
-    // narrowed again, to describe a state that lasts one deploy.
-    //
-    // A row reaching here without an id is one the backfill has not run over
-    // yet, which is exactly the window this commit exists to open and close.
-    memberId: member.memberId ?? "",
+    memberId: member.memberId,
     githubLogin: member.githubLogin,
     githubId: member.githubId,
     firstName: member.firstName,
