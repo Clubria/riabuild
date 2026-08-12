@@ -204,7 +204,9 @@ src/
   accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
   remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
                trust, authorising a key, installing the server's own binary, minting its
-               session, seeding a GitHub sign-in, and the mosh/ssh shell handoff
+               session, seeding a GitHub sign-in, and the mosh/ssh shell handoff.
+               `pick.rs` is the prompt a bare `riabuild remote` puts — one of the saved
+               servers, or a new one — and `render.rs` the box it and `list` both show
 ```
 
 `download/` decides where bytes come from and whether they are the right bytes;

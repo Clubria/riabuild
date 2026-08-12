@@ -1,0 +1,367 @@
+//! `riabuild remote` with nothing after it: which saved server, or a new one.
+//!
+//! Split out of `store.rs`, which owns `remotes.json` and the `[user@]host[:port]`
+//! half of `store::choose`, and was already at the crate's ~300-line production
+//! budget before this became a prompt rather than three behaviours chosen by how
+//! many servers happened to be saved.
+//!
+//! The question is put in two halves for one reason: [`settle`] only decides
+//! what the developer *meant*, and never acts on it. Its Add answer is
+//! therefore testable without a test process ever reaching `ask_required`,
+//! which reads the real stdin — under `cargo test` run from a terminal, that
+//! is a blocking read on the developer's own keyboard rather than a test.
+
+use super::store::{self, Record, Store};
+use super::{Remote, render};
+use crate::tasks::Ctx;
+use crate::ui::{Failure, Ui};
+use anyhow::Result;
+
+/// How many unusable answers are asked about again before riabuild takes the
+/// default. Bounded like `store::ask_name`, and for the same reason: a
+/// developer who cannot give a usable answer is better served by riabuild
+/// choosing than by being asked forever.
+const ATTEMPTS: usize = 3;
+
+/// What an answer to the picker meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// Connect to a saved server, by its index in the box.
+    Server(usize),
+    /// Add one that is not saved yet.
+    Add,
+}
+
+/// What a typed answer means, given how many servers were listed.
+///
+/// `None` is "that was not an answer" — the caller asks again. Pure, so the
+/// rules are testable without a terminal.
+pub fn parse_pick(answer: &str, count: usize) -> Option<Pick> {
+    let answer = answer.trim().to_ascii_lowercase();
+    if matches!(answer.as_str(), "n" | "new") {
+        return Some(Pick::Add);
+    }
+    let number: usize = answer.parse().ok()?;
+    if number == render::add_option(count) {
+        return Some(Pick::Add);
+    }
+    // Nothing is guessed at from here: the old picker read its answer with
+    // `unwrap_or(1)`, so `0` and a number past the end both connected to
+    // whichever server happened to be listed first.
+    (1..=count)
+        .contains(&number)
+        .then(|| Pick::Server(number - 1))
+}
+
+/// Which server this invocation is about, when the command line named none.
+pub async fn pick(ctx: &mut Ctx, store: &mut Store) -> Result<Remote> {
+    // Nothing saved: there is nothing to pick between, and a one-option
+    // picker is a worse way to ask for a hostname than asking for a hostname.
+    if store.remotes.is_empty() {
+        return add_one(ctx, store);
+    }
+    if !ctx.ui.interactive() {
+        return without_a_terminal(ctx, store);
+    }
+
+    let default = render::most_recently_used(&store.remotes).unwrap_or(0);
+    ctx.ui.info("");
+    ctx.ui.info(&render::servers_box(
+        &store.remotes,
+        render::Shown::Choosing,
+        ctx.ui.theme(),
+    ));
+    match settle(&ctx.ui, &store.remotes, default) {
+        // Whatever `settle` returns is in range: it only ever reports an index
+        // `parse_pick` accepted, or the default it was handed.
+        Pick::Server(index) => Ok((&store.remotes[index]).into()),
+        Pick::Add => add_one(ctx, store),
+    }
+}
+
+/// The answer, before anything is done about it.
+///
+/// Deciding and acting are separate so this half can be driven by a scripted
+/// `Ui` — see the note at the foot of this file's tests.
+///
+/// The default is named as well as numbered, and that is not decoration:
+/// `Ui::info` returns early under `--quiet` while `Ui::ask` does not, so
+/// `riabuild --quiet remote` puts this question with the box above it silently
+/// dropped, where a bare `[2]` refers to a row nobody was shown. The same
+/// reason `accounts::command::confirm_question` names the account inside the
+/// question rather than only in the lines above it.
+fn settle(ui: &Ui, records: &[Record], default: usize) -> Pick {
+    let count = records.len();
+    let question = match records.get(default) {
+        Some(record) => format!("Which one? [{} · {}]", default + 1, record.name),
+        None => format!("Which one? [{}]", default + 1),
+    };
+    for _ in 0..ATTEMPTS {
+        // `None` is Enter, ^D, or nobody there, and all three mean "the one you
+        // offered" — so none of them costs the developer an attempt.
+        let Some(answer) = ui.ask(&question) else {
+            break;
+        };
+        if let Some(pick) = parse_pick(&answer, count) {
+            return pick;
+        }
+        ui.warn(&format!(
+            "Pick a number from 1 to {count}, or {} to add a server.",
+            render::add_option(count)
+        ));
+    }
+    Pick::Server(default)
+}
+
+/// Both of the answers a run with no terminal gets, unchanged from before this
+/// was a prompt.
+///
+/// The crate rule is that a prompt always has a default, because asking is how
+/// riabuild *offers* a choice. This question is the exception the rule already
+/// names: connecting provisions the server, mints it a session, and lends it
+/// this laptop's GitHub sign-in, so a default taken by nobody would act on a
+/// machine nobody chose. One saved server is not a guess, and several are.
+fn without_a_terminal(ctx: &Ctx, store: &Store) -> Result<Remote> {
+    if let [record] = &store.remotes[..] {
+        ctx.ui.info(&format!(
+            "Reconnecting to {} · {}@{}",
+            record.name, record.user, record.host
+        ));
+        return Ok(record.into());
+    }
+    Err(Failure::new(
+        "asking which of your servers to connect to",
+        "Name it — `riabuild remote <name>` — there is no terminal here to ask in.",
+    )
+    .detail(format!("saved servers: {}", store.names().join(", ")))
+    .into())
+}
+
+/// Adds a server, and records it.
+fn add_one(ctx: &Ctx, store: &mut Store) -> Result<Remote> {
+    let remote = ask_for_one(ctx, store)?;
+    store::add(store, &remote);
+    Ok(remote)
+}
+
+/// The questions, once, for a server riabuild has never seen.
+///
+/// `ask_required`, not `ask`: a hostname has no default that could be right,
+/// and this is the one place in riabuild that is true of. It refuses rather
+/// than inventing one — see the `_required` pair in `ui/prompt.rs`.
+fn ask_for_one(ctx: &Ctx, store: &Store) -> Result<Remote> {
+    ctx.ui.heading("Adding a server");
+    let host = ctx.ui.ask_required("Hostname  ", None)?;
+    let port: u16 = ctx
+        .ui
+        .ask_required("Port      ", Some("22"))?
+        .parse()
+        .unwrap_or(22);
+    let user = ctx.ui.ask_required("Username  ", Some(&store::whoami()))?;
+    let name = store::ask_name(&ctx.ui, &host, &store.names());
+    Ok(Remote {
+        name,
+        host,
+        port,
+        user,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::store::record_for;
+    use crate::runner::FakeRunner;
+
+    fn remote(name: &str, host: &str) -> Remote {
+        Remote {
+            name: name.into(),
+            host: host.into(),
+            port: 22,
+            user: "ada".into(),
+        }
+    }
+
+    /// Two saved servers, the second of them the one most recently connected
+    /// to — so "the default" and "the first one saved" are different answers
+    /// and a test can tell which one was taken.
+    fn two() -> Store {
+        let mut store = Store::default();
+        let mut older = record_for(&remote("build-01", "build-01.fly.dev"));
+        older.last_used_at = crate::config::now_secs().saturating_sub(5 * 86400);
+        let mut newer = record_for(&remote("gpu", "gpu.internal"));
+        newer.last_used_at = crate::config::now_secs().saturating_sub(3600);
+        store.remotes.push(older);
+        store.remotes.push(newer);
+        store
+    }
+
+    fn one() -> Store {
+        let mut store = Store::default();
+        store
+            .remotes
+            .push(record_for(&remote("build-01", "build-01.fly.dev")));
+        store
+    }
+
+    #[test]
+    fn a_number_in_range_is_the_server_at_that_position() {
+        assert_eq!(parse_pick("1", 2), Some(Pick::Server(0)));
+        assert_eq!(parse_pick("2", 2), Some(Pick::Server(1)));
+        assert_eq!(parse_pick(" 2 \n", 2), Some(Pick::Server(1)));
+    }
+
+    #[test]
+    fn the_number_after_the_last_server_adds_one() {
+        assert_eq!(parse_pick("3", 2), Some(Pick::Add));
+        assert_eq!(parse_pick("2", 1), Some(Pick::Add));
+    }
+
+    #[test]
+    fn the_add_option_can_also_be_typed_as_a_word() {
+        // What a developer types at a prompt whose last line reads "Add a
+        // server", rather than counting the rows to find its number.
+        assert_eq!(parse_pick("n", 2), Some(Pick::Add));
+        assert_eq!(parse_pick("new", 2), Some(Pick::Add));
+        assert_eq!(parse_pick("New", 2), Some(Pick::Add));
+    }
+
+    #[test]
+    fn anything_that_is_not_an_answer_is_not_guessed_at() {
+        // 0 and 4 both used to become server 1: the old picker parsed with
+        // `unwrap_or(1)`, so a typo silently connected somewhere.
+        assert_eq!(parse_pick("0", 2), None);
+        assert_eq!(parse_pick("4", 2), None);
+        assert_eq!(parse_pick("-1", 2), None);
+        assert_eq!(parse_pick("", 2), None);
+        assert_eq!(parse_pick("gpu", 2), None);
+    }
+
+    #[test]
+    fn a_typed_number_settles_on_that_server() {
+        assert_eq!(
+            settle(&Ui::scripted(["1"]), &two().remotes, 1),
+            Pick::Server(0)
+        );
+    }
+
+    #[test]
+    fn enter_settles_on_the_default() {
+        // `ask` answers `None` for Enter, ^D, and nobody-there alike, and all
+        // three mean "the one you offered".
+        assert_eq!(
+            settle(&Ui::scripted([""]), &two().remotes, 1),
+            Pick::Server(1)
+        );
+        assert_eq!(
+            settle(&Ui::scripted([] as [&str; 0]), &two().remotes, 1),
+            Pick::Server(1)
+        );
+    }
+
+    #[test]
+    fn an_unusable_answer_is_asked_about_again() {
+        let ui = Ui::scripted(["nonsense", "1"]);
+        assert_eq!(settle(&ui, &two().remotes, 1), Pick::Server(0));
+        assert_eq!(ui.asked().len(), 2, "{:?}", ui.asked());
+    }
+
+    #[test]
+    fn a_developer_who_cannot_give_a_usable_answer_is_not_asked_forever() {
+        let ui = Ui::scripted(["x", "y", "z", "1"]);
+        assert_eq!(settle(&ui, &two().remotes, 1), Pick::Server(1));
+        assert_eq!(ui.asked().len(), ATTEMPTS, "{:?}", ui.asked());
+    }
+
+    #[test]
+    fn the_question_names_the_server_enter_would_take_not_only_its_number() {
+        // `Ui::info` returns early under `--quiet` and `Ui::ask` does not, so
+        // `riabuild --quiet remote` puts this question with the box above it
+        // silently dropped. The number alone means nothing without that box;
+        // the name is the one part the question can carry itself. Same reason
+        // `accounts::command::confirm_question` names the account it is about.
+        let ui = Ui::scripted(["1"]);
+        settle(&ui, &two().remotes, 1);
+        assert!(ui.asked()[0].contains("[2"), "{:?}", ui.asked());
+        assert!(ui.asked()[0].contains("gpu"), "{:?}", ui.asked());
+    }
+
+    #[tokio::test]
+    async fn one_saved_server_is_still_offered_a_choice_when_someone_is_there() {
+        // The behaviour change: a single saved server used to reconnect
+        // silently, so there was no way to add a second without spelling it
+        // out on the command line.
+        let (mut ctx, _home) = crate::testing::ctx_with(FakeRunner::new()).await;
+        ctx.ui = Ui::scripted(["1"]);
+        let mut store = one();
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("connects");
+
+        assert_eq!(chosen.name, "build-01");
+        assert!(
+            !ctx.ui.asked().is_empty(),
+            "the developer has to be asked, or they cannot add a second server"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_takes_the_most_recently_used_server_not_the_first_one_saved() {
+        let (mut ctx, _home) = crate::testing::ctx_with(FakeRunner::new()).await;
+        ctx.ui = Ui::scripted([""]);
+        let mut store = two();
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("connects");
+
+        assert_eq!(chosen.name, "gpu");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_terminal_and_one_saved_server_still_reconnects() {
+        // Unchanged on purpose: this is `riabuild remote` in a script, and the
+        // answer is not a guess when there is only one server it could mean.
+        let (mut ctx, _home) = crate::testing::ctx_with(FakeRunner::new()).await;
+        let mut store = one();
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("reconnects");
+
+        assert_eq!(chosen.name, "build-01");
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_terminal_and_several_saved_servers_refuses_rather_than_guessing() {
+        // Connecting is not a read: it provisions the server, mints it a
+        // session, and lends it this laptop's GitHub sign-in. Taking a default
+        // is the crate rule for a question riabuild is *offering*; this one has
+        // to be answered or declined.
+        let (mut ctx, _home) = crate::testing::ctx_with(FakeRunner::new()).await;
+        let mut store = two();
+
+        let error = pick(&mut ctx, &mut store)
+            .await
+            .expect_err("must not pick a server nobody named");
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("must be the actionable Failure");
+        assert!(
+            failure.detail.contains("build-01") && failure.detail.contains("gpu"),
+            "the developer has to be told which names they could pass: {}",
+            failure.detail
+        );
+        assert!(
+            failure.action.contains("riabuild remote"),
+            "{}",
+            failure.action
+        );
+    }
+
+    // The Add answer is deliberately not driven through `pick` here. Acting on
+    // it runs `ask_for_one`, whose questions go through `ask_required` — which
+    // reads the real stdin rather than `Ui`'s scripted answers, so a test that
+    // reached it would block on the terminal `cargo test` was launched from
+    // rather than fail. `settle` is what makes that answer testable at all:
+    // `the_add_option_can_also_be_typed_as_a_word` and
+    // `the_number_after_the_last_server_adds_one` cover the decision, and what
+    // is left in `pick` is the one match arm that calls the questions.
+}

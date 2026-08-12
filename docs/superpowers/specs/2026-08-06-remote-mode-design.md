@@ -102,30 +102,38 @@ ada@build-01 ~/Clubria/ada/ai-builders-hub $
 
 ## Every run after that
 
+Superseded by `2026-08-12-remote-picker-design.md`: a bare `riabuild remote` is one
+prompt, whatever is saved. Enter takes the most recently used server, so this is still
+the shape of a reconnect — it just asks first.
+
 ```
 $ riabuild remote
-Reconnecting to build-01 · ada@build-01.fly.dev
+
+Your servers:
+
+  1  build-01    ada@build-01.fly.dev      used 3 hours ago
+  2  gpu-bench   ada@gpu.internal:2222     used 5 days ago
+  3  Add a server
+
+  Connect without asking:  riabuild remote build-01
+  Forget a server:         riabuild remote forget gpu-bench
+
+    Which one? [1]
   ● Reachable · riabuild 2026.08.06 · current
 Checking build-01
   ● 9 items already correct
 ● Clubria environment active on build-01 — type `exit` to leave
 ```
 
-## More than one server
-
-```
-$ riabuild remote
-Which server?
-  1  build-01   ada@build-01.fly.dev       used 2 hours ago
-  2  gpu        ada@gpu.internal:2222      used 6 days ago
-  [1]
-```
+With nothing saved the questions come straight away, and with no terminal at all one
+saved server is still reconnected to without asking — see that spec for why several are
+refused instead.
 
 ## Command surface
 
 | Command | Does |
 |---|---|
-| `riabuild remote` | reconnect to the only saved server, or offer the list |
+| `riabuild remote` | pick a saved server or add one — `2026-08-12-remote-picker-design.md` |
 | `riabuild remote build-01` | reconnect to one by name |
 | `riabuild remote ada@host:2222` | add a server without prompts |
 | `riabuild remote list` | saved servers, with when each was last used |
