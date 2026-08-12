@@ -77,6 +77,26 @@ fn cover(previous: usize, line: &str) -> usize {
     previous.saturating_sub(line.chars().count())
 }
 
+/// A note whose tail is the part the developer has to act on, painted as two
+/// spans rather than one.
+///
+/// The two cannot be nested. `Theme::paint` closes with `\x1b[0m`, which resets
+/// every attribute rather than the one it opened, so a `Strong` value formatted
+/// *into* a `Muted` line would end the dim at the value and leave everything
+/// after it undimmed. Painting the prose and the value separately is what makes
+/// the emphasis local to the value.
+///
+/// Pure, and taking its `Theme`, so a test can assert what each rung of the
+/// ladder receives without owning a terminal — the same reason `depth_for` is
+/// split out of `Theme::detect`.
+fn value_line(theme: Theme, text: &str, value: &str) -> String {
+    format!(
+        "    {} {}",
+        theme.paint(Role::Muted, text),
+        theme.paint(Role::Strong, value)
+    )
+}
+
 /// `1 commit`, `2 commits`.
 ///
 /// Regular English `-s` only, which covers every noun riabuild counts. Worth a
@@ -304,6 +324,30 @@ impl Ui {
         println!("    {}", self.paint(Role::Muted, text));
     }
 
+    /// A note ending in something the developer has to read off the screen and
+    /// type somewhere else: a device code, a one-time value.
+    ///
+    /// The prose stays `Muted` like every other note; the value does not. A
+    /// device code is transcribed by hand into a browser on another machine,
+    /// and printing it dim makes the one line that has to be legible the least
+    /// legible thing on the screen — under `Signing … in to riabuild` there are
+    /// three dim lines and no way to tell which one is the work.
+    ///
+    /// `Strong` rather than a hue: this is emphasis, not a status. `Brand` and
+    /// `Danger` share `1;31` on a sixteen-colour terminal, so a brand-coloured
+    /// code would read as an error message on exactly the terminals — an old
+    /// server over SSH — where this flow is the entire interface.
+    pub fn note_value(&self, text: &str, value: &str) {
+        if self.quiet {
+            return;
+        }
+        // A note ends the status line; see `note`.
+        self.take_pending();
+        #[cfg(test)]
+        self.noted.lock().unwrap().push(format!("{text} {value}"));
+        println!("{}", value_line(self.theme, text, value));
+    }
+
     pub fn warn(&self, text: &str) {
         // Deliberately not gated on `quiet`, and on stderr: a warning is what
         // riabuild says in place of stopping, so it is the one line a run
@@ -429,6 +473,40 @@ mod tests {
         ui.working("Infisical CLI", "first run");
         ui.note("Installing infisical with Homebrew…");
         assert_eq!(ui.take_pending(), 0);
+    }
+
+    #[test]
+    fn a_device_code_is_not_dimmed_along_with_the_words_in_front_of_it() {
+        use crate::theme::Depth;
+        // The dim run closes before the code opens. Written the obvious way —
+        // a `Strong` value formatted into a `Muted` line — the inner reset
+        // would end the dim at the code and leave the rest of the line
+        // undimmed, emphasising everything except the thing to emphasise.
+        let line = value_line(
+            Theme::with_depth(Depth::TrueColor),
+            "Enter code",
+            "DHNT-ZSDM",
+        );
+        assert_eq!(line, "    \x1b[2mEnter code\x1b[0m \x1b[1mDHNT-ZSDM\x1b[0m");
+    }
+
+    #[test]
+    fn a_highlighted_value_still_reads_as_a_sentence_without_colour() {
+        // NO_COLOR, a pipe, a CI log: the emphasis is gone and the line has to
+        // survive being nothing but its words.
+        let line = value_line(Theme::plain(), "Enter code", "DHNT-ZSDM");
+        assert_eq!(line, "    Enter code DHNT-ZSDM");
+        assert!(!line.contains('\x1b'));
+    }
+
+    #[test]
+    fn a_highlighted_value_is_recorded_as_one_note() {
+        // Painted as two spans, recorded as one sentence: a test asserting on
+        // what the developer was told should not have to know the line was
+        // split to colour it.
+        let ui = Ui::new(false);
+        ui.note_value("Enter code", "DHNT-ZSDM");
+        assert_eq!(ui.noted(), vec!["Enter code DHNT-ZSDM"]);
     }
 
     #[test]

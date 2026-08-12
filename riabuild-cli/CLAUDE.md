@@ -297,6 +297,16 @@ with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *at
 (dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
 terminal theme and muddy on another.
 
+**Two roles on one line are siblings, never nested.** `Theme::paint` closes with
+`\x1b[0m`, which resets every attribute rather than the one it opened, so a `Strong`
+value formatted *into* a `Muted` line ends the dim at the value and undims everything
+after it. `ui::note_value` is the shape that gets this right — muted prose, an
+emphasised tail — and it exists because a device code printed dim is the least legible
+thing on a screen whose only purpose is that code. Reach for `Strong` there rather than
+a hue: `Brand` and `Danger` share `1;31` on a sixteen-colour terminal, and a
+brand-coloured code reads as an error on exactly the old SSH sessions where the
+device-code flow is the entire interface.
+
 Text printed by a generated rcfile — the shell banner, the accounts box — takes a `Theme`
 as a parameter rather than reading one, because it is rendered on this side of the
 boundary and printed on the other. Pass `ctx.ui.theme()`, not `ctx.ui.colour()`: the
