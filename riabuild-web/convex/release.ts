@@ -63,6 +63,28 @@ export const publishCliVersion = action({
         headers: {
           Accept: "application/vnd.github+json",
           "User-Agent": "riabuild",
+          "X-GitHub-Api-Version": "2022-11-28",
+          // The org token `github.ts` already checks membership with, so this
+          // costs no new secret and no manual step — the objection that ruled
+          // out a shared secret above.
+          //
+          // It is not about permission: `RELEASE_REPO` is public and this read
+          // works signed out. It is about the *rate limit*. Unauthenticated
+          // api.github.com allows 60 requests an hour **per IP**, and a Convex
+          // deployment's egress addresses are shared with everyone else on
+          // it — so this call can be refused for traffic riabuild never made.
+          // On 2026-08-12 it was: v2026.08.12.1 announced itself into three
+          // 403s ten seconds apart, `latestCliVersion` stayed on the release
+          // before it, and every laptop and every server riabuild set up went
+          // on running a build whose bugs were already fixed. A token raises
+          // the limit to 5000 an hour and is counted against riabuild alone.
+          //
+          // Absent, this sends no header and still works — signed out is the
+          // old behaviour, not a broken one, and a deployment without the
+          // token should not lose the ability to announce a release over it.
+          ...(process.env.GITHUB_ORG_TOKEN
+            ? { Authorization: `Bearer ${process.env.GITHUB_ORG_TOKEN}` }
+            : {}),
         },
       });
     } catch (error) {
@@ -77,8 +99,20 @@ export const publishCliVersion = action({
       );
     }
     if (!response.ok) {
+      // Named, because the remedy is nothing like the one for a refusal: a
+      // rate limit is waited out or authenticated past, and the failure that
+      // started this said only "returned 403", which reads as a permission
+      // problem nobody had.
+      const rateLimited = response.headers.get("x-ratelimit-remaining") === "0";
       throw new Error(
-        `api.github.com returned ${response.status} for the v${version} release.`,
+        `api.github.com returned ${response.status} for the v${version} release.` +
+          (rateLimited
+            ? ` The rate limit for ${
+                process.env.GITHUB_ORG_TOKEN
+                  ? "GITHUB_ORG_TOKEN"
+                  : "unauthenticated requests from this deployment"
+              } is exhausted; it resets hourly.`
+            : ""),
       );
     }
 
