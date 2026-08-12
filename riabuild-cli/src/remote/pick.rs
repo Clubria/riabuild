@@ -313,6 +313,16 @@ mod tests {
         let chosen = pick(&mut ctx, &mut store).await.expect("connects");
 
         assert_eq!(chosen.name, "gpu");
+        // …and the bracket said so before Enter was pressed. Asserted in the
+        // same test as the outcome on purpose: `settle` is handed a default
+        // rather than working one out, so a `pick` that computed the bracket
+        // from one server and connected to another would satisfy either
+        // assertion alone. The developer's guarantee is that they agree.
+        assert!(
+            ctx.ui.asked()[0].contains("[2 · gpu]"),
+            "{:?}",
+            ctx.ui.asked()
+        );
     }
 
     #[tokio::test]

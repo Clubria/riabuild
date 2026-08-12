@@ -40,20 +40,38 @@ pub fn add_option(count: usize) -> usize {
 /// prompt's default and the "connect without asking" hint name the same
 /// server, which is what makes the hint a demonstration of what Enter just
 /// did rather than a note about syntax. `None` only for an empty list.
+///
+/// "Used" means *connected to successfully*: `store::remember` writes
+/// `last_used_at` only after the server's own check run came back 0, so a
+/// server that was reached yesterday and failed to provision keeps whatever
+/// timestamp it had. That is the right reading for a default — it offers the
+/// server that last worked, not the one last attempted.
+///
+/// The index breaks ties, so the *later* record wins when two servers are
+/// equally recent — which is every server on a laptop where none has ever
+/// connected, all of them sitting at 0. Records are appended in the order they
+/// were added, so that offers the one just typed in rather than the oldest
+/// one saved. Written into the key rather than left to `max_by_key`'s
+/// documented last-wins, because a later tidy-up that reached for `fold` or a
+/// sort would flip it silently.
 pub fn most_recently_used(records: &[Record]) -> Option<usize> {
     records
         .iter()
         .enumerate()
-        .max_by_key(|(_, record)| record.last_used_at)
+        .max_by_key(|(index, record)| (record.last_used_at, *index))
         .map(|(index, _)| index)
 }
 
 /// The index of the stalest server — the one the forget hint names.
+///
+/// Ties go the other way, to the earliest record, so that on an all-zero list
+/// this and [`most_recently_used`] still name two different servers and the
+/// two hints keep teaching two different things.
 fn least_recently_used(records: &[Record]) -> Option<usize> {
     records
         .iter()
         .enumerate()
-        .min_by_key(|(_, record)| record.last_used_at)
+        .min_by_key(|(index, record)| (record.last_used_at, *index))
         .map(|(index, _)| index)
 }
 
@@ -296,6 +314,30 @@ mod tests {
                 "{command} names {named}, which is not a saved server: {text}"
             );
         }
+    }
+
+    #[test]
+    fn with_nothing_ever_connected_to_the_newest_server_is_the_one_offered() {
+        // Every `last_used_at` is 0 — two servers added, neither of which got
+        // past the install step — so recency cannot separate them and the tie
+        // rule is the whole answer. Records are appended in the order they were
+        // added, so the last one is the one the developer just typed in, and
+        // that is the better guess than the first they ever saved.
+        //
+        // Pinned rather than left to `max_by_key`'s documented last-wins: an
+        // iterator swapped for `fold` or `sorted_by` during some later tidy-up
+        // would flip it silently, and the developer would press Enter expecting
+        // what the bracket said last time.
+        let records = vec![
+            record_for(&remote("build-01", "build-01.fly.dev", 22)),
+            record_for(&remote("gpu", "gpu.internal", 22)),
+        ];
+        assert_eq!(most_recently_used(&records), Some(1));
+        assert_eq!(least_recently_used(&records), Some(0));
+
+        let text = servers_box(&records, Shown::Choosing, Theme::plain());
+        assert!(text.contains("riabuild remote gpu"), "{text}");
+        assert!(text.contains("riabuild remote forget build-01"), "{text}");
     }
 
     #[test]
