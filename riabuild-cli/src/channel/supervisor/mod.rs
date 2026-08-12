@@ -32,7 +32,6 @@ mod run;
 pub use run::{Stop, supervise};
 
 use crate::ui::Failure;
-use rand::Rng;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -150,7 +149,10 @@ pub fn backoff(attempt: u32) -> Duration {
         .saturating_mul(2u32.saturating_pow(attempt.min(5)))
         .min(BACKOFF_CEILING);
 
-    let jitter = rand::rng().random_range(0.75..1.0);
+    // Jitter is an optimisation, not a correctness property, so an unreachable
+    // OS entropy failure costs the herd-spreading and nothing else — far better
+    // than `rand::rng()`, which panicked on it and took the supervisor with it.
+    let jitter = getrandom::u32().map_or(1.0, |raw| 0.75 + 0.25 * (raw as f64 / u32::MAX as f64));
     let millis = (base.as_millis() as f64 * jitter) as u64;
     Duration::from_millis(millis.max(1_000)).min(BACKOFF_CEILING)
 }
