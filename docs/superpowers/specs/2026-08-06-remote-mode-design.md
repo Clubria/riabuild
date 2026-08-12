@@ -77,7 +77,8 @@ Adding a server
   Hostname   build-01.fly.dev
   Port       [22]
   Username   [ada]
-  This server will be known as build-01.
+
+    Name this server [build-01]
 
 Connecting to ada@build-01.fly.dev
   ● SSH key — generated for this server
@@ -248,9 +249,19 @@ the same rule the Linux design applies to `sudo`.
 } ] }
 ```
 
-Names are allocated from the hostname's first label, disambiguated with `-2` on collision,
-and are a local label only — the server never sees one. As with `state.json`, a file that
-cannot be read degrades to "no saved servers" rather than to an error.
+A name is the developer's own label for a server, asked for once when the server is added
+and offered a default: the hostname's first label, disambiguated with `-2` on collision.
+The default is right when a developer connects straight to a machine and useless behind a
+gateway, where every server reached through `ssh.cloudcli.ai` would otherwise be `ssh`,
+`ssh-2`, `ssh-3` and `remote list` would stop telling anyone which box is which. The prompt
+has a default, so an unattended run takes it rather than hanging — the crate-wide rule.
+
+A typed name is reduced to letters, digits, dot, dash and underscore, and refused if
+another server already has it: it is what `remote forget <name>` looks a server up by, and
+it reaches the server as `RIABUILD_REMOTE=<name>` inside the single-quoted `env …` prefix
+every remote invocation is wrapped in. Nothing else about it is sent anywhere. As with
+`state.json`, a file that cannot be read degrades to "no saved servers" rather than to an
+error.
 
 `hash` is the first 16 hex characters of `sha256("<user>@<host>:<port>")`. Deterministic,
 so the same three answers always resolve to the same key — which is what makes the whole
@@ -262,17 +273,30 @@ predictable, which beats being clever about it.
 
 ## Host keys
 
-Before anything is sent to the server, `ssh-keyscan -t ed25519` fetches its host key,
-riabuild shows the fingerprint, and the developer confirms once. It is then pinned in
-riabuild's own `known_hosts`, and every later connection runs with
+Before anything is sent to the server, `ssh-keyscan -t ed25519,ecdsa,rsa` fetches its host
+keys, riabuild shows one fingerprint, and the developer confirms once. That one key is then
+pinned in riabuild's own `known_hosts`, and every later connection runs with
 `StrictHostKeyChecking=yes` against that file.
 
-**One key type, and only what was shown gets pinned.** Scanning every type and displaying
-the first fingerprint would have the developer approve, typically, the RSA key while the
-ed25519 and ecdsa keys they never saw were pinned alongside it — and the fingerprint a cloud
-console gives them to compare against is usually the ed25519 one. This prompt is the trust
-anchor for everything after it: the next thing that happens is a GitHub token and a riabuild
-session going to whatever answered.
+**Every type is asked for, exactly one is pinned.** Displaying the first fingerprint and
+pinning them all would have the developer approve, typically, the RSA key while the ed25519
+and ecdsa keys they never saw were pinned alongside it — and the fingerprint a cloud console
+gives them to compare against is usually the ed25519 one. So riabuild picks one key from the
+answer, best type first (ed25519, then ecdsa, then RSA), and shows and pins that one. This
+prompt is the trust anchor for everything after it: the next thing that happens is a GitHub
+token and a riabuild session going to whatever answered.
+
+Asking for one type was the earlier design, and it was wrong in a way no test on a normal
+OpenSSH box could show. A single-type scan cannot tell a server that offers only some
+*other* type from a server that is not there: both come back empty, and riabuild has one
+wording for empty — "reaching `<host>` on port `<port>`", which sends the developer off to
+check their hostname, their port and whether SSH is running at all. SSHPiper, which fronts
+several hosted SSH gateways, offers an RSA host key and nothing else, so every server behind
+one was unreachable by that message and reachable by every other means.
+
+Pinning one type is enough for `ssh` itself: OpenSSH reorders the host key algorithms it
+offers to prefer what `known_hosts` already holds for a host, so a server offering both keys
+is asked for the pinned one.
 
 Matching an existing entry is on the exact host field, not a prefix. `build-01` and
 `build-01.fly.dev` are deliberately two different servers here, and a `starts_with` would

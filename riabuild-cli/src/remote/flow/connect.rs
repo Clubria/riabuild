@@ -362,7 +362,8 @@ mod tests {
         let fake = FakeRunner::new()
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -428,7 +429,8 @@ mod tests {
             FakeRunner::new()
                 .with(
                     &format!(
-                        "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                        "ssh-keyscan -t {} -p {} -T 5 {}",
+                        host_key::KEY_TYPES,
                         remote().port,
                         remote().host
                     ),
@@ -472,7 +474,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -546,7 +549,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -635,7 +639,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -700,7 +705,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -826,7 +832,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),
@@ -914,7 +921,8 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "")
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
                     remote().port,
                     remote().host
                 ),

@@ -53,6 +53,59 @@ pub fn entry_host(remote: &Remote) -> String {
 
 const UNREADABLE: &str = "an unreadable fingerprint";
 
+/// What `ssh-keyscan -t` is asked for, and in [`PREFERRED`] order what riabuild
+/// will pin out of the answer.
+///
+/// Not `ed25519` alone, which is what this was. A single-type scan cannot see a
+/// server that offers only some *other* type, and riabuild has exactly one way
+/// of reporting an empty scan: "reaching <host> on port <port>", which sends
+/// the developer off to check their hostname, their port, and whether the box
+/// is running SSH — for a server that answered on the first connection. SSHPiper,
+/// which fronts several hosted SSH gateways, offers an RSA host key and nothing
+/// else, so *every* riabuild remote behind one hit that dead end.
+pub const KEY_TYPES: &str = "ed25519,ecdsa,rsa";
+
+/// Best first. `ssh-keyscan` returns a line per type it was answered with, and
+/// only one of them may be pinned — see [`preferred_key`].
+const PREFERRED: [&str; 3] = ["ssh-ed25519", "ecdsa-sha2-", "ssh-rsa"];
+
+/// The one line out of a scan that riabuild will show and pin.
+///
+/// Exactly one, and this is load-bearing rather than tidy. The developer is
+/// shown a single fingerprint — the first key's — so pinning every line beside
+/// it would trust keys nobody looked at: approve the RSA fingerprint you were
+/// shown, and an unseen ed25519 key is pinned along with it. That risk is what
+/// the single-type scan this replaces was avoiding; choosing here keeps the
+/// property while letting the scan ask for every type, which is what an
+/// RSA-only server needs.
+///
+/// Pinning one type is enough for `ssh` itself: OpenSSH reorders the host key
+/// algorithms it offers to prefer what `known_hosts` already holds for that
+/// host, so a server offering both keys will be asked for the pinned one.
+///
+/// A type not in [`PREFERRED`] still counts — `-t` cannot return one today, but
+/// a future OpenSSH naming is a key riabuild saw and fingerprinted, not a
+/// reason to declare a reachable server unreachable.
+pub fn preferred_key(scan: &str) -> Option<&str> {
+    let keys: Vec<&str> = scan
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    PREFERRED
+        .iter()
+        .find_map(|wanted| {
+            keys.iter()
+                .find(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .is_some_and(|kind| kind.starts_with(wanted))
+                })
+                .copied()
+        })
+        .or_else(|| keys.first().copied())
+}
+
 /// Every fingerprint `ssh-keygen -lf -` reports for `keys`, which may be a
 /// freshly scanned key or the lines already in `known_hosts`.
 async fn fingerprints(runner: &dyn CommandRunner, keys: &str) -> Result<Vec<String>> {
@@ -158,12 +211,14 @@ pub async fn trust_host(
     let scan = runner
         .run(
             "ssh-keyscan",
-            // One key type only: scanning all of them risks the developer
-            // approving the RSA fingerprint while an unseen ed25519 key gets
-            // pinned beside it — and a cloud console hands out the ed25519 one.
+            // Every type riabuild can pin, not one: a server offering only
+            // some other type answers a single-type scan with nothing, and
+            // "nothing" is indistinguishable here from a server that is not
+            // there at all. Which of the answers gets pinned is decided by
+            // `preferred_key`, and it is still exactly one.
             &[
                 "-t",
-                "ed25519",
+                KEY_TYPES,
                 "-p",
                 &remote.port.to_string(),
                 "-T",
@@ -173,12 +228,7 @@ pub async fn trust_host(
             &RunOptions::default(),
         )
         .await?;
-    let keys: String = scan
-        .stdout
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let keys: String = preferred_key(&scan.stdout).unwrap_or_default().to_string();
     if !scan.ok() || keys.is_empty() {
         // Unreachable: no fingerprint was ever shown, unlike the mismatch and
         // declined-prompt cases below.
@@ -314,7 +364,7 @@ mod tests {
         FakeRunner::new()
             .with(
                 &format!(
-                    "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                    "ssh-keyscan -t {KEY_TYPES} -p {} -T 5 {}",
                     remote.port, remote.host
                 ),
                 0,
@@ -322,6 +372,174 @@ mod tests {
                 "",
             )
             .with("ssh-keygen -lf -", 0, fingerprint_line, "")
+    }
+
+    /// What `ssh-keyscan` prints for a gateway that offers an RSA host key and
+    /// nothing else — SSHPiper, and the hosted SSH front doors built on it.
+    /// The banner comments are part of the shape: they are the only thing a
+    /// single-type scan of such a server comes back with.
+    fn rsa_only_scan(remote: &Remote) -> String {
+        format!(
+            "# {}:{} SSH-2.0-SSHPiper\n\
+             {} ssh-rsa AAAArsakeydata\n\
+             # {}:{} SSH-2.0-SSHPiper\n",
+            remote.host, remote.port, remote.host, remote.host, remote.port
+        )
+    }
+
+    #[test]
+    fn the_best_key_of_several_is_the_one_chosen() {
+        let scan = "host ssh-rsa AAAArsa\n\
+                    host ecdsa-sha2-nistp256 AAAAecdsa\n\
+                    host ssh-ed25519 AAAAed25519\n";
+        assert_eq!(preferred_key(scan), Some("host ssh-ed25519 AAAAed25519"));
+        assert_eq!(
+            preferred_key("host ssh-rsa AAAArsa\nhost ecdsa-sha2-nistp256 AAAAecdsa\n"),
+            Some("host ecdsa-sha2-nistp256 AAAAecdsa")
+        );
+        // The case this whole change exists for: nothing but RSA on offer.
+        assert_eq!(
+            preferred_key("# host:22 SSH-2.0-SSHPiper\nhost ssh-rsa AAAArsa\n"),
+            Some("host ssh-rsa AAAArsa")
+        );
+        // Comments and blank lines are not keys, and a scan of nothing else
+        // has no key to offer.
+        assert_eq!(preferred_key("# host:22 SSH-2.0-OpenSSH_9.6\n\n"), None);
+        assert_eq!(preferred_key(""), None);
+        // A type riabuild has no opinion about is still a key it saw, and the
+        // fingerprint shown is that line's own.
+        assert_eq!(
+            preferred_key("host ssh-newthing AAAAnew"),
+            Some("host ssh-newthing AAAAnew")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scan_asks_for_every_key_type_riabuild_can_pin() {
+        // The bug, at its source. Scanning `-t ed25519` alone reports a server
+        // that offers only an RSA host key as *unreachable* — the one failure
+        // wording that sends a developer to check their hostname, their port,
+        // and whether the server is running SSH at all, when the scan in fact
+        // connected and was answered.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        let fake = Arc::new(
+            FakeRunner::new()
+                .containing("ssh-keyscan", 0, &rsa_only_scan(&remote), "")
+                .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""),
+        );
+
+        trust_host(
+            &remote,
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect("a reachable server must be scanned, not called unreachable");
+
+        let scan = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("ssh-keyscan"))
+            .expect("the host key must be scanned");
+        for key_type in ["ed25519", "ecdsa", "rsa"] {
+            assert!(
+                scan.contains(key_type),
+                "a scan that leaves out {key_type} cannot see a server offering only \
+                 that type, and reports it as unreachable: {scan}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_offering_only_an_rsa_host_key_is_pinned_rather_than_called_unreachable() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        let fake = Arc::new(
+            FakeRunner::new()
+                .containing("ssh-keyscan", 0, &rsa_only_scan(&remote), "")
+                .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""),
+        );
+
+        trust_host(
+            &remote,
+            &paths,
+            fake,
+            &Ui::new(true),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect("an RSA-only server is a server riabuild can pin");
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("known_hosts written");
+        assert!(contents.contains("ssh-rsa AAAArsakeydata"), "{contents}");
+        assert!(
+            !contents.contains('#'),
+            "a banner comment is not a host key: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_one_key_the_developer_was_shown_is_pinned() {
+        // Why the scan cannot simply pin everything it is answered with: the
+        // fingerprint on screen is the *first* key's, so pinning the rest
+        // beside it trusts keys nobody looked at. Scanning three types and
+        // pinning one is what keeps "you approved exactly what got pinned"
+        // true now that the scan is no longer restricted to a single type.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        let scan = format!(
+            "{host} ssh-rsa AAAArsakeydata\n\
+             {host} ecdsa-sha2-nistp256 AAAAecdsakeydata\n\
+             {host} ssh-ed25519 AAAAed25519keydata\n",
+            host = remote.host
+        );
+        let fake = Arc::new(
+            FakeRunner::new()
+                .containing("ssh-keyscan", 0, &scan, "")
+                .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, ""),
+        );
+
+        trust_host(
+            &remote,
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect("pins");
+
+        let shown = fake
+            .stdin_text_of("ssh-keygen -lf -")
+            .expect("the key has to be fingerprinted before it is shown");
+        assert_eq!(
+            shown.lines().count(),
+            1,
+            "the developer is shown one fingerprint, so one key is what may be \
+             fingerprinted: {shown}"
+        );
+        assert!(shown.contains("ssh-ed25519"), "{shown}");
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("known_hosts written");
+        assert_eq!(
+            contents.lines().filter(|line| !line.is_empty()).count(),
+            1,
+            "exactly the approved key, and nothing else: {contents}"
+        );
+        assert!(
+            contents.contains("ssh-ed25519 AAAAed25519keydata"),
+            "{contents}"
+        );
     }
 
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
@@ -748,7 +966,7 @@ mod tests {
         let remote = remote();
         let fake = Arc::new(FakeRunner::new().with(
             &format!(
-                "ssh-keyscan -t ed25519 -p {} -T 5 {}",
+                "ssh-keyscan -t {KEY_TYPES} -p {} -T 5 {}",
                 remote.port, remote.host
             ),
             1,
