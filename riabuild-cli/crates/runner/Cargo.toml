@@ -1,0 +1,47 @@
+[package]
+name = "riabuild-runner"
+version = "0.0.0"
+edition.workspace = true
+description = "CommandRunner: every subprocess riabuild starts, and the pty a subdued child gets"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+[features]
+# `FakeRunner` and the recorded-call machinery. Every crate above this one
+# tests against canned `gh`, `git`, `node` and `claude` output rather than a
+# real machine in a real state, so this is the single most-used item in the
+# workspace's test scaffolding.
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+# openpty, setsid, TIOCSCTTY, tcsetattr, TIOCGWINSZ.
+libc.workspace = true
+riabuild-theme.workspace = true
+# `net` looks wrong here and is not: nothing opens a socket, but
+# `tokio::io::unix::AsyncFd` — how `pty.rs` pumps without blocking the
+# reactor — is gated behind it. `signal` is SIGWINCH, forwarded so a
+# resized window reaches the program drawing into it. `sync` is `Notify`,
+# used by the fake child under the `testing` feature; it was reaching this
+# crate only because hyper asks reqwest for it, which stops being true the
+# moment this crate is built on its own.
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+riabuild-theme = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs"] }

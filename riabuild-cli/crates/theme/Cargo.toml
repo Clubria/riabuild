@@ -1,0 +1,17 @@
+[package]
+name = "riabuild-theme"
+version = "0.0.0"
+edition.workspace = true
+description = "riabuild's palette, by role, and the depth ladder under it"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+[features]
+# Hands `Theme::with_depth` across a crate boundary, which `#[cfg(test)]`
+# cannot: a dependency crate is never compiled with `cfg(test)`, so the
+# renderings a downstream test pins would not exist.
+testing = []

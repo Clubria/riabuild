@@ -1,0 +1,55 @@
+[package]
+name = "riabuild-cli"
+# Not the product version, and never bumped. riabuild is versioned by release
+# date (`2026.08.04`), which Cargo cannot express — semver forbids the leading
+# zeros. The real version is injected from the git tag as RIABUILD_VERSION and
+# read in `riabuild-version`; this field only exists because Cargo requires one.
+version = "0.0.0"
+edition.workspace = true
+description = "Sets up a Clubria developer's machine and opens the Clubria environment"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "riabuild"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+riabuild-api.workspace = true
+riabuild-channel.workspace = true
+riabuild-fetch.workspace = true
+riabuild-gh-session.workspace = true
+riabuild-keychain.workspace = true
+riabuild-paths.workspace = true
+riabuild-remote.workspace = true
+riabuild-runner.workspace = true
+riabuild-tasks.workspace = true
+riabuild-theme.workspace = true
+riabuild-ui.workspace = true
+riabuild-version.workspace = true
+# `io-std` is `tokio::io::stdin()`, reading a piped secret off the internal
+# `seed-github` command without blocking the current-thread runtime's only
+# thread the way a `std::io::stdin()` read would. This is the only crate that
+# needs it.
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "rt",
+] }
+
+[dev-dependencies]
+riabuild-keychain = { workspace = true, features = ["testing"] }
+riabuild-paths = { workspace = true, features = ["testing"] }
+riabuild-runner = { workspace = true, features = ["testing"] }
+riabuild-tasks = { workspace = true, features = ["testing"] }
+riabuild-ui = { workspace = true, features = ["testing"] }
+tempfile.workspace = true

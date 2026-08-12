@@ -1,0 +1,25 @@
+[package]
+name = "riabuild-fetch"
+version = "0.0.0"
+edition.workspace = true
+description = "Downloading a release, proving it matches its published digest, and unpacking it"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+tar.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }

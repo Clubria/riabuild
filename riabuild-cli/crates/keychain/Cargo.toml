@@ -1,0 +1,26 @@
+[package]
+name = "riabuild-keychain"
+version = "0.0.0"
+edition.workspace = true
+description = "Secret storage: the trait, the two platform CLIs, and a server's file store"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+[features]
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+riabuild-runner.workspace = true
+riabuild-ui.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+[dev-dependencies]
+riabuild-runner = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros"] }

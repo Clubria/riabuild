@@ -998,25 +998,186 @@ dependencies = [
 ]
 
 [[package]]
-name = "riabuild-cli"
+name = "riabuild-api"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "riabuild-runner",
+ "riabuild-ui",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-channel"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "clap",
- "flate2",
  "getrandom 0.3.4",
  "image",
  "libc",
- "reqwest",
- "ring",
+ "riabuild-gh-session",
+ "riabuild-paths",
+ "riabuild-runner",
+ "riabuild-ui",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "riabuild-api",
+ "riabuild-channel",
+ "riabuild-fetch",
+ "riabuild-gh-session",
+ "riabuild-keychain",
+ "riabuild-paths",
+ "riabuild-remote",
+ "riabuild-runner",
+ "riabuild-tasks",
+ "riabuild-theme",
+ "riabuild-ui",
+ "riabuild-version",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-fetch"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "reqwest",
+ "ring",
  "tar",
  "tempfile",
  "tokio",
  "zip",
 ]
+
+[[package]]
+name = "riabuild-gh-session"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "riabuild-paths",
+ "riabuild-runner",
+ "riabuild-ui",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-keychain"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "riabuild-runner",
+ "riabuild-ui",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-paths"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "riabuild-ui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-remote"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "flate2",
+ "riabuild-api",
+ "riabuild-channel",
+ "riabuild-fetch",
+ "riabuild-keychain",
+ "riabuild-paths",
+ "riabuild-runner",
+ "riabuild-tasks",
+ "riabuild-theme",
+ "riabuild-ui",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-runner"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "libc",
+ "riabuild-theme",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-tasks"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "flate2",
+ "getrandom 0.3.4",
+ "riabuild-api",
+ "riabuild-channel",
+ "riabuild-fetch",
+ "riabuild-keychain",
+ "riabuild-paths",
+ "riabuild-runner",
+ "riabuild-theme",
+ "riabuild-ui",
+ "riabuild-version",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-theme"
+version = "0.0.0"
+
+[[package]]
+name = "riabuild-ui"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "riabuild-theme",
+ "riabuild-version",
+]
+
+[[package]]
+name = "riabuild-version"
+version = "0.0.0"
 
 [[package]]
 name = "ring"
