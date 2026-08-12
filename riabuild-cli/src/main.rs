@@ -24,6 +24,7 @@ mod channel;
 mod cli;
 mod config;
 mod download;
+mod filelock;
 mod fs_move;
 mod gh_session;
 mod internal;
@@ -335,8 +336,9 @@ async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
         return Ok(());
     }
     let expanded = expand_tilde(project, &ctx.paths.home());
-    ctx.config.project_path = Some(expanded.to_string_lossy().into_owned());
-    ctx.config.save(ctx.paths.as_ref()).await
+    let chosen = expanded.to_string_lossy().into_owned();
+    ctx.update_config(|config| config.project_path = Some(chosen))
+        .await
 }
 
 /// Assembles the `Ctx` a run works against.
@@ -409,10 +411,9 @@ pub(crate) async fn connect(ctx: &mut Ctx) -> Result<()> {
 
 async fn logout(ctx: &mut Ctx) -> Result<i32> {
     ctx.keychain.delete().await?;
-    ctx.config.session_expires_at = None;
-    ctx.config.save(ctx.paths.as_ref()).await?;
-    ctx.state.forget("login");
-    ctx.state.save(ctx.paths.as_ref()).await?;
+    ctx.update_config(|config| config.session_expires_at = None)
+        .await?;
+    ctx.update_state(|state| state.forget("login")).await?;
     ctx.ui
         .info("This machine is signed out. Run `riabuild` to sign in again.");
     Ok(0)

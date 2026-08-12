@@ -131,7 +131,7 @@ pub async fn write_tool(ctx: &Ctx, name: &str, binary: &Path) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin).await?;
     let shim = bin.join(name);
-    tokio::fs::write(&shim, exec_shim(binary)).await?;
+    crate::config::write_atomic(&shim, exec_shim(binary).as_bytes()).await?;
     make_executable(&shim).await?;
     Ok(())
 }
@@ -172,7 +172,7 @@ exec riabuild channel shim {tool} "$@"
 "#
         );
         let path = bin.join(tool);
-        tokio::fs::write(&path, script).await?;
+        crate::config::write_atomic(&path, script.as_bytes()).await?;
         make_executable(&path).await?;
     }
     Ok(())
@@ -212,7 +212,7 @@ exec riabuild channel open "$@"
 "#
     );
     let path = bin.join(BROWSER_TOOL);
-    tokio::fs::write(&path, script).await?;
+    crate::config::write_atomic(&path, script.as_bytes()).await?;
     make_executable(&path).await?;
     Ok(())
 }
@@ -237,8 +237,14 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Landed by rename, like every other file riabuild generates.
+///
+/// Launcher content is deterministic given the account list, so two concurrent
+/// writers agree and no lock is needed here — the hazard is only an interrupt
+/// landing mid-write, which leaves a truncated `claude-2` that fails with a
+/// shell syntax error.
 async fn write_launcher(path: &Path, script: &str) -> Result<()> {
-    tokio::fs::write(path, script).await?;
+    crate::config::write_atomic(path, script.as_bytes()).await?;
     make_executable(path).await?;
     Ok(())
 }

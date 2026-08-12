@@ -15,6 +15,40 @@ use crate::update;
 use crate::{connect, opens_shell, tasks};
 use anyhow::Result;
 
+/// The lock a provisioning run holds across its tasks, or `None` under `--check`.
+///
+/// Two runs would otherwise both find node missing and both download it —
+/// roughly 130 MB per lost race, into a directory nothing sweeps.
+///
+/// Not taken under `--check`, which writes nothing and must never make another
+/// window wait. Not machine-wide either: the path comes from `root()`, which is
+/// namespaced per developer on a server, so one lock for the box would let one
+/// developer block another under the single Unix account they share — a denial
+/// of service wearing robustness as a disguise. Two developers installing the
+/// same toolchain concurrently is already safe; `archive/staging.rs` unpacks
+/// beside the target and renames.
+async fn provisioning_lock(ctx: &Ctx) -> Result<Option<crate::filelock::FileLock>> {
+    if ctx.dry_run {
+        return Ok(None);
+    }
+    let path = ctx.paths.provision_lock_file();
+    // The callback borrows the `Ui` rather than owning it — `Ui` is not `Clone`,
+    // and does not need to be for a line printed before the wait begins.
+    let lock = crate::filelock::FileLock::acquire(&path, || {
+        ctx.ui
+            .info("Waiting for the riabuild already setting up this machine…");
+    })
+    .await
+    .map_err(|error| {
+        ui::Failure::new(
+            "waiting for another riabuild to finish",
+            "close the other riabuild, or run this again once it has finished",
+        )
+        .detail(format!("{error:#}"))
+    })?;
+    Ok(Some(lock))
+}
+
 pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.ui.banner("Clubria");
     connect(ctx).await?;
@@ -38,6 +72,12 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         }
     }
 
+    // Acquired after the upgrade block above, because a `flock` survives `exec`
+    // and `upgrade_and_reexec` replaces this process image: taking it first
+    // would carry the lock into the new process with no guard tracking it and
+    // nothing left to release it.
+    let provisioning = provisioning_lock(ctx).await?;
+
     ctx.ui.heading("Checking this machine");
     let registry = tasks::registry();
     let outcome = engine::run_all(&registry, ctx).await?;
@@ -53,6 +93,12 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     }
 
     log_run(ctx, &outcome).await;
+
+    // Released here, before every return below it and before `open_shell` above
+    // all: that call awaits the developer's interactive shell for as long as
+    // their window stays open, and a lock held across it would make the second
+    // window wait on a human rather than on a download.
+    drop(provisioning);
 
     if ctx.dry_run {
         ctx.ui.info("");
@@ -195,6 +241,48 @@ mod tests {
     use crate::accounts;
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
+
+    /// `--check` changes nothing, so it must never make a second window wait.
+    #[tokio::test]
+    async fn a_dry_run_takes_no_provisioning_lock() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.dry_run = true;
+
+        let taken = provisioning_lock(&ctx).await.expect("dry run");
+
+        assert!(
+            taken.is_none(),
+            "a run that promises to change nothing must not hold the provisioning lock"
+        );
+    }
+
+    /// Dropping the guard is what `provision` does before the shell handoff, so
+    /// a second window has to find the lock free immediately afterwards.
+    #[tokio::test]
+    async fn a_real_run_takes_the_lock_and_releases_it_when_dropped() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+
+        let taken = provisioning_lock(&ctx).await.expect("acquire");
+        assert!(
+            taken.is_some(),
+            "a real run holds the lock across its tasks"
+        );
+        drop(taken);
+
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&waited);
+        let _second =
+            crate::filelock::FileLock::acquire(&ctx.paths.provision_lock_file(), move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .await
+            .expect("second acquire");
+
+        assert!(
+            !waited.load(std::sync::atomic::Ordering::SeqCst),
+            "the lock was still held after the guard was dropped"
+        );
+    }
 
     /// The last mile of the clipboard channel, and the one nothing else covers.
     /// Everything upstream can be correct — tunnel up, socket namespaced,

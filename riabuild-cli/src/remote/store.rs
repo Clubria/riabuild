@@ -66,8 +66,18 @@ impl Store {
         serde_json::from_str(&text).unwrap_or_default()
     }
 
-    pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
-        crate::config::write_json(&paths.remotes_file(), self).await
+    /// Acquires the lock, reads what is on disk *now*, applies `mutate`, and
+    /// writes the result atomically. See `config::State::update`.
+    ///
+    /// Shares `state_lock_file` with the other two state files: contention is
+    /// milliseconds, and one lock across all three removes any question of lock
+    /// ordering between them.
+    pub async fn update(paths: &dyn Paths, mutate: impl FnOnce(&mut Self)) -> Result<Self> {
+        let _lock = crate::filelock::FileLock::acquire(&paths.state_lock_file(), || {}).await?;
+        let mut store = Self::load(paths).await;
+        mutate(&mut store);
+        crate::config::write_json(&paths.remotes_file(), &store).await?;
+        Ok(store)
     }
 
     pub fn find(&self, name: &str) -> Option<&Record> {
@@ -211,6 +221,41 @@ pub fn add(store: &mut Store, remote: &Remote) {
     });
 }
 
+/// Writes this run's record for `name` into whatever is on disk now, leaving
+/// every other saved server exactly as it found them.
+///
+/// An upsert rather than a whole-store write, because the whole-store write is
+/// the lost update itself: the `Store` a remote flow holds was read before a
+/// long SSH conversation, and another terminal window may have added or removed
+/// a server since. Writing this run's copy back wholesale would erase that.
+///
+/// The run's own copy is refreshed from what landed, so a caller that keeps
+/// using `store` afterwards sees the merged result rather than its own snapshot.
+pub async fn persist_one(paths: &dyn Paths, store: &mut Store, name: &str) -> Result<()> {
+    let mine = store.remotes.iter().find(|r| r.name == name).cloned();
+    *store = Store::update(paths, |on_disk| {
+        let Some(mine) = mine else {
+            return;
+        };
+        match on_disk.remotes.iter_mut().find(|r| r.name == mine.name) {
+            Some(existing) => *existing = mine,
+            None => on_disk.remotes.push(mine),
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// Drops the server named `name`, leaving every other saved server alone.
+pub async fn forget_one(paths: &dyn Paths, store: &mut Store, name: &str) -> Result<()> {
+    let name = name.to_string();
+    *store = Store::update(paths, |on_disk| {
+        on_disk.remotes.retain(|r| r.name != name);
+    })
+    .await?;
+    Ok(())
+}
+
 /// Which server this invocation is about.
 ///
 /// A `target` names a saved server or spells one out (`[user@]host[:port]`).
@@ -275,7 +320,7 @@ pub async fn remember(ctx: &Ctx, store: &mut Store, remote: &Remote, version: &s
         record.last_used_at = crate::config::now_secs();
         record.last_seen_cli_version = version.to_string();
     }
-    store.save(ctx.paths.as_ref()).await
+    persist_one(ctx.paths.as_ref(), store, &remote.name).await
 }
 
 /// `riabuild remote list`.
@@ -680,7 +725,9 @@ mod tests {
             home: "/home/ada".into(),
             session_id: String::new(),
         });
-        store.save(&paths).await.expect("save");
+        Store::update(&paths, |on_disk| *on_disk = store)
+            .await
+            .expect("save");
 
         let loaded = Store::load(&paths).await;
         assert_eq!(loaded.remotes.len(), 1);
@@ -708,7 +755,9 @@ mod tests {
             home: "/home/ada".into(),
             session_id: String::new(),
         });
-        store.save(&paths).await.expect("save");
+        Store::update(&paths, |on_disk| *on_disk = store)
+            .await
+            .expect("save");
 
         let mut reloaded = Store::load(&paths).await;
         reloaded.remotes.push(Record {
@@ -724,7 +773,9 @@ mod tests {
             home: "/home/ada".into(),
             session_id: String::new(),
         });
-        reloaded.save(&paths).await.expect("save");
+        Store::update(&paths, |on_disk| *on_disk = reloaded)
+            .await
+            .expect("save");
 
         let final_store = Store::load(&paths).await;
         assert_eq!(

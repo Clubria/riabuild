@@ -71,7 +71,13 @@ async fn new(ctx: &mut Ctx) -> Result<i32> {
 
     let dir = ctx.paths.claude_profile_dir(&id);
     tokio::fs::create_dir_all(&dir).await?;
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    // `accounts::add` above owns the cap rule and the numbering, and `number`
+    // has already been reported on, so the list it produced is what gets
+    // written rather than something re-derived inside the closure. The lock
+    // still makes the read-modify-write atomic.
+    let registered = ctx.config.claude_accounts.clone();
+    ctx.update_config(|config| config.claude_accounts = registered)
+        .await?;
     shims::write_all(ctx).await?;
 
     ctx.ui.info(&format!(
@@ -170,7 +176,9 @@ async fn trust(ctx: &mut Ctx, id: &str, number: usize) {
 /// Undoes everything `new` did, so a sign-in that did not happen leaves nothing.
 async fn roll_back(ctx: &mut Ctx, number: usize, dir: &Path) -> Result<()> {
     accounts::remove(&mut ctx.config, number)?;
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    let registered = ctx.config.claude_accounts.clone();
+    ctx.update_config(|config| config.claude_accounts = registered)
+        .await?;
     // Swallowed because the refusal the caller is about to return says more than
     // this would. The stake is worth writing down: a directory left behind here
     // is one `claude_accounts::apply` *adopts* on the next run, which would
@@ -274,7 +282,9 @@ async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
     ctx.ui.note(&format!("Removed {shown}"));
 
     accounts::remove(&mut ctx.config, number)?;
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    let registered = ctx.config.claude_accounts.clone();
+    ctx.update_config(|config| config.claude_accounts = registered)
+        .await?;
     shims::write_all(ctx).await?;
     if number <= ctx.config.claude_accounts.len() {
         ctx.ui
@@ -316,7 +326,9 @@ async fn primary(ctx: &mut Ctx, number: usize) -> Result<i32> {
     }
 
     accounts::promote(&mut ctx.config, number)?;
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    let registered = ctx.config.claude_accounts.clone();
+    ctx.update_config(|config| config.claude_accounts = registered)
+        .await?;
     // Rewritten in place, so shells that are already open pick this up with no
     // further action — which is the reason the environment no longer exports
     // CLAUDE_CONFIG_DIR.
@@ -354,7 +366,13 @@ mod tests {
                 .unwrap();
             ids.push(id);
         }
-        ctx.config.claude_accounts = ids.clone();
+        // Persisted, not just held in `ctx.config`. Every command here writes
+        // the account list under the lock, which reloads first — so a registry
+        // that only ever existed in memory would vanish on the first write.
+        let registered = ids.clone();
+        ctx.update_config(|config| config.claude_accounts = registered)
+            .await
+            .unwrap();
         (ctx, home, ids)
     }
 
@@ -735,7 +753,13 @@ mod tests {
         let (mut ctx, home, _ids) = with_accounts(1).await;
         let checkout = home.path().join("code/hub");
         tokio::fs::create_dir_all(&checkout).await.unwrap();
-        ctx.config.project_path = Some(checkout.to_string_lossy().into_owned());
+        // On disk, not just in `ctx.config`: `new` writes the account list under
+        // the lock, which reloads, and a checkout that was never persisted would
+        // be gone before `trust` looks for one.
+        let chosen = checkout.to_string_lossy().into_owned();
+        ctx.update_config(|config| config.project_path = Some(chosen))
+            .await
+            .unwrap();
 
         assert_eq!(new(&mut ctx).await.unwrap(), 0);
 

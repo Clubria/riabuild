@@ -212,9 +212,11 @@ async fn apply_with(ctx: &mut Ctx, downloads: &dyn Downloads) -> Result<()> {
     ensure_node(ctx, &node_version, downloads).await?;
     ensure_pnpm(ctx, &pnpm_version, downloads).await?;
 
-    ctx.config.node_version = Some(node_version);
-    ctx.config.pnpm_version = Some(pnpm_version);
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    ctx.update_config(|config| {
+        config.node_version = Some(node_version);
+        config.pnpm_version = Some(pnpm_version);
+    })
+    .await?;
     Ok(())
 }
 

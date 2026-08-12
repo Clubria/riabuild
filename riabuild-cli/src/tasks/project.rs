@@ -281,8 +281,9 @@ impl Task for Project {
             .await?;
         }
 
-        ctx.config.project_path = Some(dir.to_string_lossy().into_owned());
-        ctx.config.save(ctx.paths.as_ref()).await?;
+        let chosen = dir.to_string_lossy().into_owned();
+        ctx.update_config(|config| config.project_path = Some(chosen))
+            .await?;
         Ok(())
     }
 }

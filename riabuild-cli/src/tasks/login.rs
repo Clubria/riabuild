@@ -81,8 +81,9 @@ impl Task for Login {
 
         // The token is now live, so everything the server knows is reachable.
         ctx.org = Some(org::fetch_config(&ctx.api).await?);
-        ctx.config.session_expires_at = Some(now_millis() + SESSION_TTL_MS);
-        ctx.config.save(ctx.paths.as_ref()).await?;
+        let expires_at = now_millis() + SESSION_TTL_MS;
+        ctx.update_config(|config| config.session_expires_at = Some(expires_at))
+            .await?;
         ctx.ui
             .note(&format!("signed in as {}", member.display_name()));
         ctx.member = Some(member);

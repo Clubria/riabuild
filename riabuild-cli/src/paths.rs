@@ -28,6 +28,26 @@ pub trait Paths: Send + Sync {
     fn config_file(&self) -> PathBuf {
         self.root().join("config.json")
     }
+    /// Guards a read-modify-write of `state.json`, `config.json` or
+    /// `remotes.json`. Held for milliseconds.
+    ///
+    /// Deliberately none of those files. Writes land by `rename`, so a lock
+    /// taken on the data file would be a lock on an inode the next write
+    /// unlinks — the following process would lock a fresh inode, see no
+    /// contention, and proceed. A lock's identity has to outlive the data it
+    /// guards, and that failure is invisible to every single-process test.
+    fn state_lock_file(&self) -> PathBuf {
+        self.root().join(".state.lock")
+    }
+    /// Guards the provisioning phase, so two runs do not install one toolchain
+    /// twice. Held for seconds to minutes, and never across the shell handoff.
+    ///
+    /// Separate from `state_lock_file` because a run holding this one saves
+    /// state after every task, and `std` is explicit that a second lock taken
+    /// by a process that already holds one is unspecified and may deadlock.
+    fn provision_lock_file(&self) -> PathBuf {
+        self.root().join(".provision.lock")
+    }
     fn org_settings_file(&self) -> PathBuf {
         self.root().join("org-settings.json")
     }
