@@ -36,10 +36,98 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
+
+      # `--all-targets` selects *targets*, not packages, and lint configuration
+      # is per-package: a member that forgets to inherit simply has the lint
+      # switched off, and clippy stays green. `unwrap_used` is the whole panic
+      # policy, so the absence has to be an error rather than a quiet default.
+      - name: Every crate inherits the workspace lints
+        run: |
+          set -euo pipefail
+          missing=0
+          for manifest in crates/*/Cargo.toml; do
+            if ! grep -q '^workspace = true' "$manifest"; then
+              echo "::error file=riabuild-cli/$manifest::missing [lints] workspace = true"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "::error::A crate without it silently loses unwrap_used = \"deny\"."
+            exit 1
+          }
+          echo "all $(ls -d crates/*/ | wc -l) crates inherit [workspace.lints]."
+
+      # `riabuild-tasks`'s `testing` feature hands the fake `Ctx` across a crate
+      # boundary, which `#[cfg(test)]` cannot. It must reach other crates
+      # through [dev-dependencies] only — `cargo build` never resolves those —
+      # so this holds by construction until someone puts features = ["testing"]
+      # on a normal dependency edge, and nothing anywhere would say so.
+      #
+      # `-e normal,build` deliberately, against cargo tree's default of
+      # `normal,build,dev`: the dev graph is what `cargo test` builds and is
+      # exactly where the feature is meant to be on. Resolving compiles nothing.
+      #
+      # The second half is not belt-and-braces: an absence check goes green the
+      # moment the feature is renamed, so it has to prove there is still
+      # something to be absent.
+      - name: The testing feature cannot reach a release build
+        run: |
+          set -euo pipefail
+          if cargo tree --locked -p riabuild-cli -e normal,build,features \
+              | grep -n 'feature "testing"'; then
+            echo "::error::'testing' is enabled in the graph cargo build resolves."
+            echo "::error::It must arrive only through [dev-dependencies]."
+            exit 1
+          fi
+          if ! cargo tree --locked -p riabuild-cli -e normal,build,dev,features \
+              | grep -q 'feature "testing"'; then
+            echo "::error::Nothing enables 'testing' even with dev-dependencies."
+            echo "::error::It was renamed or dropped, so the check above proves nothing."
+            exit 1
+          fi
+          echo "testing is reachable only through dev-dependencies."
+
+      # [profile.release] only takes effect at the workspace root. Left in a
+      # member manifest cargo ignores it with a *warning* and builds on, so the
+      # first symptom would be an unoptimised, unstripped binary in a release.
+      # Stripping is not cosmetic: release.yml re-signs after it because
+      # stripping invalidates an Apple ad-hoc signature, and an arm64 binary
+      # with a broken signature is killed on launch saying only "killed: 9".
+      - name: The release profile still applies
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo build --release --locked 2>&1 | tee "$log"
+
+          if grep -q 'profiles for the non root package will be ignored' "$log"; then
+            echo "::error::A [profile.*] table sits in a member manifest; cargo ignored it."
+            echo "::error::Profiles belong in riabuild-cli/Cargo.toml, the workspace root."
+            exit 1
+          fi
+
+          bin=target/release/riabuild
+          test -x "$bin"
+          file "$bin"
+          if file "$bin" | grep -q 'not stripped'; then
+            echo "::error::$bin still carries a symbol table; strip = \"symbols\" did not apply."
+            exit 1
+          fi
+
+          # Deliberately loose. Losing the profile is a 3-5x step change, not a
+          # few percent, so a generous ceiling catches it without ever failing
+          # on ordinary growth.
+          bytes=$(wc -c < "$bin")
+          limit=$((30 * 1024 * 1024))
+          echo "release binary: $bytes bytes (ceiling $limit)"
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "::error::$bin is $bytes bytes, past the $limit-byte ceiling."
+            echo "::error::Either [profile.release] stopped applying, or it grew a lot."
+            exit 1
+          fi
 
   web:
     name: riabuild-web

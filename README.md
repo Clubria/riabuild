@@ -61,7 +61,7 @@ distribution or glibc requirement beyond what the packages declare.
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI, shipped via Homebrew, apt, and dnf |
+| `riabuild-cli/` | Rust CLI — a cargo workspace of thirteen crates under `crates/` |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `packaging/homebrew/` | the formula template — edit this one |
 | `packaging/debian/` | the `.deb` control template |

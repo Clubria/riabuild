@@ -1,13 +1,12 @@
 # Cargo workspace — Design
 
 **Date:** 2026-08-12
-**Status:** Proposed
+**Status:** Implemented
 **Scope:** `riabuild-cli/` only. No behaviour change, no change to the shipped binary.
 
 ## Purpose
 
-`riabuild-cli` is one crate holding 38,561 lines of Rust and 928 tests across 93 inline
-`mod tests` blocks. Every edit anywhere recompiles all of it, and every `cargo test`
+`riabuild-cli` was one crate holding 39,674 lines of Rust and 944 tests. Every edit anywhere recompiles all of it, and every `cargo test`
 links one binary containing all of it.
 
 Splitting it into a workspace buys three things, in this order:
@@ -68,20 +67,20 @@ riabuild-cli/
   Cargo.toml            virtual workspace manifest
   Cargo.lock            unchanged location
   crates/
-    theme/        riabuild-theme        416   —
-    version/      riabuild-version      149   —
-    fetch/        riabuild-fetch      1,528   —
-    ui/           riabuild-ui         1,449   theme, version
-    runner/       riabuild-runner     3,080   theme
-    paths/        riabuild-paths        826   ui
-    keychain/     riabuild-keychain   1,049   runner, ui
-    api/          riabuild-api        1,300   runner, ui
-    gh-session/   riabuild-gh-session   726   paths, runner, ui
-    channel/      riabuild-channel    4,900   gh-session, paths, runner, ui
-    tasks/        riabuild-tasks     10,232   all of the above
+    theme/        riabuild-theme        423   —
+    version/      riabuild-version      179   —
+    fetch/        riabuild-fetch      1,549   —
+    ui/           riabuild-ui         1,542   theme, version
+    runner/       riabuild-runner     3,224   theme
+    paths/        riabuild-paths      1,352   ui
+    keychain/     riabuild-keychain   1,120   runner, ui
+    api/          riabuild-api        1,308   runner, ui
+    gh-session/   riabuild-gh-session   731   paths, runner, ui
+    channel/      riabuild-channel    4,918   gh-session, paths, runner, ui
+    tasks/        riabuild-tasks     10,608   all of the above
       assets/                               claude-statusline.js
-    remote/       riabuild-remote     9,421   all of the above
-    cli/          riabuild-cli        3,364   all of the above  [[bin]] name = "riabuild"
+    remote/       riabuild-remote     9,402   all of the above
+    cli/          riabuild-cli        3,488   all of the above  [[bin]] name = "riabuild"
 ```
 
 Module contents:
@@ -93,7 +92,7 @@ Module contents:
 | `riabuild-fetch` | `archive`, `download`, `tools` |
 | `riabuild-ui` | `ui`, `art` |
 | `riabuild-runner` | `runner` |
-| `riabuild-paths` | `paths`, `config` |
+| `riabuild-paths` | `paths`, `config`, `filelock` |
 | `riabuild-keychain` | `keychain` |
 | `riabuild-api` | `api` |
 | `riabuild-gh-session` | `gh_session` |
@@ -199,9 +198,18 @@ the `Ctx` builders (`test_ctx`, `ctx_with`, `build`) that `testing.rs` holds tod
 `riabuild-channel`, `riabuild-remote` and the binary take it as a **dev-dependency**.
 
 The feature cannot reach the shipped binary, because `cargo build` never resolves
-dev-dependencies — only `cargo test` does. That is a guarantee of the resolver, not a
-convention. CI asserts it anyway, since a future normal-dependency edge would break it
-silently.
+dev-dependencies. That is a guarantee of the resolver rather than a convention — but it
+is narrower than it first looks, and the original wording here was too strong.
+`cargo build --all-targets` *does* build test targets, which pulls dev-dependencies into
+the graph, and cargo then unifies their features onto the same copy of the library the
+binary links. A `riabuild` produced that way has `testing` compiled in, and would take
+every prompt's default on a real laptop.
+
+Nothing ships such a binary: `release.yml` and the e2e scripts all use plain
+`cargo build --release --locked`. But "the resolver guarantees it" is only true of the
+command that actually builds the release, so CI asserts the graph rather than trusting
+the sentence — and asserts that the feature still exists to be absent, since an
+absence-only check goes green the moment it is renamed.
 
 ## What must move to the workspace root
 
@@ -233,21 +241,21 @@ Incremental rebuild is the crate you touched plus everything downstream of it.
 
 | Edit | Today | After | Win |
 |---|---|---|---|
-| `remote` | 38.5k | 12.8k | **3.0×** |
-| `tasks` | 38.5k | 23.0k | 1.7× |
-| `channel` | 38.5k | 27.9k | 1.4× |
-| `api` | 38.5k | 24.3k | 1.6× |
-| `fetch` | 38.5k | 24.5k | 1.6× |
-| `runner` | 38.5k | 34.1k | 1.1× |
-| `ui`, `theme` | 38.5k | ~38.5k | none — accepted |
+| `remote` | 39.8k | 12.9k | **3.1×** |
+| `tasks` | 39.8k | 23.5k | 1.7× |
+| `channel` | 39.8k | 28.4k | 1.4× |
+| `api` | 39.8k | 24.8k | 1.6× |
+| `fetch` | 39.8k | 25.0k | 1.6× |
+| `runner` | 39.8k | 34.8k | 1.1× |
+| `ui`, `theme` | 39.8k | ~39.8k | none — accepted |
 
 Editing the universal bottom still rebuilds nearly everything. That is inherent, not a
 flaw in the split: `Failure` and `Theme` are reached from everywhere, and no boundary
 changes that.
 
 The effect that shows up on **every** run rather than only on downstream edits is test
-linking. One binary of 928 tests becomes thirteen, built and run in parallel, the largest
-holding 277. `cargo test -p riabuild-channel` runs 137 tests without relinking 33k
+linking. One binary of 944 tests became thirteen, built and run in parallel, the largest
+holding 275. `cargo test -p riabuild-channel` runs 137 tests without relinking 35k
 unrelated lines.
 
 Release builds are unaffected either way: `lto = true` at the workspace root still
@@ -269,11 +277,43 @@ are brokered, never stored" both live inside a single crate, and a crate boundar
 see them. They still need tests or lints. Selling the workspace on those would be selling
 a promise it cannot keep.
 
+## What implementation found
+
+Three things the graph did not show, all of which would have failed late and
+confusingly.
+
+**`tokio`'s `sync` feature was used and never declared.** `riabuild-runner` (`Notify`,
+`Mutex`) and `riabuild-channel` (`watch`, `Mutex`) both need it, and it was reaching them
+only because `hyper` asks `reqwest` for it and cargo unifies features graph-wide. Neither
+crate has `reqwest` anywhere in its own graph, so `cargo build -p riabuild-runner` would
+have failed on a dependency the single-crate build had been getting for free. This is the
+general hazard of a workspace: feature unification hides missing declarations until
+something is built alone.
+
+**`Ui::new` decided interactivity from `cfg!(test)`.** A dependency crate is never
+compiled with `cfg(test)`, so once `riabuild-ui` was a library the flag read false while
+downstream tests ran, and `interactive` became whatever the developer's terminal
+reported. Paired with `#[cfg(not(test))] fn read_answer`, a test that reached a prompt
+would have blocked on a real `stdin().read_line()` — a hung suite with no output, which
+is exactly what the "every prompt has a default" invariant exists to prevent. Both gates
+now read `any(test, feature = "testing")`, and they had to move together: changing either
+alone is worse than changing neither.
+
+**The panic policy needed thirteen exemptions, not one.** `unwrap_used = "deny"` was
+exempted for tests by a single `#![cfg_attr(test, allow(...))]` at the old crate root.
+Every crate root needs its own now, and the six that export test scaffolding need the
+feature in the gate as well — with `testing` on, the crate is compiled as a dependency
+and `cfg(test)` is false, so a `test`-only exemption would not apply.
+
+Two smaller corrections: `filelock` (added by #53 while this was being designed) belongs
+in `riabuild-paths` and brings `libc` with it, and `riabuild-paths` was the only crate
+whose third-party dependency list the design got wrong.
+
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| 457 cross-crate reference rewrites; intermediate states do not compile | One PR, staged as reviewable commits. 82% target a bottom-layer crate and are a mechanical prefix rewrite. |
+| 457 cross-crate reference rewrites (measured before `filelock` landed); intermediate states do not compile | One PR, staged as reviewable commits. 82% target a bottom-layer crate and are a mechanical prefix rewrite. |
 | `[profile.release]` silently ignored in a member | Called out above; CI compares release binary size against `main`. |
 | Lint policy dropped from new crates | `[workspace.lints]` + `[lints] workspace = true` in every member; clippy runs `--all-targets` over the workspace already. |
 | `testing` feature leaking into the release build | Dev-dependency only; CI asserts the feature is off for `cargo build --release`. |
