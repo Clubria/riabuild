@@ -176,7 +176,7 @@ fn describe_session(ctx: &Ctx) {
         return;
     };
     ctx.ui.note(&format!(
-        "signed in as {} <{}> · {} · token in your {}",
+        "signed in as {} <{}> · {} · token in {}",
         member.display_name(),
         member.email,
         member.role,

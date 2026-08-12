@@ -80,7 +80,7 @@ impl Keychain for EnvKeychain {
     }
 
     fn describe(&self) -> &'static str {
-        "RIABUILD_TOKEN environment variable"
+        "the RIABUILD_TOKEN environment variable"
     }
 }
 

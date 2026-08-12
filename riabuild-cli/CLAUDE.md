@@ -148,6 +148,15 @@ value of a provisioner is telling the truth about the machine.
 that `check()` genuinely cannot observe. If you find yourself bumping `version()` to work
 around a check that does not detect a real state, fix the check.
 
+That holds on the *first* run too, and the engine used to make an exception there — no
+record in `state.json` meant `apply()` without ever asking. `state.json` is riabuild's
+memory, not the machine's state, and something other than a previous run can have put a
+machine in shape already: `riabuild remote` writes a server's session token into its
+namespace before that server's riabuild has ever started, so `login` arrives at its first
+run already signed in. Applying anyway cost the developer a second browser approval for a
+token the server was holding. A first run is a reason to *ask* `check()`, never a reason
+to skip it.
+
 **No secrets in `~/.riabuild/`.** The riabuild session token goes in the Keychain via
 `keychain.rs`. Infisical tokens are short-lived, brokered per use, and piped straight into
 `infisical export` — never written down.

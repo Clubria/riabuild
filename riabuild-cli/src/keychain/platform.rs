@@ -154,7 +154,7 @@ impl Keychain for SecurityCliKeychain {
     }
 
     fn describe(&self) -> &'static str {
-        "macOS Keychain"
+        "your macOS Keychain"
     }
 }
 
@@ -262,7 +262,7 @@ impl Keychain for SecretToolKeychain {
     }
 
     fn describe(&self) -> &'static str {
-        "system keyring"
+        "your system keyring"
     }
 }
 
