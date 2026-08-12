@@ -43,6 +43,40 @@ pub async fn fetch(ctx: &Ctx) -> Vec<SharedServer> {
     }
 }
 
+/// What every command on its way to a connection does first: ask riabuild-web
+/// which servers the team has, and fold the answer in.
+///
+/// Returns the identities a lead's edit has superseded, for the caller to
+/// retire — see [`reconcile`].
+pub async fn refresh(ctx: &Ctx, store: &mut Store) -> Vec<Record> {
+    let servers = fetch(ctx).await;
+    reconcile(store, &servers)
+}
+
+/// The same, for `riabuild remote list`, which only reads.
+///
+/// Two differences, and both are about not surprising a developer who asked to
+/// be shown a list:
+///
+/// - **It signs in softly.** `remote list` worked with no network at all before
+///   the team's servers existed, and it still does: a failure to reach
+///   riabuild-web is a note and this laptop's own servers, never an error.
+/// - **It retires nothing.** A superseded identity is dropped on the floor
+///   here, because clearing one means an SSH round trip to a machine the
+///   developer did not ask about. Nothing is persisted either, so the address
+///   on disk stays exactly as it was and the next connect finds the same
+///   mismatch and deals with it.
+pub async fn refresh_for_listing(ctx: &mut Ctx, store: &mut Store) {
+    if let Err(error) = ctx.connect().await {
+        ctx.ui.note(&format!(
+            "Could not reach riabuild-web, so this is only what is on this laptop. ({error})"
+        ));
+        return;
+    }
+    let servers = fetch(ctx).await;
+    reconcile(store, &servers);
+}
+
 /// Folds a fetch into the store, and reports the identities it replaced.
 ///
 /// Three things happen, one per kind of server:

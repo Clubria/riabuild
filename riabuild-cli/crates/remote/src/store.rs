@@ -421,7 +421,17 @@ pub async fn forget_one(paths: &dyn Paths, store: &mut Store, name: &str) -> Res
         Some(record) => record.display_name(),
         None => name.to_string(),
     };
-    let fresh = store.fresh_shared();
+    // Everything this run learned from riabuild-web *except* the server being
+    // forgotten. Without the exclusion `restore_fresh` puts it straight back:
+    // one of the team's servers that this run refreshed is knowledge the disk
+    // does not have, so it is re-added after the merge — including the one just
+    // deleted, which would make `forget` a no-op for exactly the servers this
+    // feature added.
+    let fresh: Vec<Record> = store
+        .fresh_shared()
+        .into_iter()
+        .filter(|record| record.display_name() != key)
+        .collect();
     *store = Store::update(paths, |on_disk| {
         on_disk.remotes.retain(|r| r.display_name() != key);
     })
@@ -519,11 +529,26 @@ pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
     }
     ctx.ui.info("");
     ctx.ui.info(&super::render::servers_box(
-        &store.remotes,
+        &listing_order(store),
         super::render::Shown::Listing,
         ctx.ui.theme(),
     ));
     Ok(0)
+}
+
+/// Everything that can be connected to, and then everything that cannot.
+///
+/// A server the leads have removed is still shown — its session may still be
+/// live, and a row nobody can see is a row nobody can clear — but it is shown
+/// after the servers that work, marked `no longer shared`, so the list still
+/// reads top-down as "what you can use".
+fn listing_order(store: &Store) -> Vec<Record> {
+    let (stale, usable): (Vec<Record>, Vec<Record>) = store
+        .remotes
+        .iter()
+        .cloned()
+        .partition(|record| record.origin() == Origin::Stale);
+    usable.into_iter().chain(stale).collect()
 }
 
 /// A `Record` for `remote`, as if it had just been added and never connected

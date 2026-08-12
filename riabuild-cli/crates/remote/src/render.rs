@@ -12,7 +12,7 @@
 //! `accounts/render.rs`: nothing here decides whether this terminal gets
 //! colour, it is told.
 
-use super::store::Record;
+use super::store::{Origin, Record};
 use riabuild_theme::{Role, Theme};
 
 /// Which surface the box is being drawn for.
@@ -54,24 +54,16 @@ pub fn add_option(count: usize) -> usize {
 /// one saved. Written into the key rather than left to `max_by_key`'s
 /// documented last-wins, because a later tidy-up that reached for `fold` or a
 /// sort would flip it silently.
+///
+/// A server the leads have removed is never offered: it is the default a bare
+/// Enter would take, and connecting to a remembered address is the one thing
+/// [`Origin::Stale`] exists to prevent.
 pub fn most_recently_used(records: &[Record]) -> Option<usize> {
     records
         .iter()
         .enumerate()
+        .filter(|(_, record)| record.origin() != Origin::Stale)
         .max_by_key(|(index, record)| (record.last_used_at, *index))
-        .map(|(index, _)| index)
-}
-
-/// The index of the stalest server — the one the forget hint names.
-///
-/// Ties go the other way, to the earliest record, so that on an all-zero list
-/// this and [`most_recently_used`] still name two different servers and the
-/// two hints keep teaching two different things.
-fn least_recently_used(records: &[Record]) -> Option<usize> {
-    records
-        .iter()
-        .enumerate()
-        .min_by_key(|(index, record)| (record.last_used_at, *index))
         .map(|(index, _)| index)
 }
 
@@ -81,14 +73,14 @@ pub fn servers_box(records: &[Record], shown: Shown, theme: Theme) -> String {
     // Every column is measured before any of it is painted: an escape sequence
     // occupies no terminal columns but plenty of `chars()`, so padding computed
     // over painted text lines up on nothing.
-    let name_width = width(records.iter().map(|record| record.name.clone()));
+    let name_width = width(records.iter().map(Record::display_name));
     let login_width = width(records.iter().map(login));
     let number_width = add_option(records.len()).to_string().chars().count();
 
     for (index, record) in records.iter().enumerate() {
         let row = format!(
             "{:<name_width$}   {:<login_width$}   {}",
-            record.name,
+            record.display_name(),
             login(record),
             theme.paint(Role::Muted, &used(record)),
         );
@@ -147,6 +139,13 @@ fn login(record: &Record) -> String {
 /// today's most likely outcome on Linux. Handed to `duration_words` that reads
 /// as the whole epoch: `used 29873 days`.
 fn used(record: &Record) -> String {
+    // Said first, because it is the only thing about this row a developer can
+    // act on: the leads have removed this server (or riabuild-web could not be
+    // reached), so there is nothing to connect to and possibly a session left
+    // to revoke. `remote forget` is what clears it, and `hints` names it.
+    if record.origin() == Origin::Stale {
+        return "no longer shared".to_string();
+    }
     if record.last_used_at == 0 {
         return "never connected".to_string();
     }
@@ -177,20 +176,47 @@ fn hints(records: &[Record], shown: Shown) -> Vec<(String, String)> {
                 Shown::Listing => "Connect to one:",
             }
             .to_string(),
-            format!("riabuild remote {}", records[index].name),
+            format!("riabuild remote {}", records[index].display_name()),
         ));
     }
     // Only where it is not already an option on screen.
     if shown == Shown::Listing && !records.is_empty() {
         hints.push(("Add a server:".to_string(), "riabuild remote".to_string()));
     }
-    if let Some(index) = least_recently_used(records) {
+    if let Some(index) = forget_candidate(records) {
         hints.push((
             "Forget a server:".to_string(),
-            format!("riabuild remote forget {}", records[index].name),
+            format!("riabuild remote forget {}", records[index].display_name()),
         ));
     }
     hints
+}
+
+/// Which server the forget hint names, in order of how much it needs saying.
+///
+/// 1. **A server the leads have removed.** It is the one row on screen with
+///    something left to clean up and no other way to reach it.
+/// 2. **Otherwise the developer's own stalest server**, as before.
+/// 3. **Otherwise one of the team's**, because that is all there is.
+///
+/// The preference in the middle is not cosmetic. `render::hints` already only
+/// prints commands that would work; this is the rule that a hint must not
+/// *read* as something it is not, and `riabuild remote forget shared-gpu`
+/// against a live shared server reads like deleting the team's machine rather
+/// than letting go of this laptop's key to it.
+fn forget_candidate(records: &[Record]) -> Option<usize> {
+    stalest_where(records, |record| record.origin() == Origin::Stale)
+        .or_else(|| stalest_where(records, |record| record.origin() == Origin::Local))
+        .or_else(|| stalest_where(records, |_| true))
+}
+
+fn stalest_where(records: &[Record], keep: impl Fn(&Record) -> bool) -> Option<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| keep(record))
+        .min_by_key(|(index, record)| (record.last_used_at, *index))
+        .map(|(index, _)| index)
 }
 
 #[cfg(test)]
@@ -333,7 +359,7 @@ mod tests {
             record_for(&remote("gpu", "gpu.internal", 22)),
         ];
         assert_eq!(most_recently_used(&records), Some(1));
-        assert_eq!(least_recently_used(&records), Some(0));
+        assert_eq!(forget_candidate(&records), Some(0));
 
         let text = servers_box(&records, Shown::Choosing, Theme::plain());
         assert!(text.contains("riabuild remote gpu"), "{text}");
@@ -356,5 +382,85 @@ mod tests {
             servers_box(&two(), Shown::Choosing, Theme::with_depth(Depth::TrueColor))
                 .contains('\x1b')
         );
+    }
+
+    /// One server the developer added and one of the team's, the team's one
+    /// refreshed by this run's fetch.
+    fn mine_and_the_teams() -> Vec<Record> {
+        let mut mine = record_for(&remote("build-01", "build-01.fly.dev", 22));
+        mine.last_used_at = riabuild_paths::config::now_secs().saturating_sub(3 * 3600);
+        let teams = crate::store::shared_record_for(&remote("gpu", "gpu.internal", 2222), "k1");
+        vec![mine, teams]
+    }
+
+    #[test]
+    fn one_of_the_teams_servers_is_shown_under_its_prefixed_name() {
+        let text = servers_box(&mine_and_the_teams(), Shown::Choosing, Theme::plain());
+
+        assert!(text.contains("2  shared-gpu"), "{text}");
+        assert!(text.contains("ada@gpu.internal:2222"), "{text}");
+        // The developer's own server keeps its own name, unprefixed.
+        assert!(text.contains("1  build-01"), "{text}");
+    }
+
+    #[test]
+    fn the_forget_hint_names_a_server_the_developer_added_when_there_is_one() {
+        // `riabuild remote forget shared-gpu` reads like deleting the team's
+        // machine. It does not — it lets go of this laptop's key to it — but a
+        // hint is read before it is understood, and there is a truer example on
+        // screen.
+        let text = servers_box(&mine_and_the_teams(), Shown::Listing, Theme::plain());
+
+        assert!(text.contains("forget build-01"), "{text}");
+        assert!(!text.contains("forget shared-gpu"), "{text}");
+    }
+
+    #[test]
+    fn with_only_the_teams_servers_the_forget_hint_names_one_of_them() {
+        // Honest rather than clever, the same rule `one_saved_server_is_named_
+        // by_both_hints` follows: it is the only server there is, and a hint
+        // naming nothing would teach less than one naming this.
+        let records = vec![crate::store::shared_record_for(
+            &remote("gpu", "gpu.internal", 22),
+            "k1",
+        )];
+
+        let text = servers_box(&records, Shown::Listing, Theme::plain());
+
+        assert!(text.contains("forget shared-gpu"), "{text}");
+    }
+
+    #[test]
+    fn a_server_the_leads_removed_says_so_and_is_the_one_the_forget_hint_names() {
+        // It is the only row on screen with something left to clean up — a
+        // session that may still be live — and no other way to reach it.
+        let mut records = mine_and_the_teams();
+        records[1].fresh = false;
+        records[1].last_used_at = riabuild_paths::config::now_secs().saturating_sub(86400);
+
+        let text = servers_box(&records, Shown::Listing, Theme::plain());
+
+        assert!(text.contains("no longer shared"), "{text}");
+        assert!(text.contains("forget shared-gpu"), "{text}");
+        // …and it is never what Enter would take, nor what the connect hint
+        // demonstrates: there is nothing at that address to connect to.
+        assert_eq!(most_recently_used(&records), Some(0));
+        assert!(text.contains("riabuild remote build-01"), "{text}");
+    }
+
+    #[test]
+    fn a_box_of_nothing_but_removed_servers_offers_no_connection() {
+        let mut records = vec![crate::store::shared_record_for(
+            &remote("gpu", "gpu.internal", 22),
+            "k1",
+        )];
+        records[0].fresh = false;
+
+        assert_eq!(most_recently_used(&records), None);
+        let text = servers_box(&records, Shown::Listing, Theme::plain());
+        // No connect hint, because there is no server it could name that
+        // typing would reach — the rule the whole `hints` function exists for.
+        assert!(!text.contains("Connect to one"), "{text}");
+        assert!(text.contains("forget shared-gpu"), "{text}");
     }
 }

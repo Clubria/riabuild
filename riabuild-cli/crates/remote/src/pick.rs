@@ -55,26 +55,33 @@ pub fn parse_pick(answer: &str, count: usize) -> Option<Pick> {
 
 /// Which server this invocation is about, when the command line named none.
 pub async fn pick(ctx: &mut Ctx, store: &mut Store) -> Result<Remote> {
+    // Everything that could be connected to — which leaves out one of the
+    // team's servers that this run's fetch did not describe, because its
+    // address is a memory rather than somewhere to connect. A laptop whose
+    // only servers are those is a laptop with nothing to pick between, and
+    // falls into the add questions below exactly as an empty store does.
+    let shown: Vec<Record> = store.reachable().into_iter().cloned().collect();
+
     // Nothing saved: there is nothing to pick between, and a one-option
     // picker is a worse way to ask for a hostname than asking for a hostname.
-    if store.remotes.is_empty() {
+    if shown.is_empty() {
         return add_one(ctx, store);
     }
     if !ctx.ui.interactive() {
-        return without_a_terminal(ctx, store);
+        return without_a_terminal(ctx, &shown);
     }
 
-    let default = render::most_recently_used(&store.remotes).unwrap_or(0);
+    let default = render::most_recently_used(&shown).unwrap_or(0);
     ctx.ui.info("");
     ctx.ui.info(&render::servers_box(
-        &store.remotes,
+        &shown,
         render::Shown::Choosing,
         ctx.ui.theme(),
     ));
-    match settle(&ctx.ui, &store.remotes, default) {
+    match settle(&ctx.ui, &shown, default) {
         // Whatever `settle` returns is in range: it only ever reports an index
         // `parse_pick` accepted, or the default it was handed.
-        Pick::Server(index) => Ok((&store.remotes[index]).into()),
+        Pick::Server(index) => Ok((&shown[index]).into()),
         Pick::Add => add_one(ctx, store),
     }
 }
@@ -93,7 +100,10 @@ pub async fn pick(ctx: &mut Ctx, store: &mut Store) -> Result<Remote> {
 fn settle(ui: &Ui, records: &[Record], default: usize) -> Pick {
     let count = records.len();
     let question = match records.get(default) {
-        Some(record) => format!("Which one? [{} · {}]", default + 1, record.name),
+        // The display name, because it is the one the developer would type and
+        // the one the box above shows — and under `--quiet` the box is dropped
+        // while this question is not, so it is the only identification left.
+        Some(record) => format!("Which one? [{} · {}]", default + 1, record.display_name()),
         None => format!("Which one? [{}]", default + 1),
     };
     for _ in 0..ATTEMPTS {
@@ -121,11 +131,13 @@ fn settle(ui: &Ui, records: &[Record], default: usize) -> Pick {
 /// names: connecting provisions the server, mints it a session, and lends it
 /// this laptop's GitHub sign-in, so a default taken by nobody would act on a
 /// machine nobody chose. One saved server is not a guess, and several are.
-fn without_a_terminal(ctx: &Ctx, store: &Store) -> Result<Remote> {
-    if let [record] = &store.remotes[..] {
+fn without_a_terminal(ctx: &Ctx, shown: &[Record]) -> Result<Remote> {
+    if let [record] = shown {
         ctx.ui.info(&format!(
             "Reconnecting to {} · {}@{}",
-            record.name, record.user, record.host
+            record.display_name(),
+            record.user,
+            record.host
         ));
         return Ok(record.into());
     }
@@ -133,7 +145,14 @@ fn without_a_terminal(ctx: &Ctx, store: &Store) -> Result<Remote> {
         "asking which of your servers to connect to",
         "Name it — `riabuild remote <name>` — there is no terminal here to ask in.",
     )
-    .detail(format!("saved servers: {}", store.names().join(", ")))
+    .detail(format!(
+        "servers riabuild could reach: {}",
+        shown
+            .iter()
+            .map(Record::display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
     .into())
 }
 
@@ -364,6 +383,94 @@ mod tests {
             "{}",
             failure.action
         );
+    }
+
+    /// The developer's own server, and one of the team's that this run's fetch
+    /// described.
+    fn mine_and_the_teams() -> Store {
+        let mut store = Store::default();
+        let mut mine = record_for(&remote("build-01", "build-01.fly.dev"));
+        mine.last_used_at = riabuild_paths::config::now_secs().saturating_sub(5 * 86400);
+        store.remotes.push(mine);
+        let mut teams = crate::store::shared_record_for(&remote("gpu", "gpu.internal"), "k1");
+        teams.last_used_at = riabuild_paths::config::now_secs().saturating_sub(3600);
+        store.remotes.push(teams);
+        store
+    }
+
+    #[tokio::test]
+    async fn one_of_the_teams_servers_can_be_picked_by_its_number() {
+        let (mut ctx, _home) = riabuild_tasks::testing::ctx_with(FakeRunner::new()).await;
+        ctx.ui = Ui::scripted(["2"]);
+        let mut store = mine_and_the_teams();
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("connects");
+
+        assert_eq!(chosen.name, "shared-gpu");
+        assert_eq!(chosen.host, "gpu.internal");
+        // The prefix travels on `Remote::name`, so the server's own shell
+        // banner reads it back — and never on the address.
+        assert_eq!(chosen.target(), "ada@gpu.internal");
+    }
+
+    #[tokio::test]
+    async fn enter_can_take_one_of_the_teams_servers_too() {
+        let (mut ctx, _home) = riabuild_tasks::testing::ctx_with(FakeRunner::new()).await;
+        ctx.ui = Ui::scripted([""]);
+        let mut store = mine_and_the_teams();
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("connects");
+
+        assert_eq!(chosen.name, "shared-gpu");
+        assert!(
+            ctx.ui.asked()[0].contains("[2 · shared-gpu]"),
+            "{:?}",
+            ctx.ui.asked()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_the_leads_removed_is_not_in_the_box_and_is_not_the_default() {
+        // Its address is a memory. It is still in the store — its session may
+        // be live, and `remote list` shows it so it can be forgotten — but
+        // nothing that leads to a connection may offer it.
+        let (mut ctx, _home) = riabuild_tasks::testing::ctx_with(FakeRunner::new()).await;
+        ctx.ui = Ui::scripted([""]);
+        let mut store = mine_and_the_teams();
+        store.remotes[1].fresh = false;
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("connects");
+
+        assert_eq!(chosen.name, "build-01");
+        // The box is rendered from exactly this, so a server missing from it is
+        // a server not on screen and not numbered.
+        assert_eq!(
+            store
+                .reachable()
+                .iter()
+                .map(|record| record.display_name())
+                .collect::<Vec<_>>(),
+            vec!["build-01".to_string()]
+        );
+        assert!(
+            ctx.ui.asked()[0].contains("[1 · build-01]"),
+            "{:?}",
+            ctx.ui.asked()
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_terminal_and_one_reachable_server_the_others_do_not_make_it_ambiguous() {
+        // One of the team's servers went away; the developer's own is the only
+        // thing left that can be connected to, so this is not a guess.
+        let (mut ctx, _home) = riabuild_tasks::testing::ctx_with(FakeRunner::new()).await;
+        let mut store = mine_and_the_teams();
+        store.remotes[1].fresh = false;
+
+        let chosen = pick(&mut ctx, &mut store).await.expect("reconnects");
+
+        assert_eq!(chosen.name, "build-01");
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
     }
 
     // The Add answer is deliberately not driven through `pick` here. Acting on

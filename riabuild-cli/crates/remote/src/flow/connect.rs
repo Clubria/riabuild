@@ -23,6 +23,46 @@ use riabuild_tasks::Ctx;
 use riabuild_ui::Ui;
 use std::sync::Arc;
 
+/// Lets go of the machine the chosen server used to be, if a lead has since
+/// pointed its name somewhere else.
+///
+/// Scoped to the one server being connected to, not to every address that
+/// changed: the others are somebody else's problem this run, and each will be
+/// retired by the run that connects to it. `shared::reconcile` hands back the
+/// same superseded record on every run until one of these succeeds, because
+/// nothing has persisted the new address yet — so a failure here is retried
+/// rather than lost.
+///
+/// Never fatal. The developer asked to reach the server the leads are pointing
+/// at now, and the usual reason an address changes is that the old machine is
+/// gone — which is exactly when this cannot succeed.
+async fn retire_superseded_identity(
+    ctx: &Ctx,
+    store: &store::Store,
+    remote: &Remote,
+    superseded: &[store::Record],
+    member_id: &str,
+) {
+    let Some(chosen) = store.find(&remote.name) else {
+        return;
+    };
+    if !chosen.is_shared() {
+        return;
+    }
+    let Some(old) = superseded
+        .iter()
+        .find(|record| record.shared_id == chosen.shared_id)
+    else {
+        return;
+    };
+    if let Err(error) = crate::forget::retire_superseded(ctx, member_id, old).await {
+        ctx.ui.warn(&format!(
+            "Could not finish letting go of {}@{}: {error}",
+            old.user, old.host
+        ));
+    }
+}
+
 /// Everything from "which server" onward: reachable once `ctx.member` and
 /// `ctx.org` already hold their answers, which is what makes it testable
 /// against a `FakeRunner` without a real riabuild-web to `connect` against —
@@ -31,6 +71,7 @@ pub(super) async fn connect_and_setup(
     ctx: &mut Ctx,
     request: &Request,
     store: &mut store::Store,
+    superseded: Vec<store::Record>,
 ) -> Result<i32> {
     let accept_host_key = request.accept_host_key.as_deref();
     let remote = store::choose(ctx, store, request.target.clone()).await?;
@@ -39,6 +80,11 @@ pub(super) async fn connect_and_setup(
         .clone()
         .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
     let version = ctx.org()?.latest_cli_version.clone();
+
+    // Before anything is set up at the new address, and only for the server
+    // actually being connected to: a lead's edit may have left a key and a live
+    // session on the machine this name used to mean.
+    retire_superseded_identity(ctx, store, &remote, &superseded, &member.member_id).await;
 
     ctx.ui
         .heading(&format!("Connecting to {}", remote.target()));
@@ -383,7 +429,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = connect_and_setup(&mut ctx, &request, &mut store)
+        let error = connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
             .await
             .expect_err("a fingerprint that does not match must fail, not silently prompt");
 
@@ -486,7 +532,7 @@ mod tests {
             accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
             ..Default::default()
         };
-        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
+        let _ = connect_and_setup(&mut ctx, &request, &mut store, Vec::new()).await;
 
         let calls = fake.calls();
         let scanned = calls
@@ -567,7 +613,7 @@ mod tests {
             ..Default::default()
         };
         assert!(request.check);
-        let result = connect_and_setup(&mut ctx, &request, &mut store).await;
+        let result = connect_and_setup(&mut ctx, &request, &mut store, Vec::new()).await;
 
         // What was *run* is asserted before what was returned, so restoring
         // the old ordering fails on the `ssh-copy-id` line itself rather than
@@ -641,7 +687,7 @@ mod tests {
         // `uname -sm` answers nothing a Rust target can be derived from, so
         // this ends inside `install::ensure_riabuild` — well past
         // `resolve_home`, which is the step under test.
-        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
+        let _ = connect_and_setup(&mut ctx, &request, &mut store, Vec::new()).await;
 
         // The round trip really happened — otherwise this passes for the same
         // free reason the probe-stopped test does, and would keep passing if
@@ -690,7 +736,7 @@ mod tests {
         // `uname -sm` answers nothing a Rust target can be derived from, so
         // the run stops inside `install::ensure_riabuild` — which is past
         // the probe, and is what this asserts.
-        connect_and_setup(&mut ctx, &request, &mut store)
+        connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
             .await
             .expect_err("the fake server reports no usable platform");
         // Asserted on what ran, not on the wording of the error: stopping at
@@ -751,7 +797,7 @@ mod tests {
             ..Default::default()
         };
         assert!(request.check);
-        let error = connect_and_setup(&mut ctx, &request, &mut store)
+        let error = connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
             .await
             .expect_err("a server answering with a different host key is not a clean check");
 
@@ -822,7 +868,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!request.check);
-        connect_and_setup(&mut ctx, &request, &mut store)
+        connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
             .await
             .expect_err("the fake server reports no usable platform");
 
@@ -919,7 +965,7 @@ mod tests {
             accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
             ..Default::default()
         };
-        connect_and_setup(&mut ctx, &request, &mut store)
+        connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
             .await
             .expect_err("a key that still cannot sign in is not success");
 
@@ -979,7 +1025,7 @@ mod tests {
             accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
             ..Default::default()
         };
-        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
+        let _ = connect_and_setup(&mut ctx, &request, &mut store, Vec::new()).await;
 
         let expected = askpass::ssh_env(&remote(), ctx.paths.as_ref());
         let mut checked = 0;
@@ -1026,7 +1072,7 @@ mod tests {
             check: true,
             ..Default::default()
         };
-        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
+        let _ = connect_and_setup(&mut ctx, &request, &mut store, Vec::new()).await;
 
         assert!(
             ctx.paths.askpass_helper().exists(),
