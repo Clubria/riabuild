@@ -71,7 +71,7 @@ pub async fn seed_github(
                 // on a shared server that means every other developer's
                 // session too.
                 stdin: Some(token.trimmed().as_bytes().to_vec()),
-                ..Default::default()
+                ..super::askpass::run_options(remote, paths)
             },
         )
         .await?;

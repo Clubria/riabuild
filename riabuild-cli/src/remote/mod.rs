@@ -13,6 +13,7 @@
 //! us. Confusing the second for the first is how a developer gets phished by
 //! a box that isn't theirs.
 
+pub mod askpass;
 pub mod authorise;
 pub mod channel;
 pub mod flow;
@@ -28,7 +29,7 @@ pub mod store;
 pub use flow::run;
 
 use crate::paths::Paths;
-use crate::runner::{CommandOutput, CommandRunner, RunOptions};
+use crate::runner::{CommandOutput, CommandRunner};
 use crate::ui::Failure;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
@@ -187,7 +188,9 @@ pub async fn ssh_once(
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    runner.run("ssh", &refs, &RunOptions::default()).await
+    runner
+        .run("ssh", &refs, &askpass::run_options(remote, paths))
+        .await
 }
 
 /// The server's own home directory, asked for once and cached on the store

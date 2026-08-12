@@ -158,6 +158,54 @@ fn select(is_macos: bool, token_env: Option<&str>, session_token_file: Option<Pa
     }
 }
 
+/// Where a *server's SSH password* is kept, which is not quite the same
+/// question as [`select`] answers for the session token.
+///
+/// Two differences, both deliberate:
+///
+/// - **`RIABUILD_TOKEN` is never consulted.** It holds this machine's riabuild
+///   session, which has nothing to do with a Unix account's password on some
+///   server. Honouring it here would hand `ssh` a bearer token as a password.
+/// - **A machine with no keyring falls back to a file** rather than to a store
+///   that always fails. On Linux without `secret-tool` — a container, a CI
+///   runner, a minimal distro — the alternative is not "no password on disk",
+///   it is riabuild asking for the password again at every one of the ten SSH
+///   connections a single `riabuild remote` opens. `~/.riabuild/ssh/passwords/`
+///   is created at 0700 and the file written at 0600; see the amended
+///   "No secrets in `~/.riabuild/`" note in `riabuild-cli/CLAUDE.md`.
+///
+/// macOS is not given the fallback: `security(1)` and a login keychain are
+/// always there, and `riabuild remote` runs on a laptop, where that keychain is
+/// unlocked. The server case that forces `for_platform`'s file store does not
+/// arise — a server never runs `riabuild remote`.
+fn select_password_store(is_macos: bool, has_secret_tool: bool, fallback: PathBuf) -> Choice {
+    if is_macos {
+        return Choice::Macos;
+    }
+    if has_secret_tool {
+        return Choice::Linux;
+    }
+    Choice::File(fallback)
+}
+
+/// The store a saved SSH password for one server goes in. See
+/// [`select_password_store`] for why this is not [`for_account`].
+pub fn for_password(
+    runner: Arc<dyn CommandRunner>,
+    account: &str,
+    fallback: PathBuf,
+) -> Box<dyn Keychain> {
+    let has_secret_tool = runner.which("secret-tool").is_some();
+    match select_password_store(cfg!(target_os = "macos"), has_secret_tool, fallback) {
+        Choice::File(path) => Box::new(FileKeychain::new(path)),
+        Choice::Macos => Box::new(SecurityCliKeychain::for_account(runner, account)),
+        Choice::Linux => Box::new(SecretToolKeychain::for_account(runner, account)),
+        // `select_password_store` never returns it — the session-token
+        // override has no meaning for a server's password.
+        Choice::Env => Box::new(EnvKeychain),
+    }
+}
+
 /// Picks the right store for this machine. See [`select`] for the ordering
 /// this delegates to.
 pub fn for_platform(
@@ -181,6 +229,43 @@ pub fn for_platform(
 mod tests {
     use super::*;
     use crate::runner::FakeRunner;
+
+    #[test]
+    fn a_password_prefers_the_keyring_and_falls_back_to_a_file() {
+        let fallback = PathBuf::from("/home/ada/.riabuild/ssh/passwords/9f2c");
+        // macOS always has `security` and an unlocked login keychain on the
+        // laptop `riabuild remote` runs from, so the fallback never applies —
+        // asserted with `has_secret_tool` false, so a branch that reached the
+        // file store on macOS could not hide behind a machine that has both.
+        assert_eq!(
+            select_password_store(true, false, fallback.clone()),
+            Choice::Macos
+        );
+        assert_eq!(
+            select_password_store(false, true, fallback.clone()),
+            Choice::Linux
+        );
+        assert_eq!(
+            select_password_store(false, false, fallback.clone()),
+            Choice::File(fallback)
+        );
+    }
+
+    #[test]
+    fn a_password_never_comes_from_riabuild_token() {
+        // `RIABUILD_TOKEN` is this machine's riabuild session. Reading it here
+        // would hand `ssh` a bearer token where a Unix password belongs — and
+        // `select` *does* return `Env` for it, so this is a real difference
+        // between the two decisions rather than a restatement.
+        let fallback = PathBuf::from("/tmp/pw");
+        assert_eq!(select(false, Some("rb_live_token"), None), Choice::Env);
+        for (is_macos, has_secret_tool) in [(true, true), (false, true), (false, false)] {
+            assert_ne!(
+                select_password_store(is_macos, has_secret_tool, fallback.clone()),
+                Choice::Env
+            );
+        }
+    }
 
     #[test]
     fn a_servers_session_is_stored_under_its_own_account() {

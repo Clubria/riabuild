@@ -68,6 +68,14 @@ and mints short-lived access tokens on demand. No long-lived Infisical credentia
 written to a developer's machine. Infisical service tokens are deprecated — use machine
 identities with universal auth.
 
+Two secrets riabuild *does* keep are named exceptions, both local to one machine and
+one server, and neither is brokered: a server's own session token, and the SSH password
+for a server riabuild's key cannot sign in to. Both go in the OS keychain where there is
+one and a 0600 file where there is not, and `riabuild remote forget` deletes both. See
+"No secrets in `~/.riabuild/`" in `riabuild-cli/CLAUDE.md` for the reasoning and the
+storage rules. Nothing here loosens the sentence above it: the Infisical credential is
+still minted per use and still never written down.
+
 **Identity is GitHub, authorization is Convex.** Membership in the Clubria GitHub org
 gates access at all; `members.role` decides how much. Every secret-brokering request
 re-verifies org membership, so the Convex role is never the sole gate.
