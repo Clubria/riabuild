@@ -154,8 +154,14 @@ pub(super) async fn connect_and_setup(
         ctx.ui
             .note("--check: not minting a session or lending a GitHub sign-in.");
         let command = env_command(&prefix_refs, &binary, &["--check", "--no-shell"]);
-        let code =
-            shell::run_setup(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &command).await?;
+        let code = shell::run_setup(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &ctx.ui,
+            &command,
+        )
+        .await?;
         return Ok(code);
     }
 
@@ -204,7 +210,14 @@ pub(super) async fn connect_and_setup(
     // status, so a failed setup would return 0 and the flow would open a
     // shell on a broken box. mosh is for the shell, which is the only thing
     // that benefits from surviving sleep and roaming.
-    let code = shell::run_setup(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &setup).await?;
+    let code = shell::run_setup(
+        &remote,
+        ctx.paths.as_ref(),
+        ctx.runner.clone(),
+        &ctx.ui,
+        &setup,
+    )
+    .await?;
     if code != 0 {
         return Ok(code);
     }

@@ -41,6 +41,10 @@ pub struct Ui {
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
     pending: AtomicUsize,
+    /// Blank lines printed by [`Ui::blank`], for the tests that pin the spacing
+    /// around a handoff.
+    #[cfg(test)]
+    blanks: AtomicUsize,
     /// Answers a test feeds to `ask` in place of a terminal.
     #[cfg(test)]
     answers: std::sync::Mutex<std::collections::VecDeque<String>>,
@@ -152,6 +156,8 @@ impl Ui {
                 && std::io::stdout().is_terminal(),
             quiet,
             pending: AtomicUsize::new(0),
+            #[cfg(test)]
+            blanks: AtomicUsize::new(0),
             #[cfg(test)]
             answers: Default::default(),
             #[cfg(test)]
@@ -310,6 +316,41 @@ impl Ui {
         let line = format!("  ● {title}");
         let padding = " ".repeat(cover(self.take_pending(), &line));
         println!("\r  {} {}{}", self.paint(Role::Ok, "●"), title, padding);
+    }
+
+    /// One deliberate blank line, at a handoff.
+    ///
+    /// Spacing across a handoff is nobody's by default, and that is the bug it
+    /// exists to fix: `ssh` prints `Connection to … closed.` the moment the
+    /// remote command ends, `mosh` prints `[mosh is exiting.]` when it lets go,
+    /// and the environment shell prints an accounts box the second it starts.
+    /// None of them know what riabuild printed a line earlier, so the rule is
+    /// riabuild's to keep: **one blank line before handing the terminal to a
+    /// child that prints its own lines, and one after taking it back**.
+    ///
+    /// The other half of the rule is that whatever runs on the far side prints
+    /// none of its own — see `provision::open_shell`, where a laptop separates
+    /// its own shell and a server does not, because the laptop that opened the
+    /// connection already did.
+    ///
+    /// Counted rather than recorded in tests: what a spacing regression looks
+    /// like is a blank line missing or doubled, never one with the wrong text
+    /// in it.
+    pub fn blank(&self) {
+        if self.quiet {
+            return;
+        }
+        // A blank line ends the status line, exactly as a note does.
+        self.take_pending();
+        #[cfg(test)]
+        self.blanks.fetch_add(1, Ordering::Relaxed);
+        println!();
+    }
+
+    /// How many blank lines this `Ui` printed.
+    #[cfg(test)]
+    pub fn blanks(&self) -> usize {
+        self.blanks.load(Ordering::Relaxed)
     }
 
     pub fn note(&self, text: &str) {
