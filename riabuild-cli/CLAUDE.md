@@ -230,7 +230,9 @@ src/
                session, seeding a GitHub sign-in, and the mosh/ssh shell handoff.
                `askpass.rs` answers the password prompt when the key cannot sign
                in: the SSH_ASKPASS shim, the account the password is saved under,
-               and the environment every ssh in remote mode carries
+               and the environment every ssh in remote mode carries. `pick.rs` is
+               the prompt a bare `riabuild remote` puts — one of the saved
+               servers, or a new one — and `render.rs` the box it and `list` show
 ```
 
 `download/` decides where bytes come from and whether they are the right bytes;

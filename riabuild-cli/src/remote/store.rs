@@ -9,7 +9,7 @@ use super::Remote;
 use crate::paths::Paths;
 use crate::tasks::Ctx;
 use crate::ui::Ui;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,10 +213,9 @@ pub fn add(store: &mut Store, remote: &Remote) {
 
 /// Which server this invocation is about.
 ///
-/// A `target` names a saved server or spells one out
-/// (`[user@]host[:port]`); with none, an empty store asks the three
-/// questions once, one saved server reconnects without asking, and several
-/// saved servers are offered as a numbered list.
+/// A `target` names a saved server or spells one out (`[user@]host[:port]`).
+/// With none, the question belongs to `pick`: the servers already saved, plus
+/// the option of adding one.
 pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) -> Result<Remote> {
     if let Some(target) = target {
         if let Some(record) = store.find(&target) {
@@ -266,67 +265,7 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
         return Ok(remote);
     }
 
-    match store.remotes.len() {
-        0 => {
-            let remote = ask_for_one(ctx, store).await?;
-            add(store, &remote);
-            Ok(remote)
-        }
-        1 => {
-            let record = &store.remotes[0];
-            ctx.ui.info(&format!(
-                "Reconnecting to {} · {}@{}",
-                record.name, record.user, record.host
-            ));
-            Ok(record.into())
-        }
-        _ => {
-            ctx.ui.heading("Which server?");
-            for (index, record) in store.remotes.iter().enumerate() {
-                ctx.ui.info(&format!(
-                    "  {}  {:<10} {}@{}{}   used {}",
-                    index + 1,
-                    record.name,
-                    record.user,
-                    record.host,
-                    if record.port == 22 {
-                        String::new()
-                    } else {
-                        format!(":{}", record.port)
-                    },
-                    crate::ui::duration_words(
-                        crate::config::now_secs().saturating_sub(record.last_used_at) / 60
-                    ),
-                ));
-            }
-            let answer = ctx.ui.ask_required("", Some("1"))?;
-            let index: usize = answer.trim().parse().unwrap_or(1);
-            let record = store
-                .remotes
-                .get(index.saturating_sub(1))
-                .ok_or_else(|| anyhow!("there is no server {index}"))?;
-            Ok(record.into())
-        }
-    }
-}
-
-/// The questions, once, on a first run.
-async fn ask_for_one(ctx: &mut Ctx, store: &Store) -> Result<Remote> {
-    ctx.ui.heading("Adding a server");
-    let host = ctx.ui.ask_required("Hostname  ", None)?;
-    let port: u16 = ctx
-        .ui
-        .ask_required("Port      ", Some("22"))?
-        .parse()
-        .unwrap_or(22);
-    let user = ctx.ui.ask_required("Username  ", Some(&whoami()))?;
-    let name = ask_name(&ctx.ui, &host, &store.names());
-    Ok(Remote {
-        name,
-        host,
-        port,
-        user,
-    })
+    super::pick::pick(ctx, store).await
 }
 
 /// What a successful connect leaves behind: this server moves to the front of
@@ -340,29 +279,23 @@ pub async fn remember(ctx: &Ctx, store: &mut Store, remote: &Remote, version: &s
 }
 
 /// `riabuild remote list`.
+///
+/// The same box the picker shows, minus the numbers nothing here is waiting to
+/// read. An empty store keeps its one line rather than rendering a box with no
+/// rows, whose hints would name no server — `render::hints` exists to keep a
+/// developer from being shown a command that refuses when typed.
 pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
     if store.remotes.is_empty() {
         ctx.ui
             .info("No servers yet. Run `riabuild remote` to add one.");
         return Ok(0);
     }
-    for record in &store.remotes {
-        ctx.ui.info(&format!(
-            "  {:<10} {}@{}{}   used {}",
-            record.name,
-            record.user,
-            record.host,
-            if record.port == 22 {
-                String::new()
-            } else {
-                format!(":{}", record.port)
-            },
-            // `duration_words` takes minutes elapsed, not a timestamp.
-            crate::ui::duration_words(
-                crate::config::now_secs().saturating_sub(record.last_used_at) / 60
-            ),
-        ));
-    }
+    ctx.ui.info("");
+    ctx.ui.info(&super::render::servers_box(
+        &store.remotes,
+        super::render::Shown::Listing,
+        ctx.ui.theme(),
+    ));
     Ok(0)
 }
 
@@ -419,18 +352,23 @@ mod tests {
         }
     }
 
+    /// With nobody there to ask — a script, a CI job, this test process — one
+    /// saved server is still reconnected to rather than asked about. A
+    /// developer at a terminal now gets the picker instead
+    /// (`pick::one_saved_server_is_still_offered_a_choice_when_someone_is_there`);
+    /// what this pins is that `choose` still reaches the unattended answer
+    /// through `pick`, and asks nothing on the way.
     #[tokio::test]
-    async fn one_saved_server_reconnects_without_asking() {
+    async fn one_saved_server_reconnects_without_asking_when_nobody_is_there() {
         let (mut ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
         let mut store = Store::default();
         store.remotes.push(record_for(&remote()));
 
-        // `Ui::ask` would fail outright without a TTY, so reaching a prompt here
-        // is itself the failure this asserts against.
         let chosen = choose(&mut ctx, &mut store, None)
             .await
             .expect("reconnects");
         assert_eq!(chosen.name, "build-01");
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
     }
 
     #[test]
@@ -663,15 +601,19 @@ mod tests {
         assert_eq!(store.names(), vec!["build-01", "build-01-2"]);
     }
 
+    /// `list` renders through `render::servers_box` now, and what each column
+    /// says is asserted there. What is still this function's own is the
+    /// dispatch: a store with servers in it renders the box, and an empty one
+    /// takes the line above instead of a box whose hints could name nothing.
     #[tokio::test]
-    async fn the_last_used_column_is_a_duration_not_a_timestamp() {
+    async fn a_saved_server_is_listed_and_an_empty_store_is_not_a_box() {
         let (ctx, _home) = crate::testing::ctx_with(crate::runner::FakeRunner::new()).await;
         let mut store = Store::default();
+        assert_eq!(list(&ctx, &store).expect("lists nothing"), 0);
+
         let mut record = record_for(&remote());
         record.last_used_at = crate::config::now_secs().saturating_sub(3 * 3600);
         store.remotes.push(record);
-        // Asserting the arithmetic rather than the wording: handing
-        // `duration_words` the raw epoch renders roughly "1236111 days".
         assert_eq!(list(&ctx, &store).expect("lists"), 0);
     }
 

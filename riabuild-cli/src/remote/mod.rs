@@ -21,6 +21,8 @@ pub mod forget;
 pub mod host_key;
 pub mod identity;
 pub mod install;
+pub mod pick;
+pub mod render;
 pub mod seed;
 pub mod session;
 pub mod shell;
