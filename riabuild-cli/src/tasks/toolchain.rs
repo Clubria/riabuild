@@ -132,6 +132,14 @@ impl Task for Toolchain {
 /// non-zero exit (`NODE_OPTIONS=--bogus node -v` exits 9 with empty stdout), or
 /// output that is not a version — is real evidence about the tree, and still
 /// means replace.
+///
+/// The probe deliberately names no directory, which is what stops pnpm
+/// answering for one. `RunOptions::cwd` is `None`, so `RealRunner` runs it at
+/// the filesystem root — see `FILESYSTEM_ROOT` in `runner/`, where the pnpm
+/// version-handover this is guarding against is written up. Do **not** "fix"
+/// this by pointing it at the checkout: the Clubria repo pins pnpm too, so a
+/// probe run there would report the pin whatever binary riabuild had installed,
+/// and `check()` would go green on a machine with the wrong pnpm on it.
 async fn reported_version(ctx: &Ctx, bin: &Path) -> Result<Option<String>> {
     if !tokio::fs::try_exists(bin).await.unwrap_or(false) {
         return Ok(None);
@@ -711,6 +719,156 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&node_bin).await.unwrap(),
             "the right node\n"
+        );
+    }
+
+    /// A machine riabuild has already provisioned correctly, whose `pnpm`
+    /// answers for the directory it is standing in rather than for itself.
+    ///
+    /// Not a contrivance — this is what pnpm 11 does. `switchCliVersion` reads
+    /// the nearest `package.json` at or above pnpm's working directory and,
+    /// when a `packageManager` field names another pnpm, downloads that version
+    /// and re-execs the command through it. `pnpm -v` therefore reports the
+    /// pin, not the binary.
+    ///
+    /// `FakeRunner` cannot express this: its stubs are keyed on the invocation,
+    /// and the invocation is identical whichever directory the probe runs in.
+    /// That is exactly why the bug survived a green suite.
+    ///
+    /// Where the probe lands is resolved through
+    /// `runner::directory_for_riabuild`, not guessed here, so this cannot go on
+    /// agreeing with a rule the real runner has stopped applying.
+    struct ProvisionedMachine {
+        node: String,
+        /// The pnpm actually installed under `~/.riabuild`.
+        pnpm: String,
+    }
+
+    impl ProvisionedMachine {
+        /// pnpm's own lookup: the nearest `packageManager` at or above `dir`.
+        async fn pinned_at_or_above(dir: &Path) -> Option<String> {
+            for dir in dir.ancestors() {
+                let Ok(text) = tokio::fs::read_to_string(dir.join("package.json")).await else {
+                    continue;
+                };
+                let pinned = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|json| {
+                        Some(
+                            json.get("packageManager")?
+                                .as_str()?
+                                .strip_prefix("pnpm@")?
+                                .to_string(),
+                        )
+                    });
+                if pinned.is_some() {
+                    return pinned;
+                }
+            }
+            None
+        }
+    }
+
+    #[async_trait]
+    impl crate::runner::CommandRunner for ProvisionedMachine {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<crate::runner::CommandOutput> {
+            assert_eq!(args, ["-v"], "this task only ever asks for a version");
+            let stdout = if program.ends_with("node") {
+                // Node reads no manifest and is the control in this test: it
+                // answers the same wherever it is started.
+                format!("v{}", self.node)
+            } else {
+                let dir = crate::runner::directory_for_riabuild(options.cwd.as_deref());
+                Self::pinned_at_or_above(dir)
+                    .await
+                    .unwrap_or_else(|| self.pnpm.clone())
+            };
+            Ok(crate::runner::CommandOutput {
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        async fn run_bytes(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<crate::runner::BytesOutput> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn run_forking(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn spawn(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<Box<dyn crate::runner::ChildHandle>> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task never runs anything interactively");
+        }
+        fn which(&self, _program: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn the_version_probe_is_not_pointed_at_a_repo_that_pins_pnpm() {
+        // What `check()` compares is the binary against the repo's pin, and the
+        // two are only one directory apart: run the probe anywhere a
+        // `package.json` can answer for it and pnpm reports the pin instead, so
+        // the comparison becomes one string read twice.
+        //
+        // Standing in the developer's *own* project was the incident — riabuild
+        // reported drift `apply()` could not repair, and every retry failed
+        // identically. That half is gone at the runner: a command riabuild runs
+        // for itself no longer inherits anywhere. This pins the tempting repair,
+        // which is worse because it is silent — pointing the probe at the
+        // checkout "so pnpm can see the repo" would make `check()` go green on a
+        // machine with the wrong pnpm installed.
+        let checkout = tempfile::TempDir::new().unwrap();
+        write_file(
+            &checkout.path().join("package.json"),
+            r#"{"name":"ai-builders-hub","packageManager":"pnpm@10.20.0"}"#,
+        )
+        .await;
+
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.project_path = Some(checkout.path().to_string_lossy().into_owned());
+        write_file(
+            &ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node"),
+            "#!/bin/sh\n",
+        )
+        .await;
+        write_file(&ctx.paths.bin_dir().join("pnpm"), "#!/bin/sh\n").await;
+        ctx.runner = std::sync::Arc::new(ProvisionedMachine {
+            node: FALLBACK_NODE.to_string(),
+            pnpm: FALLBACK_PNPM.to_string(),
+        });
+
+        let status = Toolchain.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains(&format!("pnpm reports {FALLBACK_PNPM}")),
+            "the probe answered for the checkout instead of for the binary: {status:?}"
         );
     }
 
