@@ -11,6 +11,7 @@
 import type * as audit from "../audit.js";
 import type * as auth from "../auth.js";
 import type * as cliAuth from "../cliAuth.js";
+import type * as crons from "../crons.js";
 import type * as devSeed from "../devSeed.js";
 import type * as github from "../github.js";
 import type * as http from "../http.js";
@@ -33,6 +34,7 @@ declare const fullApi: ApiFromModules<{
   audit: typeof audit;
   auth: typeof auth;
   cliAuth: typeof cliAuth;
+  crons: typeof crons;
   devSeed: typeof devSeed;
   github: typeof github;
   http: typeof http;
