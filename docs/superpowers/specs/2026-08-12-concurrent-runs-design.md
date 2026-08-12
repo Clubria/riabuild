@@ -77,24 +77,45 @@ are unchanged and may be one write stale, which is the same staleness they have 
 
 ## The lock
 
-`src/filelock.rs`: an RAII guard holding an exclusive advisory `flock`.
+`src/filelock.rs`: an RAII guard holding an exclusive lock — advisory `flock` on Unix.
 
 ```rust
-pub struct FileLock { file: tokio::fs::File }  // released by the kernel on close
+pub struct FileLock { file: std::fs::File }  // released by the kernel on close
 ```
 
-`flock` is confirmed present on both supported platforms. `libc` declares it in the
-shared `src/unix/mod.rs`, gated only by `cfg(not(target_os = "solaris"))`, and
-`LOCK_EX`/`LOCK_NB`/`LOCK_UN` carry identical values in `bsd/apple/mod.rs` and
-`linux_like/mod.rs`. No new dependency: `libc` is already in the tree for `gh_session`.
+It is a `std::fs::File` because the locking methods live there and `tokio::fs::File` does
+not have them. The lock file is still *opened* through `tokio::fs::OpenOptions`, and
+handed over with `into_std().await`; the guard holds the descriptor open for its lifetime
+and never reads or writes through it.
 
-**Acquired non-blocking.** `LOCK_EX | LOCK_NB` in a retry loop with
-`tokio::time::sleep` between attempts, never a blocking `flock`. A blocking lock syscall
-on a current-thread runtime stalls every other future on it — the precise failure the
+The locking itself is `std::fs::File::try_lock` and `File::lock`, stabilised in Rust
+1.89.0 — no dependency, no `unsafe`, and no `libc`. On Unix these are precisely `flock`
+with `LOCK_EX`, `LOCK_EX | LOCK_NB` and `LOCK_UN`; on Windows they are `LockFileEx`,
+which means the `#[cfg(not(unix))]` no-op stub this design first called for is not needed
+at all. Nothing pins riabuild below that version: there is no `rust-toolchain.toml`, no
+`rust-version` in `Cargo.toml`, and CI builds on `dtolnay/rust-toolchain@stable`.
+
+**Try, then say so, then wait.** `try_lock()` runs inline and returns immediately in the
+uncontended case, which is every case that matters. Only on `TryLockError::WouldBlock`
+does the guard report the wait — through a caller-supplied callback, so `filelock.rs`
+prints nothing itself and never depends on `Ui` — and then take the blocking `lock()`.
+
+That blocking call goes through `tokio::task::spawn_blocking`. A blocking lock syscall on
+a current-thread runtime stalls every other future on it, which is the precise failure the
 "All IO is async" invariant exists to prevent, and the same reasoning `runner/pty.rs`
-follows when it pumps through `AsyncFd` rather than a blocking read. The loop is also
-where a wait becomes visible: past a threshold the guard invokes a caller-supplied
-callback, so `filelock.rs` prints nothing itself and never depends on `Ui`.
+follows when it pumps through `AsyncFd` rather than a blocking read. `File` is `Send`, so
+it moves into the blocking task and back out again.
+
+This is preferred over polling `try_lock` on a `tokio::time::sleep` interval: there is no
+interval to choose, no wakeup latency once the lock frees, and the notice is emitted
+exactly once and only under genuine contention.
+
+**Locking that the filesystem refuses is not an error.** `ENOTSUP`, `EOPNOTSUPP`,
+`ENOSYS` and `ErrorKind::Unsupported` are treated as *acquired*, and the run proceeds
+unlocked. riabuild is the first thing to run on a machine nobody has characterised —
+a home directory on NFS, an unusual container filesystem — and "cannot provision, because
+cannot lock" is a worse outcome for a provisioner than the rare interleaving the lock
+guards against. Fail open here, and only here.
 
 **No staleness handling, by construction.** A `flock` belongs to the open file
 description, so the kernel releases it when the process dies — crash, `SIGKILL`, power
@@ -115,8 +136,9 @@ guards, so the locks live at their own paths.
 | `~/.riabuild/.provision.lock` | `engine::run_all` | seconds to minutes |
 
 They cannot be one. A run holding the provisioning lock saves state after every task, and
-`flock` on a second descriptor for the same file blocks even within a single process — one
-lock file would deadlock riabuild against itself on the first task it completed.
+`std` is explicit that taking a second lock from a process that already holds one is
+unspecified and may deadlock. One lock file would hang riabuild against itself on the
+first task it completed.
 
 ## The atomic write
 
@@ -160,20 +182,19 @@ robustness as a disguise.
 
 ## Errors
 
-Failing to acquire within a cap — fifteen minutes for provisioning, seconds for state —
-becomes a `Failure` carrying what was attempted, the detail, and one next action. Never a
-panic: `unwrap_used` is denied crate-wide precisely so a provisioner never answers a
-developer with a backtrace.
+A contended lock waits rather than failing, and says so — the same contract cargo has, and
+one Clubria developers already meet when two worktrees build at once. There is no timeout.
+A cap would have to be long enough to cover a first-run toolchain download on a slow
+connection, by which point it is no longer protecting anyone from anything, and the
+printed notice is what keeps a wait from reading as a hang.
 
-A wait prints a notice once it passes about a second, and again periodically, so waiting
-never reads as hanging.
+Any other lock failure becomes a `Failure` carrying what was attempted, the detail, and
+one next action. Never a panic: `unwrap_used` is denied crate-wide precisely so a
+provisioner never answers a developer with a backtrace.
 
 Corrupt JSON still degrades to `default` under the lock — the policy is unchanged — but
 the atomic write that follows means the degraded value cannot re-corrupt the file for the
 next reader.
-
-Non-unix gets a no-op guard, mirroring the existing `#[cfg(not(unix))]` arms and their
-standing caveat that no CI job compiles them.
 
 ## Testing
 
@@ -189,6 +210,33 @@ concurrent host-key pins.
 - `--check` acquires no provisioning lock, and the provisioning lock is released before
   the interactive shell call `FakeRunner` records.
 - A guard dropped while held releases the lock, so a second acquire succeeds.
+- Contention reports itself exactly once, and an uncontended acquire reports nothing —
+  the callback fires only on the `WouldBlock` path.
+
+## Prior art: what was taken from cargo, and what was not
+
+Cargo solves this exact problem, and its solution was examined before this one was
+written.
+
+Its lock is **not reusable as a dependency**. It lives in `src/cargo/util/flock.rs`
+inside the `cargo` crate itself rather than in `cargo-util`, the crate that exists to
+publish cargo's reusable pieces. Taking a file lock from there would mean depending on
+the resolver, the registry client and the build system, against modules carrying no API
+stability promise. The licence would permit vendoring the file; the size and the churn
+argue against it.
+
+What cargo actually revealed is that **cargo no longer implements locking either** — it
+calls `std::fs::File::try_lock` and `File::lock`, having migrated off `fs2` and `fs4`.
+Borrowing cargo's technology therefore means using the standard library it uses, which is
+how this design ends up with no dependency at all.
+
+Two of its behaviours are taken directly: the try-then-report-then-block sequence, and
+treating a filesystem that cannot lock as success. Both are described above.
+
+Its `Filesystem` abstraction is deliberately not taken. That type guards a whole directory
+with shared and exclusive modes and reaches into `GlobalContext` and `Shell` to print its
+status. riabuild needs one exclusive lock on one path and delivers its message by
+callback. The behaviours port; the abstraction does not.
 
 ## Out of scope
 
