@@ -38,10 +38,26 @@ pub(super) async fn connect_and_setup(
         .member
         .clone()
         .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
-    let version = ctx.org()?.latest_cli_version.clone();
+    // Never `ctx.org()?.latest_cli_version` on its own: that is how a laptop
+    // ahead of the org pin ends up driving a server running older code than
+    // itself. `version_for_server` owns the choice and says why.
+    let version = install::version_for_server(ctx)?;
 
     ctx.ui
         .heading(&format!("Connecting to {}", remote.target()));
+    // Said out loud whenever the two halves differ, which after
+    // `version_for_server` means only a local build — the one skew it cannot
+    // remove, since `9999.0.0-dev` names no release to download. Nothing in
+    // the terminal used to report the server's version at all, so a laptop
+    // provisioning a server with older code looked exactly like the server
+    // having a bug of its own, and cost an afternoon of reading release tags
+    // to tell apart.
+    if version != ctx.cli_version {
+        ctx.ui.note(&format!(
+            "This riabuild is {}; {} will run {version}, the newest release riabuild-web offers.",
+            ctx.cli_version, remote.name
+        ));
+    }
     // Before the first `ssh`, not lazily at the one that happens to prompt:
     // `SSH_ASKPASS` is handed to every connection below, and a path that
     // names nothing is one `ssh` answers a password prompt with silence.

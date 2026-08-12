@@ -1119,6 +1119,7 @@ dependencies = [
  "riabuild-tasks",
  "riabuild-theme",
  "riabuild-ui",
+ "riabuild-version",
  "serde",
  "serde_json",
  "tar",

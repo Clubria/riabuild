@@ -92,6 +92,33 @@ pub fn at_least(text: &str, minimum: &str) -> bool {
     }
 }
 
+/// Does `version` name a riabuild release — something that could actually be
+/// downloaded?
+///
+/// Every riabuild release is a plain dotted-numeric tag, and the release
+/// pipeline enforces exactly that: `release:publishCliVersion` rejects
+/// anything that does not match `^\d+(\.\d+)*$` before it will announce it. So
+/// a version carrying any other character is one no `releases/download/v…` URL
+/// exists for.
+///
+/// The build with no tag is the case this is for. `VERSION` falls back to
+/// `9999.0.0-dev`, which sits *above* every real date — deliberately, so a
+/// local build is never replaced by a published one — and that makes it the
+/// newest version any comparison here can see. Anything choosing "the newest
+/// riabuild" therefore has to ask this first, or it picks a version that has
+/// never been published and cannot be fetched.
+///
+/// Written against the shape rather than against the `9999.0.0-dev` spelling:
+/// what disqualifies it is being unpublishable, not being that exact string,
+/// and a sentinel someone renames later is still not a release.
+pub fn is_release(version: &str) -> bool {
+    let version = version.trim();
+    !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Exact equality on the numeric components, for pinned toolchains.
 pub fn same(left: &str, right: &str) -> bool {
     match (parse(left), parse(right)) {
@@ -169,6 +196,31 @@ mod tests {
         // refused by /api/v1 with `cli_too_old`.
         assert!(at_least("9999.0.0-dev", "2026.08.04"));
         assert!(!at_least("2026.08.04", "9999.0.0-dev"));
+    }
+
+    #[test]
+    fn the_development_sentinel_is_not_a_release() {
+        // The pair that matters together: it outranks every real date (above)
+        // *and* nothing published is named after it. Something choosing the
+        // newest riabuild to put on a server would otherwise pick a version
+        // GitHub has never heard of.
+        assert!(!is_release("9999.0.0-dev"));
+        assert!(is_release("2026.08.12"));
+        assert!(is_release("2026.08.12.1"));
+    }
+
+    #[test]
+    fn a_release_is_dotted_numeric_and_nothing_else() {
+        // Exactly `release:publishCliVersion`'s own rule — the pipeline will
+        // not announce a version this would reject, so these two cannot drift
+        // into disagreeing about what a release is called.
+        assert!(is_release("2026"));
+        assert!(!is_release("v2026.08.12"));
+        assert!(!is_release("2026.08.12-rc1"));
+        assert!(!is_release("2026..12"));
+        assert!(!is_release("2026.08.12."));
+        assert!(!is_release(""));
+        assert!(!is_release("   "));
     }
 
     #[test]
