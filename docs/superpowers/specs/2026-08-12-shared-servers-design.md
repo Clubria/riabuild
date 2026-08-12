@@ -250,13 +250,15 @@ with the name and address in `meta`). Handing every developer a new machine to r
 
 ## Layout
 
+Paths are as of the cargo workspace split (#55): `riabuild-cli/crates/<crate>/src/`.
+
 | File | What |
 |---|---|
-| `riabuild-cli/src/api/remotes.rs` | the fetch, the `SharedServer` type, and its validation |
-| `riabuild-cli/src/remote/shared.rs` | `fetch_or_warn`, and reconciling a fetch into the store |
-| `riabuild-cli/src/remote/store.rs` | `shared_id`, `Origin`, `display_name`, the two-pass lookup |
-| `riabuild-cli/src/remote/render.rs` | shared rows, and the forget hint's preference |
-| `riabuild-cli/src/remote/forget.rs` | `retire_identity`, extracted; forgetting a shared record |
+| `crates/api/src/remotes.rs` | the fetch, the `SharedServer` type, and its validation |
+| `crates/remote/src/shared.rs` | `fetch_or_warn`, and reconciling a fetch into the store |
+| `crates/remote/src/store.rs` | `shared_id`, `Origin`, `display_name`, the two-pass lookup |
+| `crates/remote/src/render.rs` | shared rows, and the forget hint's preference |
+| `crates/remote/src/forget.rs` | `retire_identity`, extracted; forgetting a shared record |
 | `riabuild-web/convex/schema.ts` | `sharedServers` |
 | `riabuild-web/convex/sharedServers.ts` | list, add, update, remove, and the internal query for the endpoint |
 | `riabuild-web/convex/http.ts` | `GET /api/v1/remotes/shared` |
