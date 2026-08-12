@@ -75,6 +75,23 @@ not by our code.
 **Anything that changes access writes an `auditLog` entry.** Role promotion, suspension,
 session revocation.
 
+**Changing `DEFAULT_CLAUDE_SETTINGS` reaches nobody on its own.** `loadConfig` serves it
+only to a deployment with *no* `orgConfig` row, and a row appears the first time anyone
+saves org config — including the release workflow publishing a CLI version. On every
+deployment past that moment the stored row wins forever, so a new key ships to fresh
+deployments and to nowhere else. This has already stranded developers once: `theme`,
+`permissions.defaultMode` and `skipDangerousModePermissionPrompt` were added together and
+never reached a laptop, and Claude Code started in the default permission mode with
+nothing anywhere reporting a problem. Adding a key is therefore two steps — edit the
+constant, then run the backfill:
+
+```sh
+npx convex run org:backfillClaudeDefaults --prod
+```
+
+It is additive only and safe to re-run: a key the org already answered is left alone,
+whatever its value.
+
 **The server ships data, never logic.** No endpoint returns anything the CLI will
 execute. The Claude settings may name a program riabuild installs from its own binary —
 `statusLine` names `node ~/.riabuild/claude-statusline.js` — but never carry the program.

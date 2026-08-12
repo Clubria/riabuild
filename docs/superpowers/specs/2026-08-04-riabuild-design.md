@@ -299,6 +299,7 @@ names a registered task.
 | 9 | `env_local` | 1, 3, 5 | `.env.local` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. |
 | 10 | `claude_trust` | 5, 7 | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
 | 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
+| 12 | `claude_onboarding` | 7 | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Depends on 7 alone: unlike trust, nothing here needs a checkout. |
 
 > **Superseded for Claude Code.** This document's single-profile model — one
 > `~/.riabuild/claude/<uuid>/` reached by a `c` launcher — was replaced by an ordered list
@@ -374,6 +375,18 @@ Serving the script body instead would be a one-key remote code execution channel
 task manifest this design already rejected, wearing a different name. `node` resolves
 because `path_with_riabuild` puts riabuild's Node and `~/.riabuild/bin` on `PATH`
 together, so the interpreter is present wherever the account launchers are.
+
+**12 — `claude_onboarding`.** The second piece of Claude Code state that is not settings
+data. Signing an account in does not complete Claude Code's first-run setup: `claude auth
+login` writes the credentials and leaves `hasCompletedOnboarding` unset, and Claude Code
+gates the whole flow on that one key in `.claude.json`. So an account riabuild created,
+signed in, and trusted still opened a theme picker on first launch and then asked the
+developer to log in — to the account they had just logged into, because the login step is
+offered whenever OAuth is *available* rather than when the account is signed out. The task
+writes that one boolean into every riabuild-owned account, through the same
+read-modify-write as `claude_trust`. It writes no preferences: the theme and the
+permission mode are org policy and arrive through the settings file, and answering them
+here would put riabuild's answer where the org's cannot reach.
 
 ### Startup update check
 

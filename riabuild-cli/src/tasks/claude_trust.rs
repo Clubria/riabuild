@@ -17,13 +17,14 @@
 //! constantly, so each one is a read-modify-write that preserves every key it
 //! does not own, not a template.
 
+use super::claude_config::{self, Stored};
 use super::{Ctx, Status, Task, TaskId};
 use crate::paths::contract_tilde;
 use crate::ui::Failure;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct ClaudeTrust;
 
@@ -67,15 +68,11 @@ pub(crate) async fn trust_keys(dir: &Path) -> Vec<String> {
     keys
 }
 
-fn is_trusted(root: &Value, key: &str) -> bool {
+fn is_trusted(root: &Map<String, Value>, key: &str) -> bool {
     root.get("projects")
         .and_then(|projects| projects.get(key))
         .and_then(|entry| entry.get("hasTrustDialogAccepted"))
         == Some(&Value::Bool(true))
-}
-
-fn config_file(ctx: &Ctx, profile: &str) -> PathBuf {
-    ctx.paths.claude_config_file(profile)
 }
 
 #[async_trait]
@@ -111,26 +108,27 @@ impl Task for ClaudeTrust {
         let shown = contract_tilde(&dir, &ctx.paths.home());
 
         for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
-            let file = config_file(ctx, id);
-            let Ok(text) = tokio::fs::read_to_string(&file).await else {
-                return Ok(Status::needs(format!(
-                    "account {} has no Claude Code config yet",
-                    index + 1
-                )));
-            };
-            let Ok(root) = serde_json::from_str::<Value>(&text) else {
-                // Claude Code cannot start against this, so the machine is
-                // broken whatever the trust key says.
-                return Ok(Status::needs(format!(
-                    "the Claude Code config for account {} is not valid JSON",
-                    index + 1
-                )));
-            };
-            if !keys.iter().all(|key| is_trusted(&root, key)) {
-                return Ok(Status::needs(format!(
-                    "{shown} is not trusted by account {} yet",
-                    index + 1
-                )));
+            let number = index + 1;
+            match claude_config::read(ctx, id).await {
+                Stored::Missing => {
+                    return Ok(Status::needs(format!(
+                        "account {number} has no Claude Code config yet"
+                    )));
+                }
+                Stored::Unreadable => {
+                    // Claude Code cannot start against this, so the machine is
+                    // broken whatever the trust key says.
+                    return Ok(Status::needs(format!(
+                        "the Claude Code config for account {number} is not valid JSON"
+                    )));
+                }
+                Stored::Present(root) => {
+                    if !keys.iter().all(|key| is_trusted(&root, key)) {
+                        return Ok(Status::needs(format!(
+                            "{shown} is not trusted by account {number} yet"
+                        )));
+                    }
+                }
             }
         }
 
@@ -170,57 +168,25 @@ impl Task for ClaudeTrust {
 /// dialog on its first launch, which is precisely when the developer is about to
 /// use it.
 pub(crate) async fn trust_one(ctx: &mut Ctx, id: &str, keys: &[String]) -> Result<()> {
-    let file = config_file(ctx, id);
-    if let Some(parent) = file.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    claude_config::edit(ctx, id, |root| {
+        let mut projects = match root.remove("projects") {
+            Some(Value::Object(map)) => map,
+            _ => Map::new(),
+        };
 
-    let mut root = load_or_reset(ctx, &file).await?;
-    let mut projects = match root.remove("projects") {
-        Some(Value::Object(map)) => map,
-        _ => Map::new(),
-    };
-
-    for key in keys {
-        match projects.get_mut(key) {
-            Some(Value::Object(entry)) => {
-                entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
-            }
-            _ => {
-                projects.insert(key.clone(), new_project_entry());
+        for key in keys {
+            match projects.get_mut(key) {
+                Some(Value::Object(entry)) => {
+                    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+                }
+                _ => {
+                    projects.insert(key.clone(), new_project_entry());
+                }
             }
         }
-    }
-    root.insert("projects".into(), Value::Object(projects));
-
-    let text = serde_json::to_string_pretty(&Value::Object(root))?;
-    let staged = file.with_extension("json.riabuild-tmp");
-    tokio::fs::write(&staged, text).await?;
-    tokio::fs::rename(&staged, &file).await?;
-    Ok(())
-}
-
-/// The existing config, or a fresh one if there is nothing usable there.
-///
-/// A config that does not parse is moved aside rather than merged into or
-/// silently overwritten: it is the developer's session history and MCP servers,
-/// and a copy on disk is what makes the loss recoverable.
-async fn load_or_reset(ctx: &mut Ctx, file: &Path) -> Result<Map<String, Value>> {
-    let Ok(text) = tokio::fs::read_to_string(file).await else {
-        return Ok(Map::new());
-    };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(map)) => Ok(map),
-        _ => {
-            let aside = file.with_extension("json.unreadable");
-            tokio::fs::rename(file, &aside).await?;
-            ctx.note(format!(
-                "The Claude Code profile config was unreadable; the old file is at {}",
-                contract_tilde(&aside, &ctx.paths.home())
-            ));
-            Ok(Map::new())
-        }
-    }
+        root.insert("projects".into(), Value::Object(projects));
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -229,6 +195,7 @@ mod tests {
     use crate::accounts::new_id;
     use crate::runner::FakeRunner;
     use crate::testing::{ctx_with, write_file};
+    use claude_config::config_file;
     use std::path::PathBuf;
 
     /// A ctx with two accounts and a real checkout directory on disk.
