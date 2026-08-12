@@ -187,13 +187,21 @@ fn browser_for(ctx: &Ctx, env: &[(String, String)], inherited: Option<&str>) -> 
 /// that knows which machine the shell is being started on is the `Ctx` back in
 /// `spawn`. Dropping it would compile and read as a working banner — a
 /// developer on `build-01` would simply be told they are on their laptop.
+///
+/// It ends with a newline, and that is the blank line between the banner and
+/// the first prompt. Every printer of this text — each shell's
+/// `banner_command`, and `Ui::info` for a shell riabuild generates nothing for
+/// — adds exactly one newline of its own, so the gap has to come from the
+/// string rather than from the four places that print it. Without it the
+/// banner and the prompt are one paragraph, and the sentence telling the
+/// developer how to leave reads as part of the line they are about to type on.
 pub fn prelude(
     accounts: &[crate::accounts::status::Account],
     theme: Theme,
     server: Option<&str>,
 ) -> String {
     format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n",
         crate::accounts::render::accounts_box(accounts, theme),
         banner(theme, server)
     )
@@ -453,6 +461,27 @@ mod tests {
         let banner_line = text.find("Clubria environment active").unwrap();
         // The banner says how to leave, so it reads last, closest to the prompt.
         assert!(box_line < banner_line, "{text}");
+    }
+
+    #[test]
+    fn the_prelude_ends_with_the_blank_line_the_prompt_needs() {
+        let text = prelude(&one_account(), Theme::plain(), None);
+
+        // Every printer of this string adds exactly one newline of its own —
+        // bash's `printf '%s\n'`, zsh's `print -r --`, fish's `echo`, and
+        // `Ui::info` for a shell riabuild generates no rcfile for — so the gap
+        // between the banner and the first prompt has to be here rather than in
+        // the four places that print it. Without it the sentence telling the
+        // developer how to leave reads as part of the line they type on.
+        assert!(
+            text.ends_with(&format!("{}\n", banner(Theme::plain(), None))),
+            "the banner, then exactly one newline: {text:?}"
+        );
+        assert!(
+            !text.ends_with("\n\n"),
+            "one newline: the printer supplies the other, and two here is a \
+             wasted line in every session: {text:?}"
+        );
     }
 
     #[test]

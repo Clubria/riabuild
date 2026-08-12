@@ -1,4 +1,12 @@
 //! Opening the environment on a server: mosh when it can, ssh when it cannot.
+//!
+//! Both handoffs are spaced by `Ui::blank`, and the spacing is this side's job
+//! rather than the server's. `ssh` prints `Connection to … closed.` the instant
+//! the remote command ends and `mosh` prints `[mosh is exiting.]` when it lets
+//! the terminal go, both without a blank line of their own — so a laptop that
+//! printed nothing wedges those between its own lines, and a server that
+//! printed one of its own puts it at the top of a fresh mosh screen where
+//! there is nothing above it to separate from.
 
 use super::{Remote, askpass, identity};
 use anyhow::Result;
@@ -33,10 +41,17 @@ const MOSH_NO_SESSION: i32 = 5;
 /// would look like a success and the flow would open a shell on a broken box.
 /// mosh earns its place for the interactive shell, which is the only part that
 /// benefits from surviving sleep and roaming.
+///
+/// Nothing is printed *before* this one: the caller's `Checking <server>`
+/// heading already opens with a blank line, and the run on the far side opens
+/// with a banner of its own. The blank line after is the one there is nobody
+/// else to print — `ssh` ends the session with `Connection to … closed.` and
+/// riabuild's next line would otherwise sit directly under it.
 pub async fn run_setup(
     remote: &Remote,
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
+    ui: &Ui,
     command: &str,
 ) -> Result<i32> {
     let mut args = vec!["-t".to_string()];
@@ -44,9 +59,11 @@ pub async fn run_setup(
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    runner
+    let code = runner
         .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
-        .await
+        .await;
+    ui.blank();
+    code
 }
 
 pub async fn open(
@@ -77,6 +94,12 @@ pub async fn open(
         // this environment — so a server reached by password is reached by the
         // saved one here too, rather than prompting where mosh has already
         // taken over the terminal.
+        //
+        // The blank line is the last thing riabuild prints before the session
+        // and the only thing left between the run and `[mosh is exiting.]`
+        // once mosh gives the terminal back. The session itself opens with
+        // none of its own, so this is the whole gap in both directions.
+        ui.blank();
         let code = runner
             .run_interactive("mosh", &refs, &askpass::run_options(remote, paths))
             .await?;
@@ -106,6 +129,9 @@ pub async fn open(
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The same gap mosh gets above, and here it separates the session from the
+    // note or warning immediately in front of it as well.
+    ui.blank();
     runner
         .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
         .await
@@ -218,6 +244,58 @@ mod tests {
         );
     }
 
+    /// One blank line in front of the session, whichever way in it takes.
+    ///
+    /// Both are asserted together because the ssh fallback is the branch that
+    /// grows things in front of it — a warning that mosh could not connect, a
+    /// note that the server has no `mosh-server` — and it is the branch where
+    /// a gap printed once at the top of `open` would end up on the wrong side
+    /// of them.
+    #[tokio::test]
+    async fn one_blank_line_separates_the_run_from_the_session() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+
+        let with_mosh = Arc::new(
+            FakeRunner::new()
+                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
+                .with("mosh", 0, "", ""),
+        );
+        let ui = Ui::new(false);
+        open(&remote(), &paths, with_mosh, &ui, "riabuild shell")
+            .await
+            .expect("opens");
+        assert_eq!(ui.blanks(), 1, "mosh");
+
+        // No mosh on the laptop: a note is printed first, and the gap belongs
+        // under it rather than over it.
+        let without_mosh = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
+        let ui = Ui::new(false);
+        open(&remote(), &paths, without_mosh, &ui, "riabuild shell")
+            .await
+            .expect("falls back");
+        assert_eq!(ui.blanks(), 1, "ssh");
+    }
+
+    /// `ssh` prints `Connection to … closed.` the instant the remote command
+    /// ends, with no line of its own on either side. The line above it is the
+    /// server's — `provision` prints one at the end of a `--no-shell` run —
+    /// and this is the one below, which nothing else is in a position to
+    /// print: riabuild's next line lands directly under it otherwise.
+    #[tokio::test]
+    async fn the_setup_run_leaves_a_line_under_ssh_s_closing_message() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
+        let ui = Ui::new(false);
+
+        run_setup(&remote(), &paths, fake, &ui, "riabuild --no-shell")
+            .await
+            .expect("runs");
+
+        assert_eq!(ui.blanks(), 1);
+    }
+
     #[tokio::test]
     async fn setup_always_uses_plain_ssh_never_mosh() {
         // mosh does not propagate the remote command's exit status, so a failed
@@ -227,9 +305,15 @@ mod tests {
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
 
-        let code = run_setup(&remote(), &paths, fake.clone(), "riabuild --no-shell")
-            .await
-            .expect("runs");
+        let code = run_setup(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild --no-shell",
+        )
+        .await
+        .expect("runs");
         assert_eq!(code, 0);
         assert!(fake.calls().iter().all(|call| !call.starts_with("mosh")));
         assert!(
