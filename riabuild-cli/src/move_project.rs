@@ -89,8 +89,9 @@ pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
         .detail(format!("{error:#}"))
     })?;
 
-    ctx.config.project_path = Some(to.to_string_lossy().into_owned());
-    ctx.config.save(ctx.paths.as_ref()).await?;
+    let destination = to.to_string_lossy().into_owned();
+    ctx.update_config(|config| config.project_path = Some(destination))
+        .await?;
 
     ctx.ui.info(&format!(
         "moved {} → {}",

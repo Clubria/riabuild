@@ -147,6 +147,31 @@ session. `keychain::select_password_store` owns that choice and is the only plac
 that decides it. What the invariant was written to protect — the Infisical org
 credential — is untouched and still brokered per use.
 
+**State is read under a lock, and written by rename.** `config.json`, `state.json` and
+`remotes.json` change through `update`, never a `save` — there is no `save`, and adding one
+back is how the bug returns. `update` takes `~/.riabuild/.state.lock`, reads what is on
+disk *now*, applies the closure, and lands the result by `rename` from a temporary beside
+it. The read is inside the lock because riabuild can be running in two terminal windows:
+loading at process start and writing back at save time means the later writer wins with a
+snapshot from whenever it began, which drops a Claude account from the registry while its
+directory stays on disk — and since position *is* the account number, adopting that orphan
+later changes which account `claude-2` opens. `Ctx.config` and `Ctx.state` are read-only
+snapshots for the run; `ctx.update_config` and `ctx.update_state` refresh them from what
+actually landed. A test that seeds them in memory alone is seeding a fiction, and will see
+it discarded on the first write.
+
+`engine::run_all` additionally holds `~/.riabuild/.provision.lock`, so two runs do not
+install one toolchain twice. It is taken *after* `update::upgrade_and_reexec`, because a
+`flock` survives `exec`, and dropped *before* the shell handoff, which awaits the
+developer's terminal for hours. `--check` takes neither, and both are namespaced per
+developer rather than per machine — a box-wide lock would let one developer on a server
+block another under the Unix account they share.
+
+Both are `std::fs::File::try_lock`, then a reported wait, then a blocking `lock()` on the
+blocking pool — cargo's sequence, including its rule that a filesystem which cannot lock
+is treated as success rather than a reason to refuse to provision. Design:
+`../docs/superpowers/specs/2026-08-12-concurrent-runs-design.md`.
+
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
 `paths.rs`, `keychain/`, `tools.rs`, `download/` and `update.rs` are the only files
 that may know which one they are running on. A `cfg!(target_os)` or a

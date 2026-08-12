@@ -103,7 +103,7 @@ pub(super) async fn connect_and_setup(
         // saved server named build-01" — and that key line, this laptop's
         // host-key pin, and its key pair are removable by hand only. A record
         // for a server that never authorised at all is the cheaper mistake.
-        store.save(ctx.paths.as_ref()).await?;
+        store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
         authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
     }
 
@@ -129,7 +129,7 @@ pub(super) async fn connect_and_setup(
     // the server, and saving here unconditionally is what made a read-only
     // probe show up in `remote list` as a server the developer had set up.
     if !cli.check {
-        store.save(ctx.paths.as_ref()).await?;
+        store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
     }
     let prefix = env_prefix(&home, &member.member_id, &remote.name);
     let prefix_refs: Vec<(&str, &str)> = prefix

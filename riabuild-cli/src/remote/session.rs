@@ -231,7 +231,7 @@ pub async fn ensure(
                 saved.session_expires_at = crate::config::now_millis() + SESSION_TTL_MS;
                 saved.session_id = session_id;
             }
-            store.save(paths).await?;
+            super::store::persist_one(paths, store, &remote.name).await?;
             token
         }
     };

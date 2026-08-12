@@ -46,8 +46,25 @@ impl State {
         state
     }
 
-    pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
-        write_json(&paths.state_file(), self).await
+    /// Acquires the lock, reads what is on disk *now*, applies `mutate`, and
+    /// writes the result atomically.
+    ///
+    /// The read is inside the lock on purpose. Loading at process start and
+    /// writing back much later is what let two riabuilds clobber each other:
+    /// the later writer won with a snapshot from whenever it began. With the
+    /// read here there is no stale snapshot, and so nothing to merge.
+    ///
+    /// There is deliberately no `save`. A method that writes without taking the
+    /// lock is one a later change reaches for, and the lost update it brings
+    /// back looks exactly like the bug this replaced.
+    pub async fn update(paths: &dyn Paths, mutate: impl FnOnce(&mut Self)) -> Result<Self> {
+        // Contention here is milliseconds, so a wait is not worth a line on the
+        // developer's terminal.
+        let _lock = crate::filelock::FileLock::acquire(&paths.state_lock_file(), || {}).await?;
+        let mut state = Self::load(paths).await;
+        mutate(&mut state);
+        write_json(&paths.state_file(), &state).await?;
+        Ok(state)
     }
 
     pub fn mark_satisfied(&mut self, id: &str, version: u32, reason: &str) {
@@ -118,8 +135,22 @@ impl UserConfig {
         config
     }
 
-    pub async fn save(&self, paths: &dyn Paths) -> Result<()> {
-        write_json(&paths.config_file(), self).await
+    /// Acquires the lock, reads what is on disk *now*, applies `mutate`, and
+    /// writes the result atomically. See `State::update` for why the read is
+    /// inside the lock, and why there is no `save`.
+    ///
+    /// This one matters more than `State`'s. State is a cache, and a lost record
+    /// costs one redundant `check()`. `config.json` is where the checkout path,
+    /// the pinned versions and the ordered account list live — a lost update
+    /// there drops a Claude account from the registry while its directory stays
+    /// on disk, and because position *is* the account number, adopting that
+    /// orphan later changes which account `claude-2` opens.
+    pub async fn update(paths: &dyn Paths, mutate: impl FnOnce(&mut Self)) -> Result<Self> {
+        let _lock = crate::filelock::FileLock::acquire(&paths.state_lock_file(), || {}).await?;
+        let mut config = Self::load(paths).await;
+        mutate(&mut config);
+        write_json(&paths.config_file(), &config).await?;
+        Ok(config)
     }
 
     /// Folds the single profile of an older riabuild into the account list.
@@ -138,16 +169,66 @@ impl UserConfig {
 }
 
 pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    write_atomic(path, format!("{text}\n").as_bytes()).await
+}
+
+/// Writes beside the target and renames over it, so a reader sees the whole old
+/// file or the whole new one and never the gap between.
+///
+/// `tokio::fs::write` truncates and then writes, and an interrupt inside that
+/// window leaves a truncated file. For `state.json` that is harmless — a cache
+/// that will not parse means "check everything again". For `config.json` it is
+/// not: `UserConfig::load` answers an unparseable file with `Default`, which
+/// silently forgets the checkout, the pinned versions, and every Claude
+/// account. Same reasoning as `archive/staging.rs`, and the same requirement
+/// that the temporary share a directory with its target so the rename is atomic
+/// rather than a copy.
+pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(value)?;
-    tokio::fs::write(path, format!("{text}\n"))
+
+    let temp = temp_beside(path);
+    let written = async {
+        let mut file = tokio::fs::File::create(&temp).await?;
+        file.write_all(bytes).await?;
+        // Durable before the rename, so a power loss cannot leave the new name
+        // pointing at blocks that were never written.
+        file.sync_all().await
+    }
+    .await;
+
+    if let Err(error) = written {
+        // Best effort: the error being returned says more than this could.
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error).with_context(|| format!("could not write {}", temp.display()));
+    }
+
+    tokio::fs::rename(&temp, path)
         .await
-        .with_context(|| format!("could not write {}", path.display()))?;
+        .with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
+}
+
+/// `…/.state.json.4171-3.tmp`, in the target's own directory.
+///
+/// The counter is not decoration, for the same reason `archive/staging.rs`
+/// carries one: keyed on the pid alone, two writes to one path from a single
+/// process would compute the same temporary and unpack over each other.
+fn temp_beside(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}-{call}.tmp", std::process::id()))
 }
 
 pub fn now_secs() -> u64 {
@@ -181,14 +262,162 @@ mod tests {
     use crate::paths::RealPaths;
     use tempfile::TempDir;
 
+    /// Two `riabuild claude new` runs in two terminal windows.
+    ///
+    /// Before the lock, each run loaded `config.json` at startup and wrote its
+    /// whole snapshot back later, so the later writer won with a list that
+    /// never contained the earlier writer's account. The UUID vanished from the
+    /// registry while its directory stayed on disk — and because position *is*
+    /// the account number, adopting that orphan on a later run changes which
+    /// account `claude-2` opens.
+    #[tokio::test]
+    async fn concurrent_account_additions_do_not_lose_an_account() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("mkdir");
+
+        let mut writers = Vec::new();
+        for n in 0..8 {
+            let paths = RealPaths::rooted_at(home.path());
+            writers.push(tokio::spawn(async move {
+                UserConfig::update(&paths, |config| {
+                    config.claude_accounts.push(format!("account-{n}"));
+                })
+                .await
+                .expect("update");
+            }));
+        }
+        for writer in writers {
+            writer.await.expect("join");
+        }
+
+        let mut found = UserConfig::load(&paths).await.claude_accounts;
+        found.sort();
+        let expected: Vec<String> = (0..8).map(|n| format!("account-{n}")).collect();
+        assert_eq!(found, expected, "an account was lost between two windows");
+    }
+
+    #[tokio::test]
+    async fn concurrent_state_updates_do_not_lose_each_other() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("mkdir");
+
+        let mut writers = Vec::new();
+        for n in 0..8 {
+            let paths = RealPaths::rooted_at(home.path());
+            writers.push(tokio::spawn(async move {
+                State::update(&paths, |state| {
+                    state.mark_satisfied(&format!("task_{n}"), 1, "never_run");
+                })
+                .await
+                .expect("update");
+            }));
+        }
+        for writer in writers {
+            writer.await.expect("join");
+        }
+
+        let tasks = State::load(&paths).await.tasks;
+        assert_eq!(
+            tasks.len(),
+            8,
+            "a task record was lost; kept {:?}",
+            tasks.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_returns_exactly_what_it_wrote() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+
+        let written = UserConfig::update(&paths, |config| {
+            config.project_path = Some("/srv/checkout".into());
+        })
+        .await
+        .expect("update");
+
+        assert_eq!(written.project_path.as_deref(), Some("/srv/checkout"));
+        assert_eq!(
+            UserConfig::load(&paths).await.project_path.as_deref(),
+            Some("/srv/checkout"),
+            "what was handed back must be what landed on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_leaves_no_temporary_behind() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("state.json");
+
+        write_json(&path, &State::default()).await.expect("write");
+
+        let mut entries = tokio::fs::read_dir(home.path()).await.expect("read_dir");
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(
+            names,
+            vec!["state.json".to_string()],
+            "the temporary must be renamed away, not left beside the target"
+        );
+    }
+
+    /// The torn-read regression. With `fs::write` this fails: it truncates
+    /// before it writes, and `load` answers a truncated file with `Default`.
+    #[tokio::test]
+    async fn a_reader_never_observes_a_half_written_file() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("mkdir");
+
+        let mut full = State::default();
+        for n in 0..200 {
+            full.mark_satisfied(&format!("task_{n}"), 1, "never_run");
+        }
+        write_json(&paths.state_file(), &full).await.expect("seed");
+
+        let writer = {
+            let paths = RealPaths::rooted_at(home.path());
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    write_json(&paths.state_file(), &full).await.expect("write");
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        for _ in 0..40 {
+            let seen = State::load(&paths).await;
+            assert_eq!(
+                seen.tasks.len(),
+                200,
+                "a reader saw a file that was neither the old one nor the new one"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        writer.await.expect("join");
+    }
+
     #[tokio::test]
     async fn round_trips_state() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
 
-        let mut state = State::default();
-        state.mark_satisfied("login", 1, "never_run");
-        state.save(&paths).await.unwrap();
+        State::update(&paths, |state| {
+            state.mark_satisfied("login", 1, "never_run")
+        })
+        .await
+        .unwrap();
 
         let loaded = State::load(&paths).await;
         assert_eq!(loaded.tasks["login"].version, 1);
@@ -252,8 +481,9 @@ mod tests {
         .await
         .expect("write state");
 
-        let state = State::load(&paths).await;
-        state.save(&paths).await.expect("save state");
+        // `update` loads under the lock, which is where `forget_retired` runs,
+        // so an empty closure is exactly the "next save" this is about.
+        State::update(&paths, |_| {}).await.expect("save state");
 
         let written = tokio::fs::read_to_string(paths.state_file())
             .await
@@ -268,12 +498,12 @@ mod tests {
     async fn round_trips_user_config() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
-        let config = UserConfig {
-            project_path: Some("/Users/ada/code/hub".into()),
-            node_version: Some("22.23.1".into()),
-            ..Default::default()
-        };
-        config.save(&paths).await.unwrap();
+        UserConfig::update(&paths, |config| {
+            config.project_path = Some("/Users/ada/code/hub".into());
+            config.node_version = Some("22.23.1".into());
+        })
+        .await
+        .unwrap();
 
         let loaded = UserConfig::load(&paths).await;
         assert_eq!(loaded.project_path.as_deref(), Some("/Users/ada/code/hub"));
@@ -332,12 +562,12 @@ mod tests {
     async fn saving_drops_the_legacy_profile_from_the_file() {
         let home = TempDir::new().unwrap();
         let paths = RealPaths::rooted_at(home.path());
-        let config = UserConfig {
-            claude_accounts: vec!["11111111-2222-4333-8444-555555555555".into()],
-            claude_profile: Some("11111111-2222-4333-8444-555555555555".into()),
-            ..Default::default()
-        };
-        config.save(&paths).await.unwrap();
+        UserConfig::update(&paths, |config| {
+            config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
+            config.claude_profile = Some("11111111-2222-4333-8444-555555555555".into());
+        })
+        .await
+        .unwrap();
 
         let text = tokio::fs::read_to_string(paths.config_file())
             .await

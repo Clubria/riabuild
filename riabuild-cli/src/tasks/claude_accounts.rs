@@ -179,11 +179,11 @@ impl Task for ClaudeAccounts {
             tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&id)).await?;
             kept.push(id);
         }
-        ctx.config.claude_accounts = kept;
         // Saved before the orphan is reported: dropping accounts whose
         // directories vanished is real progress, and losing it would make the
         // next run repeat the same work to reach the same error.
-        ctx.config.save(ctx.paths.as_ref()).await?;
+        ctx.update_config(|config| config.claude_accounts = kept)
+            .await?;
 
         if let Some(found) = blocked {
             let dir = ctx.paths.claude_profile_dir(&found);
@@ -382,7 +382,13 @@ mod tests {
     /// `ctx_with` and assert the task asks to install.
     async fn ctx_with_claude(runner: FakeRunner) -> (Ctx, tempfile::TempDir) {
         let (mut ctx, home) = ctx_with(runner).await;
-        ctx.config.node_version = Some(NODE.into());
+        // Written to disk, not just into `ctx.config`: `apply` updates the
+        // config under the lock, which reloads, and a pin that was never on
+        // disk would be discarded there — leaving `ctx.claude()` as the bare
+        // name and every later assertion reading "Claude Code is not installed".
+        ctx.update_config(|config| config.node_version = Some(NODE.into()))
+            .await
+            .unwrap();
         write_file(Path::new(&ctx.claude()), "#!/bin/sh\n").await;
         (ctx, home)
     }
@@ -394,7 +400,10 @@ mod tests {
         tokio::fs::create_dir_all(ctx.paths.claude_profile_dir(&id))
             .await
             .unwrap();
-        ctx.config.claude_accounts = vec![id.clone()];
+        let registered = vec![id.clone()];
+        ctx.update_config(|config| config.claude_accounts = registered)
+            .await
+            .unwrap();
         (ctx, home, id)
     }
 

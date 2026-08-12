@@ -80,8 +80,9 @@ impl Task for OrgSettings {
         }
         tokio::fs::write(&file, serde_json::to_string_pretty(&remote.settings)?).await?;
 
-        ctx.config.org_settings_updated_at = Some(remote.updated_at);
-        ctx.config.save(ctx.paths.as_ref()).await?;
+        let updated_at = remote.updated_at;
+        ctx.update_config(|config| config.org_settings_updated_at = Some(updated_at))
+            .await?;
         Ok(())
     }
 }

@@ -128,8 +128,7 @@ async fn forget_with(
         Err(error) => return Err(error.into()),
     }
 
-    store.remotes.retain(|r| r.name != name);
-    store.save(paths).await?;
+    super::store::forget_one(paths, store, name).await?;
 
     ui.note(&format!("Forgot {name}."));
     Ok(())

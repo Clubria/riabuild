@@ -124,6 +124,24 @@ impl Ctx {
         self.notes.push(note.into());
     }
 
+    /// Applies `mutate` to the config on disk under the lock, and refreshes this
+    /// run's copy from what actually landed.
+    ///
+    /// `ctx.config` is a read-only snapshot for the run, not the authority —
+    /// which is what it always was in truth. Every write goes through here so
+    /// that the read it is based on happens inside the lock.
+    pub async fn update_config(&mut self, mutate: impl FnOnce(&mut UserConfig)) -> Result<()> {
+        self.config = UserConfig::update(self.paths.as_ref(), mutate).await?;
+        Ok(())
+    }
+
+    /// Applies `mutate` to the state on disk under the lock, and refreshes this
+    /// run's copy from what actually landed.
+    pub async fn update_state(&mut self, mutate: impl FnOnce(&mut State)) -> Result<()> {
+        self.state = State::update(self.paths.as_ref(), mutate).await?;
+        Ok(())
+    }
+
     /// The project directory the developer chose, if one has been chosen.
     pub fn project_dir(&self) -> Option<std::path::PathBuf> {
         self.config

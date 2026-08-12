@@ -152,14 +152,18 @@ pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> 
         }
 
         ctx.ui.applied(task.title());
-        ctx.state
-            .mark_satisfied(task.id(), task.version(), &reason.tag());
-        ctx.state.save(ctx.paths.as_ref()).await?;
+        let tag = reason.tag();
+        ctx.update_state(|state| state.mark_satisfied(task.id(), task.version(), &tag))
+            .await?;
         applied.insert(task.id());
         outcome.applied.push(task.id());
     }
 
-    ctx.state.save(ctx.paths.as_ref()).await?;
+    // Not a redundant no-op write: `State::load` drops records for tasks
+    // riabuild no longer has, and this is the write that makes that dropping
+    // stick. `a_dropped_record_does_not_come_back_on_the_next_save` in
+    // `config.rs` is the test that fails if it goes.
+    ctx.update_state(|_| {}).await?;
     Ok(outcome)
 }
 
@@ -335,8 +339,15 @@ mod tests {
     #[tokio::test]
     async fn a_dependency_that_ran_forces_its_dependents_to_rerun() {
         let (mut ctx, _home) = test_ctx().await;
-        ctx.state.mark_satisfied("a", 1, "never_run");
-        ctx.state.mark_satisfied("b", 1, "never_run");
+        // Seeded through the real API rather than into `ctx.state` alone: the
+        // engine reloads under the lock after every task, so a record that was
+        // never on disk is correctly gone by the time `b` is considered.
+        ctx.update_state(|state| {
+            state.mark_satisfied("a", 1, "never_run");
+            state.mark_satisfied("b", 1, "never_run");
+        })
+        .await
+        .unwrap();
         let tasks: Vec<Box<dyn Task>> = vec![
             Box::new(Fake::new(
                 "a",
