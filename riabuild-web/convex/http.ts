@@ -420,6 +420,36 @@ http.route({
 });
 
 /* -------------------------------------------------------------------------- */
+/* GET /api/v1/remotes/shared — the addresses of the team's servers            */
+/* -------------------------------------------------------------------------- */
+
+http.route({
+  path: "/api/v1/remotes/shared",
+  method: "GET",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const config = await loadConfig(ctx);
+      enforceMinVersion(req, config);
+      const { member } = await authenticate(ctx, req);
+      // Re-verified here as everywhere: identity lives in GitHub, and someone
+      // removed from the org must stop being handed the team's machines
+      // without anyone remembering to update their Convex row.
+      await requireOrgMembership(member.githubLogin);
+
+      // A candidate gets an empty list and a 200, never a 403. `riabuild
+      // remote` is also how they reach the server they set up themselves, and
+      // refusing the whole request would take that away in order to enforce a
+      // rule about servers they were never going to see.
+      if (member.role === "candidate") {
+        return jsonResponse({ servers: [] });
+      }
+      const servers = await ctx.runQuery(internal.sharedServers.forApi, {});
+      return jsonResponse({ servers });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
 /* POST /api/v1/secrets/token — short-lived Infisical access token             */
 /* -------------------------------------------------------------------------- */
 
