@@ -202,9 +202,37 @@ echo "-- container host key: $fingerprint"
 # with no edit needed here. Falls back to a pinned, immutable version if
 # nothing can answer (no `gh`, no token, offline), which reproduces today's
 # known gap deterministically rather than failing to even start.
+#
+# Three things this line has to do that it did not:
+#
+# * Pass the token. `gh` on a fresh runner is signed in to nothing, and this
+#   repository is private, so an unauthenticated read of its releases cannot
+#   work. The token is right here — already validated against the org above.
+# * Actually tolerate a failure. `set -o pipefail` is on, so `gh` exiting 4
+#   ("please run gh auth login") took the whole script down with it, four
+#   lines below a comment promising a fallback. The `if` is what makes that
+#   fallback real, and it strips the `v` by expansion rather than with a `sed`
+#   at the end of a pipeline, so nothing depends on which member of a pipeline
+#   the exit status came from.
+# * Believe stdout only when `gh` succeeded. `--jq` prints the API's error
+#   body on failure — to *stdout*, which `2>/dev/null` does not touch — so a
+#   token that is present but rejected hands back `{ "message": "Bad
+#   credentials"… }` as the version. Guarded twice: the `if`, and a shape
+#   check, because a version this script goes on to ask a container to install
+#   is not a string to take on trust.
+#
+# None of it could show up until today: the job that runs this was skipped for
+# want of RIABUILD_E2E_GH_TOKEN, so a vacuous green tick covered all three.
 version=""
 if command -v gh >/dev/null 2>&1; then
-  version="$(gh api repos/Clubria/riabuild/releases/latest --jq .tag_name 2>/dev/null | sed 's/^v//')"
+  if tag="$(GH_TOKEN="$token" gh api repos/Clubria/riabuild/releases/latest \
+    --jq .tag_name 2>/dev/null)"; then
+    version="${tag#v}"
+  fi
+  case "$version" in
+    [0-9]*) ;;
+    *) version="" ;;
+  esac
 fi
 if [ -z "$version" ]; then
   version="2026.08.04"
