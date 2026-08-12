@@ -64,6 +64,15 @@ pub struct Tunnel {
     /// being testable without a server, which is most of why the loop below
     /// can be unit-tested at all.
     pub probe: String,
+    /// The environment every `ssh` this tunnel starts is run with — in
+    /// production `remote::askpass::ssh_env`, so a forward to a server reached
+    /// by password uses the saved one rather than prompting from a background
+    /// reconnect nobody is watching.
+    ///
+    /// Composed by the caller and carried opaquely, for the same reason as
+    /// `probe` above: the supervisor knowing what a `Remote` is would end its
+    /// being unit-testable without a server.
+    pub env: Vec<(String, String)>,
 }
 
 pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
@@ -188,6 +197,11 @@ mod tests {
             remote_socket: PathBuf::from("/run/user/1000/riabuild/channel.sock"),
             local_socket: PathBuf::from("/tmp/riabuild/agent.sock"),
             probe: "riabuild channel status".into(),
+            // Stands in for `remote::askpass::ssh_env`, which this module
+            // deliberately cannot name — the point of carrying the
+            // environment opaquely is that the supervisor stays testable
+            // without a `Remote`.
+            env: vec![("SSH_ASKPASS_REQUIRE".into(), "force".into())],
         }
     }
 

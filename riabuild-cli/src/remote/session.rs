@@ -88,7 +88,7 @@ async fn write_into_namespace(
             &refs,
             &RunOptions {
                 stdin: Some(contents),
-                ..Default::default()
+                ..super::askpass::run_options(remote, paths)
             },
         )
         .await?;

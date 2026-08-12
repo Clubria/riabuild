@@ -127,6 +127,16 @@ pub enum InternalAction {
     SeedGithub,
     /// Remove what a session that died without cleaning up left behind.
     GhSweep,
+    /// Answer an `ssh` password prompt. Run by `ssh` itself, via SSH_ASKPASS.
+    ///
+    /// `trailing_var_arg` because the one argument is `ssh`'s own prompt text
+    /// — `ada@box's password: `, or `Enter passphrase for key '…': ` — which
+    /// riabuild neither chooses nor can quote, and which clap would otherwise
+    /// try to parse as flags the moment one of them began with a dash.
+    Askpass {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
 }
 
 /// `host_key::fingerprint_of` (Task 15) only ever extracts a token starting

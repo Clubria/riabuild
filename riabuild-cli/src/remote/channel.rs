@@ -16,7 +16,7 @@ mod sockets;
 
 pub use sockets::remote_socket;
 
-use super::{Remote, identity, shell};
+use super::{Remote, askpass, identity, shell};
 use crate::channel::supervisor::{Stop, Tunnel, supervise};
 use crate::paths::Paths;
 use crate::runner::CommandRunner;
@@ -204,6 +204,7 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
             remote_socket: PathBuf::from(&plan.remote_socket),
             local_socket: local_socket.clone(),
             probe: plan.probe.clone(),
+            env: askpass::ssh_env(plan.remote, plan.paths),
         },
         Ui::new(plan.quiet),
         stop.clone(),

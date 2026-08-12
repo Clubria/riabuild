@@ -107,6 +107,20 @@ pub trait Paths: Send + Sync {
     fn known_hosts_file(&self) -> PathBuf {
         self.ssh_dir().join("known_hosts")
     }
+    /// The `SSH_ASKPASS` helper riabuild points `ssh` at, so a password for a
+    /// server is asked for once rather than at every one of the connections a
+    /// single `riabuild remote` opens. Written on every run — see
+    /// `remote::askpass::ensure_helper`.
+    fn askpass_helper(&self) -> PathBuf {
+        self.ssh_dir().join("askpass")
+    }
+    /// Where a saved SSH password lands on a machine with **no keyring at
+    /// all**. The keychain is preferred everywhere it exists; see
+    /// `keychain::select_password_store`, which owns that decision, and the
+    /// amended "No secrets in `~/.riabuild/`" note in `CLAUDE.md`.
+    fn remote_password_file(&self, hash: &str) -> PathBuf {
+        self.ssh_dir().join("passwords").join(hash)
+    }
 }
 
 pub struct RealPaths {

@@ -17,6 +17,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// exist yet.
 mod prompt;
 
+/// Reading one secret with the terminal's echo off, over `/dev/tty` rather
+/// than stdin and stdout. Its own file because it shares neither of those
+/// with `prompt` above: the caller's stdout is a pipe `ssh` reads a password
+/// from, so a prompt written there would *be* the answer.
+pub mod secret;
+
 pub struct Ui {
     /// The Clubria palette, bound to what this terminal can render. Every
     /// colour riabuild prints comes from here, so there is one place to change
@@ -46,6 +52,15 @@ pub struct Ui {
     /// subcommand could name the account in lines nobody sees and still pass.
     #[cfg(test)]
     asked: std::sync::Mutex<Vec<String>>,
+    /// Every warning actually printed.
+    ///
+    /// Recorded for the same reason as `noted`, and for one more: a warning is
+    /// what riabuild says *instead of* stopping. A step downgraded from a
+    /// failure to a warning still returns `Ok`, so without this a test could
+    /// only assert that nothing went wrong — which is equally true of a step
+    /// that silently did nothing and told the developer nothing either.
+    #[cfg(test)]
+    warned: std::sync::Mutex<Vec<String>>,
     /// Every note actually printed.
     ///
     /// Recorded for the same reason as `asked`, one step further along: a note
@@ -122,6 +137,8 @@ impl Ui {
             #[cfg(test)]
             asked: Default::default(),
             #[cfg(test)]
+            warned: Default::default(),
+            #[cfg(test)]
             noted: Default::default(),
         }
     }
@@ -136,6 +153,12 @@ impl Ui {
     #[cfg(test)]
     pub fn noted(&self) -> Vec<String> {
         self.noted.lock().unwrap().clone()
+    }
+
+    /// Every warning this `Ui` printed, in order.
+    #[cfg(test)]
+    pub fn warned(&self) -> Vec<String> {
+        self.warned.lock().unwrap().clone()
     }
 
     /// A `Ui` that answers its own questions, for tests.
@@ -282,6 +305,11 @@ impl Ui {
     }
 
     pub fn warn(&self, text: &str) {
+        // Deliberately not gated on `quiet`, and on stderr: a warning is what
+        // riabuild says in place of stopping, so it is the one line a run
+        // asked to be silent still has to produce.
+        #[cfg(test)]
+        self.warned.lock().unwrap().push(text.to_string());
         eprintln!("  {} {}", self.paint(Role::Warn, "▲"), text);
     }
 

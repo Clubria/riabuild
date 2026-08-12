@@ -15,8 +15,8 @@
 use crate::cli::Cli;
 use crate::paths::Paths;
 use crate::remote::{
-    Remote, authorise, channel, env_command, env_prefix, host_key, identity, install, resolve_home,
-    seed, session, shell, ssh_once, store,
+    Remote, askpass, authorise, channel, env_command, env_prefix, host_key, identity, install,
+    resolve_home, seed, session, shell, ssh_once, store,
 };
 use crate::runner::CommandRunner;
 use crate::tasks::Ctx;
@@ -44,6 +44,12 @@ pub(super) async fn connect_and_setup(
 
     ctx.ui
         .heading(&format!("Connecting to {}", remote.target()));
+    // Before the first `ssh`, not lazily at the one that happens to prompt:
+    // `SSH_ASKPASS` is handed to every connection below, and a path that
+    // names nothing is one `ssh` answers a password prompt with silence.
+    // Rewritten each run, so a riabuild that moved is still the one that
+    // answers.
+    askpass::ensure_helper(ctx.paths.as_ref()).await?;
     identity::ensure_key(
         &remote,
         ctx.paths.as_ref(),
@@ -909,12 +915,23 @@ mod tests {
         );
     }
 
-    /// Why the first save sits *before* `authorise` rather than after it
-    /// returns `Ok`: `ssh-copy-id` can append riabuild's key to the server's
-    /// `authorized_keys` and the sign-in probe that follows still fail, at
-    /// which point `authorise` returns `Err` — a run that modified the server
-    /// and reported failure. Saving only on success would leave that key line
-    /// with no local record naming the server it is on.
+    /// Why the first save sits *before* `authorise` rather than after the run
+    /// is safely past it.
+    ///
+    /// `ssh-copy-id` appends riabuild's key to the server's
+    /// `authorized_keys`, and everything after that point can still fail:
+    /// `resolve_home` (which is where this run stops, with no `printf %s`
+    /// stubbed), the install step, the session write. Saving later would
+    /// leave that key line on a server with no local record naming it, and
+    /// `remote forget build-01` answering "there is no saved server named
+    /// build-01".
+    ///
+    /// The failure used to be `authorise`'s own — a key copied but unable to
+    /// sign in was fatal. It is a warning now, so the run continues and dies
+    /// further along instead. That is a *different* failure at a *later*
+    /// step, and the reason for the early save is unchanged by it: what
+    /// matters is that `ssh-copy-id` ran and the run then ended badly, which
+    /// both assertions below still pin.
     #[tokio::test]
     async fn a_key_copied_onto_a_server_that_then_failed_is_still_recorded() {
         let fake = FakeRunner::new()
@@ -984,6 +1001,111 @@ mod tests {
                 .is_some(),
             "the server holds riabuild's key now; `remote forget` has to be able to \
              name it"
+        );
+    }
+
+    /// The whole point of the saved password, asserted where it is actually
+    /// at risk: not in `askpass`'s own unit tests, which prove `ssh_env`
+    /// returns three pairs, but across the real sequence of calls, where a
+    /// site that kept `RunOptions::default()` is invisible until a developer
+    /// on a password-only server is asked for it again mid-run.
+    ///
+    /// Deliberately *not* a list of the sites: it asserts over every `ssh`
+    /// the run made, so a new SSH call added later is covered the day it is
+    /// written rather than the day someone remembers to extend a list.
+    #[tokio::test]
+    async fn every_ssh_in_a_run_can_answer_a_password_prompt_without_asking_again() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // The key works, so the run goes straight past `authorise` and on
+            // through `resolve_home` and into the install step — which is
+            // where it stops, `uname -sm` naming no Rust target.
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "")
+            .containing("printf %s", 0, "/home/dev", "");
+        let (mut ctx, _home, mut store, fake) = fresh_ctx(fake).await;
+
+        let cli = Cli::parse_from([
+            "riabuild",
+            "remote",
+            "build-01",
+            "--accept-host-key",
+            GOOD_FINGERPRINT,
+        ]);
+        let _ = connect_and_setup(
+            &mut ctx,
+            &cli,
+            &mut store,
+            Some("build-01".to_string()),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await;
+
+        let expected = askpass::ssh_env(&remote(), ctx.paths.as_ref());
+        let mut checked = 0;
+        for call in fake.calls() {
+            // `ssh -o BatchMode=yes` is the one family that must *not* carry
+            // it: it asks whether the key works, and a saved password that
+            // could answer for it would report a working key on a server
+            // where there is none. See `authorise::can_sign_in`.
+            if !call.starts_with("ssh ") || call.starts_with("ssh -o BatchMode=yes") {
+                continue;
+            }
+            let env = fake.env_of(&call);
+            for (key, value) in &expected {
+                assert!(
+                    env.contains(&(key.clone(), value.clone())),
+                    "`{call}` cannot answer a password prompt: {key} missing from {env:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "this asserts nothing unless the run actually made an ssh call: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// The helper has to exist before the first connection that might need
+    /// it, not be written by whichever step first notices. `SSH_ASKPASS`
+    /// naming a path with nothing at it is how `ssh` answers a password
+    /// prompt with silence — the developer sees `Permission denied` and no
+    /// prompt at all, which is worse than the ten prompts this replaces.
+    #[tokio::test]
+    async fn the_askpass_helper_is_written_before_the_first_connection() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "");
+        let (mut ctx, _home, mut store, fake) = ready_ctx(fake).await;
+
+        let cli = Cli::parse_from(["riabuild", "--check", "remote", "build-01"]);
+        let _ = connect_and_setup(&mut ctx, &cli, &mut store, Some("build-01".into()), None).await;
+
+        assert!(
+            ctx.paths.askpass_helper().exists(),
+            "nothing would answer a password prompt on this run"
+        );
+        // …and even on `--check`, which writes nothing to the *server*. The
+        // helper is this laptop's own file, like the key pair and the
+        // known_hosts line above it.
+        assert!(
+            !fake.calls().is_empty(),
+            "only meaningful if the run got as far as connecting: {:?}",
+            fake.calls()
         );
     }
 
