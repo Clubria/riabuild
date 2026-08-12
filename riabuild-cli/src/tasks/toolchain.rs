@@ -111,6 +111,32 @@ impl Task for Toolchain {
     }
 }
 
+/// Where a version probe is run from.
+///
+/// The filesystem root, and deliberately *not* the directory riabuild itself was
+/// started in. pnpm 11 walks up from wherever it starts looking for a
+/// `package.json`, and a `packageManager` field naming a different pnpm makes it
+/// download that version and hand the command straight over to it — so `pnpm -v`
+/// answers for the **directory** rather than for the binary that was asked. A
+/// developer who runs `riabuild` from inside any other Node project would
+/// otherwise have riabuild's freshly installed pnpm report that project's pin:
+/// `check()` reports drift, `apply()` reinstalls the version it already
+/// installed, `check()` re-runs from the same directory and reports the same
+/// drift, and the run hard-errors — every time, with nothing the developer can
+/// do about it but stand somewhere else.
+///
+/// pnpm offers no way to turn this off. `manage-package-manager-versions` was a
+/// pnpm 10 setting; pnpm 11 still *sets*
+/// `npm_config_manage_package_manager_versions` for the process it hands over
+/// to, but never reads it, and neither an `.npmrc` nor `--config.` reaches it.
+/// The list of commands that skip the handover is one internal command long.
+/// Where the probe runs is the whole of the lever riabuild has.
+///
+/// The root is the only directory that can promise there is no manifest above
+/// it. Anything under `$HOME` — including `~/.riabuild` — is one stray
+/// `package.json` in a home directory away from the same bug.
+const PROBE_DIR: &str = "/";
+
 /// What the tool at `bin` answers `-v` with, `Ok(None)` when there is nothing
 /// runnable there, and an error when riabuild could not find out.
 ///
@@ -138,7 +164,14 @@ async fn reported_version(ctx: &Ctx, bin: &Path) -> Result<Option<String>> {
     }
     let output = ctx
         .runner
-        .run(&bin.to_string_lossy(), &["-v"], &RunOptions::default())
+        .run(
+            &bin.to_string_lossy(),
+            &["-v"],
+            &RunOptions {
+                cwd: Some(PROBE_DIR.into()),
+                ..RunOptions::default()
+            },
+        )
         .await?;
     Ok(output.ok().then(|| output.trimmed().to_string()))
 }
@@ -711,6 +744,196 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&node_bin).await.unwrap(),
             "the right node\n"
+        );
+    }
+
+    /// A machine riabuild has already provisioned correctly, whose `pnpm`
+    /// answers for the directory it is standing in rather than for itself.
+    ///
+    /// Not a contrivance — this is what pnpm 11 does. `switchCliVersion` reads
+    /// the nearest `package.json` at or above pnpm's working directory and,
+    /// when a `packageManager` field names another pnpm, downloads that version
+    /// and re-execs the command through it. `pnpm -v` therefore reports the
+    /// pin, not the binary.
+    ///
+    /// `FakeRunner` cannot express this: its stubs are keyed on the invocation,
+    /// and the invocation is identical whichever directory the probe runs in.
+    /// That is exactly why the bug survived a green suite.
+    struct ProvisionedMachine {
+        node: String,
+        /// The pnpm actually installed under `~/.riabuild`.
+        pnpm: String,
+        /// riabuild's own working directory — what a child inherits when the
+        /// call does not name one.
+        started_in: std::path::PathBuf,
+    }
+
+    impl ProvisionedMachine {
+        /// pnpm's own lookup: the nearest `packageManager` at or above `dir`.
+        async fn pinned_at_or_above(dir: &Path) -> Option<String> {
+            for dir in dir.ancestors() {
+                let Ok(text) = tokio::fs::read_to_string(dir.join("package.json")).await else {
+                    continue;
+                };
+                let pinned = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|json| {
+                        Some(
+                            json.get("packageManager")?
+                                .as_str()?
+                                .strip_prefix("pnpm@")?
+                                .to_string(),
+                        )
+                    });
+                if pinned.is_some() {
+                    return pinned;
+                }
+            }
+            None
+        }
+    }
+
+    #[async_trait]
+    impl crate::runner::CommandRunner for ProvisionedMachine {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<crate::runner::CommandOutput> {
+            assert_eq!(args, ["-v"], "this task only ever asks for a version");
+            let stdout = if program.ends_with("node") {
+                // Node reads no manifest and is the control in this test: it
+                // answers the same wherever it is started.
+                format!("v{}", self.node)
+            } else {
+                let dir = options
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| self.started_in.clone());
+                Self::pinned_at_or_above(&dir)
+                    .await
+                    .unwrap_or_else(|| self.pnpm.clone())
+            };
+            Ok(crate::runner::CommandOutput {
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        async fn run_bytes(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<crate::runner::BytesOutput> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn run_forking(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn spawn(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<Box<dyn crate::runner::ChildHandle>> {
+            unreachable!("this task only ever asks a binary for its version");
+        }
+        async fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task never runs anything interactively");
+        }
+        fn which(&self, _program: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// A Node project of the developer's own, pinning a pnpm that is not the
+    /// one the Clubria repo asks for.
+    async fn another_node_project(pins: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(
+            &dir.path().join("package.json"),
+            &format!(r#"{{"name":"ada-side-project","packageManager":"pnpm@{pins}"}}"#),
+        )
+        .await;
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_answers_for_the_binary_not_for_the_directory_riabuild_started_in() {
+        // Ada has her own project checked out, and it pins an older pnpm. She
+        // runs `riabuild` from inside it. Nothing under her `~/.riabuild` is
+        // wrong — and riabuild told her it was, reporting drift that `apply()`
+        // dutifully "fixed" by reinstalling the version already installed,
+        // after which `check()` ran again from the same directory, read the
+        // same pin, and failed the run. There is no number of retries that
+        // gets her out of that; the only thing that ever worked was standing
+        // somewhere else, which nothing told her.
+        let elsewhere = another_node_project("10.20.0").await;
+
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_file(
+            &ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node"),
+            "#!/bin/sh\n",
+        )
+        .await;
+        write_file(&ctx.paths.bin_dir().join("pnpm"), "#!/bin/sh\n").await;
+        ctx.runner = std::sync::Arc::new(ProvisionedMachine {
+            node: FALLBACK_NODE.to_string(),
+            pnpm: FALLBACK_PNPM.to_string(),
+            started_in: elsewhere.path().to_path_buf(),
+        });
+
+        assert_eq!(Toolchain.check(&ctx).await.unwrap(), Status::Satisfied);
+    }
+
+    #[tokio::test]
+    async fn the_shared_pnpm_tree_is_not_reinstalled_over_where_riabuild_was_started() {
+        // The other half, and the expensive one. The same probe is what
+        // `ensure_pnpm` asks before deciding whether to replace the tree under
+        // the shared `tools_root()`. Answered from the wrong directory it says
+        // "wrong version" about a tree that is perfectly right, and re-extracts
+        // 50 MB over the pnpm a colleague's `pnpm dev` is running out of — not
+        // once, but on every run any developer makes from inside a Node
+        // project of their own.
+        let elsewhere = another_node_project("10.20.0").await;
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = co_tenant_paths(server.path(), "bob-member-id");
+        let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
+        let launcher = paths.pnpm_dir(FALLBACK_PNPM).join("pnpm");
+        write_file(&node_bin, "ada's node\n").await;
+        write_file(&launcher, "ada's pnpm\n").await;
+
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+        ctx.runner = std::sync::Arc::new(ProvisionedMachine {
+            node: FALLBACK_NODE.to_string(),
+            pnpm: FALLBACK_PNPM.to_string(),
+            started_in: elsewhere.path().to_path_buf(),
+        });
+
+        apply_with(&mut ctx, &UnreachableDownloads)
+            .await
+            .expect("both trees are already the pinned versions");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&launcher).await.unwrap(),
+            "ada's pnpm\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&node_bin).await.unwrap(),
+            "ada's node\n"
         );
     }
 
