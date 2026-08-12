@@ -200,6 +200,23 @@ every gate this repository has. Where the check cannot exist in CI, put it in th
 `set` reads the token back and fails loudly rather than reporting a save that did not
 happen.
 
+**A shared server's address is never read off the disk.** `remotes.json` holds one for
+each of the team's servers, but only as a copy — the record is `Origin::Stale` until this
+run's fetch of `/api/v1/remotes/shared` describes it, and nothing that leads to a
+connection looks at a `Stale` record. `Record::fresh` is `#[serde(skip)]` precisely so
+that `false` is what a record read off the disk gets. Do not "fix" that by persisting it:
+the default being the safe one is the whole mechanism, and without it a lead's edit or a
+server they removed would go on being connected to forever.
+
+What the copy is *for* is the other half: an address is an identity — `Remote::hash` is
+taken over `user@host:port` — so when a lead edits one, the old address is what
+`forget::retire_identity` needs to revoke the session and clear the key from the machine
+being left. A record also carries the `sharedId` it is keyed by, which is the riabuild-web
+row id and the only field that survives both a rename and a re-address. The display name
+(`shared-<name>`) is what `find`, `persist_one` and `forget_one` all match on, because the
+bare name does not identify a row: a shared `gpu` and a `gpu` the developer added share
+it. Design: `../docs/superpowers/specs/2026-08-12-shared-servers-design.md`.
+
 **State is read under a lock, and written by rename.** `config.json`, `state.json` and
 `remotes.json` change through `update`, never a `save` — there is no `save`, and adding one
 back is how the bug returns. `update` takes `~/.riabuild/.state.lock`, reads what is on
@@ -290,7 +307,7 @@ crates form a straight line, each depending only on those above it:
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over the SSH reverse-forward. `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the forward up and proves it carries traffic | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
-| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show | all of the above |
+| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run | all of the above |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
