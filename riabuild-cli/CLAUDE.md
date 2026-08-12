@@ -181,6 +181,9 @@ src/
                the two platform CLIs,
                the server's file store
   update.rs    version check, re-exec  ui.rs        output and prompts
+  theme.rs     the Clubria palette,    art.rs       the riabuild mark: two
+               by role, and the                     renderings and the banner
+               depth ladder under it                laid out around them
   scope.rs     laptop vs. server, from gh_session/  where the GitHub config dir
                RIABUILD_REMOTE, and the             goes, how it is created safely
                namespace it implies: member         against a co-tenant, and how
@@ -252,6 +255,25 @@ every environment shell opens with the account box, and the org's Claude setting
 checkout's trust apply to every account, never just the first.
 
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
+
+## Colour
+
+Every colour riabuild prints comes from `theme.rs`, chosen by **role** — `Ok`, `Busy`,
+`Danger`, `Brand`, `Muted` — never by writing an escape code at the call site. A role
+renders itself at each rung of a depth ladder (24-bit → 256 → the original sixteen →
+nothing), so a terminal that cannot do truecolor still gets something deliberate, and
+`NO_COLOR` or a non-tty destination gets no escapes at all.
+
+The palette is Clubria's own, read from clubria.com: `#f74f25` is the logo mark's fill,
+with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *attributes*
+(dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
+terminal theme and muddy on another.
+
+Text printed by a generated rcfile — the shell banner, the accounts box — takes a `Theme`
+as a parameter rather than reading one, because it is rendered on this side of the
+boundary and printed on the other. Pass `ctx.ui.theme()`, not `ctx.ui.colour()`: the
+latter answers only whether colour is on, which would quietly pin that text to the
+sixteen-colour rung.
 
 ## Shell integration
 

@@ -71,7 +71,7 @@ impl Ui {
     #[cfg(not(test))]
     fn read_answer(&self, question: &str) -> Option<String> {
         println!();
-        print!("    {} ", self.paint("1", question));
+        print!("    {} ", self.paint(crate::theme::Role::Strong, question));
         let _ = std::io::stdout().flush();
 
         let mut line = String::new();

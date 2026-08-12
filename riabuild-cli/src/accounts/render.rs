@@ -1,15 +1,16 @@
 //! The account list a developer sees at every shell start.
 //!
-//! `colour` is a parameter rather than something read from `Ui`, for the same
+//! The theme is a parameter rather than something read from `Ui`, for the same
 //! reason `shell::banner` takes one: this text is printed by a generated rcfile,
-//! and the `NO_COLOR` decision has to cross that boundary as data.
+//! and the colour decision has to cross that boundary as data.
 
 use super::MAX;
 use super::status::{Account, Identity};
+use crate::theme::{Role, Theme};
 
-pub fn accounts_box(accounts: &[Account], colour: bool) -> String {
+pub fn accounts_box(accounts: &[Account], theme: Theme) -> String {
     let mut lines = vec![
-        paint("Your Claude Code accounts:", "1", colour),
+        theme.paint(Role::Strong, "Your Claude Code accounts:"),
         String::new(),
     ];
 
@@ -24,7 +25,7 @@ pub fn accounts_box(accounts: &[Account], colour: bool) -> String {
         lines.push(format!(
             "  {}. {label}{padding}   {}",
             account.number,
-            identity(&account.identity, colour)
+            identity(&account.identity, theme)
         ));
     }
 
@@ -40,7 +41,7 @@ pub fn accounts_box(accounts: &[Account], colour: bool) -> String {
             let padding = " ".repeat(width - label.chars().count());
             lines.push(format!(
                 "  {}{padding}  {command}",
-                paint(&label, "2", colour)
+                theme.paint(Role::Muted, &label)
             ));
         }
     }
@@ -57,11 +58,11 @@ fn label(account: &Account) -> String {
     }
 }
 
-fn identity(identity: &Identity, colour: bool) -> String {
+fn identity(identity: &Identity, theme: Theme) -> String {
     match identity {
         Identity::LoggedIn(email) => email.clone(),
-        Identity::LoggedOut => paint("(logged out)", "2", colour),
-        Identity::Unknown(why) => paint(&format!("(cannot tell — {why})"), "2", colour),
+        Identity::LoggedOut => theme.paint(Role::Muted, "(logged out)"),
+        Identity::Unknown(why) => theme.paint(Role::Muted, &format!("(cannot tell — {why})")),
     }
 }
 
@@ -108,17 +109,10 @@ fn hints(accounts: &[Account]) -> Vec<(String, String)> {
     hints
 }
 
-fn paint(text: &str, code: &str, colour: bool) -> String {
-    if colour {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Depth;
 
     fn account(number: usize, identity: Identity) -> Account {
         Account {
@@ -138,7 +132,7 @@ mod tests {
 
     #[test]
     fn every_account_is_listed_with_the_command_that_runs_it() {
-        let text = accounts_box(&three(), false);
+        let text = accounts_box(&three(), Theme::plain());
         assert!(text.contains("Your Claude Code accounts:"), "{text}");
         // The primary carries both names, because both work.
         assert!(
@@ -157,7 +151,7 @@ mod tests {
 
     #[test]
     fn only_commands_that_would_work_are_offered() {
-        let text = accounts_box(&three(), false);
+        let text = accounts_box(&three(), Theme::plain());
         assert!(
             text.contains("Add an account:     riabuild claude new"),
             "{text}"
@@ -186,7 +180,7 @@ mod tests {
             account(4, Identity::LoggedIn("a@example.com".into())),
             account(7, Identity::LoggedIn("b@example.com".into())),
         ];
-        let text = accounts_box(&odd, false);
+        let text = accounts_box(&odd, Theme::plain());
         assert!(text.contains("riabuild claude delete 7"), "{text}");
         assert!(text.contains("riabuild claude primary 7"), "{text}");
     }
@@ -196,7 +190,7 @@ mod tests {
         // Both refuse or do nothing with one account, and a hint that fails is
         // worse than no hint.
         let one = vec![account(1, Identity::LoggedIn("clubria@proton.me".into()))];
-        let text = accounts_box(&one, false);
+        let text = accounts_box(&one, Theme::plain());
         assert!(text.contains("riabuild claude new"), "{text}");
         assert!(!text.contains("delete"), "{text}");
         assert!(!text.contains("primary"), "{text}");
@@ -208,7 +202,7 @@ mod tests {
             account(1, Identity::LoggedIn("a@example.com".into())),
             account(2, Identity::LoggedIn("b@example.com".into())),
         ];
-        assert!(!accounts_box(&signed_in, false).contains("auth login"));
+        assert!(!accounts_box(&signed_in, Theme::plain()).contains("auth login"));
     }
 
     #[test]
@@ -216,7 +210,7 @@ mod tests {
         let full: Vec<Account> = (1..=MAX)
             .map(|number| account(number, Identity::LoggedIn(format!("{number}@example.com"))))
             .collect();
-        assert!(!accounts_box(&full, false).contains("riabuild claude new"));
+        assert!(!accounts_box(&full, Theme::plain()).contains("riabuild claude new"));
     }
 
     #[test]
@@ -225,7 +219,7 @@ mod tests {
             1,
             Identity::Unknown("Claude Code did not answer in JSON".into()),
         )];
-        let text = accounts_box(&unsure, false);
+        let text = accounts_box(&unsure, Theme::plain());
         assert!(
             text.contains("(cannot tell — Claude Code did not answer in JSON)"),
             "{text}"
@@ -237,7 +231,7 @@ mod tests {
     fn without_colour_there_are_no_escapes() {
         // This text is baked into a generated rcfile, so NO_COLOR has to be
         // decided here rather than by whatever ends up printing it.
-        assert!(!accounts_box(&three(), false).contains('\x1b'));
-        assert!(accounts_box(&three(), true).contains('\x1b'));
+        assert!(!accounts_box(&three(), Theme::plain()).contains('\x1b'));
+        assert!(accounts_box(&three(), Theme::with_depth(Depth::TrueColor)).contains('\x1b'));
     }
 }
