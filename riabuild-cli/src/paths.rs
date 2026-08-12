@@ -116,7 +116,13 @@ pub struct RealPaths {
 
 impl RealPaths {
     pub fn new() -> anyhow::Result<Self> {
-        let home = dirs::home_dir().ok_or_else(|| {
+        // `std::env::home_dir` rather than the `dirs` crate. It was deprecated
+        // for years over a Windows bug riabuild could never hit, which is why
+        // that crate existed here at all; the fix landed and it was
+        // un-deprecated in Rust 1.86, well under this crate's 2024 edition
+        // floor. On macOS and Linux it is `$HOME`, then the passwd entry —
+        // exactly what `dirs` wrapped three crates around.
+        let home = std::env::home_dir().ok_or_else(|| {
             anyhow::anyhow!("riabuild could not work out your home directory (is $HOME set?)")
         })?;
         let root = root_for(&home, std::env::var("RIABUILD_ROOT").ok().as_deref())?;

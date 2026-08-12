@@ -50,10 +50,15 @@ anyhow = "1.0"
 # trait behind `Arc<dyn …>`, and that indirection is what the whole test suite
 # is built on, so the returned futures get boxed instead.
 async-trait = "0.1"
-base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
-dirs = "6.0"
 flate2 = "1.0"
+# `getrandom` rather than `rand`: the two things riabuild randomises are a v4
+# account id and reconnect jitter, both of which want raw OS bytes — there is
+# no distribution to sample and no seed anything would want to reproduce.
+# `rand` reached the same syscall through a ChaCha generator and its SIMD
+# backend, and this is the crate underneath it that `rand_core` was depending
+# on anyway, so naming it directly costs the tree nothing and drops four.
+getrandom = "0.3"
 # `gh_session`'s directory-mode repair opens by descriptor with `O_NOFOLLOW |
 # O_DIRECTORY` and `fchmod`s the fd, so a symlink cannot be swapped in between
 # the check and the chmod. Those flag values differ across Linux and macOS, so
@@ -64,7 +69,12 @@ libc = "0.2"
 # ceiling. Default features pull in a dozen codecs that never appear on a
 # pasteboard, and this binary is downloaded over a laptop connection.
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
-rand = "0.9"
+# SHA-256 for the published digests in `download`. `ring` rather than `sha2`
+# because rustls already builds it below — the algorithm is compiled into this
+# binary either way, and `sha2` would add its own `digest`/`generic-array`
+# tower on top to reach the same primitive. If rustls ever moves to another
+# crypto provider this stays correct and merely stops being free.
+ring = "0.17"
 # `rustls-tls-native-roots` reads the OS trust store rather than bundling
 # webpki-roots. A developer behind a corporate TLS-inspecting proxy has that
 # MITM root installed already; bundled roots reject it, and the symptom is an
@@ -76,8 +86,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
-tar = "0.4"
+# `xattr` is on by default and pulls `rustix` in to restore extended attributes
+# from PAX headers on unpack. Nothing riabuild unpacks has any: the Node, `gh`
+# and `infisical` tarballs are upstream CI artefacts, and a tar only carries
+# xattrs when it was deliberately written with them. Modes and mtimes are core
+# tar fields and are unaffected — the executable bit still lands.
+tar = { version = "0.4", default-features = false }
 # `rt` without `rt-multi-thread`: the runtime is current-thread by construction,
 # so a stray `Runtime::new()` cannot quietly spawn a worker pool. Note this
 # describes the reactor — `tokio::fs` is std::fs on a blocking pool, because no
@@ -95,7 +109,16 @@ tokio = { version = "1", default-features = false, features = [
     "io-std",
     "time",
 ] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# `deflate-flate2`, not `deflate`. The plain `deflate` alias is two decisions
+# in a trench coat: it adds zopfli — an encoder that spends orders of magnitude
+# more CPU to save a few percent, for archives riabuild only ever writes in its
+# own tests — and it pins flate2 to the zlib-rs backend. `png` and `tiff` ask
+# the same flate2 for its default miniz_oxide, features are unified across the
+# graph rather than per-edge, so the alias linked *both* deflate backends into
+# the binary. Naming the backend-free feature leaves one.
+zip = { version = "8.6.0", default-features = false, features = [
+    "deflate-flate2",
+] }
 
 [dev-dependencies]
 tempfile = "3"
