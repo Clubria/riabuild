@@ -79,7 +79,18 @@ pub(super) async fn run_gh_auth(
     // on. See `Ctx::gh`.
     let code = ctx
         .runner
-        .run_interactive(&ctx.gh(), args, &RunOptions::default())
+        .run_interactive(
+            &ctx.gh(),
+            args,
+            &RunOptions {
+                // Both commands that reach here open a device-code flow, which
+                // is text and a wait for a person — it survives line discipline
+                // intact. `gh`'s arrow-key selection prompt would not, which is
+                // why this is set here rather than on every `gh` invocation.
+                subdued: Some(ctx.ui.theme()),
+                ..Default::default()
+            },
+        )
         .await?;
     if code != 0 {
         return Err(Failure::new(

@@ -284,6 +284,8 @@ async fn pump(child: &mut Child, master: OwnedFd, theme: Theme) -> Result<i32> {
 
     let mut filter = Subdue::new();
     let mut painter = Painter::new(theme);
+    // Whether the developer's stdin is still worth watching.
+    let mut listening = true;
 
     let code = loop {
         tokio::select! {
@@ -303,13 +305,26 @@ async fn pump(child: &mut Child, master: OwnedFd, theme: Theme) -> Result<i32> {
                 }
             }
 
-            ready = input.readable() => {
+            ready = input.readable(), if listening => {
                 let mut guard = ready.context("could not watch the terminal")?;
                 let typed = match guard.try_io(|fd| read(fd.as_raw_fd())) {
+                    // A terminal at end of file stays readable for ever. Left
+                    // watched, this arm would be ready on every pass and spin
+                    // the loop hot for the whole of the child's life — on a
+                    // current-thread runtime, at the exact moment a developer
+                    // is watching a package install.
+                    Ok(Ok(bytes)) if bytes.is_empty() => {
+                        listening = false;
+                        Vec::new()
+                    }
                     Ok(Ok(bytes)) => bytes,
-                    // The developer's stdin ended, or could not be read. The
-                    // child keeps running; it simply gets no more input.
-                    Ok(Err(_)) | Err(_) => Vec::new(),
+                    // Unreadable for any other reason. The child keeps running;
+                    // it simply gets no more input.
+                    Ok(Err(_)) => {
+                        listening = false;
+                        Vec::new()
+                    }
+                    Err(_) => Vec::new(),
                 };
                 if !typed.is_empty() {
                     // Forwarded verbatim: unbuffered, uninspected, retained
@@ -487,6 +502,65 @@ mod tests {
     fn a_pty_is_only_offered_when_both_ends_are_a_terminal() {
         // Under `cargo test` they are not, which is the degradation the design
         // asks for: an unattended run takes exactly the path it always did.
-        assert!(!available());
+        // Ignored when the suite is run under `script` for the test below.
+        if std::env::var_os("RIABUILD_PTY_TEST").is_none() {
+            assert!(!available());
+        }
+    }
+
+    /// The terminal's `c_lflag`, which carries `ECHO` and `ICANON` — the two
+    /// bits a developer notices the loss of.
+    #[cfg(test)]
+    fn lflag() -> libc::tcflag_t {
+        // SAFETY: writes into a local.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(libc::STDIN_FILENO, &mut termios);
+            termios.c_lflag
+        }
+    }
+
+    /// End to end: a real `openpty`, a real `setsid`, a real child.
+    ///
+    /// Ignored because it needs a controlling terminal, which `cargo test` does
+    /// not have — that being the degradation the rest of the design rests on.
+    /// To run it, give the test binary one:
+    ///
+    /// ```sh
+    /// RIABUILD_PTY_TEST=1 script -qec "cargo test -- --ignored pty" /dev/null
+    /// ```
+    ///
+    /// Add `--nocapture` to watch what actually reaches the terminal. Expect a
+    /// leading `^@` on the first line and do not go looking for it in this
+    /// crate: `script` puts a stray NUL on the test's stdin, the pump forwards
+    /// it verbatim the way it forwards every keystroke, and the child's own
+    /// line discipline echoes it back as those two characters with `ECHOCTL`.
+    /// A developer's terminal does not do this; a developer pressing Ctrl-@
+    /// would, and printing `^@` is what a terminal does then too.
+    #[tokio::test]
+    #[ignore = "needs a controlling terminal; see the doc comment"]
+    async fn a_real_child_runs_under_a_pty_and_gives_the_terminal_back() {
+        assert!(available(), "run this under `script`, per the doc comment");
+
+        let before = lflag();
+        let mut command = Command::new("/bin/sh");
+        // Colour, a rewrite, and a window-title attempt — none of which should
+        // reach the terminal — and an exit code that has to survive the pump.
+        command.arg("-c").arg(
+            "printf '\\033]0;stolen\\007\\033[32mworking\\033[0m\\r\\n'; \
+             printf 'Progress: 20%%\\rProgress: 100%%\\n'; exit 7",
+        );
+
+        let code = run(command, Theme::plain(), "sh").await.expect("pty run");
+        assert_eq!(code, 7, "the child's exit status reaches the caller");
+        assert_eq!(lflag(), before, "the terminal is put back out of raw mode");
+
+        // SAFETY: reads a flag from fd 0.
+        let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "fd 0 is put back to blocking, or the shell inherits a broken stdin"
+        );
     }
 }

@@ -398,6 +398,18 @@ mod tests {
     }
 
     #[test]
+    fn the_bytes_a_real_pty_delivers() {
+        // Captured with `xxd` from a `/bin/sh` running under `script`: an OSC
+        // title, a colour, the `\r\r\n` a pty's ONLCR produces, and a progress
+        // rewrite. Written down because every other test here is a hand-built
+        // guess at what a child emits, and this one is not.
+        let out = lines(
+            b"\x1b]0;stolen\x07\x1b[32mworking\x1b[0m\r\r\nProgress: 20%\rProgress: 100%\r\n",
+        );
+        assert_eq!(out, vec!["working", "Progress: 100%"]);
+    }
+
+    #[test]
     fn invalid_utf8_does_not_lose_the_line() {
         assert_eq!(lines(b"caf\xff\n"), vec!["caf\u{fffd}"]);
     }

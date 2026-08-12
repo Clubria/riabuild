@@ -64,7 +64,7 @@ These are not style preferences. Breaking any of them produces a class of bug th
 expensive to find on someone else's laptop.
 
 **Every external process goes through `CommandRunner`.** No direct `std::process::Command`
-outside `runner.rs`. This is what makes `check()` unit-testable against canned `gh`,
+outside `runner/`. This is what makes `check()` unit-testable against canned `gh`,
 `git`, `node`, and `claude` output. Bypassing it means the only way to test a task is to
 have a real machine in a real state, and the suite gets abandoned.
 
@@ -77,6 +77,14 @@ with no output and no error to send anyone.
 The exception is **stdio**. `ui.rs` writes with `println!`/`eprintln!`, and
 `run_interactive` hands the terminal to a child process — that is a handoff, not IO
 riabuild performs. Async stdout buys nothing for line-at-a-time terminal output.
+
+**Except for a subdued child.** `RunOptions.subdued` runs a child under a pty riabuild
+owns, so riabuild *does* perform that IO: it reads the child's output, drops every escape
+sequence in it, and prints what is left as dimmed lines. That is why `runner/pty.rs` pumps
+through `AsyncFd` and never a blocking read — a subdued `sudo apt-get` holds this loop for
+as long as the developer takes to type a password, and a blocking read would hold the
+reactor with it. The handoff remains the default and the rule everywhere `subdued` is
+`None`, which is every site except apt, dnf, `gh auth login`, and `ssh-copy-id`.
 
 Three things are synchronous because they are not IO, and are not exceptions to anything:
 `paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
@@ -177,9 +185,11 @@ src/
   main.rs      entry point, dispatch   cli.rs       clap definitions
   provision.rs the default flow        internal.rs  `riabuild internal …` handlers
   config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
-  keychain/    secret storage: trait,  runner.rs    CommandRunner — all subprocesses
-               the two platform CLIs,
-               the server's file store
+  keychain/    secret storage: trait,  runner/      CommandRunner — all subprocesses.
+               the two platform CLIs,               `subdue.rs` is the line filter a
+               the server's file store              subdued child's output goes through;
+                                                    `pty.rs` is the terminal it gets
+                                                    instead of riabuild's own
   update.rs    version check, re-exec  ui.rs        output and prompts
   theme.rs     the Clubria palette,    art.rs       the riabuild mark: two
                by role, and the                     renderings and the banner
@@ -274,6 +284,20 @@ as a parameter rather than reading one, because it is rendered on this side of t
 boundary and printed on the other. Pass `ctx.ui.theme()`, not `ctx.ui.colour()`: the
 latter answers only whether colour is on, which would quietly pin that text to the
 sixteen-colour rung.
+
+**Child output has a role too.** A subdued child's lines are `Muted`, printed at
+`ui::note`'s indent, and everything the child drew *with* — colour, vertical cursor
+motion, the alternate screen, an OSC window title — is dropped before it reaches the
+terminal. riabuild does not trust a third-party program to keep a tidy terminal, so under
+`RunOptions.subdued` it does not have to. `subdued` takes a `Theme` for the same reason
+rcfile text does, and for the same reason it is `ctx.ui.theme()` that gets passed.
+
+Subduing is for the commands riabuild runs *at* the developer — apt, dnf,
+`gh auth login`, `ssh-copy-id`. Not the environment shell, not `ssh`/`mosh`, not
+`claude`: that is the developer's workspace, not riabuild's output. Not the clipboard
+shim either, where riabuild is impersonating `xclip` and its stdout is a payload rather
+than a page. Design:
+`../docs/superpowers/specs/2026-08-12-subdued-child-output-design.md`.
 
 ## Shell integration
 

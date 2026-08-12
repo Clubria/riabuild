@@ -354,6 +354,12 @@ mod tests {
             "{:?}",
             calls.calls()
         );
+        // The device-code flow prints through riabuild rather than over it.
+        // Every other `gh` in this apply() is captured, so it is the only one
+        // that asks for a pty.
+        let subdued = calls.subdued_calls();
+        assert_eq!(subdued.len(), 1, "{subdued:?}");
+        assert!(subdued[0].contains("auth refresh"), "{subdued:?}");
     }
 
     #[tokio::test]

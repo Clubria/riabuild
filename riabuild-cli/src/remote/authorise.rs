@@ -25,13 +25,20 @@
 //!   by hand instead of trusting the real client to do it.
 //!
 //! So `authorise` hands the terminal to `ssh-copy-id` via
-//! [`CommandRunner::run_interactive`], the same handoff `main.rs` uses for
-//! the environment shell. `ssh-copy-id` execs the real `ssh`, which does its
-//! own password prompting directly against the inherited terminal — with its
-//! own no-echo `termios` handling — and returns only an exit code. The
-//! password exists in the child's memory and the terminal driver's, never in
-//! any `String` this crate owns, so there is nothing here for a log line, an
-//! error message, or `Failure::detail` to accidentally include.
+//! [`CommandRunner::run_interactive`], and does it **subdued**: the child runs
+//! under a pty riabuild owns, its output is filtered down to dimmed lines, and
+//! its input is riabuild's to forward. `ssh-copy-id` execs the real `ssh`,
+//! which does its own password prompting against that pty — with its own
+//! no-echo `termios` handling, which the pty's line discipline preserves
+//! exactly — and returns only an exit code.
+//!
+//! The password therefore passes through riabuild's process on its way to the
+//! child, which it did not before. It is forwarded verbatim and immediately;
+//! no copy is kept, nothing inspects it, and the filter never sees the input
+//! direction at all. So it still exists only in the child's memory and the
+//! terminal driver's, never in any `String` this crate owns, and there is
+//! nothing here for a log line, an error message, or `Failure::detail` to
+//! accidentally include.
 //!
 //! What follows from that: a server that offers no interactive method at all
 //! (`methods()` never sees `password` or `keyboard-interactive` in sshd's
@@ -307,11 +314,26 @@ pub async fn authorise(
         remote.target(),
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // The terminal handoff described in the module doc: whatever `ssh`
-    // prompts for here — a password, a passphrase — goes straight between
-    // the developer and the real `ssh` binary. Nothing here reads it.
+    // Subdued: `ssh-copy-id` prints through riabuild rather than over it. The
+    // filter is on the *output* direction only. Whatever `ssh` prompts for here
+    // — a password, a passphrase — is forwarded to the real binary verbatim,
+    // unbuffered, uninspected, and retained nowhere.
+    //
+    // The module doc calls this a terminal handoff and says nothing here reads
+    // what the developer types. Under a pty that is no longer the whole truth:
+    // riabuild *copies* those keystrokes rather than standing beside them. It
+    // reads none of them and writes none of them down, which is a narrower
+    // claim than the old one and worth making explicitly rather than leaving to
+    // be discovered.
     let code = runner
-        .run_interactive("ssh-copy-id", &refs, &RunOptions::default())
+        .run_interactive(
+            "ssh-copy-id",
+            &refs,
+            &RunOptions {
+                subdued: Some(ui.theme()),
+                ..Default::default()
+            },
+        )
         .await?;
     if code != 0 {
         return Err(paste().command("ssh-copy-id").into());
@@ -691,6 +713,11 @@ mod tests {
             result.is_err(),
             "a key that still cannot sign in is not success"
         );
+        // The copy prints through riabuild; the probes around it are captured
+        // rather than shown, so nothing else in this path asks for a pty.
+        let subdued = fake.subdued_calls();
+        assert_eq!(subdued.len(), 1, "{subdued:?}");
+        assert!(subdued[0].starts_with("ssh-copy-id"), "{subdued:?}");
     }
 
     #[tokio::test]

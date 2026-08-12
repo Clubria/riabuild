@@ -7,6 +7,7 @@
 //! developer sees anything.
 
 use crate::runner::{CommandRunner, RunOptions};
+use crate::theme::Theme;
 use crate::ui::{Failure, Ui};
 use crate::version;
 use anyhow::Result;
@@ -165,7 +166,7 @@ pub async fn upgrade_and_reexec(
     ui.info("");
     ui.info(&format!("Updating riabuild to {to}…"));
 
-    if !run_upgrade(runner, &strategy).await? {
+    if !run_upgrade(runner, &strategy, ui.theme()).await? {
         if mandatory {
             return Err(Failure::new(
                 format!("updating riabuild to {to}, which your team now requires"),
@@ -203,7 +204,21 @@ fn decline(ui: &Ui, strategy: &Strategy, to: &str, mandatory: bool, why: &str) -
     Ok(())
 }
 
-async fn run_upgrade(runner: &dyn CommandRunner, strategy: &Strategy) -> Result<bool> {
+async fn run_upgrade(
+    runner: &dyn CommandRunner,
+    strategy: &Strategy,
+    theme: Theme,
+) -> Result<bool> {
+    // Interactive, so the sudo password prompt reaches the developer's
+    // terminal — and subdued, because apt and dnf print more, louder, and in
+    // their own colours than anything riabuild says around them. This is the
+    // one command in a run whose output riabuild takes responsibility for the
+    // look of; the pty is what makes that possible without taking the
+    // controlling terminal away from `sudo`.
+    let subdued = RunOptions {
+        subdued: Some(theme),
+        ..Default::default()
+    };
     match strategy {
         Strategy::Homebrew => Ok(runner
             .run(
@@ -213,12 +228,11 @@ async fn run_upgrade(runner: &dyn CommandRunner, strategy: &Strategy) -> Result<
             )
             .await?
             .ok()),
-        // Interactive so the sudo password prompt reaches the developer's
-        // terminal. `apt-get update` first, because the version the developer
-        // was just offered is one the local package lists have never seen.
+        // `apt-get update` first, because the version the developer was just
+        // offered is one the local package lists have never seen.
         Strategy::Apt => {
             let refreshed = runner
-                .run_interactive("sudo", &["apt-get", "update"], &RunOptions::default())
+                .run_interactive("sudo", &["apt-get", "update"], &subdued)
                 .await?;
             if refreshed != 0 {
                 return Ok(false);
@@ -227,7 +241,7 @@ async fn run_upgrade(runner: &dyn CommandRunner, strategy: &Strategy) -> Result<
                 .run_interactive(
                     "sudo",
                     &["apt-get", "install", "--only-upgrade", "-y", "riabuild"],
-                    &RunOptions::default(),
+                    &subdued,
                 )
                 .await?;
             Ok(installed == 0)
@@ -238,7 +252,7 @@ async fn run_upgrade(runner: &dyn CommandRunner, strategy: &Strategy) -> Result<
             .run_interactive(
                 "sudo",
                 &["dnf", "upgrade", "-y", "--refresh", "riabuild"],
-                &RunOptions::default(),
+                &subdued,
             )
             .await?
             == 0),
@@ -258,6 +272,9 @@ async fn reexec(runner: &dyn CommandRunner) -> Result<()> {
             &RunOptions {
                 // Prevents an upgrade loop if the new build still reports old.
                 env: vec![("RIABUILD_UPDATED".into(), "1".into())],
+                // Not subdued: the child here is riabuild, whose output is
+                // already themed. Dimming it would dim a whole second run and
+                // nest its indent under the first.
                 ..Default::default()
             },
         )
@@ -273,6 +290,45 @@ mod tests {
     #[test]
     fn a_current_build_carries_on() {
         assert_eq!(decide("0.4.0", "0.1.0", "0.4.0", false), Action::Continue);
+    }
+
+    #[tokio::test]
+    async fn a_package_manager_upgrade_prints_through_riabuild() {
+        // apt is the loudest thing in a run and none of it is riabuild's.
+        let runner = FakeRunner::new();
+        run_upgrade(&runner, &Strategy::Apt, Theme::plain())
+            .await
+            .expect("upgrade");
+        assert_eq!(
+            runner.subdued_calls(),
+            vec![
+                "sudo apt-get update",
+                "sudo apt-get install --only-upgrade -y riabuild",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dnf_is_subdued_the_same_way_apt_is() {
+        let runner = FakeRunner::new();
+        run_upgrade(&runner, &Strategy::Dnf, Theme::plain())
+            .await
+            .expect("upgrade");
+        assert_eq!(
+            runner.subdued_calls(),
+            vec!["sudo dnf upgrade -y --refresh riabuild"]
+        );
+    }
+
+    #[tokio::test]
+    async fn homebrew_is_captured_rather_than_subdued() {
+        // `brew` goes through `run`, which never reaches a terminal — there is
+        // nothing there to subdue, and asking for a pty would be noise.
+        let runner = FakeRunner::new();
+        run_upgrade(&runner, &Strategy::Homebrew, Theme::plain())
+            .await
+            .expect("upgrade");
+        assert_eq!(runner.subdued_calls(), Vec::<String>::new());
     }
 
     #[test]
