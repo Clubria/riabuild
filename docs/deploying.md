@@ -69,6 +69,12 @@ which exists only for end-to-end tests against a local backend.
 `org_check_unavailable`.** That is deliberate: riabuild fails closed, and says it could
 not check rather than claiming the developer was removed from the org.
 
+The same token also authenticates the release check in `convex/release.ts`, which reads a
+public endpoint and needs no scope for it. It is sent for the rate limit: unauthenticated
+calls get sixty an hour **per source IP**, and that IP is Convex's, shared with every
+other deployment on it. Releasing while that shared budget is spent means the release
+publishes and nobody is offered it — see `releasing.md`.
+
 ### The GitHub OAuth app
 
 Create it at <https://github.com/organizations/Clubria/settings/applications>.

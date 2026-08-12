@@ -1446,3 +1446,74 @@ describe("revoking a session", () => {
     expect(revocations).toHaveLength(1);
   });
 });
+
+describe("announcing a release", () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  /**
+   * Captures what `publishCliVersion` actually sent to GitHub, so the request
+   * headers can be asserted rather than assumed.
+   */
+  function stubGitHub(spec: {
+    status: number;
+    body?: unknown;
+    headers?: Record<string, string>;
+  }) {
+    const seen: { url?: string; headers?: Headers } = {};
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.url = input instanceof Request ? input.url : input.toString();
+      seen.headers = new Headers(init?.headers);
+      return new Response(
+        spec.body === undefined ? null : JSON.stringify(spec.body),
+        { status: spec.status, headers: spec.headers },
+      );
+    };
+    return seen;
+  }
+
+  test("the release check is authenticated, so it does not spend GitHub's per-IP budget", async () => {
+    const t = setup();
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const seen = stubGitHub({ status: 200, body: { draft: false } });
+
+    await t.action(api.release.publishCliVersion, { version: "2026.08.12.1" });
+
+    // An unauthenticated request shares one 60-per-hour budget with every other
+    // tenant on the Convex egress address. That budget ran out during the
+    // 2026.08.12.1 release and stayed out for over an hour, so the release
+    // published and nobody was offered it. This header is the whole fix.
+    expect(seen.headers?.get("authorization")).toBe("Bearer ghp_test");
+  });
+
+  test("a rate-limited GitHub is reported as a rate limit, not as a bare 403", async () => {
+    const t = setup();
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    stubGitHub({
+      status: 403,
+      body: { message: "API rate limit exceeded for 1.2.3.4" },
+      headers: { "x-ratelimit-remaining": "0" },
+    });
+
+    // "returned 403" reads identically whether the budget ran out or the token
+    // lost its access, and those need opposite responses: wait, or go and fix a
+    // credential. Diagnosing the real one cost an hour of retrying the wrong.
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
+    ).rejects.toThrow(/rate limit/i);
+  });
+
+  test("a 403 that is not a rate limit still reads as a plain refusal", async () => {
+    const t = setup();
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    stubGitHub({ status: 403, body: { message: "Forbidden" } });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
+    ).rejects.toThrow(/returned 403/);
+  });
+});
