@@ -6,7 +6,7 @@ import {
   useQuery,
 } from "convex/react";
 import { useAuthActions } from "@convex-dev/auth/react";
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { useNow } from "../lib/time";
 import { DataContext } from "./context";
@@ -56,6 +56,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
   const convex = useConvex();
 
   const membership = useMembership(isAuthenticated);
+  useStaleCredentialReset(isLoading, isAuthenticated, signOut);
 
   const data: Data = {
     auth: isLoading ? "loading" : isAuthenticated ? "signed-in" : "signed-out",
@@ -105,6 +106,72 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
 /** Convex reports "not loaded yet" as `undefined`; a query that fails throws. */
 function loadable<T>(value: T | undefined): Loadable<T> {
   return value === undefined ? { state: "loading" } : { state: "ready", value };
+}
+
+/**
+ * `@convex-dev/auth` namespaces its storage keys as `${key}_${namespace}`, so
+ * the refresh token is found by prefix rather than by an exact name we would
+ * have to keep in step with the deployment URL.
+ */
+const REFRESH_TOKEN_KEY_PREFIX = "__convexAuthRefreshToken";
+
+function hasStoredRefreshToken(): boolean {
+  try {
+    return Object.keys(window.localStorage).some((key) =>
+      key.startsWith(REFRESH_TOKEN_KEY_PREFIX),
+    );
+  } catch {
+    // Storage blocked by the browser holds no stale token either.
+    return false;
+  }
+}
+
+/**
+ * Erases sign-in state the browser is holding and the deployment will not honour.
+ *
+ * `@convex-dev/auth` renews an access token by calling `verifyCode` with the
+ * stored refresh token, and `verifyCode` *throws* when the deployment rejects
+ * one — it retries network errors and rethrows everything else. Nothing catches
+ * that, so a dead refresh token is never erased. The library means to recover
+ * and does not: `fetchAccessToken` lists `signOut` in its dependency array and
+ * never calls it, in 0.0.91 and in 0.0.95, whose `client.js` is byte-for-byte
+ * identical. There is no upgrade to take and no setting to turn on.
+ *
+ * What that leaves behind is a *torn* pair. `setToken` writes the JWT and the
+ * refresh token together and removes them together, so the two are meant to
+ * agree; a resolved signed-out state alongside a stored refresh token means
+ * they no longer do. The developer gets the sign-in screen, authorises on
+ * GitHub, and arrives back at the sign-in screen, with nothing anywhere
+ * reporting a problem — which cost us a debugging session before this existed.
+ *
+ * Clearing cannot race a live refresh: a refresh only runs while the old token
+ * is still in hand, which is to say while `isAuthenticated` is true, and this
+ * fires only once auth has settled the other way. `signOut()` does the erasing
+ * because it is the library's own API — deleting keys whose names and layout
+ * the library owns would be a second copy of its internals for us to maintain.
+ *
+ * Silent on purpose. What the developer wanted was a sign-in button that works,
+ * and once this has run they have one; a notice would explain a state they
+ * never chose and cannot act on.
+ */
+function useStaleCredentialReset(
+  isLoading: boolean,
+  isAuthenticated: boolean,
+  signOut: () => Promise<void>,
+): void {
+  const cleared = useRef(false);
+
+  useEffect(() => {
+    if (cleared.current) return;
+    if (isLoading || isAuthenticated) return;
+    if (!hasStoredRefreshToken()) return;
+
+    cleared.current = true;
+    void signOut().catch(() => {
+      // `signOut` already swallows the server call, so a rejection here means
+      // storage itself refused. There is nothing better left to try.
+    });
+  }, [isLoading, isAuthenticated, signOut]);
 }
 
 const SIGNED_OUT: Membership = { org: "Clubria", status: "signed_out" };
