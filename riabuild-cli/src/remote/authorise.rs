@@ -20,6 +20,22 @@
 //! argument for that, and against the `sshpass`-shaped alternative this file
 //! used to rule out, is in `askpass`'s module doc rather than repeated here.
 //!
+//! That handoff is **subdued**: `ssh-copy-id` runs under a pty riabuild owns,
+//! and its output is filtered down to dimmed lines rather than printed over
+//! riabuild's own. The filter is on the *output* direction only.
+//!
+//! Which leaves one thing worth being exact about. On the `askpass` path
+//! nothing is typed here at all — `ssh` asks the helper and reads the answer
+//! off its stdout pipe, so the pty carries no password in either direction. On
+//! an OpenSSH older than 8.4, which ignores `SSH_ASKPASS_REQUIRE` and prompts
+//! on the terminal itself, that terminal is now riabuild's pty, so the
+//! keystrokes pass through riabuild's process on their way to the child. They
+//! are forwarded verbatim and immediately; no copy is kept and nothing
+//! inspects them. The password still exists only in the child's memory and the
+//! terminal driver's, never in any `String` this crate owns, so there is
+//! nothing here for a log line, an error message, or `Failure::detail` to
+//! accidentally include.
+//!
 //! ## When this stops, and when it does not
 //!
 //! **riabuild stops when there is no way in, not when the convenient way in
@@ -341,14 +357,18 @@ pub async fn authorise(
         remote.target(),
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // The terminal handoff described in the module doc: whatever `ssh`
-    // prompts for here — a password, a passphrase — goes straight between
-    // the developer and the real `ssh` binary. Nothing here reads it.
+    // Subdued: `ssh-copy-id` prints through riabuild rather than over it. On
+    // top of the askpass environment, not instead of it — the helper is what
+    // answers the password prompt, and the pty is only what the child draws on.
+    // See the module doc for what that does and does not mean for keystrokes.
     let code = runner
         .run_interactive(
             "ssh-copy-id",
             &refs,
-            &super::askpass::run_options(remote, paths),
+            &RunOptions {
+                subdued: Some(ui.theme()),
+                ..super::askpass::run_options(remote, paths)
+            },
         )
         .await?;
     if code != 0 {
@@ -738,6 +758,35 @@ mod tests {
         assert!(
             warning.contains("password"),
             "…and must say what happens instead, or an `Ok` reads as success: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_copy_prints_through_riabuild_and_keeps_its_askpass_environment() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+        let fake = Arc::new(a_server_that_takes_a_password().with("ssh-copy-id", 0, "", ""));
+
+        authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
+            .await
+            .expect("a password is a way in");
+
+        // The copy is the only command here that draws on the terminal; the
+        // probes around it are captured, so nothing else asks for a pty.
+        let subdued = fake.subdued_calls();
+        assert_eq!(subdued.len(), 1, "{subdued:?}");
+        assert!(subdued[0].starts_with("ssh-copy-id"), "{subdued:?}");
+
+        // And subduing is layered *onto* the askpass environment rather than
+        // replacing it. A `RunOptions` built with `..Default::default()`
+        // instead of `..askpass::run_options(…)` would compile, pass every
+        // other test in this file, and put the password prompt back on the
+        // developer at all ten connections.
+        let env = fake.env_of("ssh-copy-id");
+        assert!(
+            env.iter().any(|(key, _)| key == "SSH_ASKPASS"),
+            "the copy lost its askpass helper: {env:?}"
         );
     }
 

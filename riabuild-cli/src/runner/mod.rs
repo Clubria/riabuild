@@ -14,7 +14,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 
+use crate::theme::Theme;
+
 mod child;
+#[cfg(unix)]
+mod pty;
+mod subdue;
 
 pub use child::ChildHandle;
 
@@ -70,6 +75,33 @@ pub struct RunOptions {
     /// be UTF-8, and a `String` cannot represent a PNG at all — so an image
     /// write would not be merely lossy, it would be unconstructible.
     pub stdin: Option<Vec<u8>>,
+    /// Run this child under a pty riabuild owns, discard everything it draws
+    /// *with*, and print what is left one dimmed line at a time.
+    ///
+    /// Honoured by `run_interactive` only. The capturing methods never reach a
+    /// terminal, so there is nothing there to subdue.
+    ///
+    /// A `Theme` rather than a `bool` for the reason `CLAUDE.md` gives for the
+    /// text a generated rcfile prints: the palette is resolved on the side that
+    /// has a `Ui` and passed to the side that does not. `runner/` has no `Ui`
+    /// and must not grow one. `Theme::plain()` is a legitimate value — line
+    /// discipline with no dim — which is what a `NO_COLOR` run produces without
+    /// a special case anywhere.
+    pub subdued: Option<Theme>,
+}
+
+/// Whether this call actually gets a pty.
+///
+/// Split out from `run_interactive` so the rule is testable without a terminal,
+/// the same reason `theme::depth_for` is split out from `Theme::detect`.
+///
+/// With no terminal the flag is ignored outright. That is not a convenience: an
+/// unattended run must not take a different code path from an attended one for
+/// a *cosmetic* reason, and a pty allocated where no terminal exists would be
+/// riabuild inventing a tty for a child that correctly concluded there wasn't
+/// one.
+pub fn should_subdue(is_terminal: bool, subdued: Option<Theme>) -> Option<Theme> {
+    is_terminal.then_some(subdued).flatten()
 }
 
 #[async_trait]
@@ -287,7 +319,18 @@ impl CommandRunner for RealRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<i32> {
-        let status = RealRunner::build(program, args, options)
+        let mut command = RealRunner::build(program, args, options);
+
+        // The handoff `CLAUDE.md` describes is still the default, and still the
+        // rule for every site that leaves `subdued` unset. Where riabuild does
+        // perform the IO it does so through `AsyncFd` on the current-thread
+        // runtime — see `pty.rs`.
+        #[cfg(unix)]
+        if let Some(theme) = should_subdue(pty::available(), options.subdued) {
+            return pty::run(command, theme, program).await;
+        }
+
+        let status = command
             .status()
             .await
             .with_context(|| format!("could not start `{program}`"))?;
@@ -443,6 +486,10 @@ pub struct Recorded {
     pub invocation: String,
     pub env: Vec<(String, String)>,
     pub stdin: Option<Vec<u8>>,
+    /// Whether the caller asked for the pty. Recorded rather than acted on:
+    /// there is no terminal under `cargo test`, so the real path is the plain
+    /// inherit either way, and what a test can still assert is the *intent*.
+    pub subdued: bool,
 }
 
 #[cfg(test)]
@@ -582,6 +629,22 @@ impl FakeRunner {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The invocations that asked for a pty.
+    ///
+    /// `calls()` answers what ran; this answers which of it riabuild took
+    /// responsibility for the look of. The split matters because it is not a
+    /// property of the command — the same `gh` runs subdued for a sign-in and
+    /// unsubdued everywhere else.
+    pub fn subdued_calls(&self) -> Vec<String> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.subdued)
+            .map(|call| call.invocation.clone())
+            .collect()
+    }
+
     /// Every child started, in spawn order.
     pub fn spawns(&self) -> Vec<String> {
         self.spawned
@@ -679,6 +742,7 @@ impl FakeRunner {
             invocation: invocation.clone(),
             env: options.env.clone(),
             stdin: options.stdin.clone(),
+            subdued: options.subdued.is_some(),
         });
         invocation
     }
@@ -1808,5 +1872,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plain.stdout, b"\x89PNG\xFF");
+    }
+}
+
+#[cfg(test)]
+mod subdued_tests {
+    use super::*;
+
+    #[test]
+    fn no_terminal_means_no_subduing_whatever_the_caller_asked_for() {
+        // CI, `cargo test`, a pipe. An unattended run must not take a
+        // different code path from an attended one for a cosmetic reason.
+        assert_eq!(should_subdue(false, Some(Theme::plain())), None);
+    }
+
+    #[test]
+    fn a_terminal_and_a_theme_is_the_only_combination_that_subdues() {
+        assert_eq!(
+            should_subdue(true, Some(Theme::plain())),
+            Some(Theme::plain())
+        );
+        assert_eq!(should_subdue(true, None), None);
+        assert_eq!(should_subdue(false, None), None);
+    }
+
+    #[test]
+    fn the_default_run_is_not_subdued() {
+        // Every existing call site constructs this way, and none of them
+        // changes behaviour because this field was added.
+        assert_eq!(RunOptions::default().subdued, None);
+    }
+
+    #[tokio::test]
+    async fn the_stub_records_which_commands_were_subdued() {
+        let runner = FakeRunner::new();
+        runner
+            .run_interactive(
+                "sudo",
+                &["apt-get", "update"],
+                &RunOptions {
+                    subdued: Some(Theme::plain()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("interactive run");
+        runner
+            .run_interactive("bash", &["-l"], &RunOptions::default())
+            .await
+            .expect("interactive run");
+
+        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(runner.subdued_calls(), vec!["sudo apt-get update"]);
+    }
+
+    #[tokio::test]
+    async fn a_scope_carries_the_subdued_flag_through() {
+        // `ScopedRunner::merge` clones the options; a field it forgot would be
+        // silently dropped for every task that runs under a scope, which is
+        // every task that touches `gh`.
+        let inner = Arc::new(FakeRunner::new());
+        let scoped = ScopedRunner::new(inner.clone(), vec![("K".into(), "V".into())]);
+        scoped
+            .run_interactive(
+                "gh",
+                &["auth", "login"],
+                &RunOptions {
+                    subdued: Some(Theme::plain()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("interactive run");
+
+        assert_eq!(inner.subdued_calls(), vec!["gh auth login"]);
     }
 }
