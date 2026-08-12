@@ -350,3 +350,149 @@ export const backfillStatusLine = internalMutation({
     return { updated: true, reason: "Status line added." };
   },
 });
+
+/**
+ * Whether a value is settings *structure* rather than a settings answer.
+ *
+ * Arrays are answers, not structure. `permissions.deny` is the case that
+ * matters: an org that trimmed the deny list has chosen it, and descending into
+ * it to restore entries riabuild once shipped would overwrite that choice one
+ * element at a time.
+ */
+function isSettingsObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Copies across every default the stored settings do not have, and nothing
+ * else. Records the dotted path of each one in `added`.
+ *
+ * Absence is the whole test. A key the org set to `false` was answered, and an
+ * answer riabuild disagrees with is still an answer.
+ */
+function fillMissing(
+  stored: Record<string, unknown>,
+  defaults: Record<string, unknown>,
+  prefix: string,
+  added: string[],
+): void {
+  for (const [key, fallback] of Object.entries(defaults)) {
+    const path = prefix === "" ? key : `${prefix}.${key}`;
+    const current = stored[key];
+
+    if (current === undefined) {
+      stored[key] = fallback;
+      added.push(path);
+    } else if (isSettingsObject(current) && isSettingsObject(fallback)) {
+      // `permissions` exists on every org that ever saved, and the keys added
+      // to it since do not. Descending is the only way they land.
+      fillMissing(current, fallback, path, added);
+    }
+  }
+}
+
+/**
+ * Gives an org the team settings that were added after it last pressed save.
+ *
+ * The general form of `backfillStatusLine`, and the reason that one existed:
+ * `loadConfig` serves `DEFAULT_CLAUDE_SETTINGS` only to a deployment with
+ * **no** `orgConfig` row, so on any org where a lead has saved once — or where
+ * a CLI release published a version, which inserts the same row — a new default
+ * reaches nobody. Editing the constant ships it to fresh deployments and to
+ * nowhere else. Run this after adding a key to it:
+ *
+ *     npx convex run org:backfillClaudeDefaults --prod
+ *
+ * The keys that stranded a real developer were `theme`,
+ * `permissions.defaultMode` and `skipDangerousModePermissionPrompt`, all added
+ * together and none of them ever backfilled. Their laptop cached settings with
+ * no permission mode in them, so every account launcher started Claude Code in
+ * the default mode with nothing anywhere reporting a problem.
+ *
+ * Conservative by design, and only ever additive: a key the org already has is
+ * left exactly as it is, whatever its value. Overwriting a lead's deliberate
+ * choice because a migration ran a second time is worse than the migration
+ * doing nothing — which is also what makes it safe to run twice, and safe to
+ * run on an org that has never been touched.
+ *
+ * One pairing is worth knowing about. `permissions.defaultMode:
+ * "bypassPermissions"` is silently downgraded unless
+ * `skipDangerousModePermissionPrompt` is set too. Both arrive together here, so
+ * an org missing both is repaired — but an org that has explicitly set
+ * `skipDangerousModePermissionPrompt: false` keeps that answer and will see the
+ * downgrade. That is the correct outcome: it declined the disclaimer.
+ *
+ * Internal on purpose, like `setLatestCliVersion`: reachable from CI and the
+ * Convex dashboard, and from no browser client.
+ */
+export const backfillClaudeDefaults = internalMutation({
+  args: {},
+  returns: v.object({
+    updated: v.boolean(),
+    added: v.array(v.string()),
+    reason: v.string(),
+  }),
+  handler: async (ctx) => {
+    const row = await ctx.db.query("orgConfig").first();
+    if (row === null) {
+      return {
+        updated: false,
+        added: [],
+        reason:
+          "No stored config — the served defaults already carry every key.",
+      };
+    }
+
+    let settings: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(row.claudeSettings);
+      if (!isSettingsObject(parsed)) throw new Error("not an object");
+      settings = parsed;
+    } catch {
+      // `org.update` rejects invalid JSON, so this means the row predates that
+      // check or was written by hand. Guessing at a repair here would replace
+      // settings nobody can see with settings nobody chose.
+      return {
+        updated: false,
+        added: [],
+        reason:
+          "Stored settings are not a JSON object. Fix them in the dashboard first.",
+      };
+    }
+
+    const added: string[] = [];
+    fillMissing(
+      settings,
+      JSON.parse(DEFAULT_CLAUDE_SETTINGS) as Record<string, unknown>,
+      "",
+      added,
+    );
+
+    if (added.length === 0) {
+      return {
+        updated: false,
+        added: [],
+        reason: "Every default is already answered.",
+      };
+    }
+
+    await ctx.db.patch("orgConfig", row._id, {
+      claudeSettings: JSON.stringify(settings, null, 2),
+      // Moving this is the point: the CLI decides whether to re-fetch by
+      // comparing it, so a settings change that leaves it alone never lands.
+      claudeSettingsUpdatedAt: Date.now(),
+    });
+
+    // No actorId: this is a migration, not a person.
+    await writeAudit(ctx, {
+      action: "org.config_updated",
+      meta: {
+        fields: "claudeSettings",
+        via: "backfillClaudeDefaults",
+        added: added.join(","),
+      },
+    });
+
+    return { updated: true, added, reason: `Added ${added.join(", ")}.` };
+  },
+});

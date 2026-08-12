@@ -774,6 +774,145 @@ describe("org config and claude settings", () => {
     // lead meant to write.
     expect(row!.claudeSettings).toBe("{ not json");
   });
+
+  /** Exactly what an org that saved before the permission keys existed holds. */
+  const preBypassSettings = JSON.stringify({
+    permissions: {
+      deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+    },
+    env: { CLUBRIA_ORG: "1" },
+  });
+
+  async function seedOrgConfig(
+    t: ReturnType<typeof setup>,
+    claudeSettings: string,
+  ) {
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings,
+        claudeSettingsUpdatedAt: 1234,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "0.1.0",
+        latestCliVersion: "0.1.0",
+        secretsUpdatedAt: 0,
+      });
+    });
+  }
+
+  const storedSettings = async (t: ReturnType<typeof setup>) => {
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    return { row: row!, settings: JSON.parse(row!.claudeSettings) };
+  };
+
+  test("the defaults backfill repairs an org that saved before bypass mode existed", async () => {
+    // The regression a developer actually hit: `claude-1` started in the
+    // default permission mode because the org row predated the keys, and
+    // editing DEFAULT_CLAUDE_SETTINGS reached fresh deployments only.
+    const t = setup();
+    await seedOrgConfig(t, preBypassSettings);
+
+    const result = await t.mutation(internal.org.backfillClaudeDefaults, {});
+    expect(result.updated).toBe(true);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+    // Without this the mode above is silently downgraded, so a backfill that
+    // added one and not the other would look repaired and behave otherwise.
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+    expect(settings.theme).toBe("auto");
+    expect(settings.statusLine.command).toBe(
+      "node ~/.riabuild/claude-statusline.js",
+    );
+    expect(result.added).toContain("permissions.defaultMode");
+
+    // The CLI re-fetches by comparing this. A backfill that left it at 1234
+    // would change the database and nobody's laptop.
+    expect(row.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
+  });
+
+  test("the defaults backfill leaves every answer the org already gave", async () => {
+    const t = setup();
+    const chosen = {
+      theme: "dark",
+      permissions: { defaultMode: "acceptEdits", deny: [] },
+      skipDangerousModePermissionPrompt: false,
+      env: { CLUBRIA_ORG: "1", EXTRA: "kept" },
+      statusLine: { type: "command", command: "my-own-statusline" },
+    };
+    await seedOrgConfig(t, JSON.stringify(chosen));
+
+    const result = await t.mutation(internal.org.backfillClaudeDefaults, {});
+    expect(result.updated).toBe(false);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings).toEqual(chosen);
+    expect(row.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("the defaults backfill never restores deny rules an org removed", async () => {
+    // An emptied deny list is a decision. Descending into an array to put
+    // riabuild's entries back would undo it one element at a time.
+    const t = setup();
+    await seedOrgConfig(t, JSON.stringify({ permissions: { deny: [] } }));
+
+    await t.mutation(internal.org.backfillClaudeDefaults, {});
+
+    const { settings } = await storedSettings(t);
+    expect(settings.permissions.deny).toEqual([]);
+    // The sibling key it never answered still arrives.
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+  });
+
+  test("running the defaults backfill twice is a no-op the second time", async () => {
+    const t = setup();
+    await seedOrgConfig(t, preBypassSettings);
+
+    expect(
+      (await t.mutation(internal.org.backfillClaudeDefaults, {})).updated,
+    ).toBe(true);
+    expect(
+      (await t.mutation(internal.org.backfillClaudeDefaults, {})).updated,
+    ).toBe(false);
+
+    const entries = await t.run(async (ctx) =>
+      ctx.db
+        .query("auditLog")
+        .collect()
+        .then((rows) =>
+          rows.filter((row) => row.meta.via === "backfillClaudeDefaults"),
+        ),
+    );
+    expect(entries).toHaveLength(1);
+  });
+
+  test("the defaults backfill refuses to guess at settings it cannot parse", async () => {
+    const t = setup();
+    await seedOrgConfig(t, "{ not json");
+
+    const result = await t.mutation(internal.org.backfillClaudeDefaults, {});
+    expect(result.updated).toBe(false);
+    expect(result.reason).toMatch(/dashboard/i);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    expect(row!.claudeSettings).toBe("{ not json");
+  });
+
+  test("the defaults backfill leaves a deployment with no stored row alone", async () => {
+    const t = setup();
+    const result = await t.mutation(internal.org.backfillClaudeDefaults, {});
+    expect(result.updated).toBe(false);
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    // Inserting one here would freeze today's defaults into the database and
+    // recreate the very trap this migration exists to undo.
+    expect(row).toBeNull();
+  });
 });
 
 describe("secret brokering", () => {

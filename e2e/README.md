@@ -69,13 +69,16 @@ canned JSON, and only a real machine pins the JSON.
 
 Two things genuinely go uncovered, because a run that stops at the last task never
 reaches the step after it: the generated launchers in `~/.riabuild/bin`, and the
-per-account trust keys. That is the task engine's ordinary fail-fast contract
-rather than anything about accounts — a failed `project` task costs the shell too.
+per-account state — the trust keys and the completed first-run setup. That is the
+task engine's ordinary fail-fast contract rather than anything about accounts — a
+failed `project` task costs the shell too.
 
 A third, the `applied=[]` idempotency invariant, is substituted rather than lost.
 Its run log is written after the tasks, so an aborted run produces none; `--check`
 completes where a real run cannot and writes the same line, and it must report
-exactly `claude_accounts,claude_trust` outstanding and nothing else. Their reason
+exactly `claude_accounts,claude_trust,claude_onboarding` outstanding and nothing
+else — both of the latter write into a `.claude.json` that only exists once an
+account does, so the missing sign-in blocks both. Their reason
 there is *first run*, not *account 1 is not signed in* — `status_for` answers a
 task with no state record without calling `check()` at all — which is why the
 assertion is on the set of task ids and not on the sentence.
