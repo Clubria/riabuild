@@ -43,7 +43,7 @@ pub(super) fn available() -> bool {
 
 /// Runs `command` under a pty, printing what it says as subdued lines.
 pub(super) async fn run(mut command: Command, theme: Theme, program: &str) -> Result<i32> {
-    let (master, slave) = open(&winsize())?;
+    let (master, slave) = open(&mut winsize())?;
 
     // Each of the child's three descriptors needs its own handle: `Stdio` takes
     // ownership of what it is given. All three are the pty, so nothing the
@@ -243,7 +243,13 @@ fn winsize() -> libc::winsize {
 }
 
 /// `openpty`, as an owned pair.
-fn open(size: &libc::winsize) -> Result<(OwnedFd, OwnedFd)> {
+///
+/// The size is taken by `&mut` and the null termios is `null_mut` because
+/// Apple's libc declares both of those parameters `*mut` where Linux's declares
+/// them `*const`. A `*mut` coerces to a `*const`, so passing the mutable form
+/// is the one spelling that compiles on both — and this is `runner/`, which is
+/// not a file allowed to branch on the operating system.
+fn open(size: &mut libc::winsize) -> Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
     // SAFETY: both out-parameters are locals, and the size is borrowed for the
@@ -253,7 +259,7 @@ fn open(size: &libc::winsize) -> Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
             size,
         )
     };
