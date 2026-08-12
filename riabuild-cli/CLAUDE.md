@@ -147,6 +147,24 @@ session. `keychain::select_password_store` owns that choice and is the only plac
 that decides it. What the invariant was written to protect — the Infisical org
 credential — is untouched and still brokered per use.
 
+**`security(1)` takes the token in argv, and that is not an oversight.** Every other
+secret riabuild hands a child travels on stdin, because argv is world-readable through
+`ps`. macOS is the one exception: `security add-generic-password` has no stdin path for a
+password. `-w` with nothing after it does not read the pipe — it calls `readpassphrase(3)`,
+which opens **`/dev/tty`** and asks the human, falling back to stdin only when `/dev/tty`
+cannot be opened. Every place a test can run is such a place, so the stdin spelling passed
+CI, passed the macOS e2e job, and shipped; on a laptop it stopped `riabuild remote` at
+`password data for new item:`, stored an empty password, and re-minted a device session on
+every run thereafter. `SecurityCliKeychain::set` carries the full argument. Do not
+"restore" the pipe.
+
+The general lesson outlives the one command: a piped stdin is not proof a child cannot
+prompt. Password readers open `/dev/tty` on purpose — `sudo`, `ssh` and `security` all do
+— and no runner has a controlling terminal, so this whole class of bug is invisible to
+every gate this repository has. Where the check cannot exist in CI, put it in the code:
+`set` reads the token back and fails loudly rather than reporting a save that did not
+happen.
+
 **State is read under a lock, and written by rename.** `config.json`, `state.json` and
 `remotes.json` change through `update`, never a `save` — there is no `save`, and adding one
 back is how the bug returns. `update` takes `~/.riabuild/.state.lock`, reads what is on
@@ -321,6 +339,16 @@ The palette is Clubria's own, read from clubria.com: `#f74f25` is the logo mark'
 with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *attributes*
 (dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
 terminal theme and muddy on another.
+
+**Two roles on one line are siblings, never nested.** `Theme::paint` closes with
+`\x1b[0m`, which resets every attribute rather than the one it opened, so a `Strong`
+value formatted *into* a `Muted` line ends the dim at the value and undims everything
+after it. `ui::note_value` is the shape that gets this right — muted prose, an
+emphasised tail — and it exists because a device code printed dim is the least legible
+thing on a screen whose only purpose is that code. Reach for `Strong` there rather than
+a hue: `Brand` and `Danger` share `1;31` on a sixteen-colour terminal, and a
+brand-coloured code reads as an error on exactly the old SSH sessions where the
+device-code flow is the entire interface.
 
 Text printed by a generated rcfile — the shell banner, the accounts box — takes a `Theme`
 as a parameter rather than reading one, because it is rendered on this side of the

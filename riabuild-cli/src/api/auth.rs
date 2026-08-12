@@ -276,8 +276,11 @@ pub async fn login(
     // Printed before any browser is attempted, and printed whatever happens.
     // Over SSH this is the whole interface, and on a laptop it is what the
     // developer checks the browser against.
+    // The code is highlighted and the link is not: the link is the one a
+    // terminal makes clickable on its own, while the code is typed by hand off
+    // this screen into a browser that may be on another machine.
     ui.note(&format!("Open {}", start.verification_uri));
-    ui.note(&format!("Enter code {}", start.user_code));
+    ui.note_value("Enter code", &start.user_code);
 
     if browser_available(current_browser_env()) {
         let target = start

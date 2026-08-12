@@ -7,9 +7,11 @@
 //! path still compiles and still has tests on the Linux host every pull request
 //! is gated on.
 //!
-//! The token reaches either tool on **stdin**, never as an argument. argv is
-//! world-readable through `ps`, and on a shared server `ps` shows other
-//! developers' processes.
+//! `secret-tool` is handed the token on **stdin**, never as an argument: argv
+//! is world-readable through `ps`. `security` cannot be — it has no stdin path
+//! for a password at all, only a `/dev/tty` prompt — so on macOS the token is
+//! an argv element and the leak is accepted. `SecurityCliKeychain::set` carries
+//! the whole argument.
 
 use super::Keychain;
 use crate::runner::{CommandRunner, RunOptions};
@@ -72,15 +74,24 @@ impl Keychain for SecurityCliKeychain {
         // `-U` updates in place; without it a second login errors on a duplicate
         // item, which would make `apply()` unsafe to run twice.
         //
-        // `-w` with no trailing value — never `-w <token>` — is what keeps the
-        // token out of argv: with nothing after it, `security` reads the
-        // password from stdin (it only falls back to an interactive prompt when
-        // stdin is a terminal, which it never is here), the same way
-        // `SecretToolKeychain::set` pipes its token to `secret-tool store`
-        // below. `-X` would take a hex-encoded password instead, but that is
-        // still an argv element and so not a fix. `ps` on this machine would
-        // show the full `security add-generic-password …` invocation to every
-        // other user, which is exactly what argv is: world-readable.
+        // The token is an argv element, and that is deliberate. `security` has
+        // no way to be given a password on stdin. `-w` with nothing after it
+        // does not read the pipe: it calls `readpassphrase(3)`, which opens
+        // **/dev/tty** and asks the human, falling back to stdin only when
+        // /dev/tty cannot be opened at all. That fallback is why the stdin
+        // spelling looked right — it is the only path CI, `cargo test` and a
+        // GitHub runner can ever take, none of them having a controlling
+        // terminal. On the laptop this actually runs on, `riabuild remote` sat
+        // at `password data for new item:` with the piped token ignored, stored
+        // an empty password when the developer pressed Enter through it, and
+        // then minted a fresh device session on every later run because the
+        // item read back empty. `-X` takes a hex-encoded password and is still
+        // argv, so it is not a fix either.
+        //
+        // The cost is real and narrow: for the few milliseconds this process
+        // lives, `ps` shows the token to other accounts on this Mac. There is
+        // no spelling that both works and avoids it. `SecretToolKeychain` below
+        // keeps its pipe — `secret-tool store` documents stdin and honours it.
         let output = self
             .runner
             .run(
@@ -93,21 +104,36 @@ impl Keychain for SecurityCliKeychain {
                     "-a",
                     &self.account,
                     "-w",
+                    token,
                 ],
-                &RunOptions {
-                    stdin: Some(token.as_bytes().to_vec()),
-                    ..Default::default()
-                },
+                &RunOptions::default(),
             )
             .await?;
-        if output.ok() {
-            Ok(())
-        } else {
-            Err(anyhow!(
+        if !output.ok() {
+            return Err(anyhow!(
                 "could not save the riabuild token to your Keychain: {}",
                 output.stderr.trim()
-            ))
+            ));
         }
+        // Then read it straight back, because an exit status is not evidence.
+        // `security` returns 0 having stored an empty password, and a `set`
+        // that lies is not a save that failed — it is a silent sign-in loop:
+        // every later `get` answers `None`, every run mints another 90-day
+        // session, and nothing anywhere says why. No CI can catch that (the
+        // prompt needs a terminal no runner has), so this is the only check
+        // that runs where the failure lives.
+        if self.get().await?.as_deref() != Some(token) {
+            return Err(Failure::new(
+                "storing the riabuild token in your Keychain",
+                format!(
+                    "riabuild saved it and read something else back. Run \
+                     `security find-generic-password -s {SERVICE} -a {}` to see what is there.",
+                    self.account
+                ),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     async fn delete(&self) -> Result<()> {
@@ -295,45 +321,82 @@ mod tests {
     #[tokio::test]
     async fn storing_twice_updates_rather_than_failing() {
         // `apply()` must be safe to run twice, which is what `-U` buys.
-        let runner = Arc::new(FakeRunner::new().with("security add-generic-password", 0, "", ""));
+        let runner = Arc::new(
+            FakeRunner::new()
+                .with("security add-generic-password", 0, "", "")
+                .then("security find-generic-password", 0, "first\n", "")
+                .then("security find-generic-password", 0, "second\n", ""),
+        );
         let keychain = SecurityCliKeychain::new(runner.clone());
         keychain.set("first").await.unwrap();
         keychain.set("second").await.unwrap();
-        assert!(runner.calls().iter().all(|call| call.contains("-U")));
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .filter(|call| call.contains("add-generic-password"))
+                .all(|call| call.contains("-U"))
+        );
     }
 
     #[tokio::test]
-    async fn a_secret_never_appears_in_a_security_argument_list() {
-        // The macOS counterpart to `a_secret_never_appears_in_a_secret_tool_argument_list`
-        // below. `-w` carries no trailing value in argv — the token travels
-        // over stdin instead, exactly like `secret-tool store` already does —
-        // so it must not show up in any recorded call. `FakeRunner::calls`
-        // only ever sees `program` and `args`, never `RunOptions.stdin`, so
-        // this is a faithful stand-in for what `ps` would show a real
-        // co-tenant on the machine.
-        //
-        // Both halves are asserted. Absence from argv alone is satisfied just
-        // as well by a `set()` that pipes nothing at all — and `-w` with no
-        // trailing value and no stdin does not fail: on a real Mac it either
-        // blocks on `security`'s interactive prompt or stores an empty
-        // password. This is the only guard that could catch that, since no PR
-        // gate runs this suite on macOS (`ci.yml` pins the cli job to ubuntu;
-        // `release.yml`'s macOS `cargo test` is tag-triggered).
-        let runner = Arc::new(FakeRunner::new().with("security add-generic-password", 0, "", ""));
+    async fn the_token_goes_to_security_in_argv_because_there_is_nowhere_else() {
+        // The deliberate exception to `a_secret_never_appears_in_a_secret_tool_argument_list`
+        // below, pinned here so removing it is a decision rather than a tidy-up.
+        // `security` reads a password from /dev/tty or from argv, and nothing
+        // else; the stdin spelling this replaced was a prompt on a developer's
+        // laptop, silent everywhere a test can run.
+        let runner = Arc::new(
+            FakeRunner::new()
+                .with("security add-generic-password", 0, "", "")
+                .with("security find-generic-password", 0, "super-secret\n", ""),
+        );
         let keychain = SecurityCliKeychain::new(runner.clone());
         keychain.set("super-secret").await.unwrap();
         assert!(
-            !runner
+            runner
                 .calls()
                 .iter()
-                .any(|call| call.contains("super-secret"))
+                .any(|call| call.contains("-w super-secret")),
+            "{:?}",
+            runner.calls()
         );
         assert_eq!(
             runner
                 .stdin_text_of("security add-generic-password")
                 .as_deref(),
-            Some("super-secret"),
-            "the token must actually reach `security` on stdin"
+            None,
+            "nothing may be piped: `security` would not read it, and a pipe here \
+             is what made the last version look correct"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_did_not_take_is_an_error_rather_than_a_sign_in_loop() {
+        // The regression test for the bug this file was rewritten over. When
+        // `security` exits 0 having stored something other than the token —
+        // an empty password, because a human pressed Enter through a prompt
+        // riabuild never meant to raise — `set` must say so. Reporting success
+        // is what turned one broken write into `riabuild remote` minting a new
+        // 90-day session on every single run, with nothing on screen to
+        // explain it.
+        let runner = Arc::new(
+            FakeRunner::new()
+                .with("security add-generic-password", 0, "", "")
+                .with("security find-generic-password", 0, "\n", ""),
+        );
+        let keychain = SecurityCliKeychain::new(runner);
+        let error = keychain
+            .set("rb_live_token")
+            .await
+            .expect_err("an empty read-back is a failed store");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("must be the actionable Failure");
+        assert!(
+            failure.action.contains("find-generic-password"),
+            "{}",
+            failure.action
         );
     }
 
@@ -381,15 +444,16 @@ mod tests {
     /// undocumented behaviour of a real external tool instead of guessing at
     /// it.
     ///
-    /// This confirms the thing a unit test cannot: that `-w` with no
-    /// trailing argv value genuinely reads the password from piped stdin,
-    /// rather than — for instance — silently storing an empty password, or
-    /// blocking forever on an interactive prompt that piped stdin can never
-    /// satisfy. That belief comes from `security`'s documented behaviour,
-    /// not from having run it: this repository's CI and every development
-    /// container it runs in are Linux, where `security` does not exist, so
-    /// nothing here has ever executed this path. Ignored for that reason —
-    /// a human with a real Mac must run it with `cargo test -- --ignored`.
+    /// This confirms the thing a unit test cannot, and the thing that was
+    /// wrong for five days: that `set` stores a token a later `get` can
+    /// actually retrieve. Run it **from a terminal**, not just from CI. The
+    /// bug it exists to catch only appears where `/dev/tty` can be opened, so
+    /// a green run in a runner or under `nohup` proves less than it looks —
+    /// which is exactly how the previous spelling reached a release.
+    ///
+    /// Ignored because this repository's PR gate is Linux, where `security`
+    /// does not exist: a human with a real Mac must run it with
+    /// `cargo test -- --ignored`.
     ///
     /// Uses a throwaway account distinct from `session-token` so running
     /// this locally cannot clobber a developer's real riabuild sign-in, and
