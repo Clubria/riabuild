@@ -63,7 +63,7 @@ impl Opener for SystemOpener {
         let options = RunOptions {
             env: vec![(
                 "PATH".into(),
-                crate::shims::clipboard::serve::path_without(&path, &self.bin_dir),
+                crate::paths::path_without(&path, &self.bin_dir),
             )],
             ..Default::default()
         };

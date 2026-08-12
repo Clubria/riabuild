@@ -255,7 +255,12 @@ impl Ui {
             return;
         }
         println!();
-        for line in art::banner(self.theme, art::glyphs_render(), org, crate::cli::VERSION) {
+        for line in art::banner(
+            self.theme,
+            art::glyphs_render(),
+            org,
+            crate::version::VERSION,
+        ) {
             println!("{line}");
         }
         println!();

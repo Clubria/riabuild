@@ -28,13 +28,36 @@ pub mod session;
 pub mod shell;
 pub mod store;
 
-pub use flow::run;
+pub use flow::{forget_server, list, run};
 
 use crate::paths::Paths;
 use crate::runner::{CommandOutput, CommandRunner};
 use crate::ui::Failure;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
+
+/// What `riabuild remote` needs from the command line, named rather than parsed.
+///
+/// The binary fills this in from `Cli`; nothing under `remote/` sees a clap
+/// type. That is not tidiness — reaching into the global `Cli` meant this
+/// module could read *any* flag rather than the ones its caller chose to hand
+/// over, and `--accept-host-key` had to be dug out by matching `cli.command`
+/// because it is scoped to the `remote` subcommand (R13 in `decisions.md`)
+/// rather than being a top-level field. Named fields make both the inputs and
+/// their scope obvious, and let the tests state a case directly instead of
+/// round-tripping it through an argv they then have to parse.
+#[derive(Debug, Clone, Default)]
+pub struct Request {
+    /// A saved server's name, or `[user@]host[:port]` to add one.
+    pub target: Option<String>,
+    /// The host key fingerprint to trust without prompting.
+    pub accept_host_key: Option<String>,
+    pub check: bool,
+    pub quiet: bool,
+    pub no_shell: bool,
+    /// Where the checkout should live *on the server*, not on this laptop.
+    pub project: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {

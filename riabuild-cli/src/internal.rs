@@ -121,7 +121,6 @@ pub(crate) async fn askpass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_ctx;
     use crate::config::{State, UserConfig};
     use crate::keychain::{self, MemoryKeychain};
     use crate::paths::{Paths, RealPaths};
@@ -168,7 +167,7 @@ mod tests {
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
         let runner: Arc<dyn CommandRunner> = fake;
         let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
-        build_ctx(
+        Ctx::new(
             scope,
             paths,
             runner,

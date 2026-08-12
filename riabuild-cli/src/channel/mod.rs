@@ -32,13 +32,8 @@ pub const LOG_ENV: &str = "RIABUILD_CHANNEL_LOG";
 /// that module exists to draw.
 pub use socket::{SOCKET_ENV, socket_path, socket_path_for_create};
 
-use crate::cli::ChannelAction;
-// `bin_dir` is a trait method, so the trait has to be in scope even though only
-// the concrete `RealPaths` is named below.
-use crate::paths::{Paths, RealPaths};
-use crate::runner::{CommandRunner, RealRunner};
-use crate::shims::clipboard::Tool;
-use crate::ui::{Failure, Ui};
+use crate::runner::CommandRunner;
+use crate::ui::Failure;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
@@ -74,57 +69,4 @@ pub fn laptop_agent(runner: Arc<dyn CommandRunner>, bin: &Path) -> Result<Arc<ag
         clipboard::backend(runner.clone(), session),
         Box::new(opener::SystemOpener::new(runner, os, bin)),
     )))
-}
-
-/// Handled before the setup flow: the shim runs on every Ctrl+V and must not
-/// check the machine or talk to the API.
-pub async fn dispatch(action: &ChannelAction, quiet: bool) -> Result<i32> {
-    let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
-
-    match action {
-        ChannelAction::Shim { tool, args } => {
-            let Some(tool) = Tool::from_name(tool) else {
-                // Not a tool riabuild shadows. The shell's own code for it,
-                // rather than a silent success.
-                return Ok(127);
-            };
-            let bin = RealPaths::new()?.bin_dir();
-            Ok(crate::shims::clipboard::run(tool, args, Some(socket_path()), &bin, &runner).await)
-        }
-
-        ChannelAction::Agent { socket } => {
-            // The creating side, so the checked resolver: this is the one call
-            // that can still refuse a socket belonging to somebody else, before
-            // `serve` unlinks whatever is in the way and binds.
-            let socket = socket_path_for_create(socket.as_deref()).await?;
-            let bin = RealPaths::new()?.bin_dir();
-            laptop_agent(runner, &bin)?.serve(&socket).await?;
-            Ok(0)
-        }
-
-        ChannelAction::Open { args } => {
-            Ok(crate::shims::browser::run(args, Some(socket_path())).await)
-        }
-
-        ChannelAction::Status => {
-            let ui = Ui::new(quiet);
-            let socket = socket_path();
-            match client::request(&socket, &protocol::Request::ChannelPing).await {
-                Ok(_) => {
-                    ui.info(&format!(
-                        "Clipboard channel — connected ({})",
-                        socket.display()
-                    ));
-                    Ok(0)
-                }
-                Err(error) => {
-                    ui.warn(&format!("Clipboard channel — down: {error}"));
-                    ui.info(
-                        "Paste will not work until the laptop reconnects. Nothing else is affected.",
-                    );
-                    Ok(1)
-                }
-            }
-        }
-    }
 }

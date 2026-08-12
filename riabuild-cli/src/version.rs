@@ -1,9 +1,34 @@
-//! Version parsing and comparison.
+//! riabuild's own version, and version parsing and comparison.
 //!
 //! Every `--version` on a developer's machine has its own shape: `gh version
 //! 2.96.0 (2026-07-02)`, `v22.23.1`, `1.2.3 (Claude Code)`. Checks compare
 //! numbers, so this pulls the first dotted-numeric run out of whatever it is
 //! given and ignores the rest.
+
+/// riabuild is versioned by release date, not by semver.
+///
+/// The version comes from the git tag, injected by the release workflow, and
+/// deliberately **not** from `CARGO_PKG_VERSION`: Cargo requires valid semver,
+/// which forbids both the leading zeros in `2026.08.04` and the fourth
+/// component a same-day rebuild needs. Taking it from the tag also makes the
+/// tag the only place a version is written down, so a binary that reports a
+/// different version than the release it shipped in is not a mistake anyone
+/// can make.
+///
+/// A local `cargo build` has no tag, and gets a sentinel that sits above every
+/// real date. That is the useful direction to fail in: it reads as obviously
+/// not-a-release, it clears any `minCliVersion` the server enforces, and
+/// `update::decide` already leaves a build ahead of the published latest alone
+/// — so working on riabuild never triggers riabuild upgrading itself.
+///
+/// It lives here rather than beside the clap definitions because it is the
+/// product's version, not a command-line concern: `art::banner` prints it, the
+/// API client sends it, and neither has any business reaching into the parser
+/// to find it.
+pub const VERSION: &str = match option_env!("RIABUILD_VERSION") {
+    Some(version) => version,
+    None => "9999.0.0-dev",
+};
 
 pub fn parse(text: &str) -> Option<Vec<u64>> {
     let mut current: Vec<u64> = Vec::new();

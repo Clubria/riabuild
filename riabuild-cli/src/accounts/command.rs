@@ -3,7 +3,6 @@
 use crate::accounts;
 use crate::accounts::render;
 use crate::accounts::status::{self, Identity};
-use crate::cli::ClaudeAction;
 use crate::paths::contract_tilde;
 use crate::runner::RunOptions;
 use crate::shims;
@@ -29,16 +28,7 @@ fn in_account(dir: &Path) -> RunOptions {
     }
 }
 
-pub async fn run(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> {
-    match action.unwrap_or(ClaudeAction::List) {
-        ClaudeAction::List => list(ctx).await,
-        ClaudeAction::New => new(ctx).await,
-        ClaudeAction::Delete { number, yes } => delete(ctx, number, yes).await,
-        ClaudeAction::Primary { number } => primary(ctx, number).await,
-    }
-}
-
-async fn list(ctx: &Ctx) -> Result<i32> {
+pub async fn list(ctx: &Ctx) -> Result<i32> {
     let found = status::read_all(ctx).await;
     ctx.ui.info("");
     ctx.ui.info(&render::accounts_box(&found, ctx.ui.theme()));
@@ -49,7 +39,7 @@ async fn list(ctx: &Ctx) -> Result<i32> {
 ///
 /// No Claude Code session is opened: signing in is the whole job, and the
 /// developer starts a session with `claude-<n>` when they want one.
-async fn new(ctx: &mut Ctx) -> Result<i32> {
+pub async fn new(ctx: &mut Ctx) -> Result<i32> {
     let id = accounts::new_id();
     // Registered before the directory exists, and deliberately in that order: a
     // directory created first and then refused at the cap is an unregistered
@@ -200,7 +190,7 @@ fn confirm_question(number: usize, named: &str) -> String {
     format!("  Delete account {number} — {named}? [y/N]")
 }
 
-async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
+pub async fn delete(ctx: &mut Ctx, number: usize, assume_yes: bool) -> Result<i32> {
     // The number before the count, so `riabuild claude delete 4` on a machine
     // with one account says there is no account 4 rather than refusing to delete
     // the only one. The right refusal for the wrong reason teaches a developer
@@ -314,7 +304,7 @@ async fn sign_out(ctx: &Ctx, dir: &Path) -> bool {
     )
 }
 
-async fn primary(ctx: &mut Ctx, number: usize) -> Result<i32> {
+pub async fn primary(ctx: &mut Ctx, number: usize) -> Result<i32> {
     // Validated for its refusal, not its value: `--check` has to report "there
     // is no account 4" rather than claim a promotion that would not happen.
     accounts::id_of(&ctx.config, number)?;

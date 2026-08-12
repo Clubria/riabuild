@@ -12,7 +12,7 @@ use crate::shims;
 use crate::tasks::{Ctx, engine};
 use crate::ui;
 use crate::update;
-use crate::{connect, opens_shell, tasks};
+use crate::{opens_shell, tasks};
 use anyhow::Result;
 
 /// The lock a provisioning run holds across its tasks, or `None` under `--check`.
@@ -51,7 +51,7 @@ async fn provisioning_lock(ctx: &Ctx) -> Result<Option<crate::filelock::FileLock
 
 pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.ui.banner("Clubria");
-    connect(ctx).await?;
+    ctx.connect().await?;
     describe_session(ctx);
 
     // A managed server has no package manager watching this binary, so it must

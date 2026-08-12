@@ -16,11 +16,12 @@ pub mod repo_status;
 pub mod toolchain;
 
 use crate::api::org::OrgConfig;
-use crate::api::{ApiClient, Member};
+use crate::api::{ApiClient, ApiError, Member};
 use crate::config::{State, UserConfig};
 use crate::keychain::Keychain;
 use crate::paths::Paths;
 use crate::runner::CommandRunner;
+use crate::scope::Scope;
 use crate::ui::Ui;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -114,6 +115,75 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// Assembles the `Ctx` a run works against.
+    ///
+    /// Lives beside `Ctx` rather than in `main` so the one field that comes
+    /// from `Scope` — `server` — is testable without standing up
+    /// `RealPaths::new()`, a real `ApiClient`, or a platform keychain.
+    /// `Ctx.server` is the only remote-mode fact a task is allowed to branch
+    /// on (see the field's own comment), and this is the one place it is set
+    /// from the environment riabuild actually found itself in — hardcoding
+    /// `None` here is the regression that leaves per-developer checkout
+    /// namespacing (`paths::remote_project_dir`, `Ctx::default_checkout`) dead
+    /// on every server despite compiling and passing every other test. See
+    /// ruling R11 in `.superpowers/sdd/2026-08-06-remote-mode/decisions.md`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        scope: &Scope,
+        paths: Arc<dyn Paths>,
+        runner: Arc<dyn CommandRunner>,
+        keychain: Arc<dyn Keychain>,
+        ui: Ui,
+        config: UserConfig,
+        state: State,
+        dry_run: bool,
+    ) -> Ctx {
+        Ctx {
+            paths,
+            runner,
+            keychain,
+            api: ApiClient::new(crate::version::VERSION),
+            ui,
+            config,
+            state,
+            org: None,
+            member: None,
+            server: scope.server.clone(),
+            cli_version: crate::version::VERSION.to_string(),
+            env: Vec::new(),
+            notes: Vec::new(),
+            dry_run,
+        }
+    }
+
+    /// Asks riabuild-web who this machine belongs to, before any task runs.
+    ///
+    /// A missing or expired session is not an error here — the `login` task
+    /// exists to fix exactly that. Anything else (suspended, removed from the
+    /// org) is surfaced immediately, because no amount of provisioning will
+    /// help.
+    pub async fn connect(&mut self) -> Result<()> {
+        let Some(token) = self.keychain.get().await? else {
+            return Ok(());
+        };
+        self.api.set_token(Some(token));
+
+        match self.api.me().await {
+            Ok(member) => {
+                self.member = Some(member);
+                self.org = Some(crate::api::org::fetch_config(&self.api).await?);
+                Ok(())
+            }
+            Err(error) => match error.downcast_ref::<ApiError>() {
+                Some(api_error) if api_error.needs_login() => {
+                    self.api.set_token(None);
+                    Ok(())
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
     pub fn org(&self) -> Result<&OrgConfig> {
         self.org
             .as_ref()

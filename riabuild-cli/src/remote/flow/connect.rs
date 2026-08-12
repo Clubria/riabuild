@@ -12,11 +12,10 @@
 //! because of the call on either side of it, so a cut through the middle
 //! would separate a guard from the thing that makes it correct.
 
-use crate::cli::Cli;
 use crate::paths::Paths;
 use crate::remote::{
-    Remote, askpass, authorise, channel, env_command, env_prefix, host_key, identity, install,
-    resolve_home, seed, session, shell, ssh_once, store,
+    Remote, Request, askpass, authorise, channel, env_command, env_prefix, host_key, identity,
+    install, resolve_home, seed, session, shell, ssh_once, store,
 };
 use crate::runner::CommandRunner;
 use crate::tasks::Ctx;
@@ -30,12 +29,11 @@ use std::sync::Arc;
 /// `flow::run` is the only caller that goes through `connect` first.
 pub(super) async fn connect_and_setup(
     ctx: &mut Ctx,
-    cli: &Cli,
+    request: &Request,
     store: &mut store::Store,
-    target: Option<String>,
-    accept_host_key: Option<&str>,
 ) -> Result<i32> {
-    let remote = store::choose(ctx, store, target).await?;
+    let accept_host_key = request.accept_host_key.as_deref();
+    let remote = store::choose(ctx, store, request.target.clone()).await?;
     let member = ctx
         .member
         .clone()
@@ -87,7 +85,7 @@ pub(super) async fn connect_and_setup(
     // server, which is the case the flag exists for. `ensure_key` and
     // `trust_host` above stay put for the same reason: a key pair and a
     // `known_hosts` line are this laptop's own files, not the server's.
-    if cli.check {
+    if request.check {
         if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
             ctx.ui.note(
                 "--check: riabuild's key is not authorised on that server yet, so there is \
@@ -128,7 +126,7 @@ pub(super) async fn connect_and_setup(
     // remove. Conditional because this is the one step `--check` runs against
     // the server, and saving here unconditionally is what made a read-only
     // probe show up in `remote list` as a server the developer had set up.
-    if !cli.check {
+    if !request.check {
         store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
     }
     let prefix = env_prefix(&home, &member.member_id, &remote.name);
@@ -150,7 +148,7 @@ pub(super) async fn connect_and_setup(
     // `--check` stops here. Everywhere else in riabuild that flag means *touch
     // nothing*, and the steps below mint a bearer token onto a remote
     // filesystem and hand that server this developer's GitHub identity.
-    if cli.check {
+    if request.check {
         ctx.ui
             .note("--check: not minting a session or lending a GitHub sign-in.");
         let command = env_command(&prefix_refs, &binary, &["--check", "--no-shell"]);
@@ -191,10 +189,10 @@ pub(super) async fn connect_and_setup(
 
     ctx.ui.heading(&format!("Checking {}", remote.name));
     let mut args: Vec<String> = vec!["--no-shell".to_string()];
-    if cli.quiet {
+    if request.quiet {
         args.push("--quiet".to_string());
     }
-    if let Some(project) = &cli.project {
+    if let Some(project) = &request.project {
         args.push("--project".to_string());
         args.push(project.clone());
     }
@@ -210,7 +208,7 @@ pub(super) async fn connect_and_setup(
     }
 
     store::remember(ctx, store, &remote, &version).await?;
-    if cli.no_shell {
+    if request.no_shell {
         return Ok(0);
     }
     // The clipboard channel comes up with the shell and goes down with it, and
@@ -222,7 +220,7 @@ pub(super) async fn connect_and_setup(
         paths: ctx.paths.as_ref(),
         runner: ctx.runner.clone(),
         ui: &ctx.ui,
-        quiet: cli.quiet,
+        quiet: request.quiet,
         remote_socket: channel::remote_socket(&session::namespace(&home, &member.member_id)),
         // The probe carries the same environment every other remote invocation
         // does, so it looks for the socket where the forward actually lands
@@ -272,11 +270,9 @@ async fn sweep_then_seed(
 mod tests {
     use super::*;
     use crate::api::Member;
-    use crate::remote::flow::accept_host_key_of;
     use crate::remote::forget;
     use crate::runner::FakeRunner;
     use crate::ui::Failure;
-    use clap::Parser;
 
     fn remote() -> Remote {
         Remote {
@@ -381,28 +377,15 @@ mod tests {
             .with("ssh-keygen -t ed25519", 0, "", "");
         let (mut ctx, _home, mut store, _fake) = ready_ctx(fake).await;
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            "SHA256:0000000000000000000000000000000000000000",
-        ]);
-        let accept_host_key = accept_host_key_of(&cli);
-        assert_eq!(
-            accept_host_key,
-            Some("SHA256:0000000000000000000000000000000000000000")
-        );
+        let request = Request {
+            target: Some("build-01".to_string()),
+            accept_host_key: Some("SHA256:0000000000000000000000000000000000000000".to_string()),
+            ..Default::default()
+        };
 
-        let error = connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("build-01".to_string()),
-            accept_host_key,
-        )
-        .await
-        .expect_err("a fingerprint that does not match must fail, not silently prompt");
+        let error = connect_and_setup(&mut ctx, &request, &mut store)
+            .await
+            .expect_err("a fingerprint that does not match must fail, not silently prompt");
 
         let message = error.to_string();
         assert!(
@@ -498,21 +481,12 @@ mod tests {
             .containing("printf %s", 0, "/home/dev", "");
         let (mut ctx, _home, mut store, fake) = fresh_ctx(fake).await;
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        let _ = connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("build-01".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await;
+        let request = Request {
+            target: Some("build-01".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            ..Default::default()
+        };
+        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
 
         let calls = fake.calls();
         let scanned = calls
@@ -586,23 +560,14 @@ mod tests {
         let (mut ctx, _home, mut store, fake) = fresh_ctx(fake).await;
         write_public_key(ctx.paths.as_ref()).await;
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "--check",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        assert!(cli.check);
-        let result = connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("build-01".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await;
+        let request = Request {
+            target: Some("build-01".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            check: true,
+            ..Default::default()
+        };
+        assert!(request.check);
+        let result = connect_and_setup(&mut ctx, &request, &mut store).await;
 
         // What was *run* is asserted before what was returned, so restoring
         // the old ordering fails on the `ssh-copy-id` line itself rather than
@@ -667,25 +632,16 @@ mod tests {
         // for, and an added record is what there is to wrongly persist.
         let mut store = store::Store::default();
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "--check",
-            "remote",
-            "ada@build-01.fly.dev",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
+        let request = Request {
+            target: Some("ada@build-01.fly.dev".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            check: true,
+            ..Default::default()
+        };
         // `uname -sm` answers nothing a Rust target can be derived from, so
         // this ends inside `install::ensure_riabuild` — well past
         // `resolve_home`, which is the step under test.
-        let _ = connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("ada@build-01.fly.dev".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await;
+        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
 
         // The round trip really happened — otherwise this passes for the same
         // free reason the probe-stopped test does, and would keep passing if
@@ -725,26 +681,18 @@ mod tests {
             .with("ssh", 0, "", "");
         let (mut ctx, _home, mut store, fake) = ready_ctx(fake).await;
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "--check",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
+        let request = Request {
+            target: Some("build-01".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            check: true,
+            ..Default::default()
+        };
         // `uname -sm` answers nothing a Rust target can be derived from, so
         // the run stops inside `install::ensure_riabuild` — which is past
         // the probe, and is what this asserts.
-        connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("build-01".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await
-        .expect_err("the fake server reports no usable platform");
+        connect_and_setup(&mut ctx, &request, &mut store)
+            .await
+            .expect_err("the fake server reports no usable platform");
         // Asserted on what ran, not on the wording of the error: stopping at
         // the probe returns `Ok(0)` rather than an `Err`, so an assertion
         // about the *error* can only ever fire for some other reason.
@@ -796,9 +744,14 @@ mod tests {
         .await
         .expect("write");
 
-        let cli = Cli::parse_from(["riabuild", "--check", "remote", "build-01"]);
-        assert!(cli.check);
-        let error = connect_and_setup(&mut ctx, &cli, &mut store, Some("build-01".into()), None)
+        let request = Request {
+            target: Some("build-01".into()),
+            accept_host_key: None,
+            check: true,
+            ..Default::default()
+        };
+        assert!(request.check);
+        let error = connect_and_setup(&mut ctx, &request, &mut store)
             .await
             .expect_err("a server answering with a different host key is not a clean check");
 
@@ -863,23 +816,15 @@ mod tests {
         // which is the state in which nothing was left behind to forget.
         let mut store = store::Store::default();
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "ada@build-01.fly.dev",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        assert!(!cli.check);
-        connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("ada@build-01.fly.dev".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await
-        .expect_err("the fake server reports no usable platform");
+        let request = Request {
+            target: Some("ada@build-01.fly.dev".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            ..Default::default()
+        };
+        assert!(!request.check);
+        connect_and_setup(&mut ctx, &request, &mut store)
+            .await
+            .expect_err("the fake server reports no usable platform");
 
         // Read back from disk, not from the in-memory store: `forget` runs in
         // a later process and sees only what `remotes.json` holds.
@@ -969,22 +914,14 @@ mod tests {
         write_public_key(ctx.paths.as_ref()).await;
         let mut store = store::Store::default();
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "ada@build-01.fly.dev",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("ada@build-01.fly.dev".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await
-        .expect_err("a key that still cannot sign in is not success");
+        let request = Request {
+            target: Some("ada@build-01.fly.dev".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            ..Default::default()
+        };
+        connect_and_setup(&mut ctx, &request, &mut store)
+            .await
+            .expect_err("a key that still cannot sign in is not success");
 
         // Only meaningful if the server really was written to.
         assert!(
@@ -1037,21 +974,12 @@ mod tests {
             .containing("printf %s", 0, "/home/dev", "");
         let (mut ctx, _home, mut store, fake) = fresh_ctx(fake).await;
 
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        let _ = connect_and_setup(
-            &mut ctx,
-            &cli,
-            &mut store,
-            Some("build-01".to_string()),
-            Some(GOOD_FINGERPRINT),
-        )
-        .await;
+        let request = Request {
+            target: Some("build-01".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            ..Default::default()
+        };
+        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
 
         let expected = askpass::ssh_env(&remote(), ctx.paths.as_ref());
         let mut checked = 0;
@@ -1092,8 +1020,13 @@ mod tests {
             .with("ssh", 0, "", "");
         let (mut ctx, _home, mut store, fake) = ready_ctx(fake).await;
 
-        let cli = Cli::parse_from(["riabuild", "--check", "remote", "build-01"]);
-        let _ = connect_and_setup(&mut ctx, &cli, &mut store, Some("build-01".into()), None).await;
+        let request = Request {
+            target: Some("build-01".into()),
+            accept_host_key: None,
+            check: true,
+            ..Default::default()
+        };
+        let _ = connect_and_setup(&mut ctx, &request, &mut store).await;
 
         assert!(
             ctx.paths.askpass_helper().exists(),

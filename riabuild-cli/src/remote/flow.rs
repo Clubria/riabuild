@@ -12,55 +12,52 @@
 
 mod connect;
 
-use super::{forget, store};
-use crate::cli::{Cli, Command, RemoteAction};
+use super::{Request, forget, store};
 use crate::tasks::{Ctx, Status, Task};
 use crate::ui::Failure;
 use anyhow::{Result, anyhow};
 
-/// `riabuild remote` — the whole flow.
-pub async fn run(
-    ctx: &mut Ctx,
-    cli: &Cli,
-    target: Option<String>,
-    action: Option<RemoteAction>,
-) -> Result<i32> {
+/// `riabuild remote list`
+pub async fn list(ctx: &mut Ctx) -> Result<i32> {
+    let store = store::Store::load(ctx.paths.as_ref()).await;
+    store::list(ctx, &store)
+}
+
+/// `riabuild remote forget <server>`
+pub async fn forget_server(ctx: &mut Ctx, name: &str) -> Result<i32> {
     let mut store = store::Store::load(ctx.paths.as_ref()).await;
 
-    match action {
-        Some(RemoteAction::List) => return store::list(ctx, &store),
-        Some(RemoteAction::Forget { name }) => {
-            // Needs `ctx.member`/`ctx.api`'s bearer token, both of which
-            // `connect` populates: the API revoke below authenticates as
-            // this laptop's own session, and the server-side cleanup needs
-            // to know whose namespace it is clearing. The default flow below
-            // also calls `connect`, but only after this match already
-            // returned for `list`/`forget`.
-            crate::connect(ctx).await?;
-            let member = ctx
-                .member
-                .clone()
-                .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
-            forget::forget_remote(
-                ctx.paths.as_ref(),
-                ctx.runner.clone(),
-                &ctx.ui,
-                &ctx.api,
-                &member.member_id,
-                &mut store,
-                &name,
-            )
-            .await?;
-            return Ok(0);
-        }
-        None => {}
-    }
+    // Needs `ctx.member`/`ctx.api`'s bearer token, both of which `connect`
+    // populates: the API revoke below authenticates as this laptop's own
+    // session, and the server-side cleanup needs to know whose namespace it is
+    // clearing.
+    ctx.connect().await?;
+    let member = ctx
+        .member
+        .clone()
+        .ok_or_else(|| anyhow!("riabuild does not know who you are yet"))?;
+    forget::forget_remote(
+        ctx.paths.as_ref(),
+        ctx.runner.clone(),
+        &ctx.ui,
+        &ctx.api,
+        &member.member_id,
+        &mut store,
+        name,
+    )
+    .await?;
+    Ok(0)
+}
 
-    // `main::connect` is what populates `ctx.member` and `ctx.org`, and it only
+/// `riabuild remote [server]` — the whole flow.
+pub async fn run(ctx: &mut Ctx, request: Request) -> Result<i32> {
+    let mut store = store::Store::load(ctx.paths.as_ref()).await;
+
+    // `Ctx::connect` is what populates `ctx.member` and `ctx.org`, and it only
     // runs from `provision` — which this command never reaches. Without it,
     // `ctx.org()?` below fails on every single `riabuild remote` with "riabuild
     // has not loaded the team configuration yet".
-    crate::connect(ctx).await?;
+    ctx.connect().await?;
 
     // The laptop then runs exactly two tasks: sign-in, because it mints the
     // server's session, and GitHub, because the server borrows this laptop's
@@ -68,22 +65,7 @@ pub async fn run(
     // departed developer fails here rather than on somebody's server.
     ensure_local_prerequisites(ctx).await?;
 
-    let accept_host_key = accept_host_key_of(cli);
-    connect::connect_and_setup(ctx, cli, &mut store, target, accept_host_key).await
-}
-
-/// The `--accept-host-key` value for this invocation, if any.
-///
-/// Scoped to `Command::Remote` (R13 in `decisions.md`), not a global `Cli`
-/// field, so it is reached by matching `cli.command` rather than reading a
-/// top-level field.
-fn accept_host_key_of(cli: &Cli) -> Option<&str> {
-    match &cli.command {
-        Some(Command::Remote {
-            accept_host_key, ..
-        }) => accept_host_key.as_deref(),
-        _ => None,
-    }
+    connect::connect_and_setup(ctx, &request, &mut store).await
 }
 
 /// The two tasks a laptop runs before it touches a server.
@@ -110,30 +92,4 @@ async fn ensure_local_prerequisites(ctx: &mut Ctx) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
-
-    #[test]
-    fn accept_host_key_is_read_out_of_command_remote_not_a_global_field() {
-        let cli = Cli::parse_from([
-            "riabuild",
-            "remote",
-            "build-01",
-            "--accept-host-key",
-            GOOD_FINGERPRINT,
-        ]);
-        assert_eq!(accept_host_key_of(&cli), Some(GOOD_FINGERPRINT));
-
-        let no_flag = Cli::parse_from(["riabuild", "remote", "build-01"]);
-        assert_eq!(accept_host_key_of(&no_flag), None);
-
-        let other_command = Cli::parse_from(["riabuild", "status"]);
-        assert_eq!(accept_host_key_of(&other_command), None);
-    }
 }

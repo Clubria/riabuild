@@ -23,6 +23,7 @@ mod art;
 mod channel;
 mod cli;
 mod config;
+mod dispatch;
 mod download;
 mod filelock;
 mod fs_move;
@@ -47,7 +48,7 @@ mod update;
 mod version;
 
 use anyhow::Result;
-use api::{ApiError, org};
+use api::ApiError;
 use clap::Parser;
 use cli::{Cli, Command};
 use config::{State, UserConfig};
@@ -98,7 +99,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // Dispatched before the setup flow: the shim runs on every Ctrl+V, so it
     // must not check the machine, talk to the API, or print a banner.
     if let Some(Command::Channel { action }) = &cli.command {
-        return channel::dispatch(action, cli.quiet).await;
+        return dispatch::channel(action, cli.quiet).await;
     }
 
     // Dispatched here for the same reason as the channel shim above, and more
@@ -195,7 +196,7 @@ async fn run(cli: Cli) -> Result<i32> {
         None => runner,
     };
 
-    let mut ctx = build_ctx(
+    let mut ctx = Ctx::new(
         &scope,
         paths.clone(),
         runner,
@@ -283,13 +284,18 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Shell) => return open_shell(ctx).await,
         Some(Command::Login) => {
             use tasks::Task;
-            connect(ctx).await?;
+            ctx.connect().await?;
             tasks::login::Login.apply(ctx).await?;
             ctx.ui.info("This machine is signed in to riabuild.");
             return Ok(0);
         }
-        Some(Command::Remote { target, action, .. }) => {
-            return remote::run(ctx, cli, target.clone(), action.clone()).await;
+        Some(Command::Remote {
+            target,
+            action,
+            accept_host_key,
+        }) => {
+            let request = dispatch::remote_request(cli, target.clone(), accept_host_key.clone());
+            return dispatch::remote(ctx, action.clone(), request).await;
         }
         Some(Command::Internal {
             action: cli::InternalAction::GhSweep,
@@ -304,7 +310,7 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         // talks only to Claude Code, so it must work with no riabuild session,
         // no network, and a machine nothing has provisioned.
         Some(Command::Claude { action }) => {
-            return accounts::command::run(ctx, action.clone()).await;
+            return dispatch::claude(ctx, action.clone()).await;
         }
         Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
         Some(Command::Channel { .. }) => {
@@ -339,74 +345,6 @@ async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
     let chosen = expanded.to_string_lossy().into_owned();
     ctx.update_config(|config| config.project_path = Some(chosen))
         .await
-}
-
-/// Assembles the `Ctx` a run works against.
-///
-/// Split out of `run` so the one field that comes from `Scope` — `server` —
-/// is testable without standing up `RealPaths::new()`, a real `ApiClient`, or
-/// a platform keychain. `run` is the only caller. `Ctx.server` is the only
-/// remote-mode fact a task is allowed to branch on (see `tasks::Ctx::server`),
-/// and this is the one place it is set from the environment riabuild actually
-/// found itself in — hardcoding `None` here is the regression that leaves
-/// per-developer checkout namespacing (`paths::remote_project_dir`,
-/// `Ctx::default_checkout`) dead on every server despite compiling and
-/// passing every other test. See ruling R11 in
-/// `.superpowers/sdd/2026-08-06-remote-mode/decisions.md`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_ctx(
-    scope: &scope::Scope,
-    paths: Arc<dyn Paths>,
-    runner: Arc<dyn CommandRunner>,
-    keychain: Arc<dyn keychain::Keychain>,
-    ui: Ui,
-    config: UserConfig,
-    state: State,
-    dry_run: bool,
-) -> Ctx {
-    Ctx {
-        paths,
-        runner,
-        keychain,
-        api: api::ApiClient::new(cli::VERSION),
-        ui,
-        config,
-        state,
-        org: None,
-        member: None,
-        server: scope.server.clone(),
-        cli_version: cli::VERSION.to_string(),
-        env: Vec::new(),
-        notes: Vec::new(),
-        dry_run,
-    }
-}
-
-/// Asks riabuild-web who this machine belongs to, before any task runs.
-///
-/// A missing or expired session is not an error here — the `login` task exists
-/// to fix exactly that. Anything else (suspended, removed from the org) is
-/// surfaced immediately, because no amount of provisioning will help.
-pub(crate) async fn connect(ctx: &mut Ctx) -> Result<()> {
-    let Some(token) = ctx.keychain.get().await? else {
-        return Ok(());
-    };
-    ctx.api.set_token(Some(token));
-
-    match ctx.api.me().await {
-        Ok(member) => {
-            ctx.member = Some(member);
-            ctx.org = Some(org::fetch_config(&ctx.api).await?);
-            Ok(())
-        }
-        Err(error) => match error.downcast_ref::<ApiError>() {
-            Some(api_error) if api_error.needs_login() => {
-                ctx.api.set_token(None);
-                Ok(())
-            }
-            _ => Err(error),
-        },
-    }
 }
 
 async fn logout(ctx: &mut Ctx) -> Result<i32> {
@@ -447,7 +385,7 @@ mod tests {
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
         let keychain: Arc<dyn keychain::Keychain> = Arc::new(MemoryKeychain::default());
-        let ctx = build_ctx(
+        let ctx = Ctx::new(
             scope,
             paths,
             runner,
@@ -464,7 +402,7 @@ mod tests {
     fn a_remote_scope_reaches_ctx_server() {
         // This is the assertion R11 exists for: a `Ctx` built from a remote
         // `Scope` must carry the server's name, not the `server: None` this
-        // wiring used to hardcode. Revert `build_ctx`'s `server:` line to
+        // wiring used to hardcode. Revert `Ctx::new`'s `server:` line to
         // `None` and this fails.
         let scope = scope::Scope::read(Some("build-01"));
         let (ctx, _home) = ctx_for(&scope);
