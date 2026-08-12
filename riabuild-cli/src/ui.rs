@@ -5,6 +5,8 @@
 //! concrete next action, and whether re-running is safe. A provisioner that
 //! fails vaguely is worse than one that does not run.
 
+use crate::art;
+use crate::theme::{Role, Theme};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -16,7 +18,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod prompt;
 
 pub struct Ui {
-    colour: bool,
+    /// The Clubria palette, bound to what this terminal can render. Every
+    /// colour riabuild prints comes from here, so there is one place to change
+    /// the scheme and no way for a call site to invent its own.
+    theme: Theme,
     quiet: bool,
     /// Whether there is a developer on the other end to answer a question.
     ///
@@ -101,9 +106,8 @@ impl Default for Ui {
 
 impl Ui {
     pub fn new(quiet: bool) -> Self {
-        let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         Self {
-            colour,
+            theme: Theme::detect(std::io::stdout().is_terminal()),
             // Both halves matter. A piped stdin with a terminal stdout is the
             // shape a CI job has, and a question asked there blocks until
             // something times out. `cfg!(test)` is the same hazard indoors: a
@@ -169,7 +173,17 @@ impl Ui {
     /// a generated rcfile rather than by `Ui`, and that file has to bake in the
     /// same `NO_COLOR` decision this made.
     pub fn colour(&self) -> bool {
-        self.colour
+        self.theme.enabled()
+    }
+
+    /// The palette this terminal gets.
+    ///
+    /// Exposed for the same reason as [`Ui::colour`]: the environment shell's
+    /// banner and the accounts box are rendered into a generated rcfile rather
+    /// than printed by `Ui`, and they have to bake in this terminal's depth —
+    /// not merely whether colour is on at all.
+    pub fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Whether there is a developer on the other end to answer a question.
@@ -188,31 +202,27 @@ impl Ui {
         self.interactive
     }
 
-    fn paint(&self, code: &str, text: &str) -> String {
-        if self.colour {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
+    fn paint(&self, role: Role, text: &str) -> String {
+        self.theme.paint(role, text)
     }
 
+    /// The mark, the wordmark, and what this invocation is about to work on.
     pub fn banner(&self, org: &str) {
         if self.quiet {
             return;
         }
         println!();
-        println!(
-            "{} {}",
-            self.paint("1;34", "riabuild"),
-            self.paint("2", &format!("· {org} environment")),
-        );
+        for line in art::banner(self.theme, art::glyphs_render(), org, crate::cli::VERSION) {
+            println!("{line}");
+        }
+        println!();
     }
 
     pub fn heading(&self, text: &str) {
         if self.quiet {
             return;
         }
-        println!("\n{}", self.paint("1", text));
+        println!("\n{}", self.paint(Role::Strong, text));
     }
 
     /// A task that needed nothing.
@@ -220,7 +230,11 @@ impl Ui {
         if self.quiet {
             return;
         }
-        println!("  {} {}", self.paint("32", "●"), self.paint("2", title));
+        println!(
+            "  {} {}",
+            self.paint(Role::Ok, "●"),
+            self.paint(Role::Muted, title)
+        );
     }
 
     /// A task about to run, with the reason it is running.
@@ -235,9 +249,9 @@ impl Ui {
         );
         print!(
             "  {} {} {}",
-            self.paint("33", "◐"),
+            self.paint(Role::Busy, "◐"),
             title,
-            self.paint("2", &format!("— {reason}")),
+            self.paint(Role::Muted, &format!("— {reason}")),
         );
         let _ = std::io::stdout().flush();
     }
@@ -252,7 +266,7 @@ impl Ui {
         // "— first run" behind, so finished tasks read "● GitHub CLI    un".
         let line = format!("  ● {title}");
         let padding = " ".repeat(cover(self.take_pending(), &line));
-        println!("\r  {} {}{}", self.paint("32", "●"), title, padding);
+        println!("\r  {} {}{}", self.paint(Role::Ok, "●"), title, padding);
     }
 
     pub fn note(&self, text: &str) {
@@ -264,11 +278,11 @@ impl Ui {
         self.take_pending();
         #[cfg(test)]
         self.noted.lock().unwrap().push(text.to_string());
-        println!("    {}", self.paint("2", text));
+        println!("    {}", self.paint(Role::Muted, text));
     }
 
     pub fn warn(&self, text: &str) {
-        eprintln!("  {} {}", self.paint("33", "▲"), text);
+        eprintln!("  {} {}", self.paint(Role::Warn, "▲"), text);
     }
 
     pub fn info(&self, text: &str) {
@@ -283,11 +297,11 @@ impl Ui {
         eprintln!();
         eprintln!(
             "  {} {}",
-            self.paint("1;31", "riabuild stopped:"),
+            self.paint(Role::Danger, "riabuild stopped:"),
             failure.attempting
         );
         if let Some(command) = &failure.command {
-            eprintln!("    {} {}", self.paint("2", "ran"), command);
+            eprintln!("    {} {}", self.paint(Role::Muted, "ran"), command);
         }
         for line in failure
             .detail
@@ -295,13 +309,17 @@ impl Ui {
             .filter(|line| !line.trim().is_empty())
             .take(8)
         {
-            eprintln!("    {}", self.paint("2", line));
+            eprintln!("    {}", self.paint(Role::Muted, line));
         }
-        eprintln!("    {} {}", self.paint("1", "do this:"), failure.action);
+        eprintln!(
+            "    {} {}",
+            self.paint(Role::Strong, "do this:"),
+            failure.action
+        );
         eprintln!(
             "    {}",
             self.paint(
-                "2",
+                Role::Muted,
                 if failure.safe_to_rerun {
                     "running `riabuild` again is safe once that is done"
                 } else {

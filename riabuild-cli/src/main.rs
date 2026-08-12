@@ -19,6 +19,7 @@
 mod accounts;
 mod api;
 mod archive;
+mod art;
 mod channel;
 mod cli;
 mod config;
@@ -38,6 +39,7 @@ mod shell;
 mod shims;
 mod tasks;
 mod testing;
+mod theme;
 mod tools;
 mod ui;
 mod update;

@@ -41,7 +41,7 @@ pub async fn run(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> {
 async fn list(ctx: &Ctx) -> Result<i32> {
     let found = status::read_all(ctx).await;
     ctx.ui.info("");
-    ctx.ui.info(&render::accounts_box(&found, ctx.ui.colour()));
+    ctx.ui.info(&render::accounts_box(&found, ctx.ui.theme()));
     Ok(0)
 }
 

@@ -12,6 +12,7 @@ pub mod zsh;
 
 use crate::runner::RunOptions;
 use crate::tasks::Ctx;
+use crate::theme::{Role, Theme};
 use anyhow::Result;
 
 /// Arguments to pass the shell, plus environment entries only it needs.
@@ -42,7 +43,7 @@ const REMOTE_HINT: &str = "— type `exit` to leave, `claude` to start working";
 /// for a good state, and the trailing advice dimmed so the headline reads first.
 ///
 /// The escapes are baked into the generated rcfile because that file, not
-/// `Ui`, is what prints them — so `colour` has to be threaded across that
+/// `Ui`, is what prints them — so the palette has to be threaded across that
 /// boundary rather than re-derived inside the shell.
 ///
 /// `server` is the name of the box this riabuild is managing, from
@@ -51,16 +52,18 @@ const REMOTE_HINT: &str = "— type `exit` to leave, `claude` to start working";
 /// through rather than re-formatted a second time, so there is exactly one
 /// sentence for "the environment is active" and one for "it is active on
 /// this named server".
-pub fn banner(colour: bool, server: Option<&str>) -> String {
+pub fn banner(theme: Theme, server: Option<&str>) -> String {
     let plain = crate::scope::Scope::read(server).banner();
-    if !colour {
+    if !theme.enabled() {
         return plain;
     }
+    let bullet = theme.paint(Role::Ok, BULLET);
     match server {
         Some(name) => format!(
-            "\x1b[32m{BULLET}\x1b[0m Clubria environment active on {name} \x1b[2m{REMOTE_HINT}\x1b[0m"
+            "{bullet} Clubria environment active on {name} {}",
+            theme.paint(Role::Muted, REMOTE_HINT)
         ),
-        None => format!("\x1b[32m{BULLET}\x1b[0m {HEADLINE} \x1b[2m{HINT}\x1b[0m"),
+        None => format!("{bullet} {HEADLINE} {}", theme.paint(Role::Muted, HINT)),
     }
 }
 
@@ -180,19 +183,19 @@ fn browser_for(ctx: &Ctx, env: &[(String, String)], inherited: Option<&str>) -> 
 /// both without any of them learning what an account is.
 ///
 /// `server` is threaded through rather than re-derived here for the same reason
-/// `colour` is: this text is baked into a generated rcfile, and the only thing
+/// the theme is: this text is baked into a generated rcfile, and the only thing
 /// that knows which machine the shell is being started on is the `Ctx` back in
 /// `spawn`. Dropping it would compile and read as a working banner — a
 /// developer on `build-01` would simply be told they are on their laptop.
 pub fn prelude(
     accounts: &[crate::accounts::status::Account],
-    colour: bool,
+    theme: Theme,
     server: Option<&str>,
 ) -> String {
     format!(
         "{}\n\n{}",
-        crate::accounts::render::accounts_box(accounts, colour),
-        banner(colour, server)
+        crate::accounts::render::accounts_box(accounts, theme),
+        banner(theme, server)
     )
 }
 
@@ -209,7 +212,7 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let env = environment(ctx);
 
     let accounts = crate::accounts::status::read_all(ctx).await;
-    let prelude = prelude(&accounts, ctx.ui.colour(), ctx.server.as_deref());
+    let prelude = prelude(&accounts, ctx.ui.theme(), ctx.server.as_deref());
 
     let (args, extra_env) = match &shell {
         Shell::Zsh => zsh::prepare(ctx, &prelude).await?,
@@ -242,6 +245,7 @@ mod tests {
     use super::*;
     use crate::runner::FakeRunner;
     use crate::testing::ctx_with;
+    use crate::theme::Depth;
 
     /// A local session opens browsers on its own. Exporting BROWSER there would
     /// point Claude Code at a shim with nowhere to send the link, turning a
@@ -339,12 +343,12 @@ mod tests {
         // Two spellings of one sentence drift apart. This is what stops the
         // NO_COLOR path and the coloured path from disagreeing.
         assert_eq!(BANNER, format!("{BULLET} {HEADLINE} {HINT}"));
-        assert_eq!(banner(false, None), BANNER);
+        assert_eq!(banner(Theme::plain(), None), BANNER);
     }
 
     #[test]
     fn colour_wraps_the_bullet_and_dims_the_advice() {
-        let coloured = banner(true, None);
+        let coloured = banner(Theme::with_depth(Depth::Ansi16), None);
         assert!(coloured.starts_with("\x1b[32m●\x1b[0m "), "{coloured:?}");
         assert!(coloured.contains("\x1b[2m— type `exit`"), "{coloured:?}");
         assert!(coloured.ends_with("\x1b[0m"), "{coloured:?}");
@@ -353,17 +357,29 @@ mod tests {
     }
 
     #[test]
+    fn a_capable_terminal_gets_the_brand_green_not_the_ansi_one() {
+        // The shell banner is baked into a generated rcfile, so it is the one
+        // place the palette could silently stay on the old sixteen colours
+        // while everything printed by `Ui` moved to the brand.
+        let coloured = banner(Theme::with_depth(Depth::TrueColor), None);
+        assert!(
+            coloured.starts_with("\x1b[38;2;61;220;132m●\x1b[0m "),
+            "{coloured:?}"
+        );
+    }
+
+    #[test]
     fn a_laptop_banner_is_unchanged_byte_for_byte() {
         // The whole reason `server` is a parameter and not a rewrite: a
         // laptop's banner — the case every existing developer sees — must be
         // exactly what it was before remote mode existed.
-        assert_eq!(banner(false, None), BANNER);
+        assert_eq!(banner(Theme::plain(), None), BANNER);
     }
 
     #[test]
     fn a_servers_banner_names_it_in_both_variants() {
-        let plain = banner(false, Some("build-01"));
-        let coloured = banner(true, Some("build-01"));
+        let plain = banner(Theme::plain(), Some("build-01"));
+        let coloured = banner(Theme::with_depth(Depth::Ansi16), Some("build-01"));
         assert!(plain.contains("build-01"), "{plain}");
         assert!(coloured.contains("build-01"), "{coloured}");
         assert!(coloured.starts_with("\x1b[32m●\x1b[0m "), "{coloured:?}");
@@ -375,8 +391,8 @@ mod tests {
         // (used by the plain path) are two spellings of one sentence — this
         // is what stops them drifting apart the way BANNER and HINT are
         // guarded above.
-        let plain = banner(false, Some("build-01"));
-        let coloured = banner(true, Some("build-01"));
+        let plain = banner(Theme::plain(), Some("build-01"));
+        let coloured = banner(Theme::with_depth(Depth::Ansi16), Some("build-01"));
         assert!(plain.contains("`exit` to leave, `claude` to start working"));
         assert!(coloured.contains("`exit` to leave, `claude` to start working"));
     }
@@ -429,7 +445,7 @@ mod tests {
 
     #[test]
     fn the_prelude_is_the_box_then_the_banner() {
-        let text = prelude(&one_account(), false, None);
+        let text = prelude(&one_account(), Theme::plain(), None);
 
         let box_line = text.find("Your Claude Code accounts:").unwrap();
         let banner_line = text.find("Clubria environment active").unwrap();
@@ -444,9 +460,9 @@ mod tests {
         // shell: everything still compiles, every other test still passes, and
         // a developer on `build-01` is told they are on their laptop with no
         // way to tell the difference.
-        let text = prelude(&one_account(), false, Some("build-01"));
+        let text = prelude(&one_account(), Theme::plain(), Some("build-01"));
         assert!(text.contains("build-01"), "{text}");
         // And the laptop case is still the laptop case.
-        assert!(!prelude(&one_account(), false, None).contains("build-01"));
+        assert!(!prelude(&one_account(), Theme::plain(), None).contains("build-01"));
     }
 }
