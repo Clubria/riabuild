@@ -164,11 +164,14 @@ What it keeps:
 - `\x08` backspaces the column, since some tools erase that way.
 - Tabs and every other printable byte are line content.
 
-**Partial lines are emitted when the read drains.** `sudo` writes `Password: ` with no
-newline and blocks. A filter that waited for `\n` would show the developer a terminal that
-had gone silent at the exact moment it wanted a password. So a drained read flushes the
-buffer, and mid-line state carries forward so the next bytes continue the line rather than
-repeating it.
+**The unterminated line is repainted after every read.** `sudo` writes `Password: ` with
+no newline and blocks. A filter that waited for `\n` would show the developer a terminal
+that had gone silent at the exact moment it wanted a password. So the current line is
+available at all times through `partial()`, and the writer repaints it in place — `\r`,
+the indent, the text, and padding covering whatever longer frame it replaces, which is the
+same idiom `ui.applied` uses at `ui.rs:268`. A repaint of an unchanged line writes nothing,
+so a child that prints a prompt and then waits does not have it reprinted on every wakeup.
+This is what makes the `\r` collapse and the blocked prompt one mechanism rather than two.
 
 The filter never prints. `pty.rs` owns the terminal and the theme, and writes each line the
 filter hands back as:
