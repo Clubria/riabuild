@@ -147,6 +147,24 @@ session. `keychain::select_password_store` owns that choice and is the only plac
 that decides it. What the invariant was written to protect — the Infisical org
 credential — is untouched and still brokered per use.
 
+**`security(1)` takes the token in argv, and that is not an oversight.** Every other
+secret riabuild hands a child travels on stdin, because argv is world-readable through
+`ps`. macOS is the one exception: `security add-generic-password` has no stdin path for a
+password. `-w` with nothing after it does not read the pipe — it calls `readpassphrase(3)`,
+which opens **`/dev/tty`** and asks the human, falling back to stdin only when `/dev/tty`
+cannot be opened. Every place a test can run is such a place, so the stdin spelling passed
+CI, passed the macOS e2e job, and shipped; on a laptop it stopped `riabuild remote` at
+`password data for new item:`, stored an empty password, and re-minted a device session on
+every run thereafter. `SecurityCliKeychain::set` carries the full argument. Do not
+"restore" the pipe.
+
+The general lesson outlives the one command: a piped stdin is not proof a child cannot
+prompt. Password readers open `/dev/tty` on purpose — `sudo`, `ssh` and `security` all do
+— and no runner has a controlling terminal, so this whole class of bug is invisible to
+every gate this repository has. Where the check cannot exist in CI, put it in the code:
+`set` reads the token back and fails loudly rather than reporting a save that did not
+happen.
+
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
 `paths.rs`, `keychain/`, `tools.rs`, `download/` and `update.rs` are the only files
 that may know which one they are running on. A `cfg!(target_os)` or a
