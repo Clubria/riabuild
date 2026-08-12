@@ -92,7 +92,7 @@ jobs:
           workspaces: riabuild-cli
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       # RIABUILD_VERSION is what cli.rs compiles in. Without it the binary
       # reports the development sentinel, and the verify step below would catch
@@ -269,9 +269,16 @@ jobs:
           RIABUILD_VERSION: ${{ env.VERSION }}
         run: |
           set -euo pipefail
-          cargo test --release --locked --target ${{ matrix.target }} \
-            tls_and_dns_work_on_this_build -- --ignored --exact \
-            download::tests::tls_and_dns_work_on_this_build
+          # `-p riabuild-fetch` rather than the whole workspace: `download`
+          # lives there now, and without it this builds thirteen test binaries
+          # under LTO on the release critical path to run one test.
+          out=$(cargo test --release --locked --target ${{ matrix.target }} \
+            -p riabuild-fetch -- --ignored --exact \
+            download::tests::tls_and_dns_work_on_this_build 2>&1 | tee /dev/stderr)
+          # libtest exits 0 when a filter matches nothing, so the exit code
+          # alone would let a renamed module turn this release-gating proof
+          # into a silent no-op.
+          grep -q '1 passed' <<<"$out"
 
       - name: Install packaging tools
         run: sudo apt-get install -y rpm

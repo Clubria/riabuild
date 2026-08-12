@@ -1,0 +1,29 @@
+[package]
+name = "riabuild-ui"
+version = "0.0.0"
+edition.workspace = true
+description = "Terminal output, prompts, and the Failure type every error becomes"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+[features]
+# `Ui::scripted` and the `asked`/`noted`/`warned` recorders, plus the gate on
+# `interactive`. That last one is why this feature is not optional: `Ui::new`
+# decides interactivity from `cfg!(test)`, which is *false* in a dependency
+# crate while a downstream test runs — so without it a test that reaches a
+# prompt would find a real terminal and block on `stdin().read_line()`.
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+# termios, to clear ECHO for the password prompt in `secret`.
+libc.workspace = true
+riabuild-theme.workspace = true
+riabuild-version.workspace = true
+
+[dev-dependencies]
+riabuild-theme = { workspace = true, features = ["testing"] }

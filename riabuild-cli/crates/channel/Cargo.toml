@@ -1,0 +1,45 @@
+[package]
+name = "riabuild-channel"
+version = "0.0.0"
+edition.workspace = true
+description = "The laptop channel: clipboard and browser over the SSH reverse-forward"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+# Reconnect jitter.
+getrandom.workspace = true
+image.workspace = true
+# One `getuid`, to refuse a socket that is not ours.
+libc.workspace = true
+riabuild-gh-session.workspace = true
+riabuild-paths.workspace = true
+riabuild-runner.workspace = true
+riabuild-ui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+riabuild-runner = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+# `test-util` is what lets the supervisor's suite advance a paused clock
+# instead of waiting on it: its ping interval is thirty seconds and its
+# backoff ceiling thirty more, and a suite that sat through those is a
+# suite people stop running. This is the only crate that needs it.
+tokio = { workspace = true, features = ["test-util"] }

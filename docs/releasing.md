@@ -89,17 +89,17 @@ second release on the same day adds a fourth component — `2026.08.04.1`, then
 beyond when it shipped.
 
 **The git tag is the only place a version is written down.** Nothing is bumped
-before tagging, and `riabuild-cli/Cargo.toml` holds a permanent `0.0.0`
+before tagging, and `riabuild-cli/crates/cli/Cargo.toml` holds a permanent `0.0.0`
 placeholder that is never the product version.
 
 That is not an accident of tooling, it is the reason the scheme works. Cargo
 requires the `version` field to be valid semver, and semver forbids both the
 leading zeros in `08` and a fourth component. So the release workflow injects
-the tag as `RIABUILD_VERSION`, and `cli.rs` compiles that in instead of
+the tag as `RIABUILD_VERSION`, and `riabuild-version` compiles that in instead of
 `CARGO_PKG_VERSION`. A binary that reports a different version than the release
 it shipped in stops being a mistake anyone can make.
 
-Both version comparators — `riabuild-cli/src/version.rs` and
+Both version comparators — `riabuild-cli/crates/version/src/lib.rs` and
 `riabuild-web/convex/lib/version.ts` — are plain dotted-numeric, so they handle
 dates, zero padding, and the fourth component without any special cases.
 `2026.08.04` and `2026.8.4` compare equal.

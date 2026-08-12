@@ -16,7 +16,7 @@ anything structural.
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI, shipped via Homebrew, apt, and dnf |
+| `riabuild-cli/` | Rust CLI — a cargo workspace of thirteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `e2e/` | the CLI and the backend tested together on macOS — `e2e/README.md` |
 | `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies |
@@ -51,7 +51,8 @@ server-driven task manifest would be a remote code execution channel onto every
 developer's laptop. Do not cross this boundary for convenience.
 
 The org settings may **name** a program and never **carry** one. The default status line
-is `node ~/.riabuild/claude-statusline.js`; the script lives in `riabuild-cli/assets/`,
+is `node ~/.riabuild/claude-statusline.js`; the script lives in
+`riabuild-cli/crates/tasks/assets/`,
 is compiled in with `include_str!`, and is installed by the `claude_statusline` task.
 Editing that string in the dashboard cannot change what runs on a laptop — only an
 upgrade can. A settings key whose value the server chose the *contents* of would

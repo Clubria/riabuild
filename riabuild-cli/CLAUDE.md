@@ -11,14 +11,15 @@ Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 
 ```sh
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo run
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p riabuild-cli        # `-p` because the root is a virtual manifest
+cargo test -p riabuild-remote    # one crate, one test binary, no relink of the rest
 ```
 
 ## One shared `target/` across worktrees
 
-A debug `target/` for this crate runs to roughly 1.8G, most of it a dependency graph
+A debug `target/` for this workspace runs to well over 2G, most of it a dependency graph
 identical on every branch. Half a dozen worktrees each building their own copy is the
 fastest way to fill a disk, so they all compile into one directory instead.
 
@@ -64,7 +65,8 @@ These are not style preferences. Breaking any of them produces a class of bug th
 expensive to find on someone else's laptop.
 
 **Every external process goes through `CommandRunner`.** No direct `std::process::Command`
-outside `runner/`. This is what makes `check()` unit-testable against canned `gh`,
+outside `riabuild-runner` — which the crate graph now enforces, since it is the only
+crate that names `tokio/process` at all. This is what makes `check()` unit-testable against canned `gh`,
 `git`, `node`, and `claude` output. Bypassing it means the only way to test a task is to
 have a real machine in a real state, and the suite gets abandoned.
 
@@ -224,7 +226,8 @@ is treated as success rather than a reason to refuse to provision. Design:
 `../docs/superpowers/specs/2026-08-12-concurrent-runs-design.md`.
 
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
-`paths.rs`, `keychain/`, `tools.rs`, `download/` and `update.rs` are the only files
+`riabuild-paths`, `riabuild-keychain`, `riabuild-fetch`'s `tools` and `download`, and
+the binary's `update.rs` are the only places
 that may know which one they are running on. A `cfg!(target_os)` or a
 `std::env::consts::OS` anywhere else is a bug — it puts a platform decision somewhere no
 test on the other platform can reach it.
@@ -241,13 +244,14 @@ package manager to install a dependency. Run them through `ctx.gh()` and `ctx.in
 rather than by name: during provisioning `~/.riabuild/bin` is not on `PATH`, so the bare
 name finds a binary no `check()` verified, or nothing at all.
 
-Pinned versions live in `tools.rs` as constants, never a `releases/latest` lookup —
+Pinned versions live in `riabuild-fetch`'s `tools` as constants, never a `releases/latest` lookup —
 what riabuild puts on a laptop should be versioned, auditable, and shipped in a signed
 release. Bumping one means bumping the task's `version()` beside it.
 
 **The version comes from the git tag, never from `Cargo.toml`.** riabuild is versioned by
-release date (`2026.08.04`), which semver cannot express, so `Cargo.toml` holds a
-permanent `0.0.0` placeholder and `cli.rs` reads `RIABUILD_VERSION` injected by the
+release date (`2026.08.04`), which semver cannot express, so `crates/cli/Cargo.toml`
+holds a permanent `0.0.0` placeholder — the workspace root has no `[package]` and no
+version at all — and `riabuild-version` reads `RIABUILD_VERSION` injected by the
 release workflow. Do not bump the crate version and do not reintroduce
 `CARGO_PKG_VERSION` — a binary reporting a version other than the release it shipped in
 makes every launch attempt an upgrade that cannot change anything. Local builds report
@@ -269,52 +273,48 @@ dependency edges you must declare.
 
 ## Layout
 
-```
-src/
-  main.rs      entry point, dispatch   cli.rs       clap definitions
-  provision.rs the default flow        internal.rs  `riabuild internal …` handlers
-  config.rs    ~/.riabuild + state     paths.rs     path resolution (trait)
-  keychain/    secret storage: trait,  runner/      CommandRunner — all subprocesses.
-               the two platform CLIs,               `subdue.rs` is the line filter a
-               the server's file store              subdued child's output goes through;
-                                                    `pty.rs` is the terminal it gets
-                                                    instead of riabuild's own
-  update.rs    version check, re-exec  ui.rs        output and prompts
-  theme.rs     the Clubria palette,    art.rs       the riabuild mark: two
-               by role, and the                     renderings and the banner
-               depth ladder under it                laid out around them
-  scope.rs     laptop vs. server, from gh_session/  where the GitHub config dir
-               RIABUILD_REMOTE, and the             goes, how it is created safely
-               namespace it implies: member         against a co-tenant, and how
-               id, server session token file        long it lives
-  move_project.rs  `move-project`      fs_move.rs   rename, or copy across filesystems
-  reset.rs     removes ~/.riabuild
-  tools.rs     the gh and infisical releases riabuild owns
-  version.rs   parsing and comparison  testing.rs   test helpers
-  api/         riabuild-web client     tasks/       trait, registry, DAG runner, one file per task
-  download/    where a release lives, what its asset is called, and the digest that
-               says the bytes are the ones upstream published
-  archive/     unpacking what download fetched: tar and zip, one member or a whole
-               tree, and `staging` for landing that tree atomically
-  shell/       zsh, bash, fish         shims/       ~/.riabuild/bin generation
-  channel/     the laptop channel: clipboard and browser over the SSH reverse-forward.
-               `socket.rs` decides where that socket lives and refuses one that is not
-               ours; `supervisor/` keeps the forward up and proves it carries traffic
-  accounts/    the Claude Code accounts: registry, status, box, `riabuild claude`
-  remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
-               trust, authorising a key, installing the server's own binary, minting its
-               session, seeding a GitHub sign-in, and the mosh/ssh shell handoff.
-               `askpass.rs` answers the password prompt when the key cannot sign
-               in: the SSH_ASKPASS shim, the account the password is saved under,
-               and the environment every ssh in remote mode carries. `pick.rs` is
-               the prompt a bare `riabuild remote` puts — one of the saved
-               servers, or a new one — and `render.rs` the box it and `list` show
-```
+A cargo workspace. `Cargo.toml` at the root is virtual — it holds the release profile,
+the lint policy, and one statement of every third-party dependency, and no code. The
+crates form a straight line, each depending only on those above it:
 
-`download/` decides where bytes come from and whether they are the right bytes;
-`archive/` only ever sees a buffer that already matched a digest. Keep that split — it
-is what makes "verified before anything is written" a property of the code rather than a
-convention.
+| Crate | What | Depends on |
+|---|---|---|
+| `theme` | the Clubria palette, by role, and the depth ladder under it | — |
+| `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
+| `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh and infisical releases riabuild owns) | — |
+| `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
+| `runner` | `CommandRunner` — all subprocesses. `subdue` is the line filter a subdued child's output goes through; `pty` is the terminal it gets instead of riabuild's own | theme |
+| `paths` | path resolution (trait), `config` (`~/.riabuild` and state), `filelock` (the lock both are read and written under) | ui |
+| `keychain` | secret storage: the trait, the two platform CLIs, the server's file store | runner, ui |
+| `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
+| `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
+| `channel` | the laptop channel: clipboard and browser over the SSH reverse-forward. `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the forward up and proves it carries traffic | gh-session, paths, runner, ui |
+| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
+| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show | all of the above |
+| `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
+
+**The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
+`riabuild-fetch` cannot reach the API client, so a string the server sent can never
+become a URL riabuild downloads from; `riabuild-tasks` cannot reach `riabuild-remote`,
+so a task cannot grow a remote-mode branch. Those were prose before, and are now
+things that fail to compile.
+
+Only the binary sees a clap type. A library that matches on a command enum has to be
+compiled with the parser, and one compiled with the parser can read any flag it likes
+rather than the ones its caller chose to pass — which is what `remote` was doing,
+reaching back into the global `Cli` from four directories down. `dispatch.rs` holds
+every argv → library mapping, and library crates take named requests.
+
+What a crate boundary does **not** enforce: "no task shells out to Homebrew, apt or
+dnf" and "secrets are brokered, never stored" both live inside a single crate. Those
+still need tests.
+
+Design: `../docs/superpowers/specs/2026-08-12-cargo-workspace-design.md`.
+
+`download` decides where bytes come from and whether they are the right bytes;
+`archive` only ever sees a buffer that already matched a digest. They are siblings
+inside `riabuild-fetch`, and keeping that split is what makes "verified before anything
+is written" a property of the code rather than a convention.
 
 **The clipboard channel's socket is namespaced, and never unlinked.** It lives at
 `<namespace>/channel.sock`, not in the runtime directory `socket_path()` would otherwise
@@ -332,7 +332,7 @@ forward is precisely what SSH's own keepalives cannot detect, because they run b
 A local socket check would test the agent's liveness, report a dead tunnel as healthy, and
 look like a tidy optimisation while deleting the guarantee.
 
-Inside `archive/`, `staging.rs` owns *how* a tree lands: unpack into a sibling
+Inside `archive`, `staging.rs` owns *how* a tree lands: unpack into a sibling
 directory and `rename` it into place, never `remove_dir_all` the target first.
 `tools_root()` is shared by every developer with an account on a server, so the
 tree being replaced may be one a colleague's `pnpm dev` is running out of. A

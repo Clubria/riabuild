@@ -1,10 +1,18 @@
-[package]
-name = "riabuild-cli"
-# Not the product version, and never bumped. riabuild is versioned by release
-# date (`2026.08.04`), which Cargo cannot express — semver forbids the leading
-# zeros. The real version is injected from the git tag as RIABUILD_VERSION and
-# read in cli.rs; this field only exists because Cargo requires one.
-version = "0.0.0"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Nothing here is a package. The binary is `crates/cli`, and this file exists to
+# hold what must be shared: the release profile, the lint policy, and one
+# statement of every third-party dependency.
+#
+# The workspace root stays at `riabuild-cli/` deliberately. Members share one
+# `target/` at the workspace root, so `riabuild-cli/target/<triple>/release/riabuild`
+# is still where the binary lands — which is what `.github/workflows/{ci,release}.yml`,
+# `e2e/run.sh`, `e2e/remote/*.sh` and `Swatinem/rust-cache` all already point at.
+# Moving the root to the repository root would have meant editing every one of them.
+
+[workspace.package]
 edition = "2024"
 description = "Sets up a Clubria developer's machine and opens the Clubria environment"
 homepage = "https://riabuild.clubria.com"
@@ -13,12 +21,28 @@ license = "MIT"
 # riabuild is distributed through the Homebrew tap, never crates.io.
 publish = false
 
-[[bin]]
-name = "riabuild"
-path = "src/main.rs"
+# A panic in a provisioner is the worst failure it has: it prints a Rust
+# backtrace on a developer's laptop, says nothing about what riabuild was doing,
+# and leaves the machine half-set-up with no advice on whether re-running is
+# safe. Every reachable error must instead become a `Failure` (see
+# `riabuild-ui`), which carries what was attempted, the command, the detail, one
+# next action, and whether a re-run is safe.
+#
+# `unwrap_used` is a clippy `restriction` lint and off by default, so `-D
+# warnings` alone never caught this. It lives here rather than in a member
+# because a lint declared in one manifest applies to that crate alone: a member
+# that forgets `[lints] workspace = true` loses the policy *silently*, since
+# clippy stays green when a lint is simply not enabled. `ci.yml` greps every
+# member manifest for the inheritance line for exactly that reason.
+[workspace.lints.clippy]
+unwrap_used = "deny"
 
 # Every developer downloads this binary over a laptop connection, so the release
 # profile optimises for what ships rather than for build time.
+#
+# This table only takes effect at the workspace root. Left in a member manifest
+# cargo ignores it with a *warning* and builds on, so the first symptom would be
+# an unoptimised, unstripped binary in a release.
 #
 # `strip` is deliberate but not sufficient on its own: on Apple silicon every
 # binary must carry a signature, rustc ad-hoc signs one at link time, and
@@ -30,23 +54,16 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 
-# A panic in a provisioner is the worst failure it has: it prints a Rust
-# backtrace on a developer's laptop, says nothing about what riabuild was doing,
-# and leaves the machine half-set-up with no advice on whether re-running is
-# safe. Every reachable error must instead become a `Failure` (see `ui.rs`),
-# which carries what was attempted, the command, the detail, one next action,
-# and whether a re-run is safe.
-#
-# `unwrap_used` is a clippy `restriction` lint and off by default, so `-D
-# warnings` alone never caught this. Tests are exempt via a `cfg_attr` in
-# `main.rs` — there, a panic is how a failed assertion reports itself.
-[lints.clippy]
-unwrap_used = "deny"
-
-[dependencies]
+# Feature inheritance is **additive only**: a member may add features to a
+# workspace dependency but can never subtract one. So each entry below carries
+# the minimum every user needs, and members ask for the rest. Putting the union
+# here instead would compile `reqwest`'s JSON stack into the download verifier
+# and tokio's process spawner into the terminal code — the comments would
+# survive and the decisions would not.
+[workspace.dependencies]
 anyhow = "1.0"
 # `async fn` in a trait is not dyn-compatible — it returns an anonymous future
-# with no known size, so there is no vtable layout for it. Ctx holds every IO
+# with no known size, so there is no vtable layout for it. `Ctx` holds every IO
 # trait behind `Arc<dyn …>`, and that indirection is what the whole test suite
 # is built on, so the returned futures get boxed instead.
 async-trait = "0.1"
@@ -59,28 +76,32 @@ flate2 = "1.0"
 # backend, and this is the crate underneath it that `rand_core` was depending
 # on anyway, so naming it directly costs the tree nothing and drops four.
 getrandom = "0.3"
-# `gh_session`'s directory-mode repair opens by descriptor with `O_NOFOLLOW |
-# O_DIRECTORY` and `fchmod`s the fd, so a symlink cannot be swapped in between
-# the check and the chmod. Those flag values differ across Linux and macOS, so
-# they come from `libc` rather than being hand-picked — it is already resolved
-# in Cargo.lock as a transitive dependency of several crates above.
+# Four crates need raw syscalls, and each for its own reason: `riabuild-runner`
+# opens and sizes a pty, `riabuild-ui` clears `ECHO` for the password prompt,
+# `riabuild-gh-session` opens by descriptor with `O_NOFOLLOW | O_DIRECTORY` and
+# `fchmod`s the fd so a symlink cannot be swapped in between the check and the
+# chmod, and `riabuild-channel` asks for one `getuid`. Those flag values differ
+# across Linux and macOS, so they come from `libc` rather than being hand-picked.
 libc = "0.2"
 # PNG and TIFF decode, PNG encode, for the clipboard channel's MAX_LONG_EDGE
-# ceiling. Default features pull in a dozen codecs that never appear on a
-# pasteboard, and this binary is downloaded over a laptop connection.
+# ceiling. TIFF is not optional: the macOS pasteboard offers `public.tiff`.
+# Default features pull in a dozen codecs that never appear on a pasteboard, and
+# this binary is downloaded over a laptop connection.
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
-# SHA-256 for the published digests in `download`. `ring` rather than `sha2`
-# because rustls already builds it below — the algorithm is compiled into this
-# binary either way, and `sha2` would add its own `digest`/`generic-array`
-# tower on top to reach the same primitive. If rustls ever moves to another
-# crypto provider this stays correct and merely stops being free.
+# SHA-256 for the published digests in `riabuild-fetch`. `ring` rather than
+# `sha2` because rustls already builds it — the algorithm is compiled into this
+# binary either way, and `sha2` would add its own `digest`/`generic-array` tower
+# on top to reach the same primitive. If rustls ever moves to another crypto
+# provider this stays correct and merely stops being free.
 ring = "0.17"
 # `rustls-tls-native-roots` reads the OS trust store rather than bundling
 # webpki-roots. A developer behind a corporate TLS-inspecting proxy has that
 # MITM root installed already; bundled roots reject it, and the symptom is an
 # opaque TLS error from every riabuild command on an otherwise working laptop.
+#
+# `json` is *not* here. `riabuild-api` is the only crate that sends or parses a
+# JSON body; `riabuild-fetch` only ever calls `.bytes()`.
 reqwest = { version = "0.12", default-features = false, features = [
-    "json",
     "rustls-tls-native-roots",
     "http2",
 ] }
@@ -92,29 +113,17 @@ serde_json = "1.0"
 # xattrs when it was deliberately written with them. Modes and mtimes are core
 # tar fields and are unaffected — the executable bit still lands.
 tar = { version = "0.4", default-features = false }
-# `rt` without `rt-multi-thread`: the runtime is current-thread by construction,
-# so a stray `Runtime::new()` cannot quietly spawn a worker pool. Note this
-# describes the reactor — `tokio::fs` is std::fs on a blocking pool, because no
-# portable async file API exists, so the process still has threads.
-tokio = { version = "1", default-features = false, features = [
-    "rt",
-    "macros",
-    "fs",
-    "process",
-    "net",
-    "io-util",
-    # SIGWINCH, forwarded to a subdued child's pty so a resized window reaches
-    # the program drawing into it. `process` already pulls this in on unix, so
-    # it changes nothing in the dependency graph — it is named because
-    # `runner/pty.rs` depends on it directly, and a future trim of `process`
-    # would otherwise break it from a distance.
-    "signal",
-    # `tokio::io::stdin()` — reads a piped secret off the internal
-    # `seed-github` command's stdin without blocking the current-thread
-    # runtime's only thread the way a `std::io::stdin()` read would.
-    "io-std",
-    "time",
-] }
+# No features at all here, and `default-features = false` on every member that
+# names it. The runtime is current-thread by construction, so a stray
+# `Runtime::new()` cannot quietly spawn a worker pool — and because features
+# unify across the graph rather than per-edge, one member leaving the defaults
+# on would hand the whole workspace the multi-threaded runtime this binary
+# deliberately does not have.
+#
+# Note this describes the reactor: `tokio::fs` is `std::fs` on a blocking pool,
+# because no portable async file API exists, so the process still has threads.
+tokio = { version = "1", default-features = false }
+tempfile = "3"
 # `deflate-flate2`, not `deflate`. The plain `deflate` alias is two decisions
 # in a trench coat: it adds zopfli — an encoder that spends orders of magnitude
 # more CPU to save a few percent, for archives riabuild only ever writes in its
@@ -126,13 +135,15 @@ zip = { version = "8.6.0", default-features = false, features = [
     "deflate-flate2",
 ] }
 
-[dev-dependencies]
-tempfile = "3"
-# `test-util` is what lets the supervisor's suite advance a paused clock instead
-# of waiting on it: its ping interval is thirty seconds and its backoff ceiling
-# thirty more, and a suite that sat through those is a suite people stop
-# running. `default-features = false` for the same reason as above — a
-# dev-dependency's features are unified into the test build, so leaving the
-# defaults on would quietly hand the tests the multi-threaded runtime this
-# binary deliberately does not have.
-tokio = { version = "1", default-features = false, features = ["test-util"] }
+riabuild-api = { path = "crates/api" }
+riabuild-channel = { path = "crates/channel" }
+riabuild-fetch = { path = "crates/fetch" }
+riabuild-gh-session = { path = "crates/gh-session" }
+riabuild-keychain = { path = "crates/keychain" }
+riabuild-paths = { path = "crates/paths" }
+riabuild-remote = { path = "crates/remote" }
+riabuild-runner = { path = "crates/runner" }
+riabuild-tasks = { path = "crates/tasks" }
+riabuild-theme = { path = "crates/theme" }
+riabuild-ui = { path = "crates/ui" }
+riabuild-version = { path = "crates/version" }

@@ -1,0 +1,61 @@
+[package]
+name = "riabuild-tasks"
+version = "0.0.0"
+edition.workspace = true
+description = "The setup tasks, the context they run against, and the shell they end in"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+[features]
+# The `Ctx` builders — a context pointed at a tempdir with every external
+# process and secret store faked. This is what makes each `check()` a unit test
+# instead of something that needs a real machine in a real state, and
+# `riabuild-remote` and the binary reach it from their own test modules.
+#
+# It arrives downstream through `[dev-dependencies]` only, which `cargo build`
+# never resolves — so it cannot reach the shipped binary. `ci.yml` asserts that
+# rather than trusting it.
+testing = [
+    "dep:tempfile",
+    "riabuild-keychain/testing",
+    "riabuild-paths/testing",
+    "riabuild-runner/testing",
+    "riabuild-theme/testing",
+    "riabuild-ui/testing",
+]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+# The v4 account id.
+getrandom.workspace = true
+riabuild-api.workspace = true
+riabuild-channel.workspace = true
+riabuild-fetch.workspace = true
+riabuild-keychain.workspace = true
+riabuild-paths.workspace = true
+riabuild-runner.workspace = true
+riabuild-theme.workspace = true
+riabuild-ui.workspace = true
+riabuild-version.workspace = true
+# `serde_json::Value` only — nothing here derives a serialiser.
+serde_json.workspace = true
+# Not a dev-dependency: `TempDir` is in the public signature of the `Ctx`
+# builders the `testing` feature exports.
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+
+[dev-dependencies]
+# Builds a fake node tarball for the toolchain suite.
+flate2.workspace = true
+riabuild-keychain = { workspace = true, features = ["testing"] }
+riabuild-paths = { workspace = true, features = ["testing"] }
+riabuild-runner = { workspace = true, features = ["testing"] }
+riabuild-theme = { workspace = true, features = ["testing"] }
+riabuild-ui = { workspace = true, features = ["testing"] }
+tar.workspace = true
+tokio = { workspace = true, features = ["macros", "time"] }

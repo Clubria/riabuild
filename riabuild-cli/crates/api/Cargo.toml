@@ -1,0 +1,27 @@
+[package]
+name = "riabuild-api"
+version = "0.0.0"
+edition.workspace = true
+description = "The riabuild-web client: sessions, org configuration, and brokered secrets"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# The only crate that sends or parses a JSON body, and so the only one
+# that pays for reqwest's JSON stack.
+reqwest = { workspace = true, features = ["json"] }
+riabuild-runner.workspace = true
+riabuild-ui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The device-code poll interval.
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -1,0 +1,12 @@
+[package]
+name = "riabuild-version"
+version = "0.0.0"
+edition.workspace = true
+description = "riabuild's own version, and version parsing"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

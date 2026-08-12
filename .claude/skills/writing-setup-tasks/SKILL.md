@@ -75,7 +75,7 @@ directories, revoked access, changed pins.
 
 ## Adding a task
 
-1. One file in `src/tasks/`, registered in `tasks/mod.rs`.
+1. One file in `crates/tasks/src/`, registered in `crates/tasks/src/lib.rs`.
 2. Declare `depends_on()`. The acyclicity test will catch a cycle; nothing will catch a
    missing edge but you.
 3. Write `check()` first, against the drift list above.
