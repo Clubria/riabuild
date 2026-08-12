@@ -56,6 +56,56 @@ test.describe("against a real backend", () => {
     await checkPage(page, info, consoleErrors, { screenshot: "smoke-404" });
   });
 
+  /**
+   * The state that stranded a developer on riabuild.clubria.com: signed out,
+   * with a refresh token still in storage that the deployment will not honour.
+   *
+   * `@convex-dev/auth` writes the JWT and the refresh token together and
+   * removes them together, so removing one is exactly the tear a rejected
+   * refresh leaves behind. The library never reconciles it — `fetchAccessToken`
+   * rethrows and erases nothing — so before `useStaleCredentialReset` this
+   * survived every reload and sent the sign-in screen straight back.
+   *
+   * No `checkPage` here: the console output during a torn load belongs to the
+   * library, and the assertion worth making is that storage came out clean.
+   */
+  test("stale sign-in state clears itself", async ({ page }) => {
+    await page.getByRole("button", { name: /sign in as devlead/i }).click();
+    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+
+    const refreshTokens = () =>
+      page.evaluate(() =>
+        Object.keys(localStorage).filter((key) =>
+          key.startsWith("__convexAuthRefreshToken"),
+        ),
+      );
+
+    expect(
+      await refreshTokens(),
+      "signing in should leave a refresh token to tear",
+    ).not.toEqual([]);
+
+    await page.evaluate(() => {
+      for (const key of Object.keys(localStorage)) {
+        if (key.startsWith("__convexAuthJWT")) localStorage.removeItem(key);
+      }
+    });
+    await page.reload();
+
+    // The door is open again...
+    await expect(
+      page.getByRole("button", { name: /sign in as devlead/i }),
+    ).toBeVisible();
+
+    // ...and the dead half went with it, rather than waiting to break the next
+    // attempt the way it did in production.
+    await expect.poll(refreshTokens, { timeout: 10_000 }).toEqual([]);
+
+    // The point of all of it: signing in works without clearing site data.
+    await page.getByRole("button", { name: /sign in as devlead/i }).click();
+    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+  });
+
   test("the authorize page renders for a signed-in machine", async ({
     page,
     consoleErrors,
