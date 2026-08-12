@@ -17,40 +17,28 @@ use crate::theme::{self, Role, Theme};
 /// Rows in the mark. Both renderings share it.
 pub const HEIGHT: usize = 6;
 
-/// The block rendering.
+/// The quadrant-triangle rendering.
 ///
-/// **Every glyph here is Block Elements, U+2580–U+259F, and that is a hard
-/// constraint rather than a preference.** The first version cut the corners with
-/// `◢◣◤◥` (U+25E2–U+25E5, Geometric Shapes), which is the shape the design
-/// wants: a true half-cell diagonal. Menlo does not carry them. macOS Terminal
-/// falls back to another face, which draws them at *its* optical size instead of
-/// the cell box — so the sloped glyphs rendered visibly smaller than the `█`
-/// beside them and the border came apart. Block Elements are defined to tile the
-/// cell exactly and every monospace font ships them, so the wall and the base
-/// are guaranteed to meet.
-///
-/// The quadrant blocks say the same thing, quantised: each one is a full cell
-/// with the corner *outside* the shape removed. `▟` is missing its upper left,
-/// so it cuts the outer left edge; `▛` is missing its lower right, so it cuts
-/// the hole's left edge facing back the other way. `▙` and `▜` mirror them. The
-/// base is `█` between `▟` and `▙`, all three of which fill the bottom of their
-/// cell — that is what keeps it flat, and it is why the half-height blocks
-/// (`▀`, `▄`) are not an option for tuning the base weight even though they are
-/// in the same Unicode block.
-///
-/// Flush left and twelve columns wide, which is what makes the mirror test
-/// below meaningful: the apex straddles columns 5 and 6, so the reflection axis
-/// falls between two cells rather than through one.
+/// `◢`/`◣` fill the lower half of their cell and `◤`/`◥` the upper half, so the
+/// outer edge fills inward and the inner edge fills back outward and the wall
+/// between them reads as one solid stroke. The base is `█` throughout: every
+/// glyph on that row has to touch the bottom of its cell or the base stops
+/// looking flat, which rules out the half-blocks that would otherwise be the
+/// obvious way to fine-tune its weight.
+/// Both renderings are flush left and twelve columns wide, which is what makes
+/// the mirror test below meaningful: the apex straddles columns 5 and 6, so the
+/// reflection axis falls between two cells rather than through one.
 const MARK: [&str; HEIGHT] = [
-    "     ▟▙",
-    "    ▟██▙",
-    "   ▟█▛▜█▙",
-    "  ▟█▛  ▜█▙",
-    " ▟█▛    ▜█▙",
-    "▟██████████▙",
+    "     ◢◣",
+    "    ◢██◣",
+    "   ◢█◤◥█◣",
+    "  ◢█◤  ◥█◣",
+    " ◢█◤    ◥█◣",
+    "◢██████████◣",
 ];
 
-/// The ASCII rendering, for terminals without a UTF-8 locale.
+/// The ASCII rendering, for terminals that will not draw the mark properly —
+/// no UTF-8 locale, or macOS Terminal. See [`glyphs_render_in`].
 ///
 /// The border is drawn by its two outlines with nothing between them: every
 /// printable ASCII fill character is noisy enough to compete with the
@@ -64,15 +52,44 @@ const ASCII: [&str; HEIGHT] = [
     "/__________\\",
 ];
 
-/// Whether the terminal's locale promises the block glyphs will render.
+/// Whether this terminal will draw the mark the way it is designed.
 ///
-/// Unset locale means ASCII. A mark that renders as six rows of `▯` is a worse
-/// first impression than one drawn in slashes, and this runs before riabuild
-/// has done anything a developer can judge it by.
+/// Two ways it will not, and both fall back to the ASCII outline rather than
+/// degrade the mark itself — a triangle drawn in slashes is a fine thing to
+/// look at, and this runs before riabuild has done anything a developer can
+/// judge it by.
 pub fn glyphs_render() -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"]
+    // Read here, decided in `glyphs_render_in`, so the rules are testable
+    // without setting process-wide environment variables — the same split
+    // `theme::depth_for` uses.
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
+    glyphs_render_in(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        locale.as_deref(),
+    )
+}
+
+/// The rules behind [`glyphs_render`].
+///
+/// `Apple_Terminal` is macOS's built-in Terminal, and it is named specifically
+/// rather than inferred from the platform: this is a fact about a font, not
+/// about an operating system. Terminal's faces — Menlo, and SF Mono on newer
+/// releases — carry Block Elements but not `◢◣◤◥` (U+25E2–U+25E5, Geometric
+/// Shapes). macOS resolves the gap through font fallback, which draws those
+/// four at the substitute face's optical size instead of the cell box, so the
+/// walls come out visibly smaller than the `█` between them and the border
+/// falls apart at every corner. iTerm2, Ghostty, Alacritty, WezTerm and VS
+/// Code's terminal all ship faces that have them, and all identify themselves
+/// differently, so none of them is affected.
+///
+/// The locale is the second rule and the older one: no UTF-8, no mark.
+pub fn glyphs_render_in(term_program: Option<&str>, locale: Option<&str>) -> bool {
+    if term_program == Some("Apple_Terminal") {
+        return false;
+    }
+    locale
         .map(|value| {
             let value = value.to_ascii_lowercase();
             value.contains("utf-8") || value.contains("utf8")
@@ -146,10 +163,10 @@ mod tests {
             .iter()
             .rev()
             .map(|glyph| match glyph {
-                '▟' => '▙',
-                '▙' => '▟',
-                '▛' => '▜',
-                '▜' => '▛',
+                '◢' => '◣',
+                '◣' => '◢',
+                '◤' => '◥',
+                '◥' => '◤',
                 '/' => '\\',
                 '\\' => '/',
                 other => *other,
@@ -178,14 +195,13 @@ mod tests {
 
     #[test]
     fn the_base_is_flat() {
-        // Every glyph on the base row must fill the bottom of its cell. `▟`,
-        // `█` and `▙` all do. `▀` does not, and a base built from it hangs
-        // above the line with a gap at each corner — which is what `▛`/`▜`
-        // would do here too, since each is missing one bottom quadrant.
+        // Every glyph on the base row must touch the bottom of its cell. `▀`
+        // and the other half-blocks do not, and a base built from them hangs
+        // above the line with a gap at each corner.
         let base = MARK[HEIGHT - 1].trim();
         let mut glyphs = base.chars();
-        assert_eq!(glyphs.next(), Some('▟'));
-        assert_eq!(glyphs.next_back(), Some('▙'));
+        assert_eq!(glyphs.next(), Some('◢'));
+        assert_eq!(glyphs.next_back(), Some('◣'));
         assert!(glyphs.all(|glyph| glyph == '█'), "{base}");
 
         let ascii = ASCII[HEIGHT - 1];
@@ -194,34 +210,16 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_is_block_elements_only() {
-        // The bug this pins: `◢◣◤◥` (U+25E2..) are the shape the design wants,
-        // but Menlo does not have them, so macOS Terminal drew them from a
-        // fallback face at that face's optical size — visibly smaller than the
-        // `█` beside them, with the border coming apart at every corner. Block
-        // Elements are defined to tile the cell and ship in every monospace
-        // font, so the wall and the base are guaranteed to meet.
+    fn the_mark_uses_no_half_height_glyphs() {
+        // The half-blocks are what a future edit would reach for to adjust the
+        // base weight. They are exactly what makes the corners hollow.
         for row in MARK {
             for glyph in row.chars() {
                 assert!(
-                    glyph == ' ' || ('\u{2580}'..='\u{259f}').contains(&glyph),
-                    "{glyph:?} (U+{:04X}) in {row:?} is outside Block Elements",
-                    glyph as u32
+                    !"▀▄▖▗▘▝▚▞▙▟▛▜".contains(glyph),
+                    "half-height glyph {glyph:?} in {row:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn the_base_row_carries_no_glyph_with_an_empty_bottom_quadrant() {
-        // Stated separately from `the_base_is_flat` because this is the rule a
-        // future edit would break: `▛` and `▜` are the right glyphs for the
-        // hole's edges and exactly the wrong ones for the base.
-        for glyph in MARK[HEIGHT - 1].trim().chars() {
-            assert!(
-                "▟█▙▄".contains(glyph),
-                "{glyph:?} does not fill the bottom of its cell"
-            );
         }
     }
 
@@ -313,18 +311,45 @@ mod tests {
 
     #[test]
     fn a_utf8_locale_is_what_selects_the_block_glyphs() {
-        // `glyphs_render` reads the process environment, so assert the decision
-        // it encodes rather than mutating env vars under parallel tests.
-        for value in ["en_US.UTF-8", "C.utf8", "en_GB.utf-8"] {
-            let value = value.to_ascii_lowercase();
-            assert!(value.contains("utf-8") || value.contains("utf8"), "{value}");
+        for locale in ["en_US.UTF-8", "C.utf8", "en_GB.utf-8"] {
+            assert!(glyphs_render_in(None, Some(locale)), "{locale}");
         }
-        for value in ["C", "POSIX", "en_US.ISO8859-1"] {
-            let value = value.to_ascii_lowercase();
+        for locale in ["C", "POSIX", "en_US.ISO8859-1"] {
+            assert!(!glyphs_render_in(None, Some(locale)), "{locale}");
+        }
+        assert!(!glyphs_render_in(None, None), "an unset locale means ascii");
+    }
+
+    #[test]
+    fn macos_terminal_gets_the_ascii_mark_however_good_its_locale_is() {
+        // Terminal.app's fonts have no U+25E2..U+25E5, and macOS fills the gap
+        // by substituting a face that draws them at its own optical size — the
+        // walls render smaller than the `█` between them. The outline is the
+        // better thing to show there.
+        assert!(!glyphs_render_in(
+            Some("Apple_Terminal"),
+            Some("en_US.UTF-8")
+        ));
+    }
+
+    #[test]
+    fn every_other_terminal_keeps_the_mark() {
+        // Named individually because the rule is about one program's fonts, not
+        // about macOS: iTerm2, Ghostty and the rest run on the same laptops and
+        // draw the mark correctly.
+        for program in ["iTerm.app", "ghostty", "WezTerm", "vscode", "Alacritty"] {
             assert!(
-                !(value.contains("utf-8") || value.contains("utf8")),
-                "{value}"
+                glyphs_render_in(Some(program), Some("en_US.UTF-8")),
+                "{program}"
             );
+        }
+        assert!(glyphs_render_in(None, Some("en_US.UTF-8")));
+    }
+
+    #[test]
+    fn a_bad_locale_still_wins_under_any_terminal() {
+        for program in [None, Some("iTerm.app"), Some("Apple_Terminal")] {
+            assert!(!glyphs_render_in(program, Some("C")), "{program:?}");
         }
     }
 
