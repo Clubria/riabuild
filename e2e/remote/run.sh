@@ -373,7 +373,19 @@ known_gap() {
   # `do_POST` and something to approve the code, this branch stops matching on
   # its own and the five assertions below start running.
   grep -q "replied with HTTP 501" "$work/ada.log" \
-    && grep -q "POST /api/v1/cli/device.* 501" "$work/stub_web.log" 2>/dev/null
+    && grep -q "POST /api/v1/cli/device.* 501" "$work/stub_web.log" 2>/dev/null \
+    && return 0
+
+  # Branch 4: item (a), and the one a GitHub runner hits. `session::ensure`
+  # reads this laptop's own token through `keychain::for_account`, which on
+  # Linux is `secret-tool` and errors rather than falling back when it is
+  # absent. An ubuntu-latest image has no libsecret, so CI stops here — one
+  # stage *earlier* than a developer machine that has one, which is why the
+  # local run reaches branch 3 and this job does not.
+  #
+  # Both greps again: "not installed" alone would forgive any missing tool.
+  grep -q "reading the riabuild token from your keyring" "$work/ada.log" \
+    && grep -q "secret-tool\` is not installed" "$work/ada.log"
 }
 
 if [ "$ada_status" -eq 124 ]; then
@@ -445,7 +457,13 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   # previous version of this banner named the musl checksum unconditionally,
   # so once that shipped it went on announcing a gap that no longer existed
   # while the run was in fact stopping somewhere else entirely.
-  if grep -q "replied with HTTP 501" "$work/ada.log"; then
+  if grep -q "reading the riabuild token from your keyring" "$work/ada.log"; then
+    stopped_at="the sign-in step, one stage past the install"
+    because="this runner has no libsecret, and session::ensure reads the
+# laptop's own token through secret-tool, which errors rather than falling
+# back when it is absent. Item (a) in this file's header. A machine that
+# does have one gets one stage further, to item (b)."
+  elif grep -q "replied with HTTP 501" "$work/ada.log"; then
     stopped_at="the sign-in step, one stage past the install"
     because="stub_web.py implements only do_GET and do_DELETE, so the
 # device-code POST this release's CLI makes gets a stock 501. That is a
