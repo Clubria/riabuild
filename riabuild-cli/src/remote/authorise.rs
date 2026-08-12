@@ -110,6 +110,50 @@ fn stale_pin(remote: &Remote, paths: &dyn Paths, stderr: String) -> anyhow::Erro
     .into()
 }
 
+/// Makes sure the developer's own `~/.ssh` exists, at mode 0700.
+///
+/// Not riabuild's `ssh_dir()` — that one is `~/.riabuild/ssh` and riabuild
+/// creates it itself. This is the real one, and it belongs to `ssh-copy-id`:
+/// it builds its temporary directory *under* `~/.ssh` and fails outright if
+/// there is nothing to build it under, with
+///
+/// ```text
+/// mktemp: failed to create directory via template '…/.ssh/ssh-copy-id.XXXXXXXXXX'
+/// ssh-copy-id: ERROR: failed to create required temporary directory under ~/.ssh
+/// ```
+///
+/// which says nothing about riabuild and gives a developer nothing to do.
+///
+/// On any laptop that has cloned over SSH or run `ssh` once, `~/.ssh` is
+/// already there — which is exactly why this went unnoticed until the remote
+/// e2e ran against a container whose home directory was fresh. riabuild's
+/// whole claim is to be the *first* thing a developer runs, and a machine
+/// that has never opened an SSH connection has no `~/.ssh` at all.
+///
+/// 0700 at creation rather than created-then-chmod: `ssh` refuses to use a
+/// key directory other users can read, so a directory made at the umask
+/// would be a second failure, later, from a different tool, with a different
+/// message.
+async fn ensure_dot_ssh(paths: &dyn Paths) -> Result<()> {
+    let dot_ssh = paths.home().join(".ssh");
+    if tokio::fs::metadata(&dot_ssh).await.is_ok() {
+        // Already there. Its mode is the developer's business — repairing it
+        // would be riabuild changing something it did not create.
+        return Ok(());
+    }
+
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(&dot_ssh).await.map_err(|error| {
+        Failure::new(
+            "preparing this machine to authorise a key",
+            "Create it yourself with `mkdir -p ~/.ssh && chmod 700 ~/.ssh`, then run `riabuild remote` again.",
+        )
+        .detail(format!("could not create {}: {error}", dot_ssh.display()))
+    })?;
+    Ok(())
+}
+
 /// Can riabuild's own key sign in, without a password and without falling
 /// back to the developer's own agent or default identities?
 ///
@@ -237,6 +281,8 @@ pub async fn authorise(
             .into());
     }
 
+    ensure_dot_ssh(paths).await?;
+
     ui.working("Authorised", "installing the key");
     // Built explicitly rather than by extending `ssh_options`, which carries
     // its own `-i` for the private key: `ssh-copy-id` parses `-i` with its
@@ -294,6 +340,74 @@ mod tests {
             port: 2222,
             user: "ada".into(),
         }
+    }
+
+    /// The laptop riabuild claims to be the first thing run on: one that has
+    /// never opened an SSH connection, so it has no `~/.ssh` at all.
+    /// `ssh-copy-id` builds its temporary directory under that path and exits
+    /// with `failed to create required temporary directory under ~/.ssh` when
+    /// it is missing — a message with riabuild nowhere in it and nothing in it
+    /// for a developer to do.
+    #[tokio::test]
+    async fn a_machine_that_has_never_used_ssh_gets_the_directory_ssh_copy_id_needs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let dot_ssh = home.path().join(".ssh");
+        assert!(
+            !dot_ssh.exists(),
+            "the point of the test is that it is absent"
+        );
+
+        ensure_dot_ssh(&paths).await.expect("creates it");
+
+        let mode = tokio::fs::metadata(&dot_ssh)
+            .await
+            .expect("created")
+            .permissions()
+            .mode()
+            & 0o777;
+        // `ssh` refuses a key directory others can read, so creating it at the
+        // umask would only move the failure to a later tool with a different
+        // message.
+        assert_eq!(mode, 0o700, "created at {mode:o}, not 0700");
+    }
+
+    /// An existing `~/.ssh` is the developer's, including its mode. Repairing
+    /// it would be riabuild changing something it did not create — and on a
+    /// normal laptop this is the case that always runs.
+    #[tokio::test]
+    async fn an_existing_ssh_directory_is_left_exactly_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let dot_ssh = home.path().join(".ssh");
+        tokio::fs::create_dir_all(&dot_ssh).await.expect("mkdir");
+        tokio::fs::set_permissions(&dot_ssh, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("chmod");
+        tokio::fs::write(dot_ssh.join("config"), "Host *\n")
+            .await
+            .expect("write");
+
+        ensure_dot_ssh(&paths).await.expect("no-op");
+
+        let mode = tokio::fs::metadata(&dot_ssh)
+            .await
+            .expect("still there")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "riabuild must not chmod what it did not create"
+        );
+        assert!(
+            dot_ssh.join("config").exists(),
+            "and must not disturb what is in it"
+        );
     }
 
     /// Writes the `.pub` file `authorise` expects to find already generated

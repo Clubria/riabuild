@@ -98,21 +98,16 @@ pub(super) async fn ensure_matching_binary(
 ) -> Result<String> {
     let path = remote_binary_path(home, version);
 
-    // Trusted by digest, never by the version it claims. A co-tenant can put
-    // a script at this path that prints any version string it likes, and
-    // every other developer on a shared account would then execute it with
-    // their session token in the environment. `sha256sum`/`shasum` is asked
-    // for the digest of what is actually there.
-    let installed = ctx.ssh(&digest_command(&path)).await?;
-    if installed.ok() && installed.trimmed() == expected {
-        return Ok(path);
-    }
-
-    ctx.ui
-        .working("riabuild", &format!("installing {version} on the server"));
-
+    // Downloaded before the server is asked anything, which is a reordering
+    // and not a detail. `expected` is the digest of the *tarball* — that is
+    // what a release publishes — and what sits at `path` on the server is the
+    // binary from inside it. The two never share a digest, so the comparison
+    // that used to happen here, and the one after the write, both compared a
+    // binary against an archive and could not succeed on any platform.
+    //
     // Verified against `expected` before a single byte is extracted or sent
-    // anywhere near the server.
+    // anywhere near the server, so the binary's own digest below is derived
+    // from bytes already proven to be the ones upstream published.
     let tarball = downloads.tarball(version, target).await?;
     if download::sha256_hex(&tarball) != expected {
         return Err(Failure::new(
@@ -123,8 +118,29 @@ pub(super) async fn ensure_matching_binary(
         .into());
     }
     let binary = archive::extract_single_file(&tarball, "riabuild")?;
+    let binary_digest = download::sha256_hex(&binary);
 
-    write_binary(ctx, home, version, expected, binary).await
+    // Trusted by digest, never by the version it claims. A co-tenant can put
+    // a script at this path that prints any version string it likes, and
+    // every other developer on a shared account would then execute it with
+    // their session token in the environment. `sha256sum`/`shasum` is asked
+    // for the digest of what is actually there.
+    //
+    // The cost of getting this right is one tarball fetched per `riabuild
+    // remote`, because the only authentic source for the binary's digest is
+    // the archive it comes out of. Caching that digest on the laptop, keyed by
+    // version and target, would remove the fetch without weakening anything —
+    // worth doing, and deliberately not done in the change that made this
+    // work at all.
+    let installed = ctx.ssh(&digest_command(&path)).await?;
+    if installed.ok() && installed.trimmed() == binary_digest {
+        return Ok(path);
+    }
+
+    ctx.ui
+        .working("riabuild", &format!("installing {version} on the server"));
+
+    write_binary(ctx, home, version, &binary_digest, binary).await
 }
 
 /// Streams already-verified bytes onto the server and confirms what landed —
@@ -242,17 +258,51 @@ mod tests {
         format!("ssh {options} {}", remote.target())
     }
 
-    /// A `Downloads` that panics if called — for tests proving a path never
-    /// touches the network at all.
-    struct UnreachableDownloads;
+    /// A tarball holding one `riabuild` member, and the two digests that come
+    /// out of it: the **archive's**, which is what a release publishes and what
+    /// `expected` carries, and the **binary's**, which is what actually lands
+    /// at the path on the server.
+    ///
+    /// Returning both from one place is the point. They are never equal, and
+    /// code that confuses them cannot install on any platform — which is what
+    /// happened, undetected, because the tests scripted the server's
+    /// `sha256sum` to answer with whatever the assertion was about to compare
+    /// against.
+    fn tarball_with(payload: &[u8]) -> (Vec<u8>, String, String) {
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "riabuild", payload)
+            .expect("append");
+        let tar_bytes = archive.into_inner().expect("finish");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
+        let tarball = encoder.finish().expect("gzip");
+
+        let archive_digest = download::sha256_hex(&tarball);
+        let binary_digest = download::sha256_hex(payload);
+        assert_ne!(
+            archive_digest, binary_digest,
+            "a tarball and its contents must not share a digest, or this fixture proves nothing"
+        );
+        (tarball, archive_digest, binary_digest)
+    }
+
+    /// Serves one prepared tarball. `checksums` still panics: this function is
+    /// handed its expected digest by the caller above and must never go
+    /// looking for one itself.
+    struct OneTarball(Vec<u8>);
 
     #[async_trait]
-    impl Downloads for UnreachableDownloads {
+    impl Downloads for OneTarball {
         async fn checksums(&self, _version: &str) -> Result<String> {
             panic!("must not fetch checksums on this path");
         }
         async fn tarball(&self, _version: &str, _target: &str) -> Result<Vec<u8>> {
-            panic!("must not download a tarball on this path");
+            Ok(self.0.clone())
         }
     }
 
@@ -270,15 +320,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_already_holding_the_right_binary_is_left_alone() {
-        // `UnreachableDownloads` makes the property absolute: this path must
-        // not touch the network at all, not merely "happens not to" in this
-        // particular stub.
+        // This used to assert the path never touched the network, via a
+        // `Downloads` that panicked. That property is gone on purpose: the
+        // only authentic source for the *binary's* digest is the archive it
+        // came out of, so the tarball is fetched before the server is asked
+        // anything. What survives — and is the property that actually matters
+        // — is that a server already holding the right bytes is not written to.
         let laptop = tempfile::TempDir::new().expect("tempdir");
         let paths = crate::paths::RealPaths::rooted_at(laptop.path());
+        let (tarball, archive_digest, binary_digest) =
+            tarball_with(b"a real riabuild, near enough");
+
         // The digest of what is on disk, not the version it claims. A co-tenant
         // can put a script at that path that prints any version string.
-        let fake =
-            Arc::new(FakeRunner::new().containing("sha256sum", 0, &format!("{EXPECTED}\n"), ""));
+        //
+        // `binary_digest`, not `archive_digest`: what sits at that path is the
+        // binary. Answering with the archive's digest here is what the old
+        // fixture did, and it made the comparison agree with itself.
+        let fake = Arc::new(FakeRunner::new().containing(
+            "sha256sum",
+            0,
+            &format!("{binary_digest}\n"),
+            "",
+        ));
         let remote = remote();
         let ctx = SshCtx {
             remote: &remote,
@@ -292,8 +356,8 @@ mod tests {
             "/home/dev",
             "2026.08.06",
             "aarch64-apple-darwin",
-            EXPECTED,
-            &UnreachableDownloads,
+            &archive_digest,
+            &OneTarball(tarball),
         )
         .await
         .expect("already installed");
