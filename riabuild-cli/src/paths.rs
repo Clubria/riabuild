@@ -107,6 +107,20 @@ pub trait Paths: Send + Sync {
     fn known_hosts_file(&self) -> PathBuf {
         self.ssh_dir().join("known_hosts")
     }
+    /// The `SSH_ASKPASS` helper riabuild points `ssh` at, so a password for a
+    /// server is asked for once rather than at every one of the connections a
+    /// single `riabuild remote` opens. Written on every run — see
+    /// `remote::askpass::ensure_helper`.
+    fn askpass_helper(&self) -> PathBuf {
+        self.ssh_dir().join("askpass")
+    }
+    /// Where a saved SSH password lands on a machine with **no keyring at
+    /// all**. The keychain is preferred everywhere it exists; see
+    /// `keychain::select_password_store`, which owns that decision, and the
+    /// amended "No secrets in `~/.riabuild/`" note in `CLAUDE.md`.
+    fn remote_password_file(&self, hash: &str) -> PathBuf {
+        self.ssh_dir().join("passwords").join(hash)
+    }
 }
 
 pub struct RealPaths {
@@ -116,7 +130,13 @@ pub struct RealPaths {
 
 impl RealPaths {
     pub fn new() -> anyhow::Result<Self> {
-        let home = dirs::home_dir().ok_or_else(|| {
+        // `std::env::home_dir` rather than the `dirs` crate. It was deprecated
+        // for years over a Windows bug riabuild could never hit, which is why
+        // that crate existed here at all; the fix landed and it was
+        // un-deprecated in Rust 1.86, well under this crate's 2024 edition
+        // floor. On macOS and Linux it is `$HOME`, then the passwd entry —
+        // exactly what `dirs` wrapped three crates around.
+        let home = std::env::home_dir().ok_or_else(|| {
             anyhow::anyhow!("riabuild could not work out your home directory (is $HOME set?)")
         })?;
         let root = root_for(&home, std::env::var("RIABUILD_ROOT").ok().as_deref())?;

@@ -1,8 +1,8 @@
 //! Opening the environment on a server: mosh when it can, ssh when it cannot.
 
-use super::{Remote, identity};
+use super::{Remote, askpass, identity};
 use crate::paths::Paths;
-use crate::runner::{CommandRunner, RunOptions};
+use crate::runner::CommandRunner;
 use crate::ui::Ui;
 use anyhow::Result;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ async fn has_mosh_server(
     args.push("command -v mosh-server".to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     runner
-        .run("ssh", &refs, &RunOptions::default())
+        .run("ssh", &refs, &askpass::run_options(remote, paths))
         .await
         .map(|output| output.ok())
         .unwrap_or(false)
@@ -45,7 +45,7 @@ pub async fn run_setup(
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     runner
-        .run_interactive("ssh", &refs, &RunOptions::default())
+        .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
         .await
 }
 
@@ -73,8 +73,12 @@ pub async fn open(
             command.to_string(),
         ];
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // mosh execs `ssh` to bootstrap the session, and that `ssh` inherits
+        // this environment — so a server reached by password is reached by the
+        // saved one here too, rather than prompting where mosh has already
+        // taken over the terminal.
         let code = runner
-            .run_interactive("mosh", &refs, &RunOptions::default())
+            .run_interactive("mosh", &refs, &askpass::run_options(remote, paths))
             .await?;
         // Only mosh's own "could not connect" exit falls back. Treating *any*
         // non-zero code as a connection failure would silently reconnect a
@@ -103,7 +107,7 @@ pub async fn open(
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     runner
-        .run_interactive("ssh", &refs, &RunOptions::default())
+        .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
         .await
 }
 

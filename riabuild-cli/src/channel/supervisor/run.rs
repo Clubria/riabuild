@@ -111,7 +111,11 @@ pub async fn supervise(
         let args = ssh_args(&tunnel);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-        let child = match runner.spawn("ssh", &argv, &RunOptions::default()).await {
+        let options = RunOptions {
+            env: tunnel.env.clone(),
+            ..Default::default()
+        };
+        let child = match runner.spawn("ssh", &argv, &options).await {
             Ok(child) => child,
             Err(error) => {
                 // An ssh that will not start at all does not start on the next
@@ -257,7 +261,14 @@ async fn probe(runner: &dyn CommandRunner, tunnel: &Tunnel) -> bool {
     // the tunnel it is supposed to be supervising.
     let answered = tokio::time::timeout(
         PING_INTERVAL,
-        runner.run("ssh", &argv, &RunOptions::default()),
+        runner.run(
+            "ssh",
+            &argv,
+            &RunOptions {
+                env: tunnel.env.clone(),
+                ..Default::default()
+            },
+        ),
     )
     .await;
 

@@ -17,7 +17,6 @@
 //! describes where their releases live and what the assets are called.
 
 use anyhow::{Context, Result, anyhow};
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
@@ -188,8 +187,12 @@ pub async fn digest_from_any(urls: &[String], filename: &str) -> Result<String> 
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Reads a whole distribution into memory.

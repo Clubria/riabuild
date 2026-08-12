@@ -105,9 +105,20 @@ async fn forget_with(
     // 2. Best-effort cleanup on the server itself.
     cleanup_server_side(&remote, paths, runner.clone(), ui, &record, member_id).await;
 
-    // 3. Local delete: the keychain item, the key pair, and the store entry.
-    let account = keychain::for_account(runner, &keychain::remote_account(&remote.hash()), None);
+    // 3. Local delete: the keychain items, the key pair, and the store entry.
+    let account = keychain::for_account(
+        runner.clone(),
+        &keychain::remote_account(&remote.hash()),
+        None,
+    );
     account.delete().await?;
+
+    // The session and the password are two accounts for one server (see
+    // `askpass::account`), so revoking the first leaves the second behind
+    // unless it is named. A password for a server the developer has asked
+    // riabuild to forget is the clearest case there is of a secret riabuild
+    // should no longer be holding.
+    super::askpass::forget(&remote, paths, runner).await?;
 
     match tokio::fs::remove_file(identity::key_path(&remote, paths)).await {
         Ok(()) => {}
@@ -435,6 +446,52 @@ mod tests {
         );
         assert!(store.find("build-01").is_none());
         assert!(!paths.identity_dir().join(remote().hash()).exists());
+    }
+
+    /// A server the developer has asked riabuild to forget is the clearest
+    /// case there is of a secret riabuild should no longer be holding — and a
+    /// saved SSH password is a *second* keychain account for the same server,
+    /// so revoking the session leaves it behind unless it is named too.
+    ///
+    /// Asserted on both accounts appearing in the deletes rather than on a
+    /// count, so the test says which secret survived when it fails.
+    #[tokio::test]
+    async fn forgetting_a_server_forgets_its_password_as_well_as_its_session() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = crate::paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+
+        let mut store = store_with(SESSION_ID);
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &revokes,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        let deletes: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| is_keychain_delete(call))
+            .collect();
+        let password = crate::remote::askpass::account(&remote());
+        let session = crate::keychain::remote_account(&remote().hash());
+        assert!(
+            deletes.iter().any(|call| call.contains(&password)),
+            "the saved SSH password outlived the server it belongs to: {deletes:?}"
+        );
+        assert!(
+            deletes.iter().any(|call| call.contains(&session)),
+            "and the session must still go too: {deletes:?}"
+        );
     }
 
     /// The step whose failure must stop everything. Until this test existed,

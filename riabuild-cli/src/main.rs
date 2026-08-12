@@ -100,6 +100,20 @@ async fn run(cli: Cli) -> Result<i32> {
         return channel::dispatch(action, cli.quiet).await;
     }
 
+    // Dispatched here for the same reason as the channel shim above, and more
+    // sharply: `ssh` runs this from inside an authentication attempt, several
+    // times per `riabuild remote`. Checking the machine or calling the API
+    // first would put that work between the developer and every connection —
+    // and `ssh` reads this process's stdout as the password, so a banner on it
+    // would *be* the answer.
+    if let Some(Command::Internal {
+        action: cli::InternalAction::Askpass { prompt },
+    }) = &cli.command
+    {
+        let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
+        return internal::askpass(paths.as_ref(), runner, &prompt.join(" ")).await;
+    }
+
     // Dispatched before anything creates or reads the tree. riabuild must not
     // recreate the directory it is about to remove, and a reset must not depend
     // on a config or state file that may be the reason it was asked for.
@@ -295,6 +309,9 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Channel { .. }) => {
             unreachable!("the channel returns before the setup flow starts")
         }
+        Some(Command::Internal {
+            action: cli::InternalAction::Askpass { .. },
+        }) => unreachable!("askpass answers before a Ctx is ever built"),
         Some(Command::Status) | None => {}
     }
 

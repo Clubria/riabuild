@@ -17,7 +17,6 @@ pub mod status;
 use crate::config::UserConfig;
 use crate::ui::{Failure, plural};
 use anyhow::Result;
-use rand::RngCore;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,9 +26,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MAX: usize = 9;
 
 /// A v4 UUID for an account directory name.
+///
+/// Infallible by design, and `rand::rng()` was not: it panics when the OS
+/// entropy source is unreachable, which is the one failure this whole binary
+/// is built to never have. Reading `getrandom` directly makes that a `Result`
+/// worth answering, and the answer is the clock. An account id names a
+/// directory and is never a secret — the keychain item derived from it is
+/// guarded by an ACL, not by being hard to guess — so it only has to be
+/// distinct from the at most eight others on this machine (`MAX`), which a
+/// nanosecond timestamp is.
 pub fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        bytes = nanos.to_le_bytes();
+    }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
