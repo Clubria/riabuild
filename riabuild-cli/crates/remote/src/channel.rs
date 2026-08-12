@@ -29,6 +29,16 @@ use std::sync::Arc;
 /// The one line remote mode's banner gains. Rendered through `Ui` exactly as
 /// the tasks above it are, so it reads as another finished item rather than as
 /// a message.
+///
+/// `Ui::satisfied` rather than `Ui::applied`, in both of the branches below.
+/// The two differ by one role — `applied` leaves the title unpainted so a task
+/// riabuild just *ran* stands out from one that was already fine — and this
+/// line joins a list where every entry is a check that passed. Painted as work
+/// done, it is the brightest thing on the screen at the end of a run, and the
+/// brightest thing is a facility nobody asked about rather than any of the
+/// setup it is sitting under. What is honest about it is unchanged either way:
+/// a tunnel that then fails to come up still reports itself in the
+/// supervisor's own voice.
 const BANNER: &str = "Clipboard channel — connected";
 
 /// Everything remote mode has to tell the channel about this session.
@@ -136,7 +146,7 @@ impl Channel {
                 // supervisor holds the forward. A tunnel that then fails to
                 // come up reports itself, in the supervisor's own voice, rather
                 // than being promised away here.
-                plan.ui.applied(BANNER);
+                plan.ui.satisfied(BANNER);
                 Channel {
                     claim: Some(claim),
                     started: Some(started),

@@ -101,7 +101,7 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     drop(provisioning);
 
     if ctx.dry_run {
-        ctx.ui.info("");
+        ctx.ui.blank();
         // "9 item(s) already correct, 0 would be set up." made a fine machine
         // read like a to-do list. The all-clear deserves to say so plainly.
         ctx.ui.info(&if outcome.applied.is_empty() {
@@ -113,10 +113,17 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
                 outcome.applied.len(),
             )
         });
+        ctx.ui.blank();
         return Ok(0);
     }
 
     if !opens_shell(cli) {
+        // A run that ends here rather than in a shell is, on a server, the
+        // remote end of `ssh -t … riabuild --no-shell`: the moment it returns,
+        // the laptop's `ssh` prints `Connection to … closed.` under whatever
+        // the last task said. Nothing on the laptop can put a line above that
+        // message — this is the only side that runs before it.
+        ctx.ui.blank();
         return Ok(0);
     }
     open_shell(ctx).await
@@ -221,7 +228,17 @@ async fn log_run(ctx: &Ctx, outcome: &engine::Outcome) {
 }
 
 pub(crate) async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
-    if shell::already_inside() {
+    open_shell_from(ctx, shell::already_inside()).await
+}
+
+/// The body, with "is riabuild already inside its own shell" as a parameter
+/// rather than read here — the same shape `reset::Request::inside_shell` takes,
+/// and for the same reason: this repository is worked on from inside the
+/// environment shell, so a test that read the real `RIABUILD_SHELL` would take
+/// the nesting branch on a maintainer's laptop and pass without ever reaching
+/// the line it was written to pin.
+async fn open_shell_from(ctx: &mut Ctx, already_inside: bool) -> Result<i32> {
+    if already_inside {
         // Nesting would stack PATH entries and leave the developer two `exit`s
         // away from their own terminal.
         ctx.ui
@@ -231,7 +248,17 @@ pub(crate) async fn open_shell(ctx: &mut Ctx) -> Result<i32> {
     // The banner itself comes from the generated rcfile, inside the new shell —
     // printing it here too is what made every developer see it twice. This blank
     // line is only separation from the task list above.
-    ctx.ui.info("");
+    //
+    // A server prints none. `riabuild shell` there is the far side of a handoff
+    // the laptop already spaced — `remote::shell::open` prints its blank line
+    // immediately before `ssh` or `mosh` — and mosh starts the session on a
+    // screen of its own, so a blank line here is not separation from anything.
+    // It is the first line of the session, above the accounts box, with nothing
+    // over it; and when mosh gives the terminal back it is still there, one
+    // line further from `[mosh is exiting.]` than the developer asked for.
+    if ctx.server.is_none() {
+        ctx.ui.blank();
+    }
     shell::spawn(ctx).await
 }
 
@@ -241,6 +268,42 @@ mod tests {
     use riabuild_runner::FakeRunner;
     use riabuild_tasks::accounts;
     use riabuild_tasks::testing::ctx_with;
+
+    /// The far side of a handoff prints no spacing of its own.
+    ///
+    /// A server's `riabuild shell` is reached by `ssh` or `mosh`, and
+    /// `remote::shell::open` has already printed the blank line in front of it
+    /// on the laptop. One here as well is not a second separator: mosh draws
+    /// the session on a screen of its own, so it is simply the first line of
+    /// that screen with nothing above it, and it is still sitting there in
+    /// front of `[mosh is exiting.]` when mosh gives the terminal back.
+    #[tokio::test]
+    async fn a_server_starts_its_session_on_the_first_line() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.ui = ui::Ui::new(false);
+        ctx.server = Some("build-01".into());
+
+        open_shell_from(&mut ctx, false).await.expect("opens");
+
+        assert_eq!(
+            ctx.ui.blanks(),
+            0,
+            "the laptop that opened the connection already printed the gap"
+        );
+    }
+
+    /// And the laptop, where there is no connection and nobody else to print
+    /// it, still separates its own task list from the shell it opens.
+    #[tokio::test]
+    async fn a_laptop_still_separates_its_task_list_from_the_shell() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.ui = ui::Ui::new(false);
+        assert!(ctx.server.is_none());
+
+        open_shell_from(&mut ctx, false).await.expect("opens");
+
+        assert_eq!(ctx.ui.blanks(), 1);
+    }
 
     /// `--check` changes nothing, so it must never make a second window wait.
     #[tokio::test]
