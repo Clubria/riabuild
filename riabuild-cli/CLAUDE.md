@@ -68,6 +68,30 @@ outside `runner/`. This is what makes `check()` unit-testable against canned `gh
 `git`, `node`, and `claude` output. Bypassing it means the only way to test a task is to
 have a real machine in a real state, and the suite gets abandoned.
 
+**A command riabuild runs never inherits the directory riabuild was started in.**
+`RunOptions.cwd` of `None` does not mean "inherit" — for every `CommandRunner` method
+but `run_interactive` it means riabuild chose no directory, and `RealRunner` runs the
+child at the filesystem root. The developer's working directory is the one input riabuild
+never chose, and tools read it: pnpm 11 walks up from it for a `package.json` and, on a
+`packageManager` field naming another pnpm, downloads that version and hands the command
+over to it, so `pnpm -v` answers for the *directory* rather than for the binary. A
+`check()` built on that reports drift the `apply()` after it cannot repair — a hard error
+on a machine with nothing wrong with it, on every run, until the developer happens to
+stand somewhere else. `infisical` reads `.infisical.json` the same way and Claude Code
+reads `.claude/`, so this is a class, not one tool.
+
+Naming a directory is still how a command that belongs to one gets there — `infisical
+export` in the checkout — and passing the path as an argument (`git -C`) is equally good.
+What is never right is leaving it to chance. Do not "fix" a version probe by pointing it
+at the checkout: the Clubria repo pins pnpm too, so the probe would report the pin
+whatever binary was installed, and the check would go green on a broken machine.
+
+`run_interactive` is the exception, and for the same reason it is the exception to the
+async-IO rule below: it is a handoff. A developer given the environment shell somewhere
+other than where they were standing would be riabuild moving them without being asked.
+The rule itself is `runner::directory_for_riabuild`, split out so it is testable without
+spawning anything.
+
 **All IO is async.** riabuild runs on a current-thread tokio runtime. Filesystem work goes
 through `tokio::fs`, HTTP through `reqwest`, and subprocesses through `tokio::process` —
 never `std::fs` or `std::process`. A blocking call on the runtime thread stalls every

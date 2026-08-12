@@ -61,8 +61,39 @@ impl BytesOutput {
     }
 }
 
+/// Where a command riabuild runs for itself lands when the call names no
+/// directory.
+///
+/// Not riabuild's own working directory, which is wherever the developer
+/// happened to be standing when they typed `riabuild` — and which is the one
+/// input riabuild never chose. Tools read that directory. pnpm 11 walks up from
+/// it for a `package.json` and, on a `packageManager` field naming another pnpm,
+/// downloads that version and hands the command over to it, so `pnpm -v` answers
+/// for the *directory* rather than for the binary that was asked; `infisical`
+/// looks for `.infisical.json` the same way, and Claude Code reads `.claude/`
+/// and `CLAUDE.md`. A version probe that inherits is asking the wrong question,
+/// and a `check()` built on it reports drift the `apply()` after it cannot
+/// repair — which is a hard error on a machine with nothing wrong with it, on
+/// every run, until the developer thinks to stand somewhere else.
+///
+/// The root is the only directory that can promise no manifest above it. Nothing
+/// under `$HOME` — `~/.riabuild` included — is more than one stray
+/// `package.json` away from the same bug.
+const FILESYSTEM_ROOT: &str = "/";
+
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
+    /// Where the child runs.
+    ///
+    /// `None` does **not** mean "inherit". For every method but
+    /// `run_interactive` it means riabuild chose no directory, and the child
+    /// gets [`FILESYSTEM_ROOT`] rather than whatever directory riabuild itself
+    /// was started in. Naming one is still how a command that genuinely belongs
+    /// to a directory — `infisical export` in the checkout — gets there.
+    ///
+    /// `run_interactive` is the exception, and for the reason `CLAUDE.md` gives
+    /// for it being the exception to the async-IO rule: it is a handoff. There
+    /// the developer's own directory is the right answer, so `None` inherits.
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// Fed to the child's stdin. Used to pipe brokered secrets without them ever
@@ -102,6 +133,22 @@ pub struct RunOptions {
 /// one.
 pub fn should_subdue(is_terminal: bool, subdued: Option<Theme>) -> Option<Theme> {
     is_terminal.then_some(subdued).flatten()
+}
+
+/// Which directory a command riabuild runs for itself actually gets.
+///
+/// Split out from `RealRunner::for_riabuild` so the rule is testable without
+/// spawning anything, the same reason `should_subdue` above is split out from
+/// `run_interactive` — and so that a test double can resolve a probe's directory
+/// the way the real runner does instead of guessing. A double that guesses is
+/// how this went unnoticed in the first place: `FakeRunner` keys its stubs on
+/// the invocation, and the invocation is identical whichever directory the child
+/// ran in.
+///
+/// Note what is *not* a parameter: riabuild's own working directory. There is no
+/// argument that could reintroduce it.
+pub fn directory_for_riabuild(cwd: Option<&Path>) -> &Path {
+    cwd.unwrap_or(Path::new(FILESYSTEM_ROOT))
 }
 
 #[async_trait]
@@ -176,6 +223,31 @@ pub trait CommandRunner: Send + Sync {
 pub struct RealRunner;
 
 impl RealRunner {
+    /// A command riabuild runs to learn or change something itself.
+    ///
+    /// It never lands in a directory riabuild did not choose: with no `cwd` it
+    /// runs at [`FILESYSTEM_ROOT`]. Every such call already either names its
+    /// directory or carries an absolute path — `git -C`, `gh repo clone <slug>
+    /// <dir>`, `dpkg -S /usr/bin/riabuild` — so there is nothing here for whose
+    /// benefit riabuild's own working directory could be the right answer, and
+    /// plenty that reads it and answers wrongly because of it.
+    fn for_riabuild(program: &str, args: &[&str], options: &RunOptions) -> Command {
+        let mut command = Self::build(program, args, options);
+        command.current_dir(directory_for_riabuild(options.cwd.as_deref()));
+        command
+    }
+
+    /// A command handed to the developer, which inherits.
+    ///
+    /// The whole of the exception, and named at the call site so that it reads
+    /// as one. `run_interactive` gives away the terminal — to the environment
+    /// shell, to `ssh`, to `gh auth login` — and a developer handed a shell
+    /// somewhere other than where they were standing would be riabuild moving
+    /// them without being asked.
+    fn for_the_developer(program: &str, args: &[&str], options: &RunOptions) -> Command {
+        Self::build(program, args, options)
+    }
+
     fn build(program: &str, args: &[&str], options: &RunOptions) -> Command {
         let mut command = Command::new(program);
         command.args(args);
@@ -197,7 +269,7 @@ impl CommandRunner for RealRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<CommandOutput> {
-        let mut command = RealRunner::build(program, args, options);
+        let mut command = RealRunner::for_riabuild(program, args, options);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.stdin(if options.stdin.is_some() {
             Stdio::piped()
@@ -239,7 +311,7 @@ impl CommandRunner for RealRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<BytesOutput> {
-        let mut command = RealRunner::build(program, args, options);
+        let mut command = RealRunner::for_riabuild(program, args, options);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.stdin(if options.stdin.is_some() {
             Stdio::piped()
@@ -271,7 +343,7 @@ impl CommandRunner for RealRunner {
     }
 
     async fn run_forking(&self, program: &str, args: &[&str], options: &RunOptions) -> Result<i32> {
-        let mut command = RealRunner::build(program, args, options);
+        let mut command = RealRunner::for_riabuild(program, args, options);
         // Null rather than piped: a pipe handed to the fork is exactly what
         // would keep this call waiting for a selection nobody is going to
         // replace.
@@ -309,7 +381,7 @@ impl CommandRunner for RealRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<Box<dyn ChildHandle>> {
-        let command = RealRunner::build(program, args, options);
+        let command = RealRunner::for_riabuild(program, args, options);
         Ok(Box::new(child::RealChild::spawn(command, program)?))
     }
 
@@ -319,7 +391,7 @@ impl CommandRunner for RealRunner {
         args: &[&str],
         options: &RunOptions,
     ) -> Result<i32> {
-        let mut command = RealRunner::build(program, args, options);
+        let mut command = RealRunner::for_the_developer(program, args, options);
 
         // The handoff `CLAUDE.md` describes is still the default, and still the
         // rule for every site that leaves `subdued` unset. Where riabuild does
@@ -1404,6 +1476,71 @@ mod tests {
             env: vec![(key.to_string(), value.to_string())],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_command_riabuild_runs_lands_at_the_root_when_it_names_no_directory() {
+        assert_eq!(directory_for_riabuild(None), Path::new("/"));
+    }
+
+    #[test]
+    fn a_named_directory_is_still_where_the_command_runs() {
+        // The rule removes the *inherited* directory, not the chosen one:
+        // `infisical export` still has to run in the checkout.
+        let named = Path::new("/home/ada/clubria");
+        assert_eq!(directory_for_riabuild(Some(named)), named);
+    }
+
+    /// The wiring, against a real child rather than the rule in isolation.
+    ///
+    /// `cargo test` runs with the crate directory as its working directory, so a
+    /// child that inherited would print that path. Printing `/` is only possible
+    /// if `for_riabuild` actually reached the `Command`. Without it this whole
+    /// module could hold a correct rule that nothing applied.
+    #[tokio::test]
+    async fn a_real_child_does_not_inherit_the_directory_riabuild_was_started_in() {
+        let output = RealRunner
+            .run("pwd", &[], &RunOptions::default())
+            .await
+            .expect("pwd");
+        assert!(output.ok(), "{output:?}");
+        assert_eq!(output.trimmed(), "/", "the child inherited");
+    }
+
+    #[tokio::test]
+    async fn a_real_child_still_runs_where_it_was_told_to() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Resolved on both sides: on macOS `/var` is a symlink to `/private/var`
+        // and `pwd` answers with the resolved path, so comparing against the
+        // tempdir's own path would fail there and nowhere else.
+        let wanted = std::fs::canonicalize(dir.path()).unwrap();
+        let output = RealRunner
+            .run(
+                "pwd",
+                &[],
+                &RunOptions {
+                    cwd: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("pwd");
+        assert_eq!(Path::new(output.trimmed()), wanted);
+    }
+
+    /// The exception, asserted rather than assumed.
+    ///
+    /// A developer handed the environment shell somewhere other than where they
+    /// were standing would be riabuild moving them without being asked, so the
+    /// handoff keeps inheriting. `run_interactive` returns only an exit code —
+    /// it gives its stdout away — so the check has to be the child's own.
+    #[tokio::test]
+    async fn a_handoff_still_inherits() {
+        let code = RealRunner
+            .run_interactive("sh", &["-c", r#"[ "$PWD" != / ]"#], &RunOptions::default())
+            .await
+            .expect("sh");
+        assert_eq!(code, 0, "the handoff was moved to the root");
     }
 
     #[tokio::test]
