@@ -9,7 +9,34 @@ import { expect, Page, test as base, TestInfo } from "@playwright/test";
  * warning or an unhandled rejection is a real defect that a screenshot alone
  * will happily show you as a perfectly nice-looking page.
  */
-export const test = base.extend<{ consoleErrors: string[] }>({
+export const test = base.extend<{ consoleErrors: string[]; fontsStubbed: boolean }>({
+  /**
+   * Keeps the suite off the network.
+   *
+   * `index.css` imports JetBrains Mono from Google Fonts at runtime, so every
+   * page load fetched a stylesheet and a `.woff2` from a third-party CDN. That
+   * makes each run a coin flip on someone else's uptime: gstatic answered 404
+   * for one pinned font file and three unrelated scenarios failed the
+   * console-error check, in a different combination on every re-run. The
+   * request is answered with an empty stylesheet instead, so the type falls
+   * back to the local monospace stack `tokens.css` already names.
+   *
+   * Safe for the screenshots because they are artifacts for a human to look at,
+   * not baselines anything is compared against — no assertion here can see
+   * which monospace face rendered.
+   *
+   * Automatic rather than opt-in: a test that forgot to ask for it would be the
+   * one flaking, and the failure would point at the scenario rather than here.
+   */
+  fontsStubbed: [
+    async ({ page }, use) => {
+      await page.route(/^https:\/\/fonts\.(googleapis|gstatic)\.com\//, (route) =>
+        route.fulfill({ status: 200, contentType: "text/css", body: "" }),
+      );
+      await use(true);
+    },
+    { auto: true },
+  ],
   consoleErrors: async ({ page }, use) => {
     const errors: string[] = [];
     page.on("console", (message) => {
