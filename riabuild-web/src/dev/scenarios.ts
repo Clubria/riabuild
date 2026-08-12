@@ -5,6 +5,7 @@ import {
   Member,
   OrgConfig,
   Session,
+  SharedServer,
 } from "../data/types";
 
 /**
@@ -205,6 +206,38 @@ const ORG: OrgConfig = {
   secretsUpdatedAt: NOW - 9 * DAY,
 };
 
+/**
+ * The team's servers. The third one is the adversarial row: a name and a
+ * hostname both at their limit, which is where the table runs out of room at
+ * 380px and where a row would widen the page if `wrap-value` were forgotten.
+ */
+const SHARED_SERVERS: SharedServer[] = [
+  {
+    _id: "s_build",
+    name: "build",
+    host: "build-01.fly.dev",
+    port: 22,
+    user: "clubria",
+    updatedAt: NOW - 30 * DAY,
+  },
+  {
+    _id: "s_gpu",
+    name: "gpu",
+    host: "gpu.internal",
+    port: 2222,
+    user: "ada",
+    updatedAt: NOW - 2 * DAY,
+  },
+  {
+    _id: "s_long",
+    name: "a".repeat(32),
+    host: `${"long-hostname-segment.".repeat(4)}example.test`,
+    port: 65535,
+    user: "s".repeat(32),
+    updatedAt: NOW - 5 * MINUTE,
+  },
+];
+
 const NOOP = async () => {};
 const REJECT = async (): Promise<never> => {
   throw new Error(
@@ -222,6 +255,7 @@ function base(viewer: Member | null): Data {
       state: "ready",
       value: [LEAD, DEVELOPER, CANDIDATE, SUSPENDED],
     },
+    sharedServers: { state: "ready", value: SHARED_SERVERS },
     auditLog: { state: "ready", value: AUDIT },
     orgConfig: { state: "ready", value: ORG },
     now: NOW,
@@ -230,6 +264,9 @@ function base(viewer: Member | null): Data {
     setStatus: NOOP,
     revokeSession: NOOP,
     updateOrg: NOOP,
+    addSharedServer: NOOP,
+    updateSharedServer: NOOP,
+    removeSharedServer: NOOP,
     signIn: NOOP,
     signOut: NOOP,
     lookupDeviceCode: async () => PENDING_REQUEST,
@@ -343,6 +380,26 @@ export const SCENARIOS: Record<string, () => Data> = {
     members: { state: "ready", value: [] },
   }),
 
+  /** No shared servers yet — what a lead sees before they add the first one. */
+  "shared-servers-empty": () => ({
+    ...base(LEAD),
+    sharedServers: { state: "ready", value: [] },
+  }),
+
+  /**
+   * The address a lead typed came back refused. The message is the real one
+   * riabuild-web sends for the rule that matters — a hostname `ssh` would read
+   * as an option — because that is the sentence a lead has to be able to act on.
+   */
+  "shared-server-refused": () => ({
+    ...base(LEAD),
+    addSharedServer: async (): Promise<never> => {
+      throw new Error(
+        "[CONVEX M(sharedServers:add)] Uncaught Error: A hostname cannot start with a dash.",
+      );
+    },
+  }),
+
   "mutation-error": () => ({
     ...base(LEAD),
     updateProfile: REJECT,
@@ -350,6 +407,9 @@ export const SCENARIOS: Record<string, () => Data> = {
     setStatus: REJECT,
     revokeSession: REJECT,
     updateOrg: REJECT,
+    addSharedServer: REJECT,
+    updateSharedServer: REJECT,
+    removeSharedServer: REJECT,
   }),
 
   overflow: () => ({
