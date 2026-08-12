@@ -126,6 +126,19 @@ minted for that server alone, it is labelled and listed in the dashboard, and
 `riabuild remote forget` revokes it. Laptops are unchanged, and the Infisical
 credential is still brokered per use and never written down.
 
+A **server's SSH password** is the second, and it is the same exception widened
+to cover a keyring-less *laptop*. `riabuild remote` falls back to a password when
+riabuild's key cannot sign in, and one run opens around ten SSH connections — so
+the password is asked for once and kept, under `remote-password:<hash>`. The
+keychain holds it wherever there is one (`security`, `secret-tool`); a machine
+with neither — a container, a CI runner, a minimal distro — gets
+`~/.riabuild/ssh/passwords/<hash>` at 0600 in a directory created at 0700,
+because the alternative there is not "no password on disk", it is riabuild asking
+again at every connection. `riabuild remote forget` deletes it beside the
+session. `keychain::select_password_store` owns that choice and is the only place
+that decides it. What the invariant was written to protect — the Infisical org
+credential — is untouched and still brokered per use.
+
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
 `paths.rs`, `keychain/`, `tools.rs`, `download/` and `update.rs` are the only files
 that may know which one they are running on. A `cfg!(target_os)` or a
@@ -205,8 +218,11 @@ src/
   remote/      remote mode: `riabuild remote` / `list` / `forget` — identity, host-key
                trust, authorising a key, installing the server's own binary, minting its
                session, seeding a GitHub sign-in, and the mosh/ssh shell handoff.
-               `pick.rs` is the prompt a bare `riabuild remote` puts — one of the saved
-               servers, or a new one — and `render.rs` the box it and `list` both show
+               `askpass.rs` answers the password prompt when the key cannot sign
+               in: the SSH_ASKPASS shim, the account the password is saved under,
+               and the environment every ssh in remote mode carries. `pick.rs` is
+               the prompt a bare `riabuild remote` puts — one of the saved
+               servers, or a new one — and `render.rs` the box it and `list` show
 ```
 
 `download/` decides where bytes come from and whether they are the right bytes;

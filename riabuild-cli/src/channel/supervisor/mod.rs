@@ -32,7 +32,6 @@ mod run;
 pub use run::{Stop, supervise};
 
 use crate::ui::Failure;
-use rand::Rng;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -64,6 +63,15 @@ pub struct Tunnel {
     /// being testable without a server, which is most of why the loop below
     /// can be unit-tested at all.
     pub probe: String,
+    /// The environment every `ssh` this tunnel starts is run with — in
+    /// production `remote::askpass::ssh_env`, so a forward to a server reached
+    /// by password uses the saved one rather than prompting from a background
+    /// reconnect nobody is watching.
+    ///
+    /// Composed by the caller and carried opaquely, for the same reason as
+    /// `probe` above: the supervisor knowing what a `Remote` is would end its
+    /// being unit-testable without a server.
+    pub env: Vec<(String, String)>,
 }
 
 pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
@@ -141,7 +149,10 @@ pub fn backoff(attempt: u32) -> Duration {
         .saturating_mul(2u32.saturating_pow(attempt.min(5)))
         .min(BACKOFF_CEILING);
 
-    let jitter = rand::rng().random_range(0.75..1.0);
+    // Jitter is an optimisation, not a correctness property, so an unreachable
+    // OS entropy failure costs the herd-spreading and nothing else — far better
+    // than `rand::rng()`, which panicked on it and took the supervisor with it.
+    let jitter = getrandom::u32().map_or(1.0, |raw| 0.75 + 0.25 * (raw as f64 / u32::MAX as f64));
     let millis = (base.as_millis() as f64 * jitter) as u64;
     Duration::from_millis(millis.max(1_000)).min(BACKOFF_CEILING)
 }
@@ -188,6 +199,11 @@ mod tests {
             remote_socket: PathBuf::from("/run/user/1000/riabuild/channel.sock"),
             local_socket: PathBuf::from("/tmp/riabuild/agent.sock"),
             probe: "riabuild channel status".into(),
+            // Stands in for `remote::askpass::ssh_env`, which this module
+            // deliberately cannot name — the point of carrying the
+            // environment opaquely is that the supervisor stays testable
+            // without a `Remote`.
+            env: vec![("SSH_ASKPASS_REQUIRE".into(), "force".into())],
         }
     }
 

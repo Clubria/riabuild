@@ -51,7 +51,7 @@ impl SshCtx<'_> {
                 &refs,
                 &RunOptions {
                     stdin: Some(stdin),
-                    ..Default::default()
+                    ..super::askpass::run_options(self.remote, self.paths)
                 },
             )
             .await

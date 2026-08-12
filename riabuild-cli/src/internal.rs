@@ -74,6 +74,37 @@ async fn accept_github_token(ctx: &Ctx, token: &str) -> Result<i32> {
     Ok(if output.ok() { 0 } else { 1 })
 }
 
+/// Answers the password prompt `ssh` is holding open, and remembers the
+/// answer.
+///
+/// Run by `ssh` itself through `SSH_ASKPASS`, not by a person and not over
+/// SSH like the two above — so it is dispatched in `main::run` before a `Ctx`
+/// exists, alongside `channel` and `reset`. It must not check the machine,
+/// read config, or talk to the API: it runs inside an authentication attempt,
+/// several times per `riabuild remote`, and anything slow here is a pause
+/// before every connection.
+///
+/// **The answer is the only thing on stdout.** `ssh` reads the first line of
+/// this process's stdout as the password, so the prompt goes to `/dev/tty`
+/// (see `ui::secret`) and every diagnostic goes to stderr.
+pub(crate) async fn askpass(
+    paths: &dyn crate::paths::Paths,
+    runner: std::sync::Arc<dyn crate::runner::CommandRunner>,
+    prompt: &str,
+) -> Result<i32> {
+    use crate::remote::askpass::{ACCOUNT_VAR, answer, store};
+
+    let account = std::env::var(ACCOUNT_VAR).unwrap_or_default();
+    let store = store(runner, paths, &account)?;
+    let answer = answer(store.as_ref(), prompt, crate::ui::secret::ask_secret).await?;
+
+    if let Some(why) = answer.not_saved {
+        eprintln!("riabuild could not save that password ({why}); it will ask again.");
+    }
+    println!("{}", answer.secret);
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

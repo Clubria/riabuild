@@ -8,7 +8,7 @@ use crate::paths::contract_tilde;
 use crate::runner::RunOptions;
 use crate::shims;
 use crate::tasks::Ctx;
-use crate::tasks::claude_trust;
+use crate::tasks::{claude_onboarding, claude_trust};
 use crate::ui::Failure;
 use anyhow::Result;
 use std::path::Path;
@@ -113,8 +113,30 @@ async fn new(ctx: &mut Ctx) -> Result<i32> {
         .into());
     }
 
+    settle_onboarding(ctx, &id, number).await;
     trust(ctx, &id, number).await;
     list(ctx).await
+}
+
+/// Records that Claude Code's first-run setup is done for one freshly created
+/// account.
+///
+/// The sign-in above is exactly what leaves it undone: `claude auth login`
+/// writes the account's credentials and never touches
+/// `hasCompletedOnboarding`, so without this the developer's very next
+/// `claude-<n>` opens the theme picker and then asks them to log in — to the
+/// account they just finished logging into. See `tasks::claude_onboarding`.
+///
+/// Separate from `trust` rather than folded into it because it needs no
+/// checkout: an account created before the project lands still deserves a
+/// Claude Code that opens. A failure is a note for the same reason trust's is —
+/// the account exists and is signed in, and the next `riabuild` run repairs it.
+async fn settle_onboarding(ctx: &mut Ctx, id: &str, number: usize) {
+    if let Err(error) = claude_onboarding::complete_one(ctx, id).await {
+        ctx.ui.note(&format!(
+            "Account {number} will still ask you Claude Code's first-run questions ({error:#}) — run `riabuild` to finish it"
+        ));
+    }
 }
 
 /// Trusts the checkout for one freshly created account.
