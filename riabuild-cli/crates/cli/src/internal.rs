@@ -71,7 +71,7 @@ pub(crate) async fn seed_github(ctx: &mut Ctx) -> Result<i32> {
 /// anything.
 async fn accept_github_token(ctx: &mut Ctx, token: &str) -> Result<i32> {
     if !tokio::fs::try_exists(&ctx.gh()).await.unwrap_or(false) {
-        crate::tasks::github_cli::install(ctx).await?;
+        riabuild_tasks::github_cli::install(ctx).await?;
     }
     let output = ctx
         .runner
