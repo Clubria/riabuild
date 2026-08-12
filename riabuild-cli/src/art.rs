@@ -37,7 +37,8 @@ const MARK: [&str; HEIGHT] = [
     "◢██████████◣",
 ];
 
-/// The ASCII rendering, for terminals without a UTF-8 locale.
+/// The ASCII rendering, for terminals that will not draw the mark properly —
+/// no UTF-8 locale, or macOS Terminal. See [`glyphs_render_in`].
 ///
 /// The border is drawn by its two outlines with nothing between them: every
 /// printable ASCII fill character is noisy enough to compete with the
@@ -51,15 +52,44 @@ const ASCII: [&str; HEIGHT] = [
     "/__________\\",
 ];
 
-/// Whether the terminal's locale promises the block glyphs will render.
+/// Whether this terminal will draw the mark the way it is designed.
 ///
-/// Unset locale means ASCII. A mark that renders as six rows of `▯` is a worse
-/// first impression than one drawn in slashes, and this runs before riabuild
-/// has done anything a developer can judge it by.
+/// Two ways it will not, and both fall back to the ASCII outline rather than
+/// degrade the mark itself — a triangle drawn in slashes is a fine thing to
+/// look at, and this runs before riabuild has done anything a developer can
+/// judge it by.
 pub fn glyphs_render() -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"]
+    // Read here, decided in `glyphs_render_in`, so the rules are testable
+    // without setting process-wide environment variables — the same split
+    // `theme::depth_for` uses.
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
+    glyphs_render_in(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        locale.as_deref(),
+    )
+}
+
+/// The rules behind [`glyphs_render`].
+///
+/// `Apple_Terminal` is macOS's built-in Terminal, and it is named specifically
+/// rather than inferred from the platform: this is a fact about a font, not
+/// about an operating system. Terminal's faces — Menlo, and SF Mono on newer
+/// releases — carry Block Elements but not `◢◣◤◥` (U+25E2–U+25E5, Geometric
+/// Shapes). macOS resolves the gap through font fallback, which draws those
+/// four at the substitute face's optical size instead of the cell box, so the
+/// walls come out visibly smaller than the `█` between them and the border
+/// falls apart at every corner. iTerm2, Ghostty, Alacritty, WezTerm and VS
+/// Code's terminal all ship faces that have them, and all identify themselves
+/// differently, so none of them is affected.
+///
+/// The locale is the second rule and the older one: no UTF-8, no mark.
+pub fn glyphs_render_in(term_program: Option<&str>, locale: Option<&str>) -> bool {
+    if term_program == Some("Apple_Terminal") {
+        return false;
+    }
+    locale
         .map(|value| {
             let value = value.to_ascii_lowercase();
             value.contains("utf-8") || value.contains("utf8")
@@ -281,18 +311,45 @@ mod tests {
 
     #[test]
     fn a_utf8_locale_is_what_selects_the_block_glyphs() {
-        // `glyphs_render` reads the process environment, so assert the decision
-        // it encodes rather than mutating env vars under parallel tests.
-        for value in ["en_US.UTF-8", "C.utf8", "en_GB.utf-8"] {
-            let value = value.to_ascii_lowercase();
-            assert!(value.contains("utf-8") || value.contains("utf8"), "{value}");
+        for locale in ["en_US.UTF-8", "C.utf8", "en_GB.utf-8"] {
+            assert!(glyphs_render_in(None, Some(locale)), "{locale}");
         }
-        for value in ["C", "POSIX", "en_US.ISO8859-1"] {
-            let value = value.to_ascii_lowercase();
+        for locale in ["C", "POSIX", "en_US.ISO8859-1"] {
+            assert!(!glyphs_render_in(None, Some(locale)), "{locale}");
+        }
+        assert!(!glyphs_render_in(None, None), "an unset locale means ascii");
+    }
+
+    #[test]
+    fn macos_terminal_gets_the_ascii_mark_however_good_its_locale_is() {
+        // Terminal.app's fonts have no U+25E2..U+25E5, and macOS fills the gap
+        // by substituting a face that draws them at its own optical size — the
+        // walls render smaller than the `█` between them. The outline is the
+        // better thing to show there.
+        assert!(!glyphs_render_in(
+            Some("Apple_Terminal"),
+            Some("en_US.UTF-8")
+        ));
+    }
+
+    #[test]
+    fn every_other_terminal_keeps_the_mark() {
+        // Named individually because the rule is about one program's fonts, not
+        // about macOS: iTerm2, Ghostty and the rest run on the same laptops and
+        // draw the mark correctly.
+        for program in ["iTerm.app", "ghostty", "WezTerm", "vscode", "Alacritty"] {
             assert!(
-                !(value.contains("utf-8") || value.contains("utf8")),
-                "{value}"
+                glyphs_render_in(Some(program), Some("en_US.UTF-8")),
+                "{program}"
             );
+        }
+        assert!(glyphs_render_in(None, Some("en_US.UTF-8")));
+    }
+
+    #[test]
+    fn a_bad_locale_still_wins_under_any_terminal() {
+        for program in [None, Some("iTerm.app"), Some("Apple_Terminal")] {
+            assert!(!glyphs_render_in(program, Some("C")), "{program:?}");
         }
     }
 
