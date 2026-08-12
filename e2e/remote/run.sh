@@ -57,21 +57,42 @@
 #      GitHub ubuntu runner has no `secret-tool`, so this needs an
 #      `apt-get install -y libsecret-tools` in the job (and a session bus,
 #      or `--no-keyring`-equivalent handling, for it to actually store).
-#   b. `POST /api/v1/cli/token` in the stub. `stub_web.py` implements only
-#      `do_GET` and `do_DELETE`, so a POST gets BaseHTTPRequestHandler's
-#      stock 501.
-#   c. An answer to the loopback browser callback. `auth::login` opens a
-#      local port and waits for the dashboard to redirect a browser back to
-#      it. Nothing in this script plays that browser. Adding `do_POST` to
-#      the stub is not enough on its own; something has to complete the
-#      callback, or `session::ensure` needs a seam this test can enter
-#      through instead.
+#   b. `POST` in the stub. `stub_web.py` implements only `do_GET` and
+#      `do_DELETE`, so a POST gets BaseHTTPRequestHandler's stock 501.
+#   c. Something to approve the device code. This used to read "an answer to
+#      the loopback browser callback", which #30 made obsolete: `auth::login`
+#      no longer opens a local port, it POSTs `/api/v1/cli/device` and polls
+#      `/api/v1/cli/token` until a human approves the code in the dashboard.
+#      So the stub needs both endpoints *and* has to play the approving human
+#      — or `session::ensure` needs a seam this test can enter through.
 #
 # None of that is written yet, on purpose: it is a second piece of work, not
-# a line to sneak into this file. When a musl checksum ships, this script
-# will get *further* than it does today and then stop at (a) — which the
-# `known_gap` check below will correctly refuse to forgive, and that failure
-# is the reminder.
+# a line to sneak into this file.
+#
+# WHERE IT ACTUALLY STOPS TODAY, which is further than any of the above
+# predicted. v2026.08.10 publishes the musl checksum, so the install now
+# completes — and getting there took three fixes, each hidden behind the one
+# before it, none of which any test could see because this script had never
+# run in CI:
+#
+#   1. The `gh api` call that resolves the release ran without a token and
+#      without `|| true`, so it exited 4 and `set -euo pipefail` ended the
+#      script four lines before the fallback that exists for that very case.
+#   2. `ssh-copy-id` builds its temporary directory under the developer's
+#      `~/.ssh` and fails when there is none. riabuild never created it — a
+#      real bug on any laptop that has not used ssh before, which is exactly
+#      the machine riabuild claims to be the first thing run on.
+#   3. `ensure_matching_binary` compared the *binary* on the server against
+#      the *tarball's* digest, which is what a release publishes. Those are
+#      never equal, so remote mode could not install on any platform. The
+#      unit tests scripted the server's `sha256sum` to answer with the value
+#      the assertion was about to compare against, so they agreed with
+#      themselves.
+#
+# It now stops at (b): the CLI POSTs `/api/v1/cli/device` and the stub
+# answers 501. The `known_gap` check below correctly refuses to forgive that,
+# and this paragraph is the reminder — the same role the previous one played,
+# now one stage further along.
 #
 # THE CLIPBOARD CHANNEL IS NOT TESTED HERE. `channel.sh`, beside this file,
 # covers it — and runs to the end, because it copies a musl binary onto the
@@ -265,7 +286,17 @@ cat > "$work/members.json" <<JSON
 }
 JSON
 
-python3 "$here/stub_web.py" "$STUB_PORT" "$work/members.json" &
+# Logged to a file as well as shown, because `known_gap` needs to read what
+# the stub was actually asked for. Which *endpoint* returned 501 is the whole
+# difference between "this harness has no `do_POST` yet", which is tracked,
+# and "riabuild started calling something unexpected", which is a bug — and
+# from riabuild's side both look like `replied with HTTP 501`.
+# A plain redirect, deliberately not `| tee`: in a pipeline `$!` is the *last*
+# element, so `stub_pid` would name `tee` and the teardown below would leave
+# python3 holding the port. The log is printed on any failure that is not a
+# tracked gap, which is the only time its contents matter.
+python3 "$here/stub_web.py" "$STUB_PORT" "$work/members.json" \
+  >"$work/stub_web.log" 2>&1 &
 stub_pid=$!
 for _ in $(seq 1 20); do
   if curl -sf "http://127.0.0.1:$STUB_PORT/api/v1/org/config" >/dev/null 2>&1; then
@@ -325,7 +356,36 @@ known_gap() {
   # its detail on separate lines, so this is two greps rather than one
   # same-line regex that could never match.
   grep -q "missing a checksum for this platform" "$work/ada.log" \
-    && grep -q "no checksum for riabuild-.*-x86_64-unknown-linux-musl" "$work/ada.log"
+    && grep -q "no checksum for riabuild-.*-x86_64-unknown-linux-musl" "$work/ada.log" \
+    && return 0
+
+  # Branch 3, and the one that fires today. v2026.08.10 publishes the musl
+  # checksum, so the install completes and the run reaches `session::ensure`,
+  # which signs in — and `stub_web.py` implements only `do_GET`/`do_DELETE`,
+  # so the device-code POST gets BaseHTTPRequestHandler's stock 501. That is
+  # item (b) in this file's header: a limitation of this harness, not of
+  # riabuild.
+  #
+  # Both greps, and the endpoint named exactly. A bare "501" would forgive any
+  # unimplemented method on any path, including one riabuild had started
+  # calling by mistake — and the whole purpose of this function is that a
+  # non-start must never be mistaken for a tracked gap. When the stub grows a
+  # `do_POST` and something to approve the code, this branch stops matching on
+  # its own and the five assertions below start running.
+  grep -q "replied with HTTP 501" "$work/ada.log" \
+    && grep -q "POST /api/v1/cli/device.* 501" "$work/stub_web.log" 2>/dev/null \
+    && return 0
+
+  # Branch 4: item (a), and the one a GitHub runner hits. `session::ensure`
+  # reads this laptop's own token through `keychain::for_account`, which on
+  # Linux is `secret-tool` and errors rather than falling back when it is
+  # absent. An ubuntu-latest image has no libsecret, so CI stops here — one
+  # stage *earlier* than a developer machine that has one, which is why the
+  # local run reaches branch 3 and this job does not.
+  #
+  # Both greps again: "not installed" alone would forgive any missing tool.
+  grep -q "reading the riabuild token from your keyring" "$work/ada.log" \
+    && grep -q "secret-tool\` is not installed" "$work/ada.log"
 }
 
 if [ "$ada_status" -eq 124 ]; then
@@ -393,20 +453,42 @@ assert_reached_the_server() {
 if [ "$ada_status" -ne 0 ] && known_gap; then
   assert_reached_the_server
   echo
+  # Which gap, in the run's own words rather than a fixed paragraph. The
+  # previous version of this banner named the musl checksum unconditionally,
+  # so once that shipped it went on announcing a gap that no longer existed
+  # while the run was in fact stopping somewhere else entirely.
+  if grep -q "reading the riabuild token from your keyring" "$work/ada.log"; then
+    stopped_at="the sign-in step, one stage past the install"
+    because="this runner has no libsecret, and session::ensure reads the
+# laptop's own token through secret-tool, which errors rather than falling
+# back when it is absent. Item (a) in this file's header. A machine that
+# does have one gets one stage further, to item (b)."
+  elif grep -q "replied with HTTP 501" "$work/ada.log"; then
+    stopped_at="the sign-in step, one stage past the install"
+    because="stub_web.py implements only do_GET and do_DELETE, so the
+# device-code POST this release's CLI makes gets a stock 501. That is a
+# limitation of this harness, not of riabuild: item (b) in this file's
+# header. Closing it needs a do_POST and something to approve the code."
+  else
+    stopped_at="the binary-install step"
+    because="riabuild v$version publishes an x86_64-unknown-linux-musl
+# tarball but no checksum for it. Releases from v2026.08.10 onward do
+# publish one, so this branch should only fire against an older tag."
+  fi
   echo "############################################################"
-  echo "# KNOWN GAP, not a regression: remote mode stopped at the"
-  echo "# binary-install step. riabuild v$version publishes an"
-  echo "# x86_64-unknown-linux-musl tarball but no checksum for it:"
-  echo "# release.yml writes the checksums file in its macOS job only."
+  echo "# KNOWN GAP, not a regression: remote mode stopped at"
+  echo "# $stopped_at."
+  echo "#"
+  echo "# $because"
   echo "#"
   echo "# Asserted just now, not assumed: a key pair was generated,"
   echo "# the container's host key was pinned, and riabuild's key was"
   echo "# authorised on the container. Those stages ran for real."
   echo "#"
-  echo "# The five isolation assertions this test names were NOT run:"
-  echo "# they need an installed server binary, which does not exist"
-  echo "# yet. This is expected until release.yml publishes the"
-  echo "# musl digests alongside the musl tarballs."
+  echo "# The five isolation assertions this test names were NOT run."
+  echo "# They need a provisioned server, which needs a session, which"
+  echo "# needs the sign-in above. Nothing in CI has yet proved the"
+  echo "# namespace isolation remote mode rests on."
   echo "#"
   echo "# The clipboard channel is NOT among what went untested here:"
   echo "# channel.sh covers it against this same container and runs to"
@@ -417,6 +499,12 @@ fi
 
 if [ "$ada_status" -ne 0 ]; then
   echo "riabuild remote failed for a reason that is not the known gap:" >&2
+  # The stub's own log, which is no longer on stdout. Without it an HTTP
+  # failure here shows riabuild's side of the exchange and not what the stub
+  # was asked for, and those two together are what say whether this is a
+  # harness limitation or a real regression.
+  echo "--- stub_web ---" >&2
+  tail -20 "$work/stub_web.log" >&2 2>/dev/null || true
   exit 1
 fi
 

@@ -291,8 +291,17 @@ mod tests {
         let version = "2026.08.06";
         let target = "x86_64-unknown-linux-musl";
 
-        let tarball = make_tarball("riabuild", b"a real riabuild binary, or close enough");
+        // Two digests, and keeping them apart is the subject of this test. The
+        // release publishes the **archive's**; what lands on the server is the
+        // **binary's**. Scripting the post-write check below with `digest`
+        // rather than `binary_digest` is what let a version ship in which
+        // `ensure_matching_binary` compared a binary against an archive — the
+        // fixture answered with whatever the assertion was about to compare.
+        let payload = b"a real riabuild binary, or close enough";
+        let tarball = make_tarball("riabuild", payload);
         let digest = download::sha256_hex(&tarball);
+        let binary_digest = download::sha256_hex(payload);
+        assert_ne!(digest, binary_digest, "otherwise this proves nothing");
         let asset = download::riabuild_asset(version, target);
         let downloads = FixedDownloads {
             checksums: format!("{digest}  {asset}\n"),
@@ -306,7 +315,7 @@ mod tests {
                 .then(&prefix, 0, "Linux x86_64\n", "") // uname -sm
                 .then(&prefix, 1, "", "No such file") // installed check: nothing there yet
                 .then(&prefix, 0, "", "") // the write
-                .then(&prefix, 0, &format!("{digest}\n"), ""), // post-write reverify
+                .then(&prefix, 0, &format!("{binary_digest}\n"), ""), // post-write reverify
         );
         let ctx = SshCtx {
             remote: &remote,
