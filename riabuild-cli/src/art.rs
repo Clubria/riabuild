@@ -17,24 +17,37 @@ use crate::theme::{self, Role, Theme};
 /// Rows in the mark. Both renderings share it.
 pub const HEIGHT: usize = 6;
 
-/// The quadrant-triangle rendering.
+/// The block rendering.
 ///
-/// `◢`/`◣` fill the lower half of their cell and `◤`/`◥` the upper half, so the
-/// outer edge fills inward and the inner edge fills back outward and the wall
-/// between them reads as one solid stroke. The base is `█` throughout: every
-/// glyph on that row has to touch the bottom of its cell or the base stops
-/// looking flat, which rules out the half-blocks that would otherwise be the
-/// obvious way to fine-tune its weight.
-/// Both renderings are flush left and twelve columns wide, which is what makes
-/// the mirror test below meaningful: the apex straddles columns 5 and 6, so the
-/// reflection axis falls between two cells rather than through one.
+/// **Every glyph here is Block Elements, U+2580–U+259F, and that is a hard
+/// constraint rather than a preference.** The first version cut the corners with
+/// `◢◣◤◥` (U+25E2–U+25E5, Geometric Shapes), which is the shape the design
+/// wants: a true half-cell diagonal. Menlo does not carry them. macOS Terminal
+/// falls back to another face, which draws them at *its* optical size instead of
+/// the cell box — so the sloped glyphs rendered visibly smaller than the `█`
+/// beside them and the border came apart. Block Elements are defined to tile the
+/// cell exactly and every monospace font ships them, so the wall and the base
+/// are guaranteed to meet.
+///
+/// The quadrant blocks say the same thing, quantised: each one is a full cell
+/// with the corner *outside* the shape removed. `▟` is missing its upper left,
+/// so it cuts the outer left edge; `▛` is missing its lower right, so it cuts
+/// the hole's left edge facing back the other way. `▙` and `▜` mirror them. The
+/// base is `█` between `▟` and `▙`, all three of which fill the bottom of their
+/// cell — that is what keeps it flat, and it is why the half-height blocks
+/// (`▀`, `▄`) are not an option for tuning the base weight even though they are
+/// in the same Unicode block.
+///
+/// Flush left and twelve columns wide, which is what makes the mirror test
+/// below meaningful: the apex straddles columns 5 and 6, so the reflection axis
+/// falls between two cells rather than through one.
 const MARK: [&str; HEIGHT] = [
-    "     ◢◣",
-    "    ◢██◣",
-    "   ◢█◤◥█◣",
-    "  ◢█◤  ◥█◣",
-    " ◢█◤    ◥█◣",
-    "◢██████████◣",
+    "     ▟▙",
+    "    ▟██▙",
+    "   ▟█▛▜█▙",
+    "  ▟█▛  ▜█▙",
+    " ▟█▛    ▜█▙",
+    "▟██████████▙",
 ];
 
 /// The ASCII rendering, for terminals without a UTF-8 locale.
@@ -133,10 +146,10 @@ mod tests {
             .iter()
             .rev()
             .map(|glyph| match glyph {
-                '◢' => '◣',
-                '◣' => '◢',
-                '◤' => '◥',
-                '◥' => '◤',
+                '▟' => '▙',
+                '▙' => '▟',
+                '▛' => '▜',
+                '▜' => '▛',
                 '/' => '\\',
                 '\\' => '/',
                 other => *other,
@@ -165,13 +178,14 @@ mod tests {
 
     #[test]
     fn the_base_is_flat() {
-        // Every glyph on the base row must touch the bottom of its cell. `▀`
-        // and the other half-blocks do not, and a base built from them hangs
-        // above the line with a gap at each corner.
+        // Every glyph on the base row must fill the bottom of its cell. `▟`,
+        // `█` and `▙` all do. `▀` does not, and a base built from it hangs
+        // above the line with a gap at each corner — which is what `▛`/`▜`
+        // would do here too, since each is missing one bottom quadrant.
         let base = MARK[HEIGHT - 1].trim();
         let mut glyphs = base.chars();
-        assert_eq!(glyphs.next(), Some('◢'));
-        assert_eq!(glyphs.next_back(), Some('◣'));
+        assert_eq!(glyphs.next(), Some('▟'));
+        assert_eq!(glyphs.next_back(), Some('▙'));
         assert!(glyphs.all(|glyph| glyph == '█'), "{base}");
 
         let ascii = ASCII[HEIGHT - 1];
@@ -180,16 +194,34 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_uses_no_half_height_glyphs() {
-        // The half-blocks are what a future edit would reach for to adjust the
-        // base weight. They are exactly what makes the corners hollow.
+    fn the_mark_is_block_elements_only() {
+        // The bug this pins: `◢◣◤◥` (U+25E2..) are the shape the design wants,
+        // but Menlo does not have them, so macOS Terminal drew them from a
+        // fallback face at that face's optical size — visibly smaller than the
+        // `█` beside them, with the border coming apart at every corner. Block
+        // Elements are defined to tile the cell and ship in every monospace
+        // font, so the wall and the base are guaranteed to meet.
         for row in MARK {
             for glyph in row.chars() {
                 assert!(
-                    !"▀▄▖▗▘▝▚▞▙▟▛▜".contains(glyph),
-                    "half-height glyph {glyph:?} in {row:?}"
+                    glyph == ' ' || ('\u{2580}'..='\u{259f}').contains(&glyph),
+                    "{glyph:?} (U+{:04X}) in {row:?} is outside Block Elements",
+                    glyph as u32
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_base_row_carries_no_glyph_with_an_empty_bottom_quadrant() {
+        // Stated separately from `the_base_is_flat` because this is the rule a
+        // future edit would break: `▛` and `▜` are the right glyphs for the
+        // hole's edges and exactly the wrong ones for the base.
+        for glyph in MARK[HEIGHT - 1].trim().chars() {
+            assert!(
+                "▟█▙▄".contains(glyph),
+                "{glyph:?} does not fill the bottom of its cell"
+            );
         }
     }
 
