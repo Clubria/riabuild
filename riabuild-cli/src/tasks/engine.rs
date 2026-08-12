@@ -85,7 +85,28 @@ pub async fn status_for(task: &dyn Task, ctx: &Ctx, applied: &HashSet<TaskId>) -
     let record = ctx.state.tasks.get(task.id());
 
     let Some(record) = record else {
-        return Ok(Status::Needs(Reason::NeverRun));
+        // No record means this riabuild has never run here. It does *not* mean
+        // the machine still needs the work: a state file is riabuild's memory,
+        // not the machine's state, and something other than a previous run can
+        // have put the machine in the desired shape already. `riabuild remote`
+        // is exactly that — it writes a server's session token into the
+        // server's namespace before the server's own riabuild has ever
+        // started, so `login` arrives at its first run already signed in.
+        //
+        // Applying anyway used to cost a second browser round trip on every
+        // new server: the laptop minted a session, and the server then asked
+        // the developer to approve a *second* device code for the token it was
+        // already holding. `check()` is authoritative — the invariant in
+        // riabuild-cli/CLAUDE.md — and skipping it here was the one place that
+        // was not true.
+        //
+        // "first run" stays the reason when work *is* needed: it is the honest
+        // and more useful explanation of why, and keeps `last_reason` stable
+        // in state.json for the run after it.
+        return Ok(match task.check(ctx).await? {
+            Status::Satisfied => Status::Satisfied,
+            Status::Needs(_) => Status::Needs(Reason::NeverRun),
+        });
     };
 
     if record.version != task.version() {
@@ -116,6 +137,25 @@ pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> 
         let reason = match status {
             Status::Satisfied => {
                 ctx.ui.satisfied(task.title());
+                // Record a task that was already in shape the first time
+                // riabuild saw this machine. Nothing was applied, but a
+                // recordless task is invisible to the `version()` escape
+                // hatch — the forced rerun for drift `check()` cannot observe
+                // — so leaving it unrecorded would quietly exempt a server
+                // from every future version bump.
+                //
+                // Never under `--check`, which reports and changes nothing —
+                // and `state.json` is part of "nothing". The macOS end-to-end
+                // suite caught this: a dry run that recorded `repo_status`
+                // left the machine different from how it found it, which is
+                // the one thing a dry run may not do.
+                if !ctx.dry_run && !ctx.state.tasks.contains_key(task.id()) {
+                    let (id, version) = (task.id(), task.version());
+                    ctx.update_state(|state| {
+                        state.mark_satisfied(id, version, "already_satisfied")
+                    })
+                    .await?;
+                }
                 outcome.satisfied.push(task.id());
                 continue;
             }
@@ -297,16 +337,59 @@ mod tests {
     #[tokio::test]
     async fn a_first_run_applies_everything_and_records_it() {
         let (mut ctx, _home) = test_ctx().await;
-        // Only one status is queued: with no record in state.json the engine
-        // reports NeverRun without asking `check()` at all, so the single call
-        // that happens is the verifying re-check after `apply()`.
-        let tasks: Vec<Box<dyn Task>> =
-            vec![Box::new(Fake::new("a", vec![], vec![Status::Satisfied]))];
+        // Two statuses: with no record in state.json the engine still asks
+        // `check()` — the machine may already be in shape — and only the first
+        // answer here says otherwise. The second is the verifying re-check
+        // after `apply()`.
+        let tasks: Vec<Box<dyn Task>> = vec![Box::new(Fake::new(
+            "a",
+            vec![],
+            vec![Status::needs("nothing here yet"), Status::Satisfied],
+        ))];
 
         let outcome = run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(outcome.applied, vec!["a"]);
         assert_eq!(ctx.state.tasks["a"].version, 1);
+        // Still "first run", not the check's own words: with no record that is
+        // both true and the more useful thing to have said.
         assert_eq!(ctx.state.tasks["a"].last_reason, "never_run");
+    }
+
+    #[tokio::test]
+    async fn a_first_run_on_a_machine_already_in_shape_applies_nothing() {
+        // The regression test for a `riabuild remote` that asked for two
+        // sign-ins on a new server. The laptop writes the server's session
+        // token into its namespace before the server's riabuild ever runs, so
+        // `login` reaches its first run already satisfied — and applying on
+        // the strength of an empty state.json alone made the developer approve
+        // a second device code for a token the server was already holding.
+        let (mut ctx, _home) = test_ctx().await;
+        let task = Fake::new("a", vec![], vec![Status::Satisfied]);
+        let applies = task.applies.clone();
+        let tasks: Vec<Box<dyn Task>> = vec![Box::new(task)];
+
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
+        assert_eq!(outcome.satisfied, vec!["a"]);
+        assert_eq!(*applies.lock().unwrap(), 0);
+        // Recorded even though nothing ran, so a later `version()` bump can
+        // still force this task through on the machine that skipped it.
+        assert_eq!(ctx.state.tasks["a"].version, 1);
+        assert_eq!(ctx.state.tasks["a"].last_reason, "already_satisfied");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_records_nothing_it_found_already_satisfied() {
+        // `--check` reports; it does not change the machine, and state.json is
+        // part of the machine. The recording above is the first thing in this
+        // engine that writes without applying, so it is the first that could
+        // get this wrong — and it did, until the macOS end-to-end suite noticed
+        // a dry run had grown a `repo_status` record out of nowhere.
+        let (mut ctx, _home) = test_ctx().await;
+        ctx.dry_run = true;
+        let tasks: Vec<Box<dyn Task>> = vec![Box::new(Fake::new("a", vec![], vec![]))];
+
+        run_all(&tasks, &mut ctx).await.unwrap();
+        assert!(ctx.state.tasks.is_empty(), "{:?}", ctx.state.tasks);
     }
 
     #[tokio::test]

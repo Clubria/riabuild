@@ -29,7 +29,7 @@ pub(crate) async fn gh_sweep(ctx: &Ctx) -> Result<i32> {
     Ok(0)
 }
 
-pub(crate) async fn seed_github(ctx: &Ctx) -> Result<i32> {
+pub(crate) async fn seed_github(ctx: &mut Ctx) -> Result<i32> {
     // `tokio::io`, not `std::io`: a blocking read on the current-thread
     // runtime stalls every other future on it, which is the invariant in
     // riabuild-cli/CLAUDE.md.
@@ -56,10 +56,23 @@ pub(crate) async fn seed_github(ctx: &Ctx) -> Result<i32> {
 /// `ctx.gh()` rather than the string `"gh"`: during provisioning
 /// `~/.riabuild/bin` is not on `PATH`, so a bare name would find whatever the
 /// server happens to have — or, far more likely on a freshly provisioned
-/// server, nothing at all. The failure would be quiet, because the laptop side
-/// treats a failed seed as a note rather than an error and falls back to an
-/// interactive sign-in.
-async fn accept_github_token(ctx: &Ctx, token: &str) -> Result<i32> {
+/// server, nothing at all.
+///
+/// That second case used to lose the lend entirely, and it was the common one.
+/// On a *first* `riabuild remote` against a server the laptop seeds before it
+/// starts the setup pass — see `remote::flow::connect_and_setup` — and the
+/// setup pass is what installs `gh`. So the seed ran against a path that did
+/// not exist yet, failed, and the laptop printed "it will sign in itself":
+/// the developer approved a GitHub device code for a credential the laptop was
+/// holding all along, on exactly the run where lending it was worth most.
+/// Installing `gh` here rather than depending on a later pass is what makes the
+/// seed self-sufficient; the setup pass then finds `gh` present, signed in and
+/// a member, and `github_cli::check` reports it satisfied without applying
+/// anything.
+async fn accept_github_token(ctx: &mut Ctx, token: &str) -> Result<i32> {
+    if !tokio::fs::try_exists(&ctx.gh()).await.unwrap_or(false) {
+        crate::tasks::github_cli::install(ctx).await?;
+    }
     let output = ctx
         .runner
         .run(
@@ -137,6 +150,20 @@ mod tests {
     /// the caller keeps it alive for the duration, along with its own handle on
     /// the `FakeRunner` — what these tests assert on is *what was run*, not the
     /// result.
+    /// Puts a file where `ctx.gh()` looks, so `accept_github_token` takes its
+    /// "already installed" branch instead of reaching for the network.
+    ///
+    /// The other branch — a server where `gh` is genuinely absent, which is the
+    /// case the install exists for — cannot be unit-tested here: it downloads a
+    /// real release through `tools::install`, which has no seam to fake.
+    async fn pretend_gh_is_installed(home: &TempDir) {
+        let gh = std::path::PathBuf::from(gh_path(home.path()));
+        tokio::fs::create_dir_all(gh.parent().expect("gh has a parent"))
+            .await
+            .expect("tool dir");
+        tokio::fs::write(&gh, b"#!/bin/sh\n").await.expect("gh");
+    }
+
     fn ctx_with_runner(home: &TempDir, scope: &scope::Scope, fake: Arc<FakeRunner>) -> Ctx {
         let paths: Arc<dyn Paths> = Arc::new(RealPaths::rooted_at(home.path()));
         let runner: Arc<dyn CommandRunner> = fake;
@@ -166,11 +193,12 @@ mod tests {
         let gh = gh_path(home.path());
         let fake =
             Arc::new(FakeRunner::new().with(&format!("{gh} auth login --with-token"), 0, "", ""));
-        let ctx = ctx_with_runner(&home, &scope::Scope::read(Some("build-01")), fake.clone());
+        pretend_gh_is_installed(&home).await;
+        let mut ctx = ctx_with_runner(&home, &scope::Scope::read(Some("build-01")), fake.clone());
 
         let token = "gho_averysecretgithubtoken";
         assert_eq!(
-            accept_github_token(&ctx, &format!("{token}\n"))
+            accept_github_token(&mut ctx, &format!("{token}\n"))
                 .await
                 .expect("gh runs"),
             0
@@ -206,9 +234,10 @@ mod tests {
             "",
             "bad token",
         ));
-        let ctx = ctx_with_runner(&home, &scope::Scope::read(Some("build-01")), fake);
+        pretend_gh_is_installed(&home).await;
+        let mut ctx = ctx_with_runner(&home, &scope::Scope::read(Some("build-01")), fake);
         assert_eq!(
-            accept_github_token(&ctx, "gho_expired")
+            accept_github_token(&mut ctx, "gho_expired")
                 .await
                 .expect("gh runs"),
             1

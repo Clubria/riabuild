@@ -58,6 +58,12 @@ pub async fn seed_github(
         return Ok(());
     }
 
+    // Said out loud because this hop is no longer instant: on a server that has
+    // never been set up, the far side installs `gh` before it can be handed
+    // anything, and that is a download with its output captured over SSH. Silent
+    // for several seconds reads as riabuild having hung.
+    ui.note("Lending this laptop's GitHub sign-in to the server…");
+
     let mut args = identity::ssh_options(remote, paths, true);
     args.push(remote.target());
     args.push(format!("{riabuild_path} internal seed-github"));
@@ -76,7 +82,17 @@ pub async fn seed_github(
         )
         .await?;
     if !seeded.ok() {
+        // With the reason, not without it. This note used to be the only trace
+        // a failed lend left, and it named no cause — so the seed silently
+        // failing on every first run against a new server (`gh` was not
+        // installed yet) looked exactly like a network blip, for as long as
+        // nobody read the code. A degradation still is not fatal, but it has
+        // to be diagnosable from the terminal it happened in.
         ui.note("Could not lend the server your GitHub sign-in; it will sign in itself.");
+        let detail = seeded.stderr.trim();
+        if !detail.is_empty() {
+            ui.note(detail);
+        }
     }
     Ok(())
 }

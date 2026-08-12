@@ -186,7 +186,11 @@ impl Task for GithubCli {
 ///
 /// This used to be `brew install gh`, which meant riabuild could not set up a
 /// machine without Homebrew on it and had nothing to offer on Linux at all.
-async fn install(ctx: &mut Ctx) -> Result<()> {
+///
+/// `pub(crate)` for one caller outside this task: `internal::seed_github`, which
+/// runs on a server *before* the setup pass that would otherwise install this,
+/// and so has to be able to put `gh` there itself. See its doc comment.
+pub(crate) async fn install(ctx: &mut Ctx) -> Result<()> {
     let release = tools::gh()?;
     ctx.ui.note(&format!("Downloading gh {}…", release.version));
 
