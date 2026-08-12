@@ -142,7 +142,7 @@ impl Task for EnvLocal {
                             format!("{}/api", brokered.site_url),
                         ),
                     ],
-                    stdin: None,
+                    ..Default::default()
                 },
             )
             .await?;

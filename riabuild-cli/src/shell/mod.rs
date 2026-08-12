@@ -227,10 +227,12 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
         }
     };
 
+    // Not subdued. This is the developer's own shell, not riabuild's output —
+    // dimming it would dim everything they went on to do in it.
     let mut options = RunOptions {
         cwd: ctx.project_dir(),
         env,
-        stdin: None,
+        ..Default::default()
     };
     options.env.extend(extra_env);
 

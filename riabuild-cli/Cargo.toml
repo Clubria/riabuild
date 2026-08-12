@@ -89,6 +89,12 @@ tokio = { version = "1", default-features = false, features = [
     "process",
     "net",
     "io-util",
+    # SIGWINCH, forwarded to a subdued child's pty so a resized window reaches
+    # the program drawing into it. `process` already pulls this in on unix, so
+    # it changes nothing in the dependency graph — it is named because
+    # `runner/pty.rs` depends on it directly, and a future trim of `process`
+    # would otherwise break it from a distance.
+    "signal",
     # `tokio::io::stdin()` — reads a piped secret off the internal
     # `seed-github` command's stdin without blocking the current-thread
     # runtime's only thread the way a `std::io::stdin()` read would.
