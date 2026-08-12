@@ -160,6 +160,9 @@ pub async fn upgrade_and_reexec(
         }
     }
 
+    // Separated from the identity lines above it the same way `heading` is:
+    // the update is a new stage of the run, not a footnote on who signed in.
+    ui.info("");
     ui.info(&format!("Updating riabuild to {to}…"));
 
     if !run_upgrade(runner, &strategy).await? {
