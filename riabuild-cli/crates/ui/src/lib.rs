@@ -30,6 +30,12 @@ mod prompt;
 /// from, so a prompt written there would *be* the answer.
 pub mod secret;
 
+/// Folding riabuild's prose to the terminal's width, and the indents every
+/// multi-line message shares. Its own file because the layout rules are pure
+/// and worth asserting on their own, and `Ui` is not.
+mod wrap;
+pub use wrap::Detail;
+
 pub struct Ui {
     /// The Clubria palette, bound to what this terminal can render. Every
     /// colour riabuild prints comes from here, so there is one place to change
@@ -48,6 +54,12 @@ pub struct Ui {
     /// Columns of a status line left on screen without a newline, so whatever
     /// replaces it can cover the whole thing. Zero means nothing is pending.
     pending: AtomicUsize,
+    /// Columns riabuild folds its own prose to, measured once at startup.
+    ///
+    /// Once, rather than per message, because a window resized mid-run would
+    /// otherwise leave a block laid out at two widths — and the measurement is
+    /// a syscall on a path that prints a line at a time.
+    width: usize,
     /// Blank lines printed by [`Ui::blank`], for the tests that pin the spacing
     /// around a handoff. Behind the `testing` feature like the recorders below
     /// it, because the spacing it pins is decided in `riabuild-cli` and
@@ -166,6 +178,7 @@ impl Ui {
                 && std::io::stdout().is_terminal(),
             quiet,
             pending: AtomicUsize::new(0),
+            width: wrap::wrap_width(wrap::terminal_columns()),
             #[cfg(any(test, feature = "testing"))]
             blanks: AtomicUsize::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -224,6 +237,22 @@ impl Ui {
     /// Claims the pending status line, so it is only covered once.
     fn take_pending(&self) -> usize {
         self.pending.swap(0, Ordering::Relaxed)
+    }
+
+    /// Ends a status line left on screen, so the next thing printed cannot land
+    /// on the end of it.
+    ///
+    /// [`Ui::applied`] and [`Ui::unresolved`] do not need this: they *replace*
+    /// that line, and cover it. This is for everything that prints past a task
+    /// without resolving it — and a warning raised from inside one is the case
+    /// that made it necessary, because it is written to stderr and so cannot
+    /// carry the `\r` that covers stdout. Left out, the run rendered as
+    /// `◐ Authorised — installing the key  ▲ riabuild's key is already…`.
+    fn end_status_line(&self) {
+        if self.take_pending() > 0 {
+            println!();
+            let _ = std::io::stdout().flush();
+        }
     }
 
     /// Whether this terminal gets colour.
@@ -377,7 +406,12 @@ impl Ui {
         self.take_pending();
         #[cfg(any(test, feature = "testing"))]
         self.noted.lock().unwrap().push(text.to_string());
-        println!("    {}", self.paint(Role::Muted, text));
+        // Recorded whole and printed folded: a test asserting what the
+        // developer was told should not have to know where the terminal
+        // happened to break the sentence.
+        for line in wrap::fold(text, self.width.saturating_sub(wrap::INDENT.len())) {
+            println!("{}{}", wrap::INDENT, self.paint(Role::Muted, &line));
+        }
     }
 
     /// A note ending in something the developer has to read off the screen and
@@ -410,7 +444,65 @@ impl Ui {
         // asked to be silent still has to produce.
         #[cfg(any(test, feature = "testing"))]
         self.warned.lock().unwrap().push(text.to_string());
-        eprintln!("  {} {}", self.paint(Role::Warn, "▲"), text);
+        self.end_status_line();
+        for (index, line) in wrap::fold(text, self.width.saturating_sub(wrap::INDENT.len()))
+            .iter()
+            .enumerate()
+        {
+            if index == 0 {
+                eprintln!("  {} {line}", self.paint(Role::Warn, "▲"));
+            } else {
+                // Under the first word, never under the mark: a hanging indent
+                // is what keeps the block reading as one warning.
+                eprintln!("{}{line}", wrap::INDENT);
+            }
+        }
+    }
+
+    /// A task that could not be finished, and that did not stop the run.
+    ///
+    /// The `▲` counterpart of [`Ui::applied`]. It covers the busy line the same
+    /// way, so the task resolves instead of sitting at `◐` for the rest of the
+    /// run, and it carries the outcome where the reason for running was. The
+    /// explanation follows beneath it, folded and dimmed — one mark for the
+    /// whole block, because a second `▲` under the first says nothing the first
+    /// did not.
+    ///
+    /// Two streams, on purpose. The mark and the outcome belong to the task
+    /// ladder, which is on stdout and is what the busy line has to be covered
+    /// on; the explanation is a warning and joins the rest of them on stderr. A
+    /// run asked to be quiet printed no ladder to cover, so there it goes to
+    /// stderr with the explanation — a warning is the one thing `--quiet` does
+    /// not silence.
+    pub fn unresolved(&self, title: &str, outcome: &str, detail: &[Detail]) {
+        // Recorded as one warning, not as a title and some lines: a test
+        // asserting that a downgraded path told the developer what happened
+        // should not have to know how the block was split up to print it.
+        #[cfg(any(test, feature = "testing"))]
+        self.warned.lock().unwrap().push(
+            std::iter::once(format!("{title} — {outcome}"))
+                .chain(detail.iter().map(|line| line.text().to_string()))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        // Measured without the colour escapes, exactly as `applied` does.
+        let plain = format!("  ▲ {title} — {outcome}");
+        let padding = " ".repeat(cover(self.take_pending(), &plain));
+        let painted = format!(
+            "  {} {} {}",
+            self.paint(Role::Warn, "▲"),
+            title,
+            self.paint(Role::Muted, &format!("— {outcome}"))
+        );
+        if self.quiet {
+            eprintln!("{painted}");
+        } else {
+            println!("\r{painted}{padding}");
+            let _ = std::io::stdout().flush();
+        }
+        for line in wrap::detail_lines(self.theme, self.width, detail) {
+            eprintln!("{line}");
+        }
     }
 
     pub fn info(&self, text: &str) {
@@ -422,6 +514,7 @@ impl Ui {
 
     /// The four things every failure must say.
     pub fn failure(&self, failure: &Failure) {
+        self.end_status_line();
         eprintln!();
         eprintln!(
             "  {} {}",
@@ -431,19 +524,43 @@ impl Ui {
         if let Some(command) = &failure.command {
             eprintln!("    {} {}", self.paint(Role::Muted, "ran"), command);
         }
+        let body = self.width.saturating_sub(wrap::INDENT.len());
         for line in failure
             .detail
             .lines()
             .filter(|line| !line.trim().is_empty())
             .take(8)
+            .flat_map(|line| wrap::fold(line, body))
         {
-            eprintln!("    {}", self.paint(Role::Muted, line));
+            eprintln!("{}{}", wrap::INDENT, self.paint(Role::Muted, &line));
         }
-        eprintln!(
-            "    {} {}",
-            self.paint(Role::Strong, "do this:"),
-            failure.action
-        );
+        // The label is folded *with* the sentence rather than printed in front
+        // of it, so the first line is measured including the nine columns it
+        // occupies. An action is the longest thing a failure carries — the
+        // remedy for a stale host key names a file, a host and two commands —
+        // and it is the line the developer has to act on.
+        let mut paragraphs = failure.action.split('\n');
+        let opening = paragraphs.next().unwrap_or_default().trim();
+        for line in wrap::fold(&format!("do this: {opening}"), body) {
+            match line.strip_prefix("do this:") {
+                Some(rest) => eprintln!(
+                    "{}{}{rest}",
+                    wrap::INDENT,
+                    self.paint(Role::Strong, "do this:")
+                ),
+                None => eprintln!("{}{line}", wrap::INDENT),
+            }
+        }
+        // Anything past the first paragraph is a line to copy — the public key
+        // in `authorise`'s paste-it-by-hand remedy is the only one today — and
+        // gets the same treatment as a warning's. That is what a `\n` in an
+        // action means, and the only thing it means: `Failure` is a plain
+        // struct built at a hundred call sites, so the alternative is asking
+        // each of them to classify a paragraph none of them has.
+        let rest: Vec<Detail> = paragraphs.map(Detail::Verbatim).collect();
+        for line in wrap::detail_lines(self.theme, self.width, &rest) {
+            eprintln!("{line}");
+        }
         eprintln!(
             "    {}",
             self.paint(
@@ -563,6 +680,49 @@ mod tests {
         let ui = Ui::new(false);
         ui.note_value("Enter code", "DHNT-ZSDM");
         assert_eq!(ui.noted(), vec!["Enter code DHNT-ZSDM"]);
+    }
+
+    #[test]
+    fn a_warning_ends_the_status_line_it_interrupts() {
+        // The reported bug: `warn` writes to stderr, so it cannot carry the
+        // `\r` that covers stdout, and it left the busy line unterminated —
+        // "◐ Authorised — installing the key  ▲ riabuild's key is already…"
+        // on one line, with the task never resolving.
+        let ui = Ui::new(false);
+        ui.working("Authorised", "installing the key");
+        ui.warn("something to say about it");
+        assert_eq!(ui.take_pending(), 0);
+    }
+
+    #[test]
+    fn an_unresolved_task_covers_the_busy_line_like_a_finished_one() {
+        let ui = Ui::new(false);
+        ui.working("Authorised", "installing the key");
+        ui.unresolved("Authorised", "the server refuses it", &[]);
+        assert_eq!(ui.take_pending(), 0);
+    }
+
+    #[test]
+    fn an_unresolved_task_is_recorded_as_one_warning() {
+        // `Ok(())` on its own is indistinguishable from a step that silently
+        // did nothing, so the recorder is what a test asserts a downgraded
+        // path actually spoke up — and it should not have to know the block
+        // was split into a title and three paragraphs to print it.
+        let ui = Ui::new(false);
+        ui.unresolved(
+            "Authorised",
+            "the server refuses it",
+            &[
+                Detail::Prose("It is already in the file."),
+                Detail::Verbatim("ssh-ed25519 AAAA riabuild"),
+            ],
+        );
+        assert_eq!(
+            ui.warned(),
+            vec![
+                "Authorised — the server refuses it It is already in the file. ssh-ed25519 AAAA riabuild"
+            ]
+        );
     }
 
     #[test]

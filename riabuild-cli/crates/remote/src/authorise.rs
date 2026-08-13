@@ -82,7 +82,7 @@ use super::identity::{key_path, ssh_options};
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandRunner, RunOptions};
-use riabuild_ui::{Failure, Ui};
+use riabuild_ui::{Detail, Failure, Ui};
 use std::sync::Arc;
 
 /// The authentication methods sshd named in its refusal, e.g. `Permission
@@ -331,6 +331,7 @@ async fn finish(
                 ui,
                 remote,
                 public_key,
+                "the key could not be written to the server",
                 &format!("riabuild could not add it to authorized_keys there ({error})"),
                 &fallback,
             );
@@ -349,17 +350,26 @@ async fn finish(
         // they end up pasting a key they have pasted before, and it is what
         // riabuild itself did on every run for as long as `ssh-copy-id` was
         // the thing deciding whether the key was installed.
-        ui.warn(&format!(
-            "riabuild's key is already in ~/.ssh/authorized_keys on {host}, and that \
-             server still refuses it — so riabuild has left the file alone rather than \
-             adding another copy of the same line.\n    \
-             {fallback}.\n    \
-             Something on {host} is not honouring that file. The usual causes are an \
-             `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
-             `AuthenticationMethods` that needs more than a key, or a home directory \
-             whose mode `StrictModes` rejects.",
-            host = remote.host,
-        ));
+        ui.unresolved(
+            "Authorised",
+            "the server refuses the key it already has",
+            &[
+                Detail::Prose(&format!(
+                    "riabuild's key is already in ~/.ssh/authorized_keys on {}, and that \
+                     server still refuses it — so riabuild has left the file alone rather \
+                     than adding another copy of the same line.",
+                    remote.host
+                )),
+                Detail::Prose(&fallback),
+                Detail::Prose(&format!(
+                    "Something on {} is not honouring that file. The usual causes are an \
+                     `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
+                     `AuthenticationMethods` that needs more than a key, or a home \
+                     directory whose mode `StrictModes` rejects.",
+                    remote.host
+                )),
+            ],
+        );
         return Ok(());
     }
 
@@ -372,6 +382,7 @@ async fn finish(
             ui,
             remote,
             public_key,
+            "the key is installed and still refused",
             "the key was copied, but signing in with it still does not work",
             &fallback,
         );
@@ -391,7 +402,7 @@ fn paste(remote: &Remote, public_key: &str) -> Failure {
     Failure::new(
         format!("authorising riabuild's key on {}", remote.host),
         format!(
-            "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n    {}",
+            "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n{}",
             remote.host,
             public_key.trim()
         ),
@@ -404,34 +415,58 @@ fn paste(remote: &Remote, public_key: &str) -> Failure {
 /// wrong one: telling a developer riabuild will "ask for the password once and
 /// remember it" on a server that has no password to ask for is the sentence
 /// this whole feature exists to stop printing.
+///
+/// A whole sentence, capital and full stop, because both warnings set it as a
+/// paragraph of its own rather than splicing it into one.
 fn fallback(remote: &Remote, entry: Option<&crate::issued::Working>) -> String {
     match entry {
         Some(entry) => format!(
-            "the rest of this run will use the {} key issued to you",
+            "The rest of this run will use the {} key issued to you.",
             entry.label
         ),
         None => format!(
-            "the rest of this run will use {}'s password instead; riabuild asks for it \
-             once and remembers it",
+            "The rest of this run will use {}'s password instead; riabuild asks for it \
+             once and remembers it.",
             remote.target()
         ),
     }
 }
 
-/// The same remedy as [`paste`], said as a warning rather than as a stop.
+/// The same remedy as [`paste`], said as a warning rather than as a stop, and
+/// said in the place the `● Authorised` would have gone — the step is over
+/// either way, and a task left at `◐` is the one outcome that is not true.
 ///
 /// Deliberately built from the same `public_key`, and deliberately still naming
 /// `authorized_keys`: the developer is getting in either way, and this is how
 /// they stop needing to.
-fn carry_on(ui: &Ui, remote: &Remote, public_key: &str, because: &str, fallback: &str) {
-    ui.warn(&format!(
-        "riabuild's key cannot sign in to {host} yet — {because}.\n    \
-         {fallback}.\n    \
-         To stop relying on that, add this line to ~/.ssh/authorized_keys on \
-         {host}:\n      {key}",
-        host = remote.host,
-        key = public_key.trim(),
-    ));
+///
+/// `outcome` is what the task line says and `because` is what the explanation
+/// opens with. They are not the same sentence twice: one has to fit beside the
+/// mark, and the other carries the error the copy actually returned.
+fn carry_on(
+    ui: &Ui,
+    remote: &Remote,
+    public_key: &str,
+    outcome: &str,
+    because: &str,
+    fallback: &str,
+) {
+    ui.unresolved(
+        "Authorised",
+        outcome,
+        &[
+            Detail::Prose(&format!(
+                "riabuild's key cannot sign in to {} yet — {because}.",
+                remote.host
+            )),
+            Detail::Prose(fallback),
+            Detail::Prose(&format!(
+                "To stop relying on that, add this line to ~/.ssh/authorized_keys on {}:",
+                remote.host
+            )),
+            Detail::Verbatim(public_key.trim()),
+        ],
+    );
 }
 
 #[cfg(test)]
