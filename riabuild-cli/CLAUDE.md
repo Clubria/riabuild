@@ -295,11 +295,17 @@ runner's own answer could ever be asserted.
 `keychain::select` took `is_macos` from the day it was written, and the three wrappers
 around it — `for_platform`, `for_password`, `for_account` — went on asking `cfg!`
 themselves, so every test that went *through* a wrapper silently asserted "…and the host
-is Linux". Six did. They passed the `ubuntu-latest` pull-request gate for the whole life
-of the keyring-less fallback and then failed together on the release workflow's macOS
-job — which runs *after* the tag is pushed, so the first two releases that carried them
-had no binaries at all. Half-applying this pattern is worse than not applying it, because
-the extracted function looks like the coverage already exists.
+is Linux". Six did. They passed the pull-request gate for the whole life of the
+keyring-less fallback and then failed together on the release workflow's macOS job —
+which runs *after* the tag is pushed, so the first two releases that carried them had no
+binaries at all. Half-applying this pattern is worse than not applying it, because the
+extracted function looks like the coverage already exists.
+
+**The gate has a Mac, and that is not the same as running your test on one.** `e2e.yml`'s
+"riabuild on macOS" job runs on `pull_request`, so a macOS runner is not what was missing
+— it runs the end-to-end suite, and `cargo test` on macOS happens only in `release.yml`.
+Do not read a green "riabuild on macOS" as unit-test coverage of a platform branch. The
+parameter is what makes that branch assertable, on every host and on every run.
 
 Each wrapper now takes `is_macos`, and `each_wrapper_passes_the_platform_it_is_actually_running_on`
 pins all three to the host's real answer. That test is not optional: a parameter without

@@ -99,10 +99,16 @@ pub async fn for_account(
 /// host is Linux".
 ///
 /// That is not a hypothetical. The tests below did exactly that, passed the
-/// `ubuntu-latest` pull-request gate for the whole life of the keyring-less
-/// fallback, and then failed six-at-once on the release workflow's macOS job —
-/// which is the only macOS runner this repository has, and runs after the tag
-/// is pushed. A test that cannot fail until release is not a gate.
+/// pull-request gate for the whole life of the keyring-less fallback, and then
+/// failed six-at-once on the release workflow's macOS job — after the tag was
+/// pushed, so two releases produced no binaries at all.
+///
+/// A macOS runner on the gate would not have caught it, and it is worth being
+/// exact about why, because `e2e.yml` *has* one: "riabuild on macOS" runs on
+/// `pull_request` and it runs the end-to-end suite. `cargo test` on macOS
+/// happens in `release.yml` and nowhere else. So the question to ask of a
+/// platform-dependent test is not "does CI have a Mac" — it is "does anything
+/// run *this test* on one before a tag", and here the answer was no.
 async fn for_account_on(
     is_macos: bool,
     runner: Arc<dyn CommandRunner>,
@@ -644,11 +650,12 @@ mod tests {
 
     // The tests above now pass `is_macos` explicitly, so both platforms'
     // outcomes are asserted on every host — which they were not when each
-    // wrapper asked `cfg!` itself, and PR CI only runs `ubuntu-latest` (the
-    // sole macOS runner is `release.yml`'s tag-triggered job, not the
-    // pull_request gate). The tests below call `select` directly, which is
-    // still the tightest place to pin the *ordering* of the branches: no
-    // runner, no store construction, just the decision.
+    // wrapper asked `cfg!` itself, and the only `cargo test` this repository
+    // runs on a Mac is in `release.yml`, after the tag. (`e2e.yml`'s "riabuild
+    // on macOS" job does run on `pull_request`, but it runs the end-to-end
+    // suite, not this crate's unit tests.) The tests below call `select`
+    // directly, which is still the tightest place to pin the *ordering* of the
+    // branches: no runner, no store construction, just the decision.
 
     #[test]
     fn select_prefers_the_file_store_over_macos_even_when_is_macos_is_true() {
