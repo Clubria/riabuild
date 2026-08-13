@@ -272,6 +272,24 @@ pub async fn resolve_home(
     Ok(home)
 }
 
+/// The variable a cloudcli box reads to decide whether to wrap a session in
+/// tmux, and the value that tells it not to.
+///
+/// riabuild opens the environment shell itself, and a profile that `exec`s
+/// tmux in front of it takes the terminal riabuild is in the middle of handing
+/// over: the banner, the accounts box and the `exit` that is supposed to end
+/// the session all land inside a pane instead. Set as an *environment*
+/// variable rather than written into a generated rcfile, because the rcfile
+/// sources the developer's own config first and by then tmux has already
+/// started — the answer has to be in the environment before any shell reads
+/// anything.
+///
+/// A pair rather than two constants so the key and the value cannot be used
+/// apart; [`env_prefix`] and [`shell::open`] are its two callers, and they set
+/// it at different depths on purpose. See `shell::open` for why the mosh path
+/// needs its own copy.
+pub const NO_TMUX: (&str, &str) = ("CLOUDCLI_NO_TMUX", "1");
+
 /// The environment the server's own riabuild runs under, as `(key, value)`
 /// pairs ready for [`env_command`] — never a `VAR=x` prefix, which fish
 /// rejects outright and which mosh never gives a shell the chance to parse
@@ -289,6 +307,14 @@ pub async fn resolve_home(
 /// `xclip` would read Ben's laptop. Naming it also switches on
 /// `shell::browser_for`, which exports `BROWSER` only where a channel exists to
 /// open a link on.
+///
+/// [`NO_TMUX`] rides along here rather than being set anywhere further in,
+/// because everything the server runs hangs off this prefix — the setup run,
+/// the channel probe, `internal seed-github`, and the `riabuild shell` that
+/// becomes the developer's session. `RealRunner` adds to the child's inherited
+/// environment rather than replacing it, so a value set on the wire here is
+/// still set for the bash riabuild spawns three processes later, before that
+/// bash reads a line of the developer's own config.
 pub fn env_prefix(home: &str, member_id: &str, name: &str) -> Vec<(String, String)> {
     let namespace = session::namespace(home, member_id);
     vec![
@@ -298,6 +324,7 @@ pub fn env_prefix(home: &str, member_id: &str, name: &str) -> Vec<(String, Strin
             riabuild_channel::SOCKET_ENV.to_string(),
             channel::remote_socket(&namespace),
         ),
+        (NO_TMUX.0.to_string(), NO_TMUX.1.to_string()),
     ]
 }
 
@@ -547,6 +574,37 @@ mod tests {
             .map(|(_, value)| value.as_str())
             .expect("root");
         assert!(socket.starts_with(root), "{socket} is not under {root}");
+    }
+
+    /// Every remote invocation, not only the shell: the setup run hands the
+    /// terminal over too, and a tmux that swallowed *that* would leave the
+    /// developer watching a pane instead of a provisioning run.
+    #[test]
+    fn no_remote_invocation_lets_the_server_wrap_the_session_in_tmux() {
+        let env = env_prefix(
+            "/home/dev",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "build-01",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == NO_TMUX.0)
+                .map(|(_, value)| value.as_str()),
+            Some(NO_TMUX.1),
+            "{env:?}"
+        );
+
+        // On the wire it is a quoted `env` argument like every other pair —
+        // never a `VAR=x` prefix, which fish rejects and mosh never parses.
+        let command = env_command(
+            &env.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            "/home/dev/.riabuild/riabuild/2026.08.06/riabuild",
+            &["shell"],
+        );
+        assert!(command.starts_with("env "), "{command}");
+        assert!(command.contains("'CLOUDCLI_NO_TMUX=1'"), "{command}");
     }
 
     #[tokio::test]
