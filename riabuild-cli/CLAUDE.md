@@ -187,11 +187,23 @@ The design spec for Linux support ruled this out, on the grounds that
 developer a token to copy, and the string never appears in riabuild-web at all.
 That bullet is corrected in the spec rather than left standing.
 
+The **cache of a server's session on a keyring-less laptop** is the same
+widening once more, at `~/.riabuild/remote-sessions/<hash>`. `riabuild remote`
+reads that cache so a second run finds the server's token without re-minting;
+without a fallback it errored, and `riabuild remote` was unusable from any
+laptop with no libsecret — `e2e/remote/run.sh` carried it as "known gap (a)".
+Storing it is also the *conservative* option: the alternative is not "no token
+on disk", it is a fresh 90-day session minted on every run and recorded nowhere
+this laptop can revoke it. `riabuild remote forget` deletes it with the rest.
+
 `keychain::keyring_answers` owns the "is there a keyring here?" question and is
 the only place that decides it — `runner.which("secret-tool")` is not an answer
-to it, and reintroducing that test is how this bug comes back. `describe()` must
-name where the token really went: `provision.rs` prints it, and it is the only
-line telling the developer their token is in a file rather than a keyring.
+to it, and reintroducing that test is how this bug comes back. All three call
+sites (`for_platform`, `for_password`, `for_account`) ask it; a fourth that
+asks `which` instead will look correct, pass CI, and fail on a server.
+`describe()` must name where the token really went: `provision.rs` prints it,
+and it is the only line telling the developer their token is in a file rather
+than a keyring.
 
 A **server's SSH password** is the third, and it is the same exception widened
 to cover a keyring-less *laptop*. `riabuild remote` falls back to a password when

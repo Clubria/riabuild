@@ -48,15 +48,22 @@
 # is the point of this paragraph — the next step after the install is
 # `session::ensure`, and it needs three things this setup does not have:
 #
-#   a. A keyring. `session::ensure` calls `keychain::for_account(…, None)`,
-#      which on Linux is `secret-tool` and *errors* when it is missing
-#      ("reading the riabuild token from your keyring") rather than falling
-#      back. `RIABUILD_TOKEN` cannot answer this: `for_account` ignores it
-#      deliberately, because that variable is this machine's own override
-#      and honouring it here would hand every server the same token. A
-#      GitHub ubuntu runner has no `secret-tool`, so this needs an
-#      `apt-get install -y libsecret-tools` in the job (and a session bus,
-#      or `--no-keyring`-equivalent handling, for it to actually store).
+#   a. CLOSED — a keyring is no longer needed. This used to read:
+#      `session::ensure` calls `keychain::for_account(…, None)`, which on
+#      Linux is `secret-tool` and *errors* when it is missing rather than
+#      falling back, so a GitHub ubuntu runner stops here and would need an
+#      `apt-get install -y libsecret-tools` (and a session bus, or
+#      "`--no-keyring`-equivalent handling", for it to actually store).
+#
+#      It is the second of those that shipped, and it turned out to matter
+#      well beyond this harness: the same "is there a keyring?" test was
+#      `which("secret-tool")` at three call sites, which is not the question
+#      — libsecret is a client for a D-Bus Secret Service, so the binary is
+#      present on plenty of machines with nothing listening. `for_account`
+#      now falls back to a 0600 file per server, exactly as the saved SSH
+#      password already did. `RIABUILD_TOKEN` still cannot answer this, and
+#      still should not: it is this machine's own override, and honouring it
+#      here would hand every server the same token.
 #   b. `POST` in the stub. `stub_web.py` implements only `do_GET` and
 #      `do_DELETE`, so a POST gets BaseHTTPRequestHandler's stock 501.
 #   c. Something to approve the device code. This used to read "an answer to
@@ -376,16 +383,18 @@ known_gap() {
     && grep -q "POST /api/v1/cli/device.* 501" "$work/stub_web.log" 2>/dev/null \
     && return 0
 
-  # Branch 4: item (a), and the one a GitHub runner hits. `session::ensure`
-  # reads this laptop's own token through `keychain::for_account`, which on
-  # Linux is `secret-tool` and errors rather than falling back when it is
-  # absent. An ubuntu-latest image has no libsecret, so CI stops here — one
-  # stage *earlier* than a developer machine that has one, which is why the
-  # local run reaches branch 3 and this job does not.
+  # There is no branch 4. It used to forgive item (a) — a runner with no
+  # libsecret, where `for_account` errored instead of falling back, stopping
+  # CI one stage *earlier* than a developer machine with a keyring. That was
+  # a real gap in riabuild rather than in this harness, and it is fixed: a
+  # machine whose keyring does not answer now keeps a server's session in a
+  # 0600 file. So CI and a laptop stop at the same place, branch 3, and this
+  # job stops being the one that proves least.
   #
-  # Both greps again: "not installed" alone would forgive any missing tool.
-  grep -q "reading the riabuild token from your keyring" "$work/ada.log" \
-    && grep -q "secret-tool\` is not installed" "$work/ada.log"
+  # Do not restore it. A keyring failure reaching this script again is a
+  # regression in `keychain::keyring_answers`, and forgiving it here is how
+  # it would ship unnoticed.
+  return 1
 }
 
 if [ "$ada_status" -eq 124 ]; then
@@ -457,13 +466,7 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   # previous version of this banner named the musl checksum unconditionally,
   # so once that shipped it went on announcing a gap that no longer existed
   # while the run was in fact stopping somewhere else entirely.
-  if grep -q "reading the riabuild token from your keyring" "$work/ada.log"; then
-    stopped_at="the sign-in step, one stage past the install"
-    because="this runner has no libsecret, and session::ensure reads the
-# laptop's own token through secret-tool, which errors rather than falling
-# back when it is absent. Item (a) in this file's header. A machine that
-# does have one gets one stage further, to item (b)."
-  elif grep -q "replied with HTTP 501" "$work/ada.log"; then
+  if grep -q "replied with HTTP 501" "$work/ada.log"; then
     stopped_at="the sign-in step, one stage past the install"
     because="stub_web.py implements only do_GET and do_DELETE, so the
 # device-code POST this release's CLI makes gets a stock 501. That is a

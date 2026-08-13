@@ -185,8 +185,9 @@ pub async fn ensure(
     let keychain = keychain::for_account(
         runner.clone(),
         &keychain::remote_account(&remote.hash()),
-        None,
-    );
+        paths.remote_session_file(&remote.hash()),
+    )
+    .await;
 
     // A stored token is not automatically a live one. It expires, and
     // `forget` on another laptop may have revoked it. Writing a dead token to

@@ -61,18 +61,33 @@ pub fn remote_account(hash: &str) -> String {
 /// `RIABUILD_TOKEN` is deliberately *not* consulted here: it is this
 /// machine's override, and using it for a server's session would give every
 /// server the same token.
-pub fn for_account(
+///
+/// A keyring-less laptop falls back to a file, on the same terms as
+/// [`select_password_store`] — and this is the third of the three call sites
+/// that had to stop asking `which("secret-tool")`. It errored instead of
+/// falling back, which made `riabuild remote` unusable from any laptop without
+/// libsecret: `e2e/remote/run.sh` carried it as a documented "known gap" that
+/// stopped its CI run one stage earlier than a developer machine.
+///
+/// Storing it is also the more conservative option, not the looser one. The
+/// alternative is not "no token on disk" — it is a *new 90-day session minted
+/// on every run*, each one recorded nowhere this laptop can later revoke,
+/// which is precisely what `session::ensure` warns about when it refuses to
+/// let a server sign itself in.
+pub async fn for_account(
     runner: Arc<dyn CommandRunner>,
     account: &str,
-    session_token_file: Option<PathBuf>,
+    keyringless_fallback: PathBuf,
 ) -> Box<dyn Keychain> {
-    if let Some(path) = session_token_file {
-        return Box::new(FileKeychain::server_namespace(path));
+    let answers = platform::keyring_answers(runner.as_ref()).await;
+    match select_password_store(cfg!(target_os = "macos"), answers, keyringless_fallback) {
+        Choice::Macos => Box::new(SecurityCliKeychain::for_account(runner, account)),
+        Choice::Linux => Box::new(SecretToolKeychain::for_account(runner, account)),
+        Choice::LinuxFile(path) => Box::new(FileKeychain::keyringless_machine(path)),
+        // `select_password_store` returns neither.
+        Choice::Env => Box::new(EnvKeychain),
+        Choice::ServerFile(path) => Box::new(FileKeychain::server_namespace(path)),
     }
-    if cfg!(target_os = "macos") {
-        return Box::new(SecurityCliKeychain::for_account(runner, account));
-    }
-    Box::new(SecretToolKeychain::for_account(runner, account))
 }
 
 /// Reads `RIABUILD_TOKEN`. For CI and for end-to-end tests against a local
@@ -339,6 +354,31 @@ mod tests {
                 Choice::Env
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_keyringless_laptop_can_still_cache_a_servers_session() {
+        // `e2e/remote/run.sh` carried this as "known gap (a)" — `riabuild
+        // remote` was unusable from any laptop without libsecret, because
+        // `for_account` errored instead of falling back.
+        //
+        // Storing it is the conservative option. Without it the laptop mints a
+        // fresh 90-day session on *every* run, and records none of them
+        // anywhere it could later revoke — which is the exact outcome
+        // `session::ensure` refuses to allow a server to cause.
+        let fallback = PathBuf::from("/home/ada/.riabuild/remote-sessions/9f2c");
+        let store = for_account(runner_with_no_dbus(), "remote:9f2c", fallback).await;
+        assert_eq!(
+            store.describe(),
+            "a private file, because this machine has no keyring"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_laptop_with_a_keyring_still_caches_a_servers_session_in_it() {
+        let fallback = PathBuf::from("/home/ada/.riabuild/remote-sessions/9f2c");
+        let store = for_account(runner_with_a_working_keyring(), "remote:9f2c", fallback).await;
+        assert_eq!(store.describe(), "your system keyring");
     }
 
     #[test]

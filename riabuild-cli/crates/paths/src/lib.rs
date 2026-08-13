@@ -158,6 +158,19 @@ pub trait Paths: Send + Sync {
     fn remote_password_file(&self, hash: &str) -> PathBuf {
         self.ssh_dir().join("passwords").join(hash)
     }
+    /// The laptop's cache of one *server's* session token, on a laptop with no
+    /// keyring to hold it. Keyed by `Remote::hash()`, so several servers never
+    /// collide and `remote forget` deletes exactly one.
+    ///
+    /// Separate from [`remote_password_file`](Paths::remote_password_file)
+    /// because they are different secrets for the same server — a riabuild
+    /// bearer token and a Unix password — and `forget` deletes them
+    /// individually. Separate from
+    /// [`session_token_file`](Paths::session_token_file) because that one is
+    /// *this* machine's own session: one file per laptop, not per server.
+    fn remote_session_file(&self, hash: &str) -> PathBuf {
+        self.root().join("remote-sessions").join(hash)
+    }
 }
 
 pub struct RealPaths {
