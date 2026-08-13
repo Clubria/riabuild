@@ -436,6 +436,30 @@ than a page. Design:
 ## Shell integration
 
 `bash --rcfile` **replaces** the user's `.bashrc`; zsh has no `--rcfile` and needs
-`ZDOTDIR`. Generated rcfiles must source the user's real config **first**, then apply
-riabuild's environment. Getting this wrong silently destroys a developer's prompt,
-aliases, and history config, which reads as *riabuild broke my shell*.
+`ZDOTDIR`; fish needs `XDG_CONFIG_HOME`. Generated rcfiles must source the user's real
+config **first**, then apply riabuild's environment. Getting the first half wrong silently
+destroys a developer's prompt, aliases, and history config, which reads as *riabuild broke
+my shell*.
+
+**The second half is not optional either, and exporting from the parent process does not
+cover it.** The developer's config runs *after* riabuild set the environment, and
+prepending to `PATH` is the most common line in a dotfile — Ubuntu ships it for
+`~/.local/bin`, and nvm, pyenv, mise, asdf and conda each write their own. Any one of them
+demotes `~/.riabuild/bin` from the front, and three separate things that document
+"`~/.riabuild/bin` leads `PATH` inside the environment shell" as load-bearing stop working
+at once: the `claude` launcher, the clipboard shims, and the `xdg-open` that carries links
+to the laptop. Nothing errors. The developer's own `claude` simply starts instead of
+riabuild's. `export BROWSER=firefox` in a `.bashrc` defeats the link channel the same way.
+
+So `shell::environment_command` re-applies riabuild's environment at the bottom of every
+generated rcfile — the same "riabuild gets the last word" shape the prompt hook already
+uses. `PATH` is **moved to the front, never overwritten**: restating the parent's literal
+value would discard whatever the developer's config legitimately added, which is the
+opposite of the promise in each generated file's own header. Every other variable is
+riabuild's outright and is simply re-exported.
+
+The POSIX snippet is shared by bash and zsh; fish has its own because `PATH` is a list
+there. The strip is a `tr`/`grep`/`paste` pipeline rather than a shell loop because one
+string has to run under both shells, and zsh does not word-split an unquoted `$PATH` — the
+obvious `for entry in $PATH` reads as a single element there and collapses the whole
+variable to one directory.

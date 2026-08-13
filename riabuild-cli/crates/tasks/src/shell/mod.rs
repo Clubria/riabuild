@@ -107,18 +107,78 @@ impl Shell {
     }
 }
 
+/// riabuild's own directories, in the order they have to lead `PATH`.
+pub fn riabuild_path_dirs(ctx: &Ctx) -> Vec<String> {
+    let mut dirs = vec![ctx.paths.bin_dir()];
+    if let Some(node_version) = &ctx.config.node_version {
+        dirs.push(ctx.paths.node_dir(node_version).join("bin"));
+    }
+    dirs.iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// `PATH` with riabuild's own directories in front, so `node`, `pnpm` and
 /// `claude` resolve to the versions riabuild installed.
 pub fn path_with_riabuild(ctx: &Ctx, current_path: &str) -> String {
-    let mut prefix = vec![ctx.paths.bin_dir()];
-    if let Some(node_version) = &ctx.config.node_version {
-        prefix.push(ctx.paths.node_dir(node_version).join("bin"));
-    }
-    let prefix: Vec<String> = prefix
+    format!("{}:{current_path}", riabuild_path_dirs(ctx).join(":"))
+}
+
+/// The POSIX snippet a generated rcfile runs *after* sourcing the developer's
+/// own configuration — shared by bash and zsh, which both accept it verbatim.
+///
+/// The parent process exports riabuild's environment into the shell, and for a
+/// long time that was assumed to settle it. It does not. `.bashrc` and `.zshrc`
+/// run afterwards, and prepending to `PATH` there is the single most common
+/// line in a developer's dotfiles — Ubuntu ships it for `~/.local/bin`, and
+/// nvm, pyenv, mise, asdf and conda each write their own. Any one of them
+/// demotes `~/.riabuild/bin` from the front, and everything that depends on it
+/// leading silently stops working: the `claude` launcher, the clipboard shims,
+/// and the `xdg-open` that carries links to the laptop. The symptom is not an
+/// error — it is a developer's own `claude` starting instead of riabuild's.
+///
+/// This is the same shape the prompt already uses: riabuild goes last so it
+/// gets the last word over whatever the developer configured.
+///
+/// `PATH` is **moved to the front rather than overwritten.** Restating the
+/// parent's literal value would throw away everything the developer's rcfile
+/// legitimately added, which is the opposite of the "riabuild only adds on
+/// top" promise in each generated file's own header. Every other variable is
+/// riabuild's outright and is simply re-exported.
+///
+/// The strip is a `tr`/`grep`/`paste` pipeline rather than a shell loop because
+/// this one string has to run under both shells: zsh does not word-split an
+/// unquoted `$PATH`, so the obvious `for entry in $PATH` reads as a single
+/// element there and silently collapses the whole variable to one directory.
+pub fn environment_command(env: &[(String, String)], dirs: &[String]) -> String {
+    let strip: String = dirs
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|dir| format!(" -e {}", shell_quote(dir)))
         .collect();
-    format!("{}:{current_path}", prefix.join(":"))
+    let mut script = format!(
+        r#"# riabuild's own environment, applied on top of the configuration above.
+# The developer's rcfile has already run, and prepending to PATH is the most
+# common line in one — so riabuild's directories are moved back to the front
+# here rather than left wherever that put them. What they added is kept.
+_riabuild_rest=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF{strip} | paste -sd: -)
+PATH={lead}${{_riabuild_rest:+:$_riabuild_rest}}
+export PATH
+unset _riabuild_rest"#,
+        lead = shell_quote(&dirs.join(":")),
+    );
+    for (name, value) in env {
+        // Rebuilt above from the live value; restating the parent's would drop
+        // whatever the developer's own rcfile added to it.
+        if name == "PATH" {
+            continue;
+        }
+        script.push_str(&format!("\nexport {name}={}", shell_quote(value)));
+    }
+    script
+}
+
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 pub fn environment(ctx: &Ctx) -> Vec<(String, String)> {
@@ -223,9 +283,9 @@ pub async fn spawn(ctx: &mut Ctx) -> Result<i32> {
     let prelude = prelude(&accounts, ctx.ui.theme(), ctx.server.as_deref());
 
     let (args, extra_env) = match &shell {
-        Shell::Zsh => zsh::prepare(ctx, &prelude).await?,
-        Shell::Bash => bash::prepare(ctx, &prelude).await?,
-        Shell::Fish => fish::prepare(ctx, &prelude).await?,
+        Shell::Zsh => zsh::prepare(ctx, &prelude, &env).await?,
+        Shell::Bash => bash::prepare(ctx, &prelude, &env).await?,
+        Shell::Fish => fish::prepare(ctx, &prelude, &env).await?,
         // riabuild generates no startup file for a shell it does not know, so
         // there is nothing inside it to print this. The parent says it instead
         // — and only here, so it is still said once.
@@ -422,6 +482,64 @@ mod tests {
             .into_owned();
         assert!(path.starts_with(&format!("{bin}:{node}:")), "{path}");
         assert!(path.ends_with("/usr/bin:/bin"));
+    }
+
+    fn dirs() -> Vec<String> {
+        vec![
+            "/home/ada/.riabuild/bin".to_string(),
+            "/home/ada/.riabuild/node/24.19.0/bin".to_string(),
+        ]
+    }
+
+    #[test]
+    fn the_environment_command_puts_riabuild_directories_back_in_front() {
+        // The developer's rcfile has already run by the time this does, and
+        // theirs is the one that may have prepended ~/.local/bin.
+        let script = environment_command(&[], &dirs());
+        assert!(
+            script.contains("PATH='/home/ada/.riabuild/bin:/home/ada/.riabuild/node/24.19.0/bin'"),
+            "{script}"
+        );
+        assert!(script.contains("export PATH"), "{script}");
+    }
+
+    #[test]
+    fn the_environment_command_keeps_what_the_developer_added_to_path() {
+        // Restating the parent's literal PATH would discard nvm, cargo and
+        // their own ~/bin. The tail is rebuilt from the live value instead.
+        let script = environment_command(&[], &dirs());
+        assert!(script.contains("\"$PATH\""), "{script}");
+    }
+
+    #[test]
+    fn the_environment_command_strips_a_stale_copy_rather_than_stacking_one() {
+        // A developer whose rcfile re-sources itself, or a nested shell, must
+        // not grow a second copy of riabuild's directories.
+        let script = environment_command(&[], &dirs());
+        for dir in dirs() {
+            assert!(script.contains(&format!("-e '{dir}'")), "{script}");
+        }
+    }
+
+    #[test]
+    fn the_environment_command_reexports_riabuilds_own_variables() {
+        // BROWSER is the one that bites: `export BROWSER=firefox` in a .bashrc
+        // silently defeats the shim that carries links to the laptop.
+        let env = vec![
+            ("PATH".to_string(), "/parent/path/only".to_string()),
+            ("RIABUILD_SHELL".to_string(), "1".to_string()),
+            (
+                "BROWSER".to_string(),
+                "/home/ada/.riabuild/bin/xdg-open".to_string(),
+            ),
+        ];
+        let script = environment_command(&env, &dirs());
+        assert!(script.contains("export RIABUILD_SHELL='1'"), "{script}");
+        assert!(
+            script.contains("export BROWSER='/home/ada/.riabuild/bin/xdg-open'"),
+            "{script}"
+        );
+        assert!(!script.contains("/parent/path/only"), "{script}");
     }
 
     #[tokio::test]
