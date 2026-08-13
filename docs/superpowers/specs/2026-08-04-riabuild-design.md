@@ -399,6 +399,26 @@ upgrade mandatory.
 Unconditionally running `brew update` on every launch would cost 5–30 s of a full tap
 fetch before the developer sees anything.
 
+The check runs on **every command**, not only the setup flow it started in. A developer
+whose day is `riabuild remote` and `riabuild claude` would otherwise never run the one
+command that updates riabuild, and would go on driving servers from a build months old —
+with `remote::install::version_for_server` handing each server a *newer* riabuild than
+the laptop, which is the pairing that section forbids.
+
+Four commands are excepted, and the rule for them is that riabuild updates on every
+command whose stdout is a terminal a human is reading:
+
+| Command | Why not |
+|---|---|
+| `internal …` | Plumbing the laptop runs on a server over SSH. `ssh` reads `internal askpass`'s stdout *as the password* |
+| `channel …` | The clipboard and browser shims — stdout is a payload, and they run on every Ctrl+V |
+| `env` | Prints `export` lines for a shell to evaluate |
+| `reset` | Runs before the tree is read, because that tree may be why it was asked for |
+
+Which is also why the check cannot precede argv parsing: telling those four apart from
+`riabuild status` is what parsing argv is for. A managed server never self-updates
+either — no package manager put its binary there.
+
 ### The environment shell
 
 After all tasks report satisfied, riabuild spawns `$SHELL` with the environment injected

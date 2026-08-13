@@ -1,12 +1,12 @@
 //! The default flow: `riabuild` with no subcommand.
 //!
-//! Connect, say whose machine this is, upgrade if the org requires it, run
-//! every task, write the shims, log the run, and hand the developer their
-//! shell. `main.rs` decides *which* flow an invocation is; this is the one
-//! that provisions.
+//! Connect, say whose machine this is, run every task, write the shims, log
+//! the run, and hand the developer their shell. `main.rs` decides *which* flow
+//! an invocation is; this is the one that provisions — and it is also where
+//! riabuild's own upgrade used to live, before `main::keep_current` widened it
+//! to every command.
 
 use crate::cli::Cli;
-use crate::update;
 use crate::{opens_shell, tasks};
 use anyhow::Result;
 use riabuild_paths::config;
@@ -54,27 +54,15 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.connect().await?;
     describe_session(ctx);
 
-    // A managed server has no package manager watching this binary, so it must
-    // never try to replace itself — see `scope.rs` and `tasks::Ctx::server`.
-    if let Some(org) = &ctx.org
-        && ctx.server.is_none()
-    {
-        match update::decide(
-            &ctx.cli_version,
-            &org.min_cli_version,
-            &org.latest_cli_version,
-            update::already_updated(),
-        ) {
-            update::Action::Continue => {}
-            update::Action::Upgrade { to, mandatory } => {
-                update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory).await?;
-            }
-        }
-    }
-
-    // Acquired after the upgrade block above, because a `flock` survives `exec`
-    // and `upgrade_and_reexec` replaces this process image: taking it first
-    // would carry the lock into the new process with no guard tracking it and
+    // The update check that used to stand here now runs for *every* command,
+    // from `main::keep_current`, before this function is reached. It has not
+    // been dropped — it has been widened, and `update::action_for` carries the
+    // "a managed server never replaces its own binary" guard that used to be
+    // spelled here.
+    //
+    // Acquired after that check, because a `flock` survives `exec` and
+    // `upgrade_and_reexec` replaces this process image: taking it first would
+    // carry the lock into the new process with no guard tracking it and
     // nothing left to release it.
     let provisioning = provisioning_lock(ctx).await?;
 

@@ -332,6 +332,32 @@ riabuild` there installs a *second* riabuild elsewhere and leaves this one in pl
 every upgrade reports success and nothing changes. That case prints the command and never
 sudoes.
 
+**riabuild updates itself on every command whose stdout is a terminal a human is
+reading.** `main::keep_current` runs it once, at the top of `run_inner`, for every
+invocation; it lived in `provision` alone until a developer whose day is `riabuild
+remote` and `riabuild claude` turned out never to run the one command that updates
+riabuild. That is not cosmetic drift — `install::version_for_server` then hands each
+server a *newer* riabuild than the laptop driving it, which is exactly the unmatched
+pair the invariant above forbids.
+
+`update::applies_to` holds the four exceptions and matches `Command` exhaustively, like
+`opens_shell`, so a new subcommand is a compile error rather than a silent `false`.
+Each is excepted because its stdout is a **payload**, or because it must run on a
+machine riabuild cannot read: `internal …` (`ssh` reads `askpass`'s stdout *as the
+password*, from inside an authentication attempt), `channel …` (the clipboard and
+browser shims, on every Ctrl+V), `env` (`export` lines a shell evaluates, and `Ui::info`
+writes to stdout), and `reset` (dispatched before the tree is read at all). This is also
+the answer to "why not update before argv is parsed": telling those four apart from
+`riabuild status` is precisely what parsing argv is for.
+
+Two things hold the rest of it up. `update::action_for` owns both guards — a managed
+server never replaces its own binary, and a laptop with no session has no floor to be
+below — so neither is restated anywhere. And the connect it depends on is **soft**: a
+laptop that cannot reach riabuild-web carries on, because `riabuild claude` is
+documented to work with no session, no network, and a machine nothing has provisioned.
+The flows that genuinely need the API still call `connect` themselves and still fail
+loudly; `Ctx::connect` is idempotent within a run so that costs nothing.
+
 ## Adding or changing a setup task
 
 Read `.claude/skills/writing-setup-tasks/SKILL.md` first. It covers the `Task` trait,
