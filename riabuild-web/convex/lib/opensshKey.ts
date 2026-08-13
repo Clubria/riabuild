@@ -78,12 +78,21 @@ class Reader {
     return view.getUint32(0, false);
   }
 
-  string(): Uint8Array {
+  /**
+   * `slice`, not `subarray`, so the bytes returned own their buffer.
+   *
+   * A view would keep the whole decoded private key alive behind every field
+   * read out of it, and `crypto.subtle.digest` will not take a view whose
+   * buffer TypeScript cannot prove is an `ArrayBuffer` rather than a
+   * `SharedArrayBuffer`. Both problems go away with a copy, and the largest
+   * thing copied here is one public key.
+   */
+  string(): Uint8Array<ArrayBuffer> {
     const length = this.uint32();
     if (this.offset + length > this.bytes.length) {
       throw new KeyParseError("That key is truncated — it ends mid-field.");
     }
-    const slice = this.bytes.subarray(this.offset, this.offset + length);
+    const slice = this.bytes.slice(this.offset, this.offset + length);
     this.offset += length;
     return slice;
   }
