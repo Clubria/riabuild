@@ -146,7 +146,10 @@ impl Agent {
             )
             .await?;
         if !output.ok() {
-            anyhow::bail!("ssh-add refused {}: {}", key.label, output.stderr.trim());
+            // The label is the caller's to name — it already has it, and
+            // repeating it here reads as "the cloudcli key: ssh-add
+            // refused cloudcli".
+            anyhow::bail!("ssh-add refused it: {}", output.stderr.trim());
         }
         Ok(public)
     }
