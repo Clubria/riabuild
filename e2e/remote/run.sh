@@ -81,7 +81,9 @@
 #   2. `ssh-copy-id` builds its temporary directory under the developer's
 #      `~/.ssh` and fails when there is none. riabuild never created it — a
 #      real bug on any laptop that has not used ssh before, which is exactly
-#      the machine riabuild claims to be the first thing run on.
+#      the machine riabuild claims to be the first thing run on. (Since
+#      `authorise` grew its own copy step, riabuild no longer runs
+#      `ssh-copy-id` at all, and needs no local `~/.ssh` to install a key.)
 #   3. `ensure_matching_binary` compared the *binary* on the server against
 #      the *tarball's* digest, which is what a release publishes. Those are
 #      never equal, so remote mode could not install on any platform. The
@@ -176,12 +178,12 @@ if ! GH_TOKEN="$token" gh api /user/memberships/orgs/Clubria >/dev/null 2>&1; th
 fi
 
 # One key, two developers: they share the Unix account, which is the point.
-# An ssh-agent (rather than `-i`) is what lets `authorise::authorise`'s
-# `ssh-copy-id` step add each developer's *new* riabuild key onto the
-# container without ever needing this account's (nonexistent) password —
-# verified by hand against a real container before writing this script:
-# `ssh-copy-id` tries every identity an agent offers before it ever falls
-# back to a password prompt.
+# An ssh-agent (rather than `-i`) is what lets `authorise::authorise`'s copy
+# step add each developer's *new* riabuild key onto the container without ever
+# needing this account's (nonexistent) password. That works because the copy
+# is the one `ssh` riabuild runs without `IdentitiesOnly=yes`, so the agent's
+# identities are still offered — the same property `ssh-copy-id` relied on
+# when this step was still shelling out to it.
 ssh-keygen -t ed25519 -N "" -f "$work/seed" -C "riabuild e2e" >/dev/null
 cp "$work/seed.pub" "$here/authorized_keys"
 

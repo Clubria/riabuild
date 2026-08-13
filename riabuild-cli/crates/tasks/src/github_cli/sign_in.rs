@@ -56,12 +56,13 @@ pub(super) async fn run_gh_auth(
     // `run_interactive` sites each have something that ends them:
     // `auth::login`'s browser wait is bounded at 180s, `shell::open` is
     // skipped by `--no-shell`, and `update.rs` re-execs riabuild itself.
-    // `remote::authorise`'s `ssh-copy-id` is the real second delegated-prompt
-    // site and is deliberately *not* guarded here: it typically errors rather
-    // than hanging with no controlling terminal, which if true makes a guard
-    // unnecessary — but nothing proves it, because `e2e/remote/run.sh`
-    // sidesteps that path with an ssh-agent. Treat it as unproven, not as
-    // covered.
+    // `remote::authorise`'s key copy was the second delegated-prompt site,
+    // and is no longer one at all: it is a captured `ssh` rather than a
+    // `run_interactive`, and the prompt behind it is `ui::secret`, which
+    // fails outright when there is no `/dev/tty` to ask on. Nothing is piped
+    // to that child's stdin either, so `run` hands it `Stdio::null()` and
+    // even an OpenSSH too old to honour `SSH_ASKPASS_REQUIRE` reads EOF and
+    // exits rather than waiting for a person who is not there.
     if !ctx.ui.interactive() {
         return Err(Failure::new(
             attempting,

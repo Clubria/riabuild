@@ -384,7 +384,7 @@ mod tests {
                 .identity_dir()
                 .join(remote().hash())
                 .with_extension("pub"),
-            "ssh-ed25519 AAAA riabuild",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild",
         )
         .await
         .expect("write pub");
@@ -968,9 +968,9 @@ mod tests {
                 "",
             )
             .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
-            // The same refusal before and after the copy: `ssh-copy-id`
-            // succeeds, the recheck does not, so `authorise` fails *after*
-            // having written to the server.
+            // The same refusal before and after the copy: the key lands in
+            // `authorized_keys`, the recheck still fails, so `authorise` has
+            // written to the server before this run goes wrong.
             .with(
                 "ssh -o BatchMode=yes",
                 255,
@@ -983,7 +983,7 @@ mod tests {
                 "",
                 "Permission denied (publickey,password).",
             )
-            .with("ssh-copy-id", 0, "", "");
+            .containing("authorized_keys", 0, "", "");
         let (mut ctx, _home, fake) = riabuild_tasks::testing::ctx_and_runner(fake).await;
         ctx.member = Some(member());
         write_public_key(ctx.paths.as_ref()).await;
@@ -1002,7 +1002,7 @@ mod tests {
         assert!(
             fake.calls()
                 .iter()
-                .any(|call| call.starts_with("ssh-copy-id")),
+                .any(|call| call.contains("authorized_keys")),
             "{:?}",
             fake.calls()
         );
