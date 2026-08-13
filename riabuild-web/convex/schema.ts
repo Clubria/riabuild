@@ -113,6 +113,33 @@ export default defineSchema({
     secretsUpdatedAt: v.number(),
   }),
 
+  /**
+   * The addresses of the team's servers, typed once by a lead and read by
+   * every developer's CLI through `GET /api/v1/remotes/shared`.
+   *
+   * Deliberately holds no secret, and is the one table here that could not
+   * hold one usefully: a shared server's SSH key pair, its saved password and
+   * the riabuild session minted for it all belong to the single laptop that
+   * made them, and a session minted for one laptop is not shareable. What is
+   * shared is an address, which is inert.
+   *
+   * `name` is stored bare. The CLI shows it as `shared-<name>` so it cannot
+   * collide with a server a developer added themselves, and that prefix is
+   * never written down at either end — it exists between the two lists, which
+   * is where the collision it prevents happens.
+   *
+   * Design: `docs/superpowers/specs/2026-08-12-shared-servers-design.md`.
+   */
+  sharedServers: defineTable({
+    name: v.string(),
+    host: v.string(),
+    port: v.number(),
+    user: v.string(),
+    createdBy: v.id("members"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_name", ["name"]),
+
   auditLog: defineTable({
     actorId: v.optional(v.id("members")),
     action: v.string(),

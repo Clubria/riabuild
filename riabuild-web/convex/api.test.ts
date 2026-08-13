@@ -89,7 +89,9 @@ describe("member ids", () => {
     // below for Infisical — which is out of scope here.
     const t = setup();
     const { rowId } = await seedMember(t);
-    const member = await t.run(async (ctx) => await ctx.db.get("members", rowId));
+    const member = await t.run(
+      async (ctx) => await ctx.db.get("members", rowId),
+    );
     expect(member?.memberId).toMatch(UUID);
   });
 
@@ -732,12 +734,12 @@ describe("org config and claude settings", () => {
       });
     });
 
-    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
-      true,
-    );
-    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
-      false,
-    );
+    expect(
+      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
+    ).toBe(true);
+    expect(
+      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
+    ).toBe(false);
 
     const entries = await t.run(async (ctx) =>
       ctx.db
@@ -1086,7 +1088,10 @@ describe("member administration", () => {
     const promotion = entries.find(
       (entry) => entry.action === "member.role_changed",
     );
-    expect(promotion?.meta).toMatchObject({ from: "candidate", to: "developer" });
+    expect(promotion?.meta).toMatchObject({
+      from: "candidate",
+      to: "developer",
+    });
   });
 
   test("a lead cannot demote themselves into locking everyone out", async () => {
@@ -1244,6 +1249,108 @@ describe("member administration", () => {
   });
 });
 
+describe("announcing a release", () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  /** Stands in for api.github.com, and records how it was asked. */
+  function stubGithub(options: {
+    status: number;
+    body?: unknown;
+    rateLimitRemaining?: string;
+  }) {
+    const calls: { url: string; authorization: string | null }[] = [];
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      const headers = new Headers(init?.headers);
+      calls.push({ url, authorization: headers.get("authorization") });
+      return new Response(
+        options.body === undefined ? null : JSON.stringify(options.body),
+        {
+          status: options.status,
+          headers: {
+            "x-ratelimit-remaining": options.rateLimitRemaining ?? "4999",
+          },
+        },
+      );
+    };
+    return calls;
+  }
+
+  test("the release check is authenticated with the org token", async () => {
+    // Not for permission — the repository is public and this read works
+    // signed out. For the rate limit: unauthenticated api.github.com allows
+    // 60 requests an hour per IP, and a Convex deployment shares its egress
+    // addresses, so a signed-out check is refused for traffic riabuild never
+    // made. That is what stranded v2026.08.12.1 on the shelf while every
+    // machine kept installing the release before it.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    const calls = stubGithub({ status: 200, body: { draft: false } });
+
+    const result = await t.action(api.release.publishCliVersion, {
+      version: "2026.08.12.1",
+    });
+
+    expect(result).toEqual({ updated: true, latestCliVersion: "2026.08.12.1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/releases/tags/v2026.08.12.1");
+    expect(calls[0].authorization).toBe("Bearer ghp_test");
+  });
+
+  test("a deployment with no org token still announces, unauthenticated", async () => {
+    // The token buys headroom, not permission. Losing the ability to announce
+    // a release without one would trade a rate limit for a manual step.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "");
+    const t = setup();
+    const calls = stubGithub({ status: 200, body: { draft: false } });
+
+    await t.action(api.release.publishCliVersion, { version: "2026.08.12.1" });
+
+    expect(calls[0].authorization).toBeNull();
+  });
+
+  test("a rate-limited refusal says so instead of reading as forbidden", async () => {
+    // The message the failing run left was "api.github.com returned 403",
+    // which sends whoever reads it looking for a permission they never
+    // lacked. The version must also stay put: an unverified release is not
+    // one to offer every developer.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 403, rateLimitRemaining: "0" });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
+    ).rejects.toThrow(/rate limit for GITHUB_ORG_TOKEN is exhausted/i);
+
+    expect((await t.query(api.org.get)).latestCliVersion).toBe("0.1.0");
+  });
+
+  test("a release GitHub has never heard of is not announced", async () => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 404 });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.09.01" }),
+    ).rejects.toThrow(/Cut the release before announcing it/i);
+  });
+
+  test("a draft release is not announced", async () => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 200, body: { draft: true } });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.09.01" }),
+    ).rejects.toThrow(/still a draft/i);
+  });
+});
+
 describe("revoking a session", () => {
   const realFetch = globalThis.fetch;
 
@@ -1254,7 +1361,8 @@ describe("revoking a session", () => {
     vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
     globalThis.fetch = async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : input.toString();
-      if (url.includes("api.github.com")) return new Response(null, { status: 204 });
+      if (url.includes("api.github.com"))
+        return new Response(null, { status: 204 });
       throw new Error(`unexpected fetch to ${url}`);
     };
   });
@@ -1284,7 +1392,9 @@ describe("revoking a session", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ revoked: true });
 
-    const revoked = await t.run(async (ctx) => await ctx.db.get("cliSessions", victimId!));
+    const revoked = await t.run(
+      async (ctx) => await ctx.db.get("cliSessions", victimId!),
+    );
     expect(revoked?.revokedAt).toBeTruthy();
 
     // The revoked token is dead everywhere, not just on the laptop that held it.
@@ -1321,7 +1431,9 @@ describe("revoking a session", () => {
     expect(response.status).toBe(404);
     expect((await response.json()).error.code).toBe("session_unknown");
     expect(
-      await t.run(async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt),
+      await t.run(
+        async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt,
+      ),
     ).toBeFalsy();
 
     // The victim's session survives untouched — the failed attempt didn't
@@ -1350,7 +1462,10 @@ describe("revoking a session", () => {
 
   test("an org lead can revoke somebody else's session", async () => {
     const t = setup();
-    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: leadRow } = await seedMember(t, {
+      login: "lead",
+      role: "lead",
+    });
     const { rowId: devRow } = await seedMember(t, { login: "bob" });
     const caller = await issueSession(t, leadRow);
     const victim = await issueSession(t, devRow);
@@ -1409,7 +1524,10 @@ describe("revoking a session", () => {
     // token survives the first call — unlike the self-revoke case above,
     // where the second call never reaches the mutation.
     const t = setup();
-    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: leadRow } = await seedMember(t, {
+      login: "lead",
+      role: "lead",
+    });
     const { rowId: devRow } = await seedMember(t, { login: "bob" });
     const caller = await issueSession(t, leadRow);
     await issueSession(t, devRow);
@@ -1447,73 +1565,189 @@ describe("revoking a session", () => {
   });
 });
 
-describe("announcing a release", () => {
+describe("the team's shared servers", () => {
   const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+  });
 
   afterEach(() => {
     vi.unstubAllEnvs();
     globalThis.fetch = realFetch;
   });
 
-  /**
-   * Captures what `publishCliVersion` actually sent to GitHub, so the request
-   * headers can be asserted rather than assumed.
-   */
-  function stubGitHub(spec: {
-    status: number;
-    body?: unknown;
-    headers?: Record<string, string>;
-  }) {
-    const seen: { url?: string; headers?: Headers } = {};
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      seen.url = input instanceof Request ? input.url : input.toString();
-      seen.headers = new Headers(init?.headers);
-      return new Response(
-        spec.body === undefined ? null : JSON.stringify(spec.body),
-        { status: spec.status, headers: spec.headers },
-      );
+  /** Stands in for GitHub's org membership check. 204 is "yes". */
+  function stubMembership(status: number) {
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.includes("api.github.com")) {
+        return new Response(null, { status });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
     };
-    return seen;
   }
 
-  test("the release check is authenticated, so it does not spend GitHub's per-IP budget", async () => {
+  async function seedServer(
+    t: ReturnType<typeof setup>,
+    lead: Id<"members">,
+    overrides: Partial<{
+      name: string;
+      host: string;
+      port: number;
+      user: string;
+    }> = {},
+  ) {
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      await ctx.db.insert("sharedServers", {
+        name: overrides.name ?? "gpu",
+        host: overrides.host ?? "gpu.internal",
+        port: overrides.port ?? 2222,
+        user: overrides.user ?? "ada",
+        createdBy: lead,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+  }
+
+  test("a developer gets every shared server, with its row id", async () => {
     const t = setup();
-    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
-    const seen = stubGitHub({ status: 200, body: { draft: false } });
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedServer(t, rowId);
+    await seedServer(t, rowId, {
+      name: "build",
+      host: "build.internal",
+      port: 22,
+    });
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
 
-    await t.action(api.release.publishCliVersion, { version: "2026.08.12.1" });
-
-    // An unauthenticated request shares one 60-per-hour budget with every other
-    // tenant on the Convex egress address. That budget ran out during the
-    // 2026.08.12.1 release and stayed out for over an hour, so the release
-    // published and nobody was offered it. This header is the whole fix.
-    expect(seen.headers?.get("authorization")).toBe("Bearer ghp_test");
-  });
-
-  test("a rate-limited GitHub is reported as a rate limit, not as a bare 403", async () => {
-    const t = setup();
-    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
-    stubGitHub({
-      status: 403,
-      body: { message: "API rate limit exceeded for 1.2.3.4" },
-      headers: { "x-ratelimit-remaining": "0" },
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
     });
 
-    // "returned 403" reads identically whether the budget ran out or the token
-    // lost its access, and those need opposite responses: wait, or go and fix a
-    // credential. Diagnosing the real one cost an hour of retrying the wrong.
-    await expect(
-      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
-    ).rejects.toThrow(/rate limit/i);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // Sorted by name, so the picker's numbering is stable between runs rather
+    // than following whatever order the rows happen to come back in.
+    expect(body.servers.map((server: { name: string }) => server.name)).toEqual(
+      ["build", "gpu"],
+    );
+    expect(body.servers[1]).toMatchObject({
+      name: "gpu",
+      host: "gpu.internal",
+      port: 2222,
+      user: "ada",
+    });
+    // The id is what the CLI keys its own state by — it has to be there, and it
+    // has to survive a rename and an address edit, which is what a row id does.
+    expect(typeof body.servers[1].id).toBe("string");
+    expect(body.servers[1].id.length).toBeGreaterThan(0);
   });
 
-  test("a 403 that is not a rate limit still reads as a plain refusal", async () => {
+  test("a lead gets them too", async () => {
     const t = setup();
-    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
-    stubGitHub({ status: 403, body: { message: "Forbidden" } });
+    const { rowId } = await seedMember(t, { role: "lead" });
+    await seedServer(t, rowId);
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
 
-    await expect(
-      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
-    ).rejects.toThrow(/returned 403/);
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).servers).toHaveLength(1);
+  });
+
+  test("a candidate gets an empty list rather than a refusal", async () => {
+    // 200 and { servers: [] }, never 403. `riabuild remote` is also how a
+    // candidate reaches the server they set up themselves, and refusing the
+    // whole request would take that away in order to enforce a rule about
+    // servers they were never going to see.
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    await seedServer(t, rowId);
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ servers: [] });
+  });
+
+  test("someone who has left the GitHub org gets 403, not a server list", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedServer(t, rowId);
+    const token = await issueSession(t, rowId);
+    stubMembership(404);
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(403);
+    const body = await response.json();
+    expect(body.error.code).toBe("not_org_member");
+  });
+
+  test("no session at all gets 401", async () => {
+    const t = setup();
+    const response = await t.fetch("/api/v1/remotes/shared", {});
+    expect(response.status).toBe(401);
+  });
+
+  test("a revoked session gets 401", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId, { revoked: true });
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(401);
+  });
+
+  test("a CLI below the version floor is told to upgrade", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("orgConfig", {
+        claudeSettings: "{}",
+        claudeSettingsUpdatedAt: 0,
+        repoSlug: "Clubria/ai-builders-hub",
+        minCliVersion: "2026.09.01",
+        latestCliVersion: "2026.09.01",
+        secretsUpdatedAt: 0,
+      });
+    });
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token, "2026.08.01"),
+    });
+
+    expect(response.status).toBe(409);
+  });
+
+  test("an empty table is an empty list, not an error", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ servers: [] });
   });
 });

@@ -57,6 +57,29 @@ export type OrgConfig = {
   secretsUpdatedAt: number;
 };
 
+/**
+ * One of the team's servers, as a lead sees it.
+ *
+ * `name` is bare. Every developer's CLI shows it as `shared-<name>` so it
+ * cannot be confused with a server they added themselves, and neither end
+ * stores that prefix — which is why nothing here does either.
+ */
+export type SharedServer = {
+  _id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  updatedAt: number;
+};
+
+export type SharedServerAddress = {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+};
+
 export type MembershipStatus =
   | "member"
   | "not_member"
@@ -85,6 +108,12 @@ export type Data = {
   sessions: Loadable<Session[]>;
   /** Lead-only. Stays `loading` for everyone else, who never renders it. */
   members: Loadable<Member[]>;
+  /**
+   * Lead-only, like `members` — but only the *section* is. Every developer
+   * reads the same servers through their CLI's picker, which is where they can
+   * act on them.
+   */
+  sharedServers: Loadable<SharedServer[]>;
   auditLog: Loadable<AuditEntry[]>;
   orgConfig: Loadable<OrgConfig>;
   /** Ticking clock, so "expired" is computed rather than frozen at mount. */
@@ -99,6 +128,15 @@ export type Data = {
   setStatus(p: { memberId: string; status: MemberStatus }): Promise<void>;
   revokeSession(p: { sessionId: string }): Promise<void>;
   updateOrg(p: OrgUpdate): Promise<void>;
+  addSharedServer(p: SharedServerAddress): Promise<void>;
+  /**
+   * Editing an address is editing an identity: riabuild keys a server's SSH
+   * key, its saved password and its session off `user@host:port`. Every
+   * developer's CLI retires the old one on its next connect, but until it runs
+   * their credentials point at the machine that name used to mean.
+   */
+  updateSharedServer(p: SharedServerAddress & { id: string }): Promise<void>;
+  removeSharedServer(p: { id: string }): Promise<void>;
   signIn(p?: { redirectTo?: string }): Promise<void>;
   /**
    * Present only in dev builds, and only works against a deployment that sets

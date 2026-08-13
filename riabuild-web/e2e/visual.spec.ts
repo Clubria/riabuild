@@ -126,6 +126,44 @@ test.describe("interaction states", () => {
     });
   });
 
+  test("an address riabuild-web refuses says which rule it broke", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // The rule that is not cosmetic — a hostname `ssh` would read as an option
+    // — so the sentence a lead gets back has to name it rather than say the
+    // save failed.
+    await page.goto("/?scenario=shared-server-refused");
+    // Exact: "name" alone also matches "first name", "last name" and
+    // "username", and a filled-in username with an empty name is a screenshot
+    // that shows something other than what this test says it does.
+    await page.getByLabel("name", { exact: true }).fill("gpu");
+    await page.getByLabel("hostname").fill("-oProxyCommand=x");
+    await page.getByLabel("username").fill("ada");
+    await page.getByRole("button", { name: /add server/i }).click();
+    await expect(page.getByText("A hostname cannot start with a dash.")).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "shared-server-refused-after-add",
+    });
+  });
+
+  test("editing an address warns that it is a different machine", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // A rename is free; an address change re-identifies the server for every
+    // developer, and the warning is what stops a lead doing it by accident.
+    await page.goto("/?scenario=lead");
+    await page.getByRole("button", { name: "Edit shared-gpu" }).click();
+    await page.getByLabel("hostname").fill("gpu-2.internal");
+    await expect(
+      page.getByText("This is a different machine to riabuild"),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "shared-server-readdressed",
+    });
+  });
+
   test("a failed lookup surfaces in a panel", async ({
     page,
     consoleErrors,

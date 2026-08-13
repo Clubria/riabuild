@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use riabuild_fetch::download;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandOutput, CommandRunner, RunOptions};
+use riabuild_tasks::Ctx;
 use riabuild_ui::{Failure, Ui};
+use riabuild_version as version;
 use std::sync::Arc;
 
 /// The fixed `(remote, paths, runner, ui)` quad every step below needs —
@@ -101,6 +103,51 @@ impl Downloads for RealDownloads {
                 .into()
             })
     }
+}
+
+/// Which riabuild a server should be given: the newer of what this laptop is
+/// running and what the org announces as latest.
+///
+/// It used to be the org's `latestCliVersion` alone, and that put an *older*
+/// riabuild on the server than the one driving it. The two are halves of one
+/// protocol — this side runs `internal gh-sweep` and `internal seed-github` on
+/// that side, hands it `RIABUILD_ROOT`, and reads its exit code — and only the
+/// matched pair is ever tested. The skew is not hypothetical: on 2026-08-12 a
+/// laptop already upgraded to 2026.08.12.1 provisioned a server with
+/// 2026.08.12, because the release workflow publishes the Homebrew formula
+/// several minutes before the job that moves `latestCliVersion` runs. The
+/// server got the build whose `seed-github` could not install `gh` before
+/// using it, and whose engine skipped `check()` on a first run — so the
+/// developer was asked to approve a second device code for a session the
+/// laptop had just minted, and both bugs looked live again on a laptop
+/// carrying both fixes. The window is minutes wide, but the class is not: any
+/// laptop ahead of the org pin does this, silently, every run.
+///
+/// Newer of the two rather than simply this laptop's own, so a laptop that is
+/// *behind* — one whose upgrade needs a sudo the developer declined — still
+/// hands new servers the current release instead of pinning them to whatever
+/// it happens to be stuck on. What this guarantees is one direction only: the
+/// server is never behind the laptop.
+///
+/// A local build has no release to offer, so it keeps taking the org's answer
+/// — `9999.0.0-dev` sorts above every real date (see `version::is_release`),
+/// and downloading it would 404. That is also what keeps `e2e/remote/run.sh`,
+/// which runs a `cargo build` against a container, installing a real release.
+///
+/// Takes the whole `Ctx` where everything else in this file takes explicit
+/// arguments, deliberately: the bug was never in comparing two versions, it
+/// was in *which two fields* the caller read. Reading them here is what puts
+/// that choice under test.
+pub fn version_for_server(ctx: &Ctx) -> Result<String> {
+    let latest = &ctx.org()?.latest_cli_version;
+    let mine = &ctx.cli_version;
+    Ok(
+        if version::is_release(mine) && !version::at_least(latest, mine) {
+            mine.clone()
+        } else {
+            latest.clone()
+        },
+    )
 }
 
 /// Installs riabuild `version` on `remote`, if it is not already there, and
@@ -191,6 +238,67 @@ mod tests {
             port: 22,
             user: "ada".into(),
         }
+    }
+
+    /// A `Ctx` that reports `mine` as its own version and `latest` as the
+    /// org's — the two fields `version_for_server` chooses between, and the
+    /// pair a caller reading only one of them gets wrong.
+    async fn ctx_with_versions(mine: &str, latest: &str) -> (Ctx, tempfile::TempDir) {
+        let (mut ctx, home) = riabuild_tasks::testing::ctx_with(FakeRunner::new()).await;
+        ctx.cli_version = mine.to_string();
+        let mut org = riabuild_tasks::testing::org_config();
+        org.latest_cli_version = latest.to_string();
+        ctx.org = Some(org);
+        (ctx, home)
+    }
+
+    #[tokio::test]
+    async fn a_laptop_ahead_of_the_org_pin_does_not_install_an_older_server() {
+        // The 2026-08-12 incident, as a test: the laptop had upgraded through
+        // the tap and `latestCliVersion` had not moved yet, so the server was
+        // handed the build whose `seed-github` could not install `gh` and
+        // whose engine asked for a second device code on a first run.
+        let (ctx, _home) = ctx_with_versions("2026.08.12.1", "2026.08.12").await;
+        assert_eq!(
+            version_for_server(&ctx).expect("an org is loaded"),
+            "2026.08.12.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_laptop_behind_the_org_pin_still_gives_the_server_the_release() {
+        // The direction that must not change: a laptop stuck on an old build
+        // — an upgrade needing a sudo the developer declined — must not pin
+        // every server it touches to that build.
+        let (ctx, _home) = ctx_with_versions("2026.08.10", "2026.08.12").await;
+        assert_eq!(
+            version_for_server(&ctx).expect("an org is loaded"),
+            "2026.08.12"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_build_takes_the_org_answer_rather_than_its_own_sentinel() {
+        // `9999.0.0-dev` sorts above every real date, so a plain comparison
+        // picks it — and no such release exists to download. This is also
+        // `e2e/remote/run.sh`, which runs a `cargo build` against a container.
+        let (ctx, _home) = ctx_with_versions("9999.0.0-dev", "2026.08.12").await;
+        assert_eq!(
+            version_for_server(&ctx).expect("an org is loaded"),
+            "2026.08.12"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_org_pin_that_is_not_a_version_loses_to_a_real_release() {
+        // `at_least` reads an unparseable string as "no", which here means the
+        // laptop's own release wins. That is the useful direction: the org's
+        // answer could not have been downloaded anyway.
+        let (ctx, _home) = ctx_with_versions("2026.08.12", "not a version").await;
+        assert_eq!(
+            version_for_server(&ctx).expect("an org is loaded"),
+            "2026.08.12"
+        );
     }
 
     /// The exact prefix `identity::ssh_options` plus the login target

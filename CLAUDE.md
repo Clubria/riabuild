@@ -69,6 +69,15 @@ and mints short-lived access tokens on demand. No long-lived Infisical credentia
 written to a developer's machine. Infisical service tokens are deprecated — use machine
 identities with universal auth.
 
+**A shared server shares an address, never a credential.** Leads enter the team's
+servers in the dashboard and every developer's CLI reads them from
+`GET /api/v1/remotes/shared` on every run — hostname, port, username, and nothing else.
+The SSH key pair, the saved password and the riabuild session for one of those servers
+belong to the single laptop that made them, because a session minted for one laptop is
+not shareable. The CLI can neither add nor remove a shared server; what
+`riabuild remote forget shared-<name>` removes is this laptop's own traces. See
+`docs/superpowers/specs/2026-08-12-shared-servers-design.md`.
+
 Two secrets riabuild *does* keep are named exceptions, both local to one machine and
 one server, and neither is brokered: a server's own session token, and the SSH password
 for a server riabuild's key cannot sign in to. Both go in the OS keychain where there is

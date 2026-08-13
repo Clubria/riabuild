@@ -30,6 +30,7 @@ pub mod pick;
 pub mod render;
 pub mod seed;
 pub mod session;
+pub mod shared;
 pub mod shell;
 pub mod store;
 

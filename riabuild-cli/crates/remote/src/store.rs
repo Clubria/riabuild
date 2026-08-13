@@ -43,7 +43,77 @@ pub struct Record {
     /// the SSH cleanup rather than calling the API with an empty id.
     #[serde(default)]
     pub session_id: String,
+    /// Empty for a server this laptop added. Otherwise the riabuild-web row id
+    /// of the shared server this record holds *local state* for — the session,
+    /// the home directory, and when it was last connected to, none of which is
+    /// shareable and all of which is this laptop's alone.
+    ///
+    /// The address beside it is a *copy* of what riabuild-web last served, kept
+    /// only so that an address a lead has since edited can still be cleaned up
+    /// at the machine it used to name. It is never what riabuild connects to:
+    /// see [`Record::origin`].
+    #[serde(default)]
+    pub shared_id: String,
+    /// Whether this run's fetch of `/api/v1/remotes/shared` refreshed this
+    /// record. In memory only, and **false by default on purpose** — a record
+    /// read off the disk has not been refreshed by anything, so a shared server
+    /// starts every run out of reach and becomes reachable only when
+    /// riabuild-web has just described it. That is what makes "pull the address
+    /// every time" a property of the code rather than a promise.
+    #[serde(skip)]
+    pub fresh: bool,
 }
+
+/// Where a record's address came from, which decides what may be done with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Added on this laptop. Its address is its own.
+    Local,
+    /// One of the team's, described by riabuild-web during this run.
+    Shared,
+    /// One of the team's, *not* described by riabuild-web during this run —
+    /// either the fetch failed or the leads have removed it. The address here
+    /// is a memory, so nothing may connect to it; the session recorded beside
+    /// it may still be live, so `remote list` shows it and `remote forget`
+    /// accepts it.
+    Stale,
+}
+
+impl Record {
+    pub fn origin(&self) -> Origin {
+        if self.shared_id.is_empty() {
+            Origin::Local
+        } else if self.fresh {
+            Origin::Shared
+        } else {
+            Origin::Stale
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        !self.shared_id.is_empty()
+    }
+
+    /// What this server is called everywhere a developer sees or types it.
+    ///
+    /// The prefix is applied here and stored nowhere: `remotes.json` holds the
+    /// bare name with a `sharedId` beside it, and riabuild-web holds the bare
+    /// name too. It exists between the two lists, which is where the collision
+    /// it prevents actually happens — a team `gpu` and a `gpu` somebody added
+    /// themselves are two servers, and the picker has to be able to say which.
+    pub fn display_name(&self) -> String {
+        if self.is_shared() {
+            format!("{DISPLAY_PREFIX}{}", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+/// What a shared server's name is shown with. A local name may not start with
+/// it — see [`ask_name`] — and riabuild-web refuses it on a shared name, so the
+/// prefixed form belongs to exactly one server.
+pub const DISPLAY_PREFIX: &str = "shared-";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,12 +151,79 @@ impl Store {
         Ok(store)
     }
 
+    /// The server a developer meant by `name`.
+    ///
+    /// Two passes rather than one predicate with an `||` in it, because the
+    /// ordering *is* the behaviour: a local server always answers to its own
+    /// name, even when the team has a shared server called the same thing. A
+    /// single `find` matching either spelling would resolve by whichever record
+    /// happened to be saved first, which is the same class of bug the duplicate
+    /// -record comment below this describes.
+    ///
+    /// So: the display name first — `gpu` finds a local `gpu`, `shared-gpu`
+    /// finds the team's — and only then the bare name, which is what lets
+    /// `riabuild remote gpu` still reach the team's `gpu` on a laptop that has
+    /// no `gpu` of its own.
     pub fn find(&self, name: &str) -> Option<&Record> {
-        self.remotes.iter().find(|record| record.name == name)
+        self.find_index(name).map(|index| &self.remotes[index])
     }
 
+    pub fn find_mut(&mut self, name: &str) -> Option<&mut Record> {
+        self.find_index(name).map(|index| &mut self.remotes[index])
+    }
+
+    fn find_index(&self, name: &str) -> Option<usize> {
+        self.remotes
+            .iter()
+            .position(|record| record.display_name() == name)
+            .or_else(|| self.remotes.iter().position(|record| record.name == name))
+    }
+
+    /// The servers this run may connect to: everything except a shared server
+    /// riabuild-web has not described during it. See [`Origin::Stale`].
+    pub fn reachable(&self) -> Vec<&Record> {
+        self.remotes
+            .iter()
+            .filter(|record| record.origin() != Origin::Stale)
+            .collect()
+    }
+
+    /// Every name a developer could type, in the spelling they would type it.
     pub fn names(&self) -> Vec<String> {
-        self.remotes.iter().map(|r| r.name.clone()).collect()
+        self.remotes.iter().map(Record::display_name).collect()
+    }
+
+    /// What this run learned from riabuild-web, which the disk does not know.
+    fn fresh_shared(&self) -> Vec<Record> {
+        self.remotes
+            .iter()
+            .filter(|record| record.origin() == Origin::Shared)
+            .cloned()
+            .collect()
+    }
+
+    /// Puts this run's knowledge of the team's servers back after a merge with
+    /// the disk.
+    ///
+    /// `persist_one` and `forget_one` replace this run's `Store` with what
+    /// actually landed, which is the whole point of them — they exist so that a
+    /// second terminal window's servers are not erased by this one's snapshot.
+    /// But what lands is what serde wrote, and a fresh shared server is in
+    /// neither: `fresh` is `#[serde(skip)]`, and a shared server this laptop
+    /// has never connected to has no row on disk at all. Without this, the
+    /// first save of a connect would drop the very server being connected to
+    /// out of the store it is being read from.
+    fn restore_fresh(&mut self, fresh: Vec<Record>) {
+        for record in fresh {
+            match self
+                .remotes
+                .iter_mut()
+                .find(|existing| existing.shared_id == record.shared_id)
+            {
+                Some(existing) => existing.fresh = true,
+                None => self.remotes.push(record),
+            }
+        }
     }
 }
 
@@ -148,6 +285,15 @@ pub fn ask_name(ui: &Ui, host: &str, taken: &[String]) -> String {
             ));
             continue;
         }
+        if name.to_ascii_lowercase().starts_with(DISPLAY_PREFIX) {
+            // Reserved: it is how the team's servers are shown, so a local one
+            // wearing it would be two servers a developer cannot tell apart at
+            // the prompt — the same reason a name already taken is refused.
+            ui.warn(&format!(
+                "Names starting with \"{DISPLAY_PREFIX}\" belong to the team's servers. Pick another."
+            ));
+            continue;
+        }
         if name != answer.trim() {
             ui.note(&format!("This server will be known as {name}."));
         }
@@ -185,9 +331,15 @@ pub fn allocate_name(host: &str, taken: &[String]) -> String {
 }
 
 impl From<&Record> for Remote {
+    /// The *display* name travels, not the bare one. `Remote::name` is what
+    /// reaches `RIABUILD_REMOTE`, so it is what the server's shell banner reads
+    /// back — "active on shared-gpu" — and what `store::remember` looks the
+    /// record up by afterwards. `Remote::hash` is taken over the login target
+    /// and never the name, so nothing about which key or session this server
+    /// uses depends on the prefix.
     fn from(record: &Record) -> Self {
         Remote {
-            name: record.name.clone(),
+            name: record.display_name(),
             host: record.host.clone(),
             port: record.port,
             user: record.user.clone(),
@@ -219,6 +371,8 @@ pub fn add(store: &mut Store, remote: &Remote) {
         last_seen_cli_version: String::new(),
         home: String::new(),
         session_id: String::new(),
+        shared_id: String::new(),
+        fresh: false,
     });
 }
 
@@ -232,28 +386,57 @@ pub fn add(store: &mut Store, remote: &Remote) {
 ///
 /// The run's own copy is refreshed from what landed, so a caller that keeps
 /// using `store` afterwards sees the merged result rather than its own snapshot.
+/// Matched on the *display* name throughout, which is the one spelling that
+/// belongs to exactly one server. The bare `name` does not: a shared `gpu` and
+/// a `gpu` the developer added themselves both carry `"gpu"` in this field, and
+/// keying on it would have each overwrite the other's row — one session id
+/// landing on the other's record, and `forget` revoking a session for a machine
+/// it is not about.
 pub async fn persist_one(paths: &dyn Paths, store: &mut Store, name: &str) -> Result<()> {
-    let mine = store.remotes.iter().find(|r| r.name == name).cloned();
+    let mine = store.find(name).cloned();
+    let fresh = store.fresh_shared();
     *store = Store::update(paths, |on_disk| {
         let Some(mine) = mine else {
             return;
         };
-        match on_disk.remotes.iter_mut().find(|r| r.name == mine.name) {
+        let key = mine.display_name();
+        match on_disk.remotes.iter_mut().find(|r| r.display_name() == key) {
             Some(existing) => *existing = mine,
             None => on_disk.remotes.push(mine),
         }
     })
     .await?;
+    store.restore_fresh(fresh);
     Ok(())
 }
 
 /// Drops the server named `name`, leaving every other saved server alone.
+///
+/// For a shared server this drops only this laptop's record of it — the row in
+/// riabuild-web is untouched, so the server is back in the picker on the next
+/// run with no key, no password and no session. The CLI has no way to remove a
+/// server from the team, and this is not one.
 pub async fn forget_one(paths: &dyn Paths, store: &mut Store, name: &str) -> Result<()> {
-    let name = name.to_string();
+    let key = match store.find(name) {
+        Some(record) => record.display_name(),
+        None => name.to_string(),
+    };
+    // Everything this run learned from riabuild-web *except* the server being
+    // forgotten. Without the exclusion `restore_fresh` puts it straight back:
+    // one of the team's servers that this run refreshed is knowledge the disk
+    // does not have, so it is re-added after the merge — including the one just
+    // deleted, which would make `forget` a no-op for exactly the servers this
+    // feature added.
+    let fresh: Vec<Record> = store
+        .fresh_shared()
+        .into_iter()
+        .filter(|record| record.display_name() != key)
+        .collect();
     *store = Store::update(paths, |on_disk| {
-        on_disk.remotes.retain(|r| r.name != name);
+        on_disk.remotes.retain(|r| r.display_name() != key);
     })
     .await?;
+    store.restore_fresh(fresh);
     Ok(())
 }
 
@@ -291,13 +474,18 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
         // genuine second account on the same box, and the run that follows
         // fails at authentication, which announces itself.
         if let Some(record) = store.remotes.iter_mut().find(|r| r.hash == remote.hash()) {
-            // The freshly typed spelling wins. `Build-01.Fly.Dev` and
-            // `build-01.fly.dev.` already hash to this same record, so this
-            // changes only how the record reads back in `remote list`, never
-            // which server it is or which key it uses.
-            record.host = remote.host.clone();
-            record.port = remote.port;
-            record.user = remote.user.clone();
+            // The freshly typed spelling wins — unless the address is the
+            // team's, where riabuild-web's spelling is the one that has to
+            // survive the run: this record is refreshed from it on every fetch,
+            // so a local edit here would be overwritten anyway, and in the
+            // meantime `remote list` would show a developer's typing as though
+            // a lead had entered it. The identity is the same either way, since
+            // this branch is reached only on an equal `Remote::hash`.
+            if !record.is_shared() {
+                record.host = remote.host.clone();
+                record.port = remote.port;
+                record.user = remote.user.clone();
+            }
             return Ok(Remote::from(&*record));
         }
 
@@ -317,7 +505,10 @@ pub async fn choose(ctx: &mut Ctx, store: &mut Store, target: Option<String>) ->
 /// What a successful connect leaves behind: this server moves to the front of
 /// "recently used", and remembers the riabuild version it is now running.
 pub async fn remember(ctx: &Ctx, store: &mut Store, remote: &Remote, version: &str) -> Result<()> {
-    if let Some(record) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
+    // `find_mut`, not a match on the bare `name`: `remote.name` is the display
+    // name, so a shared server would otherwise miss its own record and a local
+    // server of the same bare name would be stamped instead.
+    if let Some(record) = store.find_mut(&remote.name) {
         record.last_used_at = riabuild_paths::config::now_secs();
         record.last_seen_cli_version = version.to_string();
     }
@@ -338,11 +529,26 @@ pub fn list(ctx: &Ctx, store: &Store) -> Result<i32> {
     }
     ctx.ui.info("");
     ctx.ui.info(&super::render::servers_box(
-        &store.remotes,
+        &listing_order(store),
         super::render::Shown::Listing,
         ctx.ui.theme(),
     ));
     Ok(0)
+}
+
+/// Everything that can be connected to, and then everything that cannot.
+///
+/// A server the leads have removed is still shown — its session may still be
+/// live, and a row nobody can see is a row nobody can clear — but it is shown
+/// after the servers that work, marked `no longer shared`, so the list still
+/// reads top-down as "what you can use".
+fn listing_order(store: &Store) -> Vec<Record> {
+    let (stale, usable): (Vec<Record>, Vec<Record>) = store
+        .remotes
+        .iter()
+        .cloned()
+        .partition(|record| record.origin() == Origin::Stale);
+    usable.into_iter().chain(stale).collect()
 }
 
 /// A `Record` for `remote`, as if it had just been added and never connected
@@ -363,6 +569,19 @@ pub fn record_for(remote: &super::Remote) -> Record {
         last_seen_cli_version: String::new(),
         home: String::new(),
         session_id: String::new(),
+        shared_id: String::new(),
+        fresh: false,
+    }
+}
+
+/// A `Record` for one of the team's servers, as this run's fetch would leave
+/// it: refreshed, and never connected to.
+#[cfg(test)]
+pub fn shared_record_for(remote: &super::Remote, id: &str) -> Record {
+    Record {
+        shared_id: id.to_string(),
+        fresh: true,
+        ..record_for(remote)
     }
 }
 
@@ -396,6 +615,183 @@ mod tests {
             port: 22,
             user: "ada".into(),
         }
+    }
+
+    fn named(name: &str, host: &str) -> Remote {
+        Remote {
+            name: name.into(),
+            host: host.into(),
+            port: 22,
+            user: "ada".into(),
+        }
+    }
+
+    /// One server the developer added, and one of the team's, deliberately
+    /// under the same bare name — the collision the display prefix exists for.
+    fn both_called_gpu() -> Store {
+        let mut store = Store::default();
+        store.remotes.push(record_for(&named("gpu", "gpu.local")));
+        store
+            .remotes
+            .push(shared_record_for(&named("gpu", "gpu.internal"), "k1"));
+        store
+    }
+
+    #[test]
+    fn a_local_server_answers_to_its_own_name_even_when_the_team_has_one_too() {
+        // The ordering is the behaviour. A single `find` matching either
+        // spelling would resolve by whichever record happened to be saved
+        // first, so which `gpu` a developer reached would depend on the order
+        // of a JSON file.
+        let store = both_called_gpu();
+
+        assert_eq!(store.find("gpu").expect("finds one").host, "gpu.local");
+        assert_eq!(
+            store.find("shared-gpu").expect("finds one").host,
+            "gpu.internal"
+        );
+    }
+
+    #[test]
+    fn a_bare_name_reaches_the_teams_server_when_nothing_local_claims_it() {
+        let mut store = Store::default();
+        store
+            .remotes
+            .push(shared_record_for(&named("gpu", "gpu.internal"), "k1"));
+
+        assert_eq!(
+            store.find("gpu").expect("finds the team's").host,
+            "gpu.internal"
+        );
+    }
+
+    #[test]
+    fn the_display_prefix_is_never_written_down() {
+        // `remotes.json` holds the bare name with a sharedId beside it, and
+        // riabuild-web holds the bare name too. The prefix lives between the
+        // two lists, which is where the collision it prevents happens.
+        let record = shared_record_for(&named("gpu", "gpu.internal"), "k1");
+        assert_eq!(record.name, "gpu");
+        assert_eq!(record.display_name(), "shared-gpu");
+
+        let json = serde_json::to_string(&record).expect("serialises");
+        assert!(!json.contains("shared-gpu"), "{json}");
+        assert!(json.contains("\"sharedId\":\"k1\""), "{json}");
+        // …and freshness is not written either, so a record read back off the
+        // disk is out of reach until a fetch describes it again.
+        assert!(!json.contains("fresh"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_record_read_back_off_the_disk_is_out_of_reach_until_a_fetch() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = Store::default();
+        store
+            .remotes
+            .push(shared_record_for(&named("gpu", "gpu.internal"), "k1"));
+        persist_one(&paths, &mut store, "shared-gpu")
+            .await
+            .expect("persists");
+
+        let loaded = Store::load(&paths).await;
+
+        assert_eq!(loaded.remotes.len(), 1);
+        assert_eq!(loaded.remotes[0].origin(), Origin::Stale);
+        assert!(
+            loaded.reachable().is_empty(),
+            "an address off the disk is a memory, not somewhere to connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_servers_of_one_bare_name_are_two_rows_on_disk() {
+        // `persist_one` upserts, and keying that on the bare name would have
+        // these two overwrite each other: one session id landing on the other's
+        // record, and `forget` revoking a session for a machine it is not
+        // about.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = both_called_gpu();
+        store.remotes[1].session_id = "sess_team".into();
+
+        persist_one(&paths, &mut store, "gpu").await.expect("local");
+        persist_one(&paths, &mut store, "shared-gpu")
+            .await
+            .expect("shared");
+
+        let loaded = Store::load(&paths).await;
+        assert_eq!(loaded.remotes.len(), 2, "{:?}", loaded.names());
+        assert_eq!(loaded.find("gpu").expect("local").session_id, "");
+        assert_eq!(
+            loaded.find("shared-gpu").expect("shared").session_id,
+            "sess_team"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisting_a_server_leaves_the_teams_others_reachable() {
+        // `persist_one` replaces this run's store with what landed on disk, and
+        // freshness is in-memory only — so without `mark_fresh` a mid-flow save
+        // would turn every shared server Stale and the connect in progress
+        // would find its own server unreachable.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = both_called_gpu();
+
+        persist_one(&paths, &mut store, "shared-gpu")
+            .await
+            .expect("persists");
+
+        // Still there, and still reachable — the connect that triggered this
+        // save has several more steps to run against this very record.
+        let record = store.find("shared-gpu").expect("still there");
+        assert_eq!(record.origin(), Origin::Shared);
+        assert_eq!(record.host, "gpu.internal");
+        assert!(!store.reachable().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgetting_one_of_the_teams_servers_leaves_the_local_one_of_that_name() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = both_called_gpu();
+        persist_one(&paths, &mut store, "gpu").await.expect("local");
+        persist_one(&paths, &mut store, "shared-gpu")
+            .await
+            .expect("shared");
+
+        forget_one(&paths, &mut store, "shared-gpu")
+            .await
+            .expect("forgets");
+
+        let loaded = Store::load(&paths).await;
+        assert_eq!(loaded.names(), vec!["gpu".to_string()]);
+        assert_eq!(loaded.remotes[0].host, "gpu.local");
+    }
+
+    #[tokio::test]
+    async fn a_developer_cannot_name_a_server_the_way_the_team_s_are_shown() {
+        // Reserved, for the same reason a name already taken is: two servers a
+        // developer cannot tell apart at the prompt.
+        let (mut ctx, _home) =
+            riabuild_tasks::testing::ctx_with(riabuild_runner::FakeRunner::new()).await;
+        ctx.ui = Ui::scripted(["shared-gpu", "mine"]);
+        let mut store = Store::default();
+
+        let chosen = choose(&mut ctx, &mut store, Some("ada@gpu.internal".into()))
+            .await
+            .expect("adds it under the second answer");
+
+        assert_eq!(chosen.name, "mine");
+        assert!(
+            ctx.ui
+                .warned()
+                .iter()
+                .any(|warning| warning.contains("belong to the team")),
+            "{:?}",
+            ctx.ui.warned()
+        );
     }
 
     /// With nobody there to ask — a script, a CI job, this test process — one
@@ -738,6 +1134,8 @@ mod tests {
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
             session_id: String::new(),
+            shared_id: String::new(),
+            fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = store)
             .await
@@ -768,6 +1166,8 @@ mod tests {
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
             session_id: String::new(),
+            shared_id: String::new(),
+            fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = store)
             .await
@@ -786,6 +1186,8 @@ mod tests {
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
             session_id: String::new(),
+            shared_id: String::new(),
+            fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = reloaded)
             .await

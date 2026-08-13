@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod org;
+pub mod remotes;
 pub mod secrets;
 
 use anyhow::{Context, Result};
