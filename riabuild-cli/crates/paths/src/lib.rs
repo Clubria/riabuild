@@ -135,6 +135,19 @@ pub trait Paths: Send + Sync {
     fn identity_dir(&self) -> PathBuf {
         self.root().join("ssh-identities")
     }
+    /// Where the `ssh-agent` riabuild runs for one server keeps its socket and
+    /// the public halves that address its identities.
+    ///
+    /// One directory per server, so two `riabuild remote` runs against
+    /// different machines cannot take each other's socket over.
+    ///
+    /// Note what does **not** live here, and cannot: the issued private keys
+    /// themselves. They go from the API response into `ssh-add`'s stdin and
+    /// exist nowhere on a filesystem. A socket and a public key are both inert
+    /// — see `remote::issued::agent`.
+    fn agent_dir(&self, server_hash: &str) -> PathBuf {
+        self.root().join("agent").join(server_hash)
+    }
     /// Where riabuild's own `known_hosts` lives — never the developer's
     /// `~/.ssh/known_hosts`. See `remote::identity::ssh_options`'s `-F
     /// /dev/null`, which is what makes that true.

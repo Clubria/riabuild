@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# `openssh.rs` — decoding the key container and encoding the public blob back.
+base64.workspace = true
+# SHA-256, for an issued key's fingerprint. Free: rustls builds `ring` anyway.
+ring.workspace = true
 # The only crate that sends or parses a JSON body, and so the only one
 # that pays for reqwest's JSON stack.
 reqwest = { workspace = true, features = ["json"] }

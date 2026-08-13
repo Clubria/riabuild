@@ -7,7 +7,8 @@
  *   infisical CLI GET  /api/v4/secrets                     (tasks/env_local.rs)
  *
  * Everything between those two calls — brokering, the short-lived token, the
- * environment-not-arguments handoff, writing and git-ignoring `.env.local` — is
+ * environment-not-arguments handoff, writing and git-ignoring one
+ * `.env.<environment>` per environment the developer may see — is
  * riabuild's own code and runs unmodified. The only thing faked here is the
  * third-party host, which is exactly where the seam belongs: putting a real
  * Infisical machine identity into GitHub Actions would place the credential
@@ -17,7 +18,7 @@
  * more than it looks: when the Infisical CLI changes which endpoint it calls —
  * it was /api/v3/secrets/raw before v4 — this fails as "the stub does not
  * implement GET /api/v5/whatever" instead of quietly returning nothing and
- * letting the run pass with an empty `.env.local`.
+ * letting the run pass with an empty `.env.dev`.
  *
  * Usage: node infisical-stub.mjs
  *   Binds an ephemeral port on 127.0.0.1 and prints `listening <port>` as its
@@ -33,17 +34,30 @@ const CLIENT_ID = process.env.STUB_CLIENT_ID ?? "e2e-client-id";
 const CLIENT_SECRET = process.env.STUB_CLIENT_SECRET ?? "e2e-client-secret";
 
 /**
- * The secrets a successful run must end up with in `.env.local`.
+ * The secrets a successful run must end up with, per environment.
  *
  * Deliberately recognisable: `run.sh` greps for these exact pairs, so a
- * `.env.local` written from anything other than this stub fails the assertion
- * rather than passing because some file with the right name exists.
+ * `.env.<environment>` written from anything other than this stub fails the
+ * assertion rather than passing because some file with the right name exists.
+ *
+ * The marker differs per environment on purpose. Serving one set of secrets for
+ * every environment would let riabuild write staging's export into `.env.dev`
+ * — or pull `dev` twice and name the second copy `.env.staging` — with every
+ * assertion still passing. The value is what proves each file came from the
+ * environment it is named after.
  */
-const SECRETS = [
-  { secretKey: "CLUBRIA_E2E_MARKER", secretValue: "brokered-through-riabuild" },
-  { secretKey: "DATABASE_URL", secretValue: "postgres://e2e.invalid/clubria" },
-  { secretKey: "OPENAI_API_KEY", secretValue: "sk-not-a-real-key" },
-];
+const SECRETS_BY_ENVIRONMENT = {
+  dev: [
+    { secretKey: "CLUBRIA_E2E_MARKER", secretValue: "brokered-through-riabuild" },
+    { secretKey: "DATABASE_URL", secretValue: "postgres://e2e.invalid/clubria" },
+    { secretKey: "OPENAI_API_KEY", secretValue: "sk-not-a-real-key" },
+  ],
+  staging: [
+    { secretKey: "CLUBRIA_E2E_MARKER", secretValue: "brokered-through-riabuild-staging" },
+    { secretKey: "DATABASE_URL", secretValue: "postgres://e2e.invalid/clubria-staging" },
+    { secretKey: "OPENAI_API_KEY", secretValue: "sk-not-a-real-staging-key" },
+  ],
+};
 
 /**
  * The Infisical CLI parses `INFISICAL_TOKEN` locally and rejects anything that
@@ -113,7 +127,21 @@ const server = createServer((req, res) => {
         // ever leaked a stored credential in here, this is what would catch it.
         return json(res, 401, { message: "stub: not the token this stub brokered" });
       }
-      return json(res, 200, { secrets: SECRETS, imports: [] });
+      const environment = new URL(req.url, "http://stub").searchParams.get(
+        "environment",
+      );
+      const secrets = SECRETS_BY_ENVIRONMENT[environment ?? ""];
+      if (secrets === undefined) {
+        // Loud rather than empty, for the same reason the 501 below is: a
+        // riabuild that asked for an environment nobody configured should fail
+        // the run, not write a `.env.<name>` with nothing in it.
+        return json(res, 404, {
+          message:
+            `stub: no secrets for environment ${JSON.stringify(environment)}. ` +
+            `Known: ${Object.keys(SECRETS_BY_ENVIRONMENT).join(", ")}.`,
+        });
+      }
+      return json(res, 200, { secrets, imports: [] });
     }
 
     console.log(`  ^ unimplemented`);

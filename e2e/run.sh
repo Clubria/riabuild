@@ -52,7 +52,7 @@ E2E_LATEST_CLI_VERSION="2026.01.01"
 
 # Distinctive enough that finding it in org-settings.json proves the file came
 # from this deployment rather than from a developer's real cache.
-E2E_CLAUDE_SETTINGS='{"env":{"CLUBRIA_E2E":"1"},"permissions":{"deny":["Read(./.env.local)"]}}'
+E2E_CLAUDE_SETTINGS='{"env":{"CLUBRIA_E2E":"1"},"permissions":{"deny":["Read(./.env.dev)","Read(./.env.staging)"]}}'
 
 # ---------------------------------------------------------------------------
 # Output
@@ -320,6 +320,10 @@ set_env INFISICAL_DEVELOPER_CLIENT_ID "$STUB_CLIENT_ID"
 set_env INFISICAL_DEVELOPER_CLIENT_SECRET "$STUB_CLIENT_SECRET"
 set_env INFISICAL_PROJECT_ID "e2e-project"
 set_env INFISICAL_ENVIRONMENT dev
+# The seeded member is a developer, so this run must come back with both files.
+# A candidate would get `dev` alone; that split is unit-tested rather than run
+# here, because this suite has one seeded member and one checkout.
+set_env INFISICAL_STAGING_ENVIRONMENT staging
 set_env INFISICAL_SECRET_PATH /
 pass "deployment configured"
 
@@ -623,12 +627,27 @@ check "the status line script was installed from the binary" \
   test -s "$RIA_HOME/claude-statusline.js"
 
 # The whole reason riabuild exists: a developer ends up with working secrets.
-ENV_LOCAL="$PROJECT_DIR/.env.local"
-check "the project has a .env.local" test -f "$ENV_LOCAL"
+ENV_DEV="$PROJECT_DIR/.env.dev"
+check "the project has a .env.dev" test -f "$ENV_DEV"
 check_contains "the secrets came through the broker" \
-  "$(cat "$ENV_LOCAL" 2>/dev/null)" "CLUBRIA_E2E_MARKER"
-check ".env.local is ignored by git" \
-  git -C "$PROJECT_DIR" check-ignore -q .env.local
+  "$(cat "$ENV_DEV" 2>/dev/null)" "CLUBRIA_E2E_MARKER"
+check ".env.dev is ignored by git" \
+  git -C "$PROJECT_DIR" check-ignore -q .env.dev
+
+# A developer may see staging, so the same run must have pulled it as well —
+# into its own file, from its own environment.
+ENV_STAGING="$PROJECT_DIR/.env.staging"
+check "the project has a .env.staging" test -f "$ENV_STAGING"
+check ".env.staging is ignored by git" \
+  git -C "$PROJECT_DIR" check-ignore -q .env.staging
+# The two files must not be the same export under two names. The stub serves a
+# different marker per environment precisely so this can be asserted: without
+# it, pulling `dev` twice would satisfy every check above.
+check_contains "staging secrets came from the staging environment" \
+  "$(cat "$ENV_STAGING" 2>/dev/null)" "brokered-through-riabuild-staging"
+check_missing "the dev file did not get staging's secrets" \
+  "$(cat "$ENV_DEV" 2>/dev/null)" "brokered-through-riabuild-staging"
+
 check_missing "no secret was written into ~/.riabuild" \
   "$(grep -rl "brokered-through-riabuild" "$RIA_HOME" 2>/dev/null || true)" "$RIA_HOME"
 

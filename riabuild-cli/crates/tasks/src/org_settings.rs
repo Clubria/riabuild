@@ -87,6 +87,44 @@ impl Task for OrgSettings {
     }
 }
 
+/// Brings this machine's copy of the team settings up to date, outside the task
+/// engine.
+///
+/// `pub(crate)` alongside `claude_trust::trust_one` and its two neighbours, and
+/// for the same reason: `riabuild claude new` creates an account and hands it
+/// straight to the developer, so the next `riabuild` run is too late. The
+/// difference is that this one is not per-account. One file serves every
+/// launcher, which is exactly why nothing outside the engine was ensuring it —
+/// and why a machine that had never completed a provisioning run gave a brand
+/// new account no org policy at all, silently, since the launcher drops
+/// `--settings` rather than naming a file that is not there.
+///
+/// The whole task, not a file test: `check()` compares what is cached against
+/// what the server says it published, so this repairs a stale copy as well as a
+/// missing one.
+pub(crate) async fn ensure_cached(ctx: &mut Ctx) -> Result<()> {
+    if OrgSettings.check(ctx).await? == Status::Satisfied {
+        return Ok(());
+    }
+
+    // `check()` answers the signed-out machine without touching the network,
+    // and `apply()` would then spend a request learning what it already knows:
+    // there is no session to fetch with. `riabuild claude` is documented to
+    // work with no session and no network, so this returns rather than hanging
+    // a browser sign-in behind an HTTP timeout.
+    if ctx.member.is_none() {
+        return Err(anyhow::anyhow!("this machine is not signed in to riabuild"));
+    }
+
+    OrgSettings.apply(ctx).await?;
+    // The invariant, kept where the engine cannot keep it: apply is always
+    // followed by a re-run of check.
+    match OrgSettings.check(ctx).await? {
+        Status::Satisfied => Ok(()),
+        Status::Needs(still) => Err(anyhow::anyhow!("{}", still.describe())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +157,23 @@ mod tests {
             format!("{status:?}").contains("waiting for sign-in"),
             "{status:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ensuring_on_a_signed_out_machine_reports_that_rather_than_the_network() {
+        // `riabuild claude new` calls this on a machine that may have no
+        // session, no network, and nothing provisioned. `check` answers that
+        // case without a request, so `apply` would spend a round trip — and a
+        // reqwest timeout — learning there is no token to send. The wording is
+        // the observable difference: an error that reached the network names
+        // the host or the status, and this one names the sign-in.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        assert!(ctx.member.is_none());
+
+        let error = ensure_cached(&mut ctx)
+            .await
+            .expect_err("nothing can be fetched without a session");
+        assert!(error.to_string().contains("not signed in"), "{error}");
     }
 
     #[tokio::test]

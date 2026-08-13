@@ -148,11 +148,20 @@ pub fn script(public_key: &str) -> Result<String> {
 /// agent, is what proves who we are while the new key is being installed.
 /// `BatchMode` is likewise absent — a password is a legitimate way in here,
 /// and this is the one step whose whole job is to make it unnecessary later.
+///
+/// `entry` is the credential that gets us *in* to do it, and it is the whole
+/// of what an issued key changes about this file. `None` is the original
+/// behaviour: whatever the developer's own agent or `~/.ssh` offers, and then
+/// the account password through `askpass`. `Some` names one identity in
+/// riabuild's own agent, which is what makes this step work on a server that
+/// has no password to ask for. What the script does, and how it decides
+/// whether the line is already there, is identical either way.
 pub async fn install_key(
     remote: &Remote,
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     public_key: &str,
+    entry: Option<&crate::issued::Working>,
 ) -> Result<Installed> {
     // Before the connection, deliberately: a key that is not a key cannot be
     // installed by any number of round trips, and a `grep` for nothing would
@@ -160,6 +169,18 @@ pub async fn install_key(
     let script = script(public_key)?;
 
     let mut args = identity::ssh_options(remote, paths, false);
+    if let Some(entry) = entry {
+        // `IdentitiesOnly=yes` here too, and it is doing work: without it the
+        // agent offers every key it holds before this one, and a server with a
+        // low `MaxAuthTries` can drop the connection before reaching the key
+        // that was just proved to work.
+        args.push("-o".to_string());
+        args.push(format!("IdentityAgent={}", entry.socket.to_string_lossy()));
+        args.push("-o".to_string());
+        args.push("IdentitiesOnly=yes".to_string());
+        args.push("-i".to_string());
+        args.push(entry.public_key_path.to_string_lossy().into_owned());
+    }
     args.push(remote.target());
     args.push(shell_command(&script));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -493,7 +514,7 @@ mod tests {
         let paths = RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new().containing("authorized_keys", 0, "", ""));
 
-        install_key(&remote(), &paths, fake.clone(), KEY)
+        install_key(&remote(), &paths, fake.clone(), KEY, None)
             .await
             .expect("added");
 
@@ -531,7 +552,7 @@ mod tests {
         let paths = RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new().containing("authorized_keys", 3, "", ""));
 
-        let installed = install_key(&remote(), &paths, fake, KEY)
+        let installed = install_key(&remote(), &paths, fake, KEY, None)
             .await
             .expect("already there is an outcome, not an error");
 
@@ -556,7 +577,7 @@ mod tests {
             "sh: cannot create /home/ada/.ssh/authorized_keys: Read-only file system",
         ));
 
-        let error = install_key(&remote(), &paths, fake, KEY)
+        let error = install_key(&remote(), &paths, fake, KEY, None)
             .await
             .expect_err("a failed copy must not read as success");
 
@@ -577,7 +598,7 @@ mod tests {
         let paths = RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new().containing("authorized_keys", 0, "", ""));
 
-        install_key(&remote(), &paths, fake.clone(), "")
+        install_key(&remote(), &paths, fake.clone(), "", None)
             .await
             .expect_err("an empty key is not something to install");
 

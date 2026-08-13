@@ -91,6 +91,25 @@ export type SharedServerAddress = {
   user: string;
 };
 
+/**
+ * An SSH key the org issues, as a lead sees it.
+ *
+ * Note what is not here and never will be: the private key. Nothing returns one
+ * to a browser — not on edit, not behind a reveal — which is why `fingerprint`
+ * is stored and shown at all. It is how a lead tells two rows apart, and how
+ * they confirm which key a row holds, without the row ever handing it back.
+ */
+export type IssuedKey = {
+  _id: string;
+  label: string;
+  keyType: string;
+  publicKey: string;
+  fingerprint: string;
+  /** Member row ids. Resolved against `members` for display. */
+  issuedTo: string[];
+  updatedAt: number;
+};
+
 export type MembershipStatus =
   | "member"
   | "not_member"
@@ -125,6 +144,8 @@ export type Data = {
    * act on them.
    */
   sharedServers: Loadable<SharedServer[]>;
+  /** Lead-only, like `sharedServers`. A developer receives these through their CLI. */
+  issuedKeys: Loadable<IssuedKey[]>;
   auditLog: Loadable<AuditEntry[]>;
   orgConfig: Loadable<OrgConfig>;
   /** Ticking clock, so "expired" is computed rather than frozen at mount. */
@@ -148,6 +169,15 @@ export type Data = {
    */
   updateSharedServer(p: SharedServerAddress & { id: string }): Promise<void>;
   removeSharedServer(p: { id: string }): Promise<void>;
+  addIssuedKey(p: { label: string; privateKey: string }): Promise<void>;
+  /**
+   * Rotation. The row, its name and the people it is issued to all survive;
+   * only the secret changes. Nothing on a laptop stores an issued key, so a
+   * developer's next run picks the new one up with no action from them.
+   */
+  replaceIssuedKey(p: { id: string; privateKey: string }): Promise<void>;
+  setIssuedKeyMembers(p: { id: string; issuedTo: string[] }): Promise<void>;
+  removeIssuedKey(p: { id: string }): Promise<void>;
   signIn(p?: { redirectTo?: string }): Promise<void>;
   /**
    * Present only in dev builds, and only works against a deployment that sets

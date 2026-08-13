@@ -5,6 +5,11 @@ import { api, internal } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { randomToken, sha256Hex } from "./lib/crypto";
+import {
+  ED25519_FINGERPRINT,
+  ED25519_PRIVATE,
+  ED25519_PUBLIC,
+} from "./lib/opensshKey.fixtures";
 
 const modules = import.meta.glob("./**/*.ts");
 
@@ -566,6 +571,34 @@ describe("org config and claude settings", () => {
     expect((await response.json()).repoSlug).toBe("Clubria/ai-builders-hub");
   });
 
+  test("config names the environments the CLI must have on disk", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(token),
+    });
+    // `check()` runs on every `riabuild --check` and must not broker a token to
+    // learn which files it is looking for — brokering hits Infisical and writes
+    // an audit row. So the list is served here too.
+    expect((await response.json()).secretEnvironments).toEqual([
+      "dev",
+      "staging",
+    ]);
+  });
+
+  test("a candidate's config names dev alone", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(token),
+    });
+    // Otherwise `check()` would demand a `.env.staging` that `apply()` is never
+    // going to be allowed to write — a task that can never go green.
+    expect((await response.json()).secretEnvironments).toEqual(["dev"]);
+  });
+
   test("the retired checkout path is still sent, so older CLIs can parse this", async () => {
     const t = setup();
     const { rowId } = await seedMember(t);
@@ -780,7 +813,7 @@ describe("org config and claude settings", () => {
   /** Exactly what an org that saved before the permission keys existed holds. */
   const preBypassSettings = JSON.stringify({
     permissions: {
-      deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+      deny: ["Read(./.env)", "Read(./.env.*)", "Bash(git push --force:*)"],
     },
     env: { CLUBRIA_ORG: "1" },
   });
@@ -865,6 +898,77 @@ describe("org config and claude settings", () => {
     expect(settings.permissions.deny).toEqual([]);
     // The sibling key it never answered still arrives.
     expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+  });
+
+  test("an org still denying dotenv reads is taught the new filenames", async () => {
+    // riabuild used to write one `.env.local` and now writes `.env.dev` and
+    // `.env.staging`. `Read(./.env)` is an exact path, so neither new file is
+    // covered — and `backfillClaudeDefaults` cannot help, because it only adds
+    // keys that are *absent* and `permissions.deny` is present on every stored
+    // row. Without this migration the secrets riabuild just wrote would be
+    // readable by every Claude Code account on every existing deployment.
+    const t = setup();
+    await seedOrgConfig(
+      t,
+      JSON.stringify({
+        permissions: {
+          deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+        },
+      }),
+    );
+
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(true);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings.permissions.deny).toContain("Read(./.env.*)");
+    // Additive only: nothing the org already had is removed, including the
+    // now-redundant exact entry for the file riabuild no longer writes.
+    expect(settings.permissions.deny).toContain("Read(./.env.local)");
+    expect(settings.permissions.deny).toContain("Bash(git push --force:*)");
+    // The CLI re-fetches by comparing this; leaving it would change the
+    // database and nobody's laptop.
+    expect(row.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
+  });
+
+  test("an org that removed its dotenv denials is left alone", async () => {
+    // The same rule the defaults backfill follows: an emptied deny list is a
+    // decision, and putting an entry back one element at a time undoes it.
+    // This migration teaches orgs the new *filenames*; it does not re-argue
+    // whether dotenv files should be denied at all.
+    const t = setup();
+    const chosen = { permissions: { deny: ["Bash(git push --force:*)"] } };
+    await seedOrgConfig(t, JSON.stringify(chosen));
+
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(false);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings).toEqual(chosen);
+    expect(row.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("running the dotenv migration twice is a no-op the second time", async () => {
+    const t = setup();
+    await seedOrgConfig(
+      t,
+      JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }),
+    );
+
+    await t.mutation(internal.org.denyEveryDotenvFile, {});
+    const { row: first } = await storedSettings(t);
+    const second = await t.mutation(internal.org.denyEveryDotenvFile, {});
+
+    expect(second.updated).toBe(false);
+    const { row } = await storedSettings(t);
+    expect(row.claudeSettingsUpdatedAt).toBe(first.claudeSettingsUpdatedAt);
+  });
+
+  test("a deployment with no stored config needs no dotenv migration", async () => {
+    // It is served DEFAULT_CLAUDE_SETTINGS, which already carries the glob.
+    const t = setup();
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(false);
   });
 
   test("running the defaults backfill twice is a no-op the second time", async () => {
@@ -1003,6 +1107,56 @@ describe("secret brokering", () => {
       clientId: "cand-id",
       clientSecret: "cand-secret",
     });
+  });
+
+  test("a developer is told to pull dev and staging", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    const body = await response.json();
+    expect(body.environments).toEqual(["dev", "staging"]);
+    // Still the base environment on its own, because a CLI released before
+    // `environments` existed reads this field and nothing else.
+    expect(body.environment).toBe("dev");
+  });
+
+  test("a candidate is told to pull dev alone", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    expect((await response.json()).environments).toEqual(["dev"]);
+  });
+
+  test("the audit entry records every environment that was brokered", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+
+    const meta = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("auditLog").collect();
+      return rows.find((row) => row.action === "secrets.token_brokered")?.meta;
+    });
+    // Which environments a credential opened is the part worth being able to
+    // answer later; the single `environment` field cannot say "and staging".
+    expect(meta?.environments).toBe("dev,staging");
   });
 
   test("leaving the GitHub org ends access, whatever Convex says", async () => {
@@ -1956,5 +2110,209 @@ describe("the team's shared servers", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ servers: [] });
+  });
+});
+
+describe("the SSH keys the org issues", () => {
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  /** Stands in for GitHub's org membership check. 204 is "yes". */
+  function stubMembership(status: number) {
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.includes("api.github.com")) {
+        return new Response(null, { status });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    };
+  }
+
+  async function seedKey(
+    t: ReturnType<typeof setup>,
+    lead: Id<"members">,
+    issuedTo: Id<"members">[],
+    overrides: Partial<{ label: string; privateKey: string }> = {},
+  ) {
+    await t.run(async (ctx) => {
+      const now = Date.now();
+      await ctx.db.insert("issuedKeys", {
+        label: overrides.label ?? "prod-bastion",
+        privateKey: overrides.privateKey ?? ED25519_PRIVATE,
+        publicKey: ED25519_PUBLIC,
+        fingerprint: ED25519_FINGERPRINT,
+        keyType: "ssh-ed25519",
+        issuedTo,
+        createdBy: lead,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+  }
+
+  test("a developer gets the keys issued to them, whole", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedKey(t, rowId, [rowId]);
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.keys).toHaveLength(1);
+    expect(body.keys[0]).toMatchObject({
+      label: "prod-bastion",
+      keyType: "ssh-ed25519",
+      publicKey: ED25519_PUBLIC,
+      fingerprint: ED25519_FINGERPRINT,
+    });
+    // The private half travels in the same response. A second, separately
+    // authorised fetch would be theatre — same session, same bearer token,
+    // same connection — and the CLI needs every key it is entitled to in
+    // order to probe them anyway.
+    expect(body.keys[0].privateKey).toContain("BEGIN OPENSSH PRIVATE KEY");
+    expect(typeof body.keys[0].id).toBe("string");
+  });
+
+  test("a developer gets nothing from a key issued to somebody else", async () => {
+    // The whole authorisation model in one assertion: entitlement is a list on
+    // the row, and a member not on it is not served, whatever their role.
+    const t = setup();
+    const { rowId: ada } = await seedMember(t, { role: "developer" });
+    const { rowId: alan } = await seedMember(t, {
+      role: "developer",
+      login: "alan",
+    });
+    await seedKey(t, ada, [alan]);
+    const token = await issueSession(t, ada);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ keys: [] });
+  });
+
+  test("a candidate gets an empty list rather than a refusal", async () => {
+    // 200 and `{ keys: [] }`, never 403 — the rule /api/v1/remotes/shared
+    // already sets. `riabuild remote` is also how a candidate reaches the
+    // server they set up themselves.
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    await seedKey(t, rowId, [rowId]);
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ keys: [] });
+  });
+
+  test("someone who has left the GitHub org gets 403, not a private key", async () => {
+    // The one that matters most on this endpoint. This is the only response in
+    // riabuild carrying a durable credential, so `members.role` being stale
+    // must not be enough to keep it flowing.
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedKey(t, rowId, [rowId]);
+    const token = await issueSession(t, rowId);
+    stubMembership(404);
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(403);
+    const body = await response.json();
+    expect(body.error.code).toBe("not_org_member");
+    expect(JSON.stringify(body)).not.toContain("BEGIN OPENSSH");
+  });
+
+  test("no session at all gets 401", async () => {
+    const t = setup();
+    const response = await t.fetch("/api/v1/issued-keys", {});
+    expect(response.status).toBe(401);
+  });
+
+  test("a revoked session gets 401", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedKey(t, rowId, [rowId]);
+    const token = await issueSession(t, rowId, { revoked: true });
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(401);
+  });
+
+  test("a served fetch is written to the audit log by label", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedKey(t, rowId, [rowId]);
+    await seedKey(t, rowId, [rowId], { label: "gpu-box" });
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    await t.fetch("/api/v1/issued-keys", { headers: bearer(token) });
+
+    const audit = await t.run(async (ctx) =>
+      ctx.db.query("auditLog").collect(),
+    );
+    const served = audit.find((row) => row.action === "issued_key.served");
+    expect(served?.meta.keys).toBe("gpu-box,prod-bastion");
+    expect(served?.meta.count).toBe("2");
+    expect(JSON.stringify(audit)).not.toContain("BEGIN OPENSSH");
+  });
+
+  test("a candidate's refused fetch is not logged as a fetch", async () => {
+    // Nothing was served, so there is nothing to have taken a copy of. A row
+    // here would make the log read as though a candidate had been handed keys.
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    await seedKey(t, rowId, [rowId]);
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    await t.fetch("/api/v1/issued-keys", { headers: bearer(token) });
+
+    const audit = await t.run(async (ctx) =>
+      ctx.db.query("auditLog").collect(),
+    );
+    expect(audit.find((row) => row.action === "issued_key.served")).toBe(
+      undefined,
+    );
+  });
+
+  test("no keys at all is an empty list, not an error", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/issued-keys", {
+      headers: bearer(token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ keys: [] });
   });
 });

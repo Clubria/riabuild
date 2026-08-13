@@ -136,7 +136,7 @@ export default defineSchema({
     defaultProjectPath: v.optional(v.string()),
     minCliVersion: v.string(),
     latestCliVersion: v.string(),
-    /** Bumped when secrets rotate; the CLI treats an older .env.local as stale. */
+    /** Bumped when secrets rotate; the CLI treats an older .env.<environment> as stale. */
     secretsUpdatedAt: v.number(),
   }),
 
@@ -166,6 +166,51 @@ export default defineSchema({
     createdAt: v.number(),
     updatedAt: v.number(),
   }).index("by_name", ["name"]),
+
+  /**
+   * SSH keys the org issues: a private key a lead pastes once, and the members
+   * it is issued to.
+   *
+   * This is the one table here that holds a long-lived secret in plaintext, and
+   * `../../CLAUDE.md` names it as a deliberate third exception to "secrets are
+   * brokered, never stored" rather than leaving the invariant and this row to
+   * contradict each other quietly. Say the cost plainly: a dump of this
+   * database hands out working SSH access to whatever these keys open. It is
+   * here because the alternative is not a brokered key — it is that key
+   * arriving over Slack and living in someone's `~/.ssh` forever.
+   *
+   * What bounds it is everywhere else. No route returns `privateKey` to a
+   * browser. Every fetch is audited by label, so "who took a copy" has an
+   * answer. The CLI holds it only in an `ssh-agent` riabuild owns and never on
+   * a filesystem. And it *bootstraps* rather than replaces: it authenticates
+   * one `ssh-copy-id`, after which the developer's own per-laptop key carries
+   * the run and `remote forget` still has exactly one line to remove.
+   *
+   * `publicKey`, `fingerprint` and `keyType` are derived from `privateKey` by
+   * `lib/opensshKey.ts` and never accepted from a client — an OpenSSH container
+   * carries its own public half, so this costs one digest and no key
+   * mathematics. They exist so a lead can identify a row without the row ever
+   * handing the secret back, which is what makes "no reveal control" a usable
+   * rule rather than an obstruction.
+   *
+   * `issuedTo` is an array on the row rather than a join table. Convex cannot
+   * index array-contains, so "keys issued to me" is a bounded scan — the same
+   * shape and the same 200-row bound `sharedServers` uses, for the same reason:
+   * this list is tens of rows, typed by hand.
+   *
+   * Design: `docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md`.
+   */
+  issuedKeys: defineTable({
+    label: v.string(),
+    privateKey: v.string(),
+    publicKey: v.string(),
+    fingerprint: v.string(),
+    keyType: v.string(),
+    issuedTo: v.array(v.id("members")),
+    createdBy: v.id("members"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_label", ["label"]),
 
   auditLog: defineTable({
     actorId: v.optional(v.id("members")),
