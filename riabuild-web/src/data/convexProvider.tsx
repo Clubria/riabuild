@@ -42,6 +42,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     isLead ? { limit: 40 } : "skip",
   );
   const sharedServers = useQuery(api.sharedServers.list, isLead ? {} : "skip");
+  const issuedKeys = useQuery(api.issuedKeys.list, isLead ? {} : "skip");
 
   const updateProfile = useMutation(api.members.updateProfile);
   const setRole = useMutation(api.members.setRole);
@@ -51,6 +52,10 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
   const addSharedServer = useMutation(api.sharedServers.add);
   const updateSharedServer = useMutation(api.sharedServers.update);
   const removeSharedServer = useMutation(api.sharedServers.remove);
+  const addIssuedKey = useMutation(api.issuedKeys.create);
+  const replaceIssuedKey = useMutation(api.issuedKeys.replaceKey);
+  const setIssuedKeyMembers = useMutation(api.issuedKeys.setIssuedTo);
+  const removeIssuedKey = useMutation(api.issuedKeys.remove);
   const approveDevice = useMutation(api.cliAuth.approve);
   const denyDevice = useMutation(api.cliAuth.deny);
   /**
@@ -69,6 +74,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     sessions: loadable(sessions),
     members: loadable(members),
     sharedServers: loadable(sharedServers),
+    issuedKeys: loadable(issuedKeys),
     auditLog: loadable(auditLog),
     orgConfig: loadable(orgConfig),
     now,
@@ -96,6 +102,21 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     },
     removeSharedServer: async (p) => {
       await removeSharedServer({ id: p.id as never });
+    },
+    addIssuedKey: async (p) => {
+      await addIssuedKey(p);
+    },
+    replaceIssuedKey: async (p) => {
+      await replaceIssuedKey({ id: p.id as never, privateKey: p.privateKey });
+    },
+    setIssuedKeyMembers: async (p) => {
+      await setIssuedKeyMembers({
+        id: p.id as never,
+        issuedTo: p.issuedTo as never[],
+      });
+    },
+    removeIssuedKey: async (p) => {
+      await removeIssuedKey({ id: p.id as never });
     },
     signIn: async (p) => {
       await signIn("github", p?.redirectTo !== undefined ? { redirectTo: p.redirectTo } : {});

@@ -1,3 +1,8 @@
+import {
+  ED25519_FINGERPRINT,
+  ED25519_PRIVATE,
+  ENCRYPTED_PRIVATE,
+} from "../convex/lib/opensshKey.fixtures";
 import { AUTHORIZE_QUERY, SCENARIO_NAMES } from "../src/dev/scenarios";
 import { checkPage, expect, test } from "./helpers";
 
@@ -161,6 +166,46 @@ test.describe("interaction states", () => {
     ).toBeVisible();
     await checkPage(page, info, consoleErrors, {
       screenshot: "shared-server-readdressed",
+    });
+  });
+
+  test("a pasted key fills in what will be stored, before it is stored", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // The whole point of the paste box: a lead can see the public key and the
+    // fingerprint that the row will carry, derived in the browser from the key
+    // itself, while the private half is still only in the textarea.
+    await page.goto("/?scenario=lead");
+    await page.getByLabel("key name").fill("prod-bastion");
+    await page.getByLabel("private key").fill(ED25519_PRIVATE);
+    await expect(page.getByText(ED25519_FINGERPRINT)).toBeVisible();
+    // Scoped to the preview's own definition list: the table above it lists a
+    // key of the same type, and an unscoped match would pass on that row while
+    // the preview stayed empty.
+    await expect(
+      page.getByRole("definition").filter({ hasText: /^ssh-ed25519$/ }),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "issued-key-preview",
+    });
+  });
+
+  test("a key that will not parse says so at the box, not after saving", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // A passphrase-protected key is the likeliest bad paste, and it is refused
+    // before any round trip: `ssh-add` would prompt for that passphrase on a
+    // developer's laptop with nobody able to answer it.
+    await page.goto("/?scenario=lead");
+    await page.getByLabel("key name").fill("prod-bastion");
+    await page.getByLabel("private key").fill(ENCRYPTED_PRIVATE);
+    await expect(page.getByText(/protected by a passphrase/)).toBeVisible();
+    // And the control that would store it stays unavailable.
+    await expect(page.getByRole("button", { name: /add key/i })).toBeDisabled();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "issued-key-unparseable",
     });
   });
 

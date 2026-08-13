@@ -540,6 +540,53 @@ http.route({
 });
 
 /* -------------------------------------------------------------------------- */
+/* GET /api/v1/issued-keys — the SSH keys issued to this developer             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The only response in riabuild that carries a durable credential.
+ *
+ * Everything else brokered here expires on its own — an Infisical token in
+ * minutes, a session on revocation. A private SSH key does neither, which is
+ * why this handler is the one place the org check is doing the whole job and
+ * why the fetch itself is logged, inside `serveForApi`, next to the read.
+ *
+ * The private half travels in the same response as the metadata rather than
+ * behind a second, separately authorised call. A second round trip would be
+ * theatre: same session, same bearer token, same connection — and the CLI needs
+ * every key it is entitled to anyway, because it probes them one at a time to
+ * find which one the chosen server accepts.
+ */
+http.route({
+  path: "/api/v1/issued-keys",
+  method: "GET",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const config = await loadConfig(ctx);
+      enforceMinVersion(req, config);
+      const { member } = await authenticate(ctx, req);
+      // `members.role` is never the sole gate, and on this endpoint that is not
+      // a formality: a stale Convex row would otherwise keep handing a departed
+      // developer a key that opens a machine indefinitely.
+      await requireOrgMembership(member.githubLogin);
+
+      // A candidate gets an empty list and a 200, for the reason
+      // /api/v1/remotes/shared does. Returned before `serveForApi` rather than
+      // through it, deliberately: nothing is served, so nothing was taken a
+      // copy of, and an audit row here would read as though a candidate had
+      // been handed keys.
+      if (member.role === "candidate") {
+        return jsonResponse({ keys: [] });
+      }
+      const keys = await ctx.runMutation(internal.issuedKeys.serveForApi, {
+        memberId: member._id,
+      });
+      return jsonResponse({ keys });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
 /* POST /api/v1/secrets/token — short-lived Infisical access token             */
 /* -------------------------------------------------------------------------- */
 

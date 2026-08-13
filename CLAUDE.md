@@ -89,6 +89,24 @@ remote forget` deletes a server's copies of both. See "No secrets in `~/.riabuil
 sentence above it: the Infisical credential is still minted per use and still never
 written down.
 
+**One secret riabuild-web keeps is neither brokered nor local: an issued SSH key.** A lead
+pastes a private key into the dashboard and names the members it is issued to; their CLIs
+pull it to reach servers riabuild's own key cannot sign in to — a managed bastion, a
+hardened box with `PasswordAuthentication no`, anything whose `authorized_keys` the
+developer does not administer. Say the cost out loud rather than discovering it later:
+**it is stored in Convex in plaintext, it is readable by any lead, and a dump of that
+database hands out working SSH access to whatever those keys open.** It is here because
+the alternative is not a brokered key — it is that key arriving over Slack and living in
+someone's `~/.ssh` forever. Bounding it is the whole design: the key is **derived** into a
+public half and fingerprint so a lead never needs the secret back, no route returns a
+stored private key to a browser, every fetch is audited by label, the CLI holds it only in
+an `ssh-agent` riabuild owns and never on a filesystem, and it **bootstraps rather than
+replaces** — it authenticates one `ssh-copy-id`, after which this laptop's own key carries
+the run and `remote forget` still has exactly one developer's line to remove. See
+`docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md`. Nothing here loosens the
+two sentences above it either: the Infisical credential is still minted per use, and a
+developer's own account password is still their own.
+
 **Identity is GitHub, authorization is Convex.** Membership in the Clubria GitHub org
 gates access at all; `members.role` decides how much. Every secret-brokering request
 re-verifies org membership, so the Convex role is never the sole gate.

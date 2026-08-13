@@ -10,6 +10,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod auth;
+pub mod issued;
+pub mod openssh;
 pub mod org;
 pub mod remotes;
 pub mod secrets;
