@@ -27,6 +27,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = [
     "fs",
+    # The pump's transport *is* this process's stdin and stdout: `ssh -T <host>
+    # riabuild channel pump` carries every request and reply over them. This is
+    # the one place riabuild reads stdio asynchronously rather than handing it
+    # to a child, so it is the one crate that needs `io-std`.
+    "io-std",
     "io-util",
     "macros",
     "net",

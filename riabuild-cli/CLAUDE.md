@@ -403,7 +403,7 @@ crates form a straight line, each depending only on those above it:
 | `keychain` | secret storage: the trait, the two platform CLIs, the file store for machines with no keyring, and `keyring_answers` — whether a Secret Service actually replies | runner, ui |
 | `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
-| `channel` | the laptop channel: clipboard and browser over the SSH reverse-forward. `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the forward up and proves it carries traffic | gh-session, paths, runner, ui |
+| `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run | all of the above |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
@@ -441,11 +441,31 @@ it never exists at the umask even briefly, and a path that is a symlink or owned
 another uid is refused rather than removed: unlinking is how you take over someone
 else's channel, not how you recover from a stale one.
 
-The health probe runs **on the server**, not against the laptop's own socket. The forward
-runs server-to-laptop, so only a probe originating there can see it wedged — and a wedged
-forward is precisely what SSH's own keepalives cannot detect, because they run below it.
-A local socket check would test the agent's liveness, report a dead tunnel as healthy, and
-look like a tidy optimisation while deleting the guarantee.
+**The transport is `ssh -T <host> riabuild channel pump`, and it must stay that way.** The
+channel asks an SSH server to run a command and for nothing else — no `-R`, no
+`AllowStreamLocalForwarding`, no `StreamLocalBindUnlink`, no line in anyone's
+`sshd_config`. Command execution is a floor remote mode already stands on (setup,
+`session::ensure`, installing the server's binary, the shell itself), so a channel built on
+it needs no permission the session did not already have. Reaching for a forward again — for
+a second socket, for a "simpler" path — reintroduces a dependency that hardened servers
+refuse outright and that some SSH implementations have never implemented.
+
+It also put the socket's lifecycle in the wrong hands. Under `-R` **sshd** called `bind()`,
+so whether a stale socket could be replaced was `sshd_config`'s `StreamLocalBindUnlink`
+(default `no`); the `-o StreamLocalBindUnlink=yes` riabuild passed was a *client* option
+governing only sockets `ssh` itself creates, i.e. `-L`. It did nothing, and one
+`channel.sock` left by a killed session disabled paste on that server permanently, with no
+riabuild flag able to clear it. The pump owns the bind now, so clearing a dead socket is an
+ordinary `unlink` by its owner — and a socket that still *answers* is refused rather than
+taken, because taking one silently cuts a colleague's session.
+
+**There is no health probe, and adding one back would be a mistake.** The old design ran a
+second short-lived `ssh` every thirty seconds to prove the forward carried traffic, because
+a forward is a channel riding on the ssh session and can wedge while ssh believes itself
+connected — keepalives run below it and cannot see that. With the exec transport the
+requests travel over the ssh session's own stdio, so "carrying traffic" and "alive" are one
+question, and `ServerAliveInterval` answers it on the same connection. What the probe fed —
+the backoff reset — is now the request count `serve_pipe` returns.
 
 Inside `archive`, `staging.rs` owns *how* a tree lands: unpack into a sibling
 directory and `rename` it into place, never `remove_dir_all` the target first.

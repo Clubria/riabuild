@@ -28,7 +28,7 @@ mod child;
 mod pty;
 mod subdue;
 
-pub use child::ChildHandle;
+pub use child::{ChildHandle, ChildReader, ChildWriter, PipedChildHandle};
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -195,19 +195,48 @@ pub trait CommandRunner: Send + Sync {
     /// Starts a child and hands back a handle to it instead of waiting for it.
     ///
     /// Every other method here finishes by waiting for exit, which is the one
-    /// thing the clipboard channel's `ssh -N -R` must not do: the supervisor
-    /// has to ping *through* the forward while the forward is up, and a tunnel
-    /// run through `run` would only return once it had already failed.
+    /// thing a long-lived child must not do: the clipboard channel's `ssh` runs
+    /// for the length of a session, and one run through `run` would only return
+    /// once it had already failed.
     ///
-    /// `options.stdin` is ignored. A held child is not something anything
-    /// writes to — `ssh -N` reads none — and a pipe left open for nobody is one
-    /// more handle keeping a dead tunnel from being noticed.
+    /// `options.stdin` is ignored, and both of the child's own halves are
+    /// nulled. Use `spawn_piped` for a child riabuild talks to; a pipe left
+    /// open for nobody is one more handle keeping a dead connection from being
+    /// noticed.
     async fn spawn(
         &self,
         program: &str,
         args: &[&str],
         options: &RunOptions,
     ) -> Result<Box<dyn ChildHandle>>;
+
+    /// The same, keeping the child's stdin and stdout so riabuild can talk to
+    /// it.
+    ///
+    /// One caller: the clipboard channel, whose transport *is* a child's stdio.
+    /// `ssh -T <host> riabuild channel pump` carries every request and reply
+    /// over this pipe, which is what lets the channel work on a server that
+    /// grants nothing beyond running a command — no port forwarding, no unix
+    /// socket forwarding, no `sshd_config` anyone has to edit.
+    ///
+    /// Separate from `spawn` rather than a flag on it because the two differ in
+    /// their return type, and because the nulled stdio above is the right
+    /// default: a pipe opened for a child nobody reads is a handle keeping a
+    /// dead tunnel from being noticed.
+    /// Defaulted so the test doubles scattered across the workspace — which
+    /// stub `CommandRunner` for a task and will never open a channel — do not
+    /// each need an identical copy of a method they do not use. The default
+    /// refuses rather than returning an empty pipe: a channel handed a stdio
+    /// that silently carries nothing is the failure this whole design exists
+    /// to remove, and it must not be reintroduced as a stub's convenience.
+    async fn spawn_piped(
+        &self,
+        program: &str,
+        _args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<Box<dyn PipedChildHandle>> {
+        anyhow::bail!("this CommandRunner cannot pipe `{program}`'s stdio")
+    }
 
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
@@ -392,6 +421,16 @@ impl CommandRunner for RealRunner {
         Ok(Box::new(child::RealChild::spawn(command, program)?))
     }
 
+    async fn spawn_piped(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn PipedChildHandle>> {
+        let command = RealRunner::for_riabuild(program, args, options);
+        Ok(Box::new(child::RealChild::spawn_piped(command, program)?))
+    }
+
     async fn run_interactive(
         &self,
         program: &str,
@@ -525,6 +564,18 @@ struct FakeChild {
     /// `None` for a child scripted to stay up: `wait` then resolves only once
     /// `kill` has been called.
     exit: Option<CommandOutput>,
+    /// The halves riabuild talks over, present only for a `spawn_piped` child.
+    /// The other ends live in `FakeRunner::pipes`, so a test drives this child
+    /// the way a real `riabuild channel pump` would — by writing frames at it
+    /// and reading the frames that come back.
+    stdin: std::sync::Mutex<Option<ChildWriter>>,
+    stdout: std::sync::Mutex<Option<ChildReader>>,
+    /// The far ends, held here rather than on the runner so that killing this
+    /// child *closes* them — which is what a real `ssh` dying does, and what
+    /// anything reading the pipe is waiting for. Parked on the runner instead,
+    /// they outlived every child, no read ever saw an end of pipe, and a
+    /// supervisor that waits for its reader to finish waited for ever.
+    far: std::sync::Mutex<Option<FakePipes>>,
     killed: std::sync::Mutex<bool>,
     /// Wakes a pending `wait`. `notify_one` rather than `notify_waiters`
     /// because it stores a permit when nobody is waiting yet — a kill that
@@ -553,9 +604,37 @@ impl ChildHandle for Arc<FakeChild> {
 
     async fn kill(&self) -> Result<()> {
         *self.killed.lock().unwrap() = true;
+        // Dropping the far ends is the fake's stand-in for the kernel closing a
+        // dead process's pipes: without it a reader waits for an end of pipe
+        // that never comes.
+        *self.far.lock().unwrap() = None;
         self.stopped.notify_one();
         Ok(())
     }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl PipedChildHandle for Arc<FakeChild> {
+    fn take_stdin(&self) -> Option<ChildWriter> {
+        self.stdin.lock().ok()?.take()
+    }
+
+    fn take_stdout(&self) -> Option<ChildReader> {
+        self.stdout.lock().ok()?.take()
+    }
+}
+
+/// The far end of a scripted child's stdio — the test's side of the pipe.
+///
+/// `to_riabuild` is what the pump would write: frames riabuild reads as the
+/// child's stdout. `from_riabuild` is what riabuild writes to the child's
+/// stdin. Named for direction rather than for stream, because "the child's
+/// stdout" and "the end a test writes to" are opposite ends of one pipe and
+/// naming them after the stream is how they get connected backwards.
+#[cfg(any(test, feature = "testing"))]
+pub struct FakePipes {
+    pub to_riabuild: tokio::io::DuplexStream,
+    pub from_riabuild: tokio::io::DuplexStream,
 }
 
 /// One recorded invocation: what was run, with what environment, and what was
@@ -734,6 +813,17 @@ impl FakeRunner {
             .collect()
     }
 
+    /// The far end of the `n`th piped child's stdio, taken once.
+    ///
+    /// A test drives the channel through this: write a request frame into
+    /// `to_riabuild`, read the reply out of `from_riabuild`. Taken rather than
+    /// borrowed because the two halves usually go to two tasks, the same way
+    /// the supervisor splits the real thing.
+    pub fn pipes(&self, n: usize) -> Option<FakePipes> {
+        let spawned = self.spawned.lock().unwrap();
+        spawned.get(n)?.far.lock().unwrap().take()
+    }
+
     /// The children whose handles were killed, in spawn order.
     ///
     /// The teardown half of the supervisor's contract, and the half `calls()`
@@ -860,8 +950,9 @@ impl FakeRunner {
 
     /// Pops the next child queued for the longest matching key, by the same
     /// prefix rule the response stubs use — `spawning("ssh", …)` answers for
-    /// the whole `ssh -N -R … ada@box` command line the supervisor builds,
-    /// which no test should have to spell out to script an exit.
+    /// the whole `ssh -T … ada@box riabuild channel pump` command line the
+    /// supervisor builds, which no test should have to spell out to script an
+    /// exit.
     fn next_child(&self, invocation: &str) -> Option<Ending> {
         let mut children = self.children.lock().unwrap();
         let key = children
@@ -1043,11 +1134,56 @@ impl CommandRunner for FakeRunner {
                 Ending::Alone(output) => Some(output),
                 Ending::OnlyWhenKilled => None,
             },
+            stdin: std::sync::Mutex::new(None),
+            stdout: std::sync::Mutex::new(None),
+            far: std::sync::Mutex::new(None),
             killed: std::sync::Mutex::new(false),
             stopped: tokio::sync::Notify::new(),
         });
         // Kept here as well as handed out, so `killed()` can answer after the
         // code under test has dropped its handle.
+        self.spawned.lock().unwrap().push(child.clone());
+        Ok(Box::new(child))
+    }
+
+    async fn spawn_piped(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn PipedChildHandle>> {
+        let invocation = self.record(program, args, options);
+        let key = FakeRunner::stub_key(program, args);
+        // A piped child defaults to staying up rather than to exiting 127. The
+        // transport it stands in for is a session that lives as long as the
+        // shell, so "no stub" here means "an ssh that stayed connected and said
+        // nothing", which is what a test driving the pipe by hand wants.
+        let ending = self
+            .next_child(&invocation)
+            .or_else(|| self.next_child(&key))
+            .unwrap_or(Ending::OnlyWhenKilled);
+
+        // 64 KB each way, matching a real pipe's buffer closely enough that a
+        // test can hit backpressure the same way production would.
+        let (their_stdin, our_stdin) = tokio::io::duplex(64 * 1024);
+        let (their_stdout, our_stdout) = tokio::io::duplex(64 * 1024);
+
+        let child = Arc::new(FakeChild {
+            invocation,
+            exit: match ending {
+                Ending::Alone(output) => Some(output),
+                Ending::OnlyWhenKilled => None,
+            },
+            stdin: std::sync::Mutex::new(Some(Box::new(our_stdin) as ChildWriter)),
+            stdout: std::sync::Mutex::new(Some(Box::new(our_stdout) as ChildReader)),
+            far: std::sync::Mutex::new(Some(FakePipes {
+                to_riabuild: their_stdout,
+                from_riabuild: their_stdin,
+            })),
+            killed: std::sync::Mutex::new(false),
+            stopped: tokio::sync::Notify::new(),
+        });
+
         self.spawned.lock().unwrap().push(child.clone());
         Ok(Box::new(child))
     }
@@ -1167,6 +1303,17 @@ impl CommandRunner for ScopedRunner {
         options: &RunOptions,
     ) -> Result<Box<dyn ChildHandle>> {
         self.inner.spawn(program, args, &self.merge(options)).await
+    }
+
+    async fn spawn_piped(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<Box<dyn PipedChildHandle>> {
+        self.inner
+            .spawn_piped(program, args, &self.merge(options))
+            .await
     }
 
     async fn run_interactive(

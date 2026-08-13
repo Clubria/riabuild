@@ -4,6 +4,7 @@
 //! split is what lets every dispatch decision — the snapshot, the size cap, the
 //! empty-versus-raced distinction — be tested without a socket anywhere.
 
+mod pipe;
 mod server;
 
 use crate::clipboard::Clipboard;
@@ -249,7 +250,7 @@ fn payload(mime: &str, bytes: Vec<u8>) -> (Response, Option<Vec<u8>>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mime::{PNG, TEXT};
     use anyhow::Result;
@@ -356,7 +357,7 @@ mod tests {
 
     /// An agent over a fixed clipboard, for the socket tests in `server`, which
     /// only need something that answers.
-    pub(super) fn agent_holding(types: &[&str], bytes: &[u8]) -> Agent {
+    pub(crate) fn agent_holding(types: &[&str], bytes: &[u8]) -> Agent {
         agent(FakeClipboard::holding(types, bytes))
     }
 

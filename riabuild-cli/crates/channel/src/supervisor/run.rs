@@ -1,11 +1,11 @@
 //! The loop that drives the decisions next door.
 //!
-//! One connection at a time: spawn `ssh -N -R` and hold the handle, probe on an
-//! interval while it is up, and decide from how it ended whether to rebuild or
-//! to stop. The child is *held* rather than waited for, which is the whole
-//! reason `CommandRunner::spawn` exists — a tunnel run through `run` would only
-//! return once it had already died, and the probe has to happen while it is
-//! alive.
+//! One connection at a time: spawn `ssh -T <host> riabuild channel pump`, serve
+//! the laptop's agent on the child's stdio for as long as it lives, and decide
+//! from how it ended whether to rebuild or to stop. The child is *held* rather
+//! than waited for, which is the whole reason `CommandRunner::spawn_piped`
+//! exists — the channel runs for the length of a session, and a connection run
+//! through `run` would only return once it had already died.
 //!
 //! Nothing here propagates an error to its caller. The channel is strictly
 //! optional (see `channel`'s module doc): a supervisor that cannot start, or
@@ -14,17 +14,17 @@
 //! `Err` — the developer's shell is not this task's to take down, and a `?`
 //! reaching a caller that used `?` in turn is exactly how it would.
 
-use super::{PING_INTERVAL, PING_MISSES, Tunnel, backoff, diagnose, probe_args, ssh_args};
-use riabuild_runner::{ChildHandle, CommandRunner, RunOptions};
+use super::{Tunnel, backoff, diagnose, ssh_args};
+use crate::agent::Agent;
+use riabuild_runner::{CommandRunner, RunOptions};
 use riabuild_ui::{Failure, Ui};
 use std::sync::Arc;
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
 
 /// The caller's end of a running supervisor.
 ///
 /// Cloneable and inert: holding one keeps nothing alive, so a caller that drops
-/// it without stopping the supervisor gets a tunnel that shuts itself down
+/// it without stopping the supervisor gets a channel that shuts itself down
 /// rather than one that outlives the shell it belongs to.
 #[derive(Clone)]
 pub struct Stop(Arc<watch::Sender<bool>>);
@@ -40,7 +40,7 @@ impl Stop {
         Self(Arc::new(watch::channel(false).0))
     }
 
-    /// Asks the supervisor to kill the tunnel and return.
+    /// Asks the supervisor to close the connection and return.
     ///
     /// Idempotent, and safe both before the supervisor has started and after it
     /// has already returned. `send_replace` rather than `send` for the first of
@@ -60,7 +60,7 @@ impl Stop {
 ///
 /// `changed()` on its own reports only transitions this receiver has not seen,
 /// so a stop that landed before the supervisor reached this point would never
-/// wake it: the shell would exit and the tunnel would stay up behind it.
+/// wake it: the shell would exit and the connection would stay up behind it.
 async fn stopped(signal: &mut watch::Receiver<bool>) {
     loop {
         let asked = *signal.borrow_and_update();
@@ -77,7 +77,7 @@ async fn stopped(signal: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Keeps the tunnel up until asked to stop.
+/// Keeps the channel up until asked to stop.
 ///
 /// Returns the failure that ended it, or `None` when it ended because it was
 /// told to. A returned failure has already been shown to the developer; it
@@ -87,17 +87,20 @@ async fn stopped(signal: &mut watch::Receiver<bool>) {
 ///
 /// Takes an owned `Ui` because it outlives the call that started it: this runs
 /// as a background task beside the developer's shell, so borrowing the caller's
-/// printer would tie the tunnel's lifetime to a stack frame that returned long
-/// ago.
+/// printer would tie the channel's lifetime to a stack frame that returned long
+/// ago. `agent` is shared rather than owned for the mirror reason — one agent
+/// answers every connection this loop builds, and rebuilding it per attempt
+/// would re-detect the laptop's clipboard tooling on every network blip.
 pub async fn supervise(
     runner: Arc<dyn CommandRunner>,
     tunnel: Tunnel,
+    agent: Arc<Agent>,
     ui: Ui,
     stop: Stop,
 ) -> Option<Failure> {
     let mut signal = stop.signal();
     // Consecutive failures, and therefore the position in the backoff schedule.
-    // Reset by a connection that actually carried a probe, so a laptop that
+    // Reset by a connection that actually carried a request, so a laptop that
     // suspends every afternoon reconnects in a second rather than inheriting
     // the ceiling from a bad week.
     let mut attempt = 0u32;
@@ -115,7 +118,7 @@ pub async fn supervise(
             env: tunnel.env.clone(),
             ..Default::default()
         };
-        let child = match runner.spawn("ssh", &argv, &options).await {
+        let child = match runner.spawn_piped("ssh", &argv, &options).await {
             Ok(child) => child,
             Err(error) => {
                 // An ssh that will not start at all does not start on the next
@@ -124,7 +127,7 @@ pub async fn supervise(
                 return Some(report(
                     &ui,
                     Failure::new(
-                        "riabuild could not start the clipboard channel's SSH tunnel",
+                        "riabuild could not start the clipboard channel",
                         "Check that `ssh` is installed and runnable, then open a new riabuild shell. Everything except paste works without it.",
                     )
                     .command(format!("ssh {}", args.join(" ")))
@@ -133,19 +136,49 @@ pub async fn supervise(
             }
         };
 
-        let connection = hold(child.as_ref(), runner.as_ref(), &tunnel, &mut signal).await;
+        let (Some(to_server), Some(from_server)) = (child.take_stdin(), child.take_stdout()) else {
+            // Unreachable through `RealRunner`, which pipes both halves for
+            // every `spawn_piped`. Reported rather than ignored because the
+            // alternative is a supervisor that rebuilds a channel carrying
+            // nothing, forever, with nothing on screen saying why.
+            let _ = child.kill().await;
+            return Some(report(
+                &ui,
+                Failure::new(
+                    "riabuild could not open the clipboard channel's pipe",
+                    "Open a new riabuild shell. Everything except paste works without it.",
+                ),
+            ));
+        };
 
-        match connection.ended {
-            Ended::Stopped => {
-                // Killed explicitly rather than left to `kill_on_drop`: the
-                // developer's shell has exited and the remote socket has to be
-                // free before the next session tries to bind it.
-                let _ = child.kill().await;
-                return None;
-            }
-            Ended::Wedged => {
-                let _ = child.kill().await;
-            }
+        // The agent owns both halves for the length of this connection, and
+        // dropping them on its way out is load-bearing: closing the child's
+        // stdin gives the pump an end of input, which ends the pump, which ends
+        // this `ssh`. That chain is what makes an agent that stops serving —
+        // on a frame it cannot read, say — turn into a clean rebuild rather
+        // than a live connection nobody is listening to.
+        let serving = tokio::spawn(Arc::clone(&agent).serve_pipe(from_server, to_server));
+
+        let ended = tokio::select! {
+            exited = child.wait() => match exited {
+                Ok(output) => Ended::Exited(output.stderr),
+                // Losing track of the child is not a configuration fault, so it
+                // takes the ordinary retry path rather than being fed to
+                // `diagnose` as if ssh had said it.
+                Err(error) => Ended::Exited(error.to_string()),
+            },
+            () = stopped(&mut signal) => Ended::Stopped,
+        };
+
+        // Killed explicitly rather than left to `kill_on_drop`: the developer's
+        // shell has exited, and the pump on the far side should go with it
+        // rather than wait out its own read.
+        let _ = child.kill().await;
+        // The pipes close with the child, so this resolves rather than hanging.
+        let carried = matches!(serving.await, Ok(Ok(count)) if count > 0);
+
+        match ended {
+            Ended::Stopped => return None,
             Ended::Exited(stderr) => {
                 if let Some(failure) = diagnose(&stderr) {
                     return Some(report(&ui, failure));
@@ -153,7 +186,7 @@ pub async fn supervise(
             }
         }
 
-        if connection.carried {
+        if carried {
             attempt = 0;
         }
 
@@ -171,108 +204,9 @@ pub async fn supervise(
 enum Ended {
     /// The caller asked the supervisor to stop.
     Stopped,
-    /// The probe went unanswered `PING_MISSES` times running: ssh still
-    /// believes it is connected, and the forward is carrying nothing.
-    Wedged,
-    /// ssh exited on its own, with whatever it wrote to stderr — the only
-    /// place a server that refuses the forward says so.
+    /// ssh exited on its own, with whatever it wrote to stderr — the only place
+    /// a server that cannot run the pump says so.
     Exited(String),
-}
-
-struct Connection {
-    ended: Ended,
-    /// Whether a probe ever came back on this connection.
-    ///
-    /// This, rather than how long it lasted, is what "the connection stayed up"
-    /// means: a tunnel that came up, forwarded nothing and sat there for an
-    /// hour has not earned a reset of the backoff schedule.
-    carried: bool,
-}
-
-/// Watches one live tunnel until something ends it.
-async fn hold(
-    child: &dyn ChildHandle,
-    runner: &dyn CommandRunner,
-    tunnel: &Tunnel,
-    signal: &mut watch::Receiver<bool>,
-) -> Connection {
-    let mut misses = 0u32;
-    let mut carried = false;
-
-    let mut ticker = tokio::time::interval(PING_INTERVAL);
-    // `interval`'s first tick is immediate, and probing a tunnel that has not
-    // finished connecting would score a miss against every healthy start.
-    ticker.tick().await;
-    // Without this, a probe that took longer than the interval is followed by
-    // an instant second tick, so a slow server burns through `PING_MISSES` in
-    // no time and the supervisor tears down a tunnel that is merely sluggish.
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            // Recreated on every iteration, which the losing branches make
-            // routine: `ChildHandle::wait` takes `&self` and releases what it
-            // holds when its future is dropped, precisely so this is allowed.
-            exited = child.wait() => {
-                let stderr = match exited {
-                    Ok(output) => output.stderr,
-                    // Losing track of the child is not a configuration fault,
-                    // so it takes the ordinary retry path rather than being
-                    // fed to `diagnose` as if ssh had said it.
-                    Err(error) => error.to_string(),
-                };
-                return Connection { ended: Ended::Exited(stderr), carried };
-            }
-            () = stopped(signal) => {
-                return Connection { ended: Ended::Stopped, carried };
-            }
-            _ = ticker.tick() => {
-                if probe(runner, tunnel).await {
-                    misses = 0;
-                    carried = true;
-                } else {
-                    misses = misses.saturating_add(1);
-                    if misses >= PING_MISSES {
-                        return Connection { ended: Ended::Wedged, carried };
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// One end-to-end health probe, run on the server over its own ssh.
-///
-/// The cost, stated so nobody has to rediscover it: this is **one extra
-/// short-lived SSH connection every `PING_INTERVAL`**, for as long as a
-/// developer's session lasts. That is the price of a probe that can observe a
-/// wedged forward at all. The forward runs server→laptop, so a probe that
-/// originates on the laptop — opening `tunnel.local_socket` here, say — tests
-/// the agent's liveness and reports a wedged tunnel as perfectly healthy. It
-/// would be cheaper, it would pass, and it would silently delete the only
-/// mechanism that catches a half-open socket. Do not optimise it into one.
-async fn probe(runner: &dyn CommandRunner, tunnel: &Tunnel) -> bool {
-    let args = probe_args(tunnel);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-
-    // A probe that has not answered within the interval it is measuring is a
-    // miss by definition. Without the bound, one hung ssh holds this loop and
-    // the supervisor stops noticing anything at all — including the exit of
-    // the tunnel it is supposed to be supervising.
-    let answered = tokio::time::timeout(
-        PING_INTERVAL,
-        runner.run(
-            "ssh",
-            &argv,
-            &RunOptions {
-                env: tunnel.env.clone(),
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
-
-    matches!(answered, Ok(Ok(output)) if output.ok())
 }
 
 /// Shows a failure without claiming riabuild stopped.
@@ -299,238 +233,188 @@ fn report(ui: &Ui, failure: Failure) -> Failure {
 mod tests {
     use super::super::tests::tunnel;
     use super::*;
+    use crate::agent::tests::agent_holding;
+    use crate::mime::TEXT;
     use riabuild_runner::FakeRunner;
     use std::time::Duration;
 
-    /// Virtual time from now until the fake has started `count` tunnels.
+    fn agent() -> Arc<Agent> {
+        Arc::new(agent_holding(&[TEXT], b"hello"))
+    }
+
+    /// Virtual time from now until the fake has started `count` children.
     ///
     /// Polling rather than a channel, because under a paused clock the polling
     /// *is* the mechanism: time only moves when the runtime has nothing left to
-    /// run, so this sleep is what lets the supervisor's backoff and ping
-    /// intervals elapse — instantly, in wall-clock terms. `PING_INTERVAL` is
-    /// thirty seconds and the backoff ceiling is thirty more; a suite that
-    /// waited them out is a suite people stop running.
-    async fn spawns_reach(fake: &FakeRunner, count: usize) -> Duration {
-        let start = tokio::time::Instant::now();
-        for _ in 0..40_000 {
+    /// run, so this sleep is what lets the supervisor's backoff elapse.
+    async fn until_spawns(fake: &FakeRunner, count: usize) {
+        for _ in 0..2_000 {
             if fake.spawns().len() >= count {
-                return start.elapsed();
+                return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("only {} tunnels were started", fake.spawns().len());
+        panic!("only {} of {count} spawns happened", fake.spawns().len());
     }
 
-    /// What the supervisor returned, once its task has ended.
-    async fn finished(loops: tokio::task::JoinHandle<Option<Failure>>) -> Option<Failure> {
-        loops.await.expect("the supervisor task ran to completion")
-    }
-
-    fn probes(fake: &FakeRunner) -> Vec<String> {
-        fake.calls()
-            .into_iter()
-            .filter(|call| call.contains("riabuild channel status"))
-            .collect()
-    }
-
-    /// A tight reconnect loop against a server that is down is a denial of
-    /// service against the developer's own machine, so the schedule the
-    /// supervisor publishes has to be the one it actually waits.
+    /// The whole point, asserted against what actually reaches `ssh`: a command
+    /// on the server, and no forward anywhere.
     #[tokio::test(start_paused = true)]
-    async fn successive_failures_wait_the_backoff_schedule_they_promise() {
-        let fake = Arc::new(
-            FakeRunner::new()
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host."),
-        );
+    async fn the_supervisor_runs_a_command_and_requests_no_forward() {
+        let fake = Arc::new(FakeRunner::new());
         let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        // Each call measures from where the previous one stopped, so these are
-        // the gaps between attempts rather than times since the start.
-        spawns_reach(&fake, 1).await;
-        let first = spawns_reach(&fake, 2).await;
-        let second = spawns_reach(&fake, 3).await;
-        let third = spawns_reach(&fake, 4).await;
-
-        stop.stop();
-        assert!(finished(loops).await.is_none());
-
-        // `backoff(0)` is a second exactly — its jitter falls below the floor.
-        assert!(first >= Duration::from_millis(990), "{first:?}");
-        assert!(first <= Duration::from_millis(1_030), "{first:?}");
-        // `backoff(1)` is two seconds jittered down by up to a quarter.
-        assert!(second >= Duration::from_millis(1_490), "{second:?}");
-        assert!(second <= Duration::from_millis(2_030), "{second:?}");
-        // `backoff(2)`, likewise, from four.
-        assert!(third >= Duration::from_millis(2_990), "{third:?}");
-        assert!(third <= Duration::from_millis(4_030), "{third:?}");
-    }
-
-    /// The half-open socket: ssh is happy, the forward carries nothing, and
-    /// only the probe can tell. Two misses and the tunnel is rebuilt.
-    #[tokio::test(start_paused = true)]
-    async fn a_probe_that_stops_answering_tears_the_tunnel_down_and_rebuilds_it() {
-        let fake = Arc::new(
-            FakeRunner::new()
-                .spawning_until_killed("ssh")
-                .spawning_until_killed("ssh")
-                .containing("riabuild channel status", 1, "", "the channel is down"),
-        );
-        let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        spawns_reach(&fake, 2).await;
-        // Read before stopping, because the stop tears down the *replacement*
-        // tunnel too and that kill would mask the one this test is about.
-        let probes = probes(&fake);
-        let killed = fake.killed();
-        stop.stop();
-        assert!(finished(loops).await.is_none());
-
-        assert_eq!(
-            probes.len(),
-            PING_MISSES as usize,
-            "the tunnel should be torn down on miss {PING_MISSES}, not later: {probes:?}"
-        );
-        // Without this the test passes just as well against a supervisor that
-        // leaks every wedged ssh it replaces — one per resume, each still
-        // holding a forward.
-        assert_eq!(killed.len(), 1, "{killed:?}");
-        assert!(killed[0].starts_with("ssh -N -R"), "{killed:?}");
-    }
-
-    /// One dropped probe is a blip. Tearing a working tunnel down for it would
-    /// make the mechanism that protects the channel the thing that interrupts
-    /// it.
-    #[tokio::test(start_paused = true)]
-    async fn a_probe_that_answers_again_forgets_the_miss() {
-        let fake = Arc::new(
-            FakeRunner::new()
-                .spawning_until_killed("ssh")
-                .then("ssh", 1, "", "no answer")
-                .containing("riabuild channel status", 0, "", ""),
-        );
-        let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        spawns_reach(&fake, 1).await;
-        tokio::time::sleep(PING_INTERVAL * 5).await;
-
-        assert!(probes(&fake).len() >= 4, "{:?}", probes(&fake));
-        assert_eq!(fake.spawns().len(), 1, "the tunnel was rebuilt anyway");
-        assert!(fake.killed().is_empty(), "{:?}", fake.killed());
-
-        stop.stop();
-        assert!(finished(loops).await.is_none());
-    }
-
-    /// Retrying a server that forbids socket forwarding is an infinite loop
-    /// against a wall, and the developer never learns why paste is dead.
-    #[tokio::test(start_paused = true)]
-    async fn a_server_that_forbids_the_forward_stops_the_supervisor() {
-        let fake = Arc::new(FakeRunner::new().spawning(
-            "ssh",
-            255,
-            "Error: remote port forwarding failed for listen path /run/user/1000/riabuild/channel.sock",
+        let supervising = tokio::spawn(supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Ui::new(true),
+            stop.clone(),
         ));
-        let runner: Arc<dyn CommandRunner> = fake.clone();
 
-        let failure = supervise(runner, tunnel(), Ui::new(true), Stop::new())
-            .await
-            .expect("a refused forward is a failure the developer must act on");
+        until_spawns(&fake, 1).await;
+        let spawned = fake.spawns().join(" ");
+        assert!(spawned.contains("channel pump"), "{spawned}");
+        assert!(!spawned.contains("-R"), "{spawned}");
 
+        stop.stop();
+        assert!(supervising.await.expect("join").is_none());
+    }
+
+    /// A stop must end the loop *and* kill the connection: an ssh left behind
+    /// holds a pump on the server that the next session would collide with.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_kills_the_connection_and_returns_no_failure() {
+        let fake = Arc::new(FakeRunner::new());
+        let stop = Stop::new();
+        let supervising = tokio::spawn(supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Ui::new(true),
+            stop.clone(),
+        ));
+
+        until_spawns(&fake, 1).await;
+        stop.stop();
+
+        assert!(supervising.await.expect("join").is_none());
+        assert_eq!(
+            fake.killed().len(),
+            1,
+            "the ssh must be killed: {:?}",
+            fake.killed()
+        );
+    }
+
+    /// An ordinary disconnect is rebuilt rather than reported. This is a laptop
+    /// that slept, and there is nothing for the developer to do about it.
+    #[tokio::test(start_paused = true)]
+    async fn an_ordinary_disconnect_is_retried() {
+        let fake = Arc::new(
+            FakeRunner::new()
+                .spawning("ssh", 255, "Connection closed by remote host")
+                .spawning("ssh", 255, "Connection closed by remote host"),
+        );
+        let stop = Stop::new();
+        let supervising = tokio::spawn(supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Ui::new(true),
+            stop.clone(),
+        ));
+
+        until_spawns(&fake, 2).await;
+        stop.stop();
+        assert!(supervising.await.expect("join").is_none());
+    }
+
+    /// A server with no pump is a wall: every attempt fails identically, so the
+    /// supervisor stops and says so instead of backing off to the ceiling and
+    /// retrying there for the rest of the session.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_cannot_run_the_pump_stops_the_loop_with_a_failure() {
+        let fake =
+            Arc::new(FakeRunner::new().spawning("ssh", 127, "bash: riabuild: command not found"));
+        let supervising = tokio::spawn(supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Ui::new(true),
+            Stop::new(),
+        ));
+
+        let failure = supervising.await.expect("join").expect("a failure");
+        assert!(failure.to_string().contains("pump"), "{failure}");
+        assert_eq!(fake.spawns().len(), 1, "it must not retry a wall");
+    }
+
+    /// An `ssh` that will not start at all is the same wall: reported once,
+    /// never retried.
+    #[tokio::test(start_paused = true)]
+    async fn an_ssh_that_cannot_start_is_reported_once() {
+        // `NoRunner` has no `spawn_piped`, so the trait's refusing default
+        // answers — which is exactly the shape of a laptop with no ssh.
+        struct NoRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for NoRunner {
+            async fn run(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &RunOptions,
+            ) -> anyhow::Result<riabuild_runner::CommandOutput> {
+                anyhow::bail!("no")
+            }
+            async fn run_bytes(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &RunOptions,
+            ) -> anyhow::Result<riabuild_runner::BytesOutput> {
+                anyhow::bail!("no")
+            }
+            async fn run_forking(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &RunOptions,
+            ) -> anyhow::Result<i32> {
+                anyhow::bail!("no")
+            }
+            async fn spawn(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &RunOptions,
+            ) -> anyhow::Result<Box<dyn riabuild_runner::ChildHandle>> {
+                anyhow::bail!("no")
+            }
+            async fn run_interactive(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &RunOptions,
+            ) -> anyhow::Result<i32> {
+                anyhow::bail!("no")
+            }
+            fn which(&self, _: &str) -> Option<std::path::PathBuf> {
+                None
+            }
+        }
+
+        let failure = supervise(
+            Arc::new(NoRunner),
+            tunnel(),
+            agent(),
+            Ui::new(true),
+            Stop::new(),
+        )
+        .await
+        .expect("a failure");
         assert!(
-            failure.to_string().contains("AllowStreamLocalForwarding"),
+            failure.to_string().contains("clipboard channel"),
             "{failure}"
         );
-        assert_eq!(fake.spawns().len(), 1, "it retried a server that said no");
-    }
-
-    /// The other half of the same decision: a laptop that closed its lid is not
-    /// a configuration fault, and stopping for one would leave paste broken for
-    /// the rest of the session over a blip.
-    #[tokio::test(start_paused = true)]
-    async fn an_ordinary_disconnect_is_retried_rather_than_reported() {
-        let fake = Arc::new(
-            FakeRunner::new()
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning_until_killed("ssh"),
-        );
-        let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        spawns_reach(&fake, 2).await;
-        stop.stop();
-        let ended = finished(loops).await;
-        assert!(
-            ended.is_none(),
-            "a disconnect was reported as something to act on: {ended:?}"
-        );
-    }
-
-    /// The developer's shell has exited. A tunnel that takes until the next
-    /// ping to notice holds the remote socket the next session needs.
-    #[tokio::test(start_paused = true)]
-    async fn a_stop_request_kills_the_tunnel_and_returns_promptly() {
-        let fake = Arc::new(FakeRunner::new().spawning_until_killed("ssh"));
-        let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        spawns_reach(&fake, 1).await;
-
-        let asked = tokio::time::Instant::now();
-        stop.stop();
-        assert!(finished(loops).await.is_none());
-
-        // Under a paused clock an idle runtime jumps straight to the next
-        // deadline, so a supervisor that only noticed on its next tick would
-        // show a full `PING_INTERVAL` here.
-        assert!(
-            asked.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            asked.elapsed()
-        );
-        assert_eq!(fake.killed().len(), 1, "{:?}", fake.killed());
-    }
-
-    /// Otherwise a laptop that suspends every afternoon inherits the ceiling
-    /// from whatever went wrong last week, and a healthy reconnect waits half a
-    /// minute for no reason.
-    #[tokio::test(start_paused = true)]
-    async fn a_connection_that_carried_traffic_starts_the_backoff_over() {
-        let fake = Arc::new(
-            FakeRunner::new()
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning("ssh", 255, "Connection to build-01 closed by remote host.")
-                .spawning_until_killed("ssh")
-                .spawning_until_killed("ssh")
-                // The third tunnel answers once and then goes quiet, which is
-                // what makes it a connection that carried traffic.
-                .then("ssh", 0, "", "")
-                .containing("riabuild channel status", 1, "", "the channel is down"),
-        );
-        let stop = Stop::new();
-        let runner: Arc<dyn CommandRunner> = fake.clone();
-        let loops = tokio::spawn(supervise(runner, tunnel(), Ui::new(true), stop.clone()));
-
-        spawns_reach(&fake, 3).await;
-        let after_a_working_tunnel = spawns_reach(&fake, 4).await;
-        stop.stop();
-        assert!(finished(loops).await.is_none());
-
-        // Three intervals to answer once and then miss twice, and then the
-        // wait this test is about. Two failures preceded it, so an unreset
-        // schedule would wait `backoff(2)` — at least three seconds.
-        let waited = after_a_working_tunnel - PING_INTERVAL * 3;
-        assert!(waited >= Duration::from_millis(990), "{waited:?}");
-        assert!(waited <= Duration::from_millis(1_030), "{waited:?}");
     }
 }

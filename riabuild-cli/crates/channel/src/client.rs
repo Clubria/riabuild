@@ -68,6 +68,17 @@ async fn exchange(mut stream: UnixStream, request: &Request, body: &[u8]) -> Res
             .context("could not send the payload to the laptop channel")?;
     }
     stream.flush().await?;
+    // Half-close: the write half only, so the reply still comes back down the
+    // read half. This is what tells the pump the request is complete, and it is
+    // why the pump can relay bytes without parsing them — end of input is the
+    // end of the request, so nothing on the server has to know that
+    // `clipboard.write` is the one operation with a body. Harmless on the
+    // direct-socket path, where `agent::serve_one` frames on the announced
+    // length and never waits for EOF.
+    stream
+        .shutdown()
+        .await
+        .context("could not finish sending the request to the laptop channel")?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();

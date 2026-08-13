@@ -54,6 +54,16 @@ pub async fn channel(action: &ChannelAction, quiet: bool) -> Result<i32> {
             Ok(0)
         }
 
+        ChannelAction::Pump { socket } => {
+            // The creating side, so the checked resolver — the same one `Agent`
+            // uses, and for the same reason: on a server several developers
+            // share, this is what refuses a path that is a symlink or belongs
+            // to another account instead of binding over it.
+            let socket = channel::socket_path_for_create(socket.as_deref()).await?;
+            channel::pump::run(&socket).await?;
+            Ok(0)
+        }
+
         ChannelAction::Open { args } => {
             Ok(shims::browser::run(args, Some(channel::socket_path())).await)
         }
