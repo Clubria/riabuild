@@ -296,7 +296,7 @@ names a registered task.
 | 6 | `repo_status` | 5 | **Reports only.** Ahead/behind counts and dirty-tree state. Never pulls. |
 | 7 | `claude_accounts` | 4 | at least one account directory exists, account 1 is signed in, `claude --version` ≥ floor. |
 | 8 | `org_settings` | 1 | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
-| 9 | `env_local` | 1, 3, 5 | `.env.local` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. |
+| 9 | `env_local` | 1, 3, 5 | one `.env.<environment>` per environment in `orgConfig.secretEnvironments` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. A developer or lead gets `.env.dev` and `.env.staging`; a candidate gets `.env.dev`. The task id is historical — it wrote a single `.env.local` before environments were plural. |
 | 10 | `claude_trust` | 5, 7 | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
 | 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
 | 12 | `claude_onboarding` | 7 | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Depends on 7 alone: unlike trust, nothing here needs a checkout. |

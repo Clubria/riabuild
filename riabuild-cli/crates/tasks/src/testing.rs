@@ -23,6 +23,9 @@ pub fn org_config() -> OrgConfig {
         min_cli_version: "0.1.0".into(),
         latest_cli_version: "0.1.0".into(),
         secrets_updated_at: 0,
+        // A developer who may see staging, which is the case with two files to
+        // get right. Tests for the narrower case set this to `["dev"]`.
+        secret_environments: vec!["dev".into(), "staging".into()],
     }
 }
 

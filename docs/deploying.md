@@ -56,6 +56,10 @@ npx convex env set RIABUILD_GITHUB_ORG  Clubria
 npx convex env set GITHUB_ORG_TOKEN     <PAT with read:org, held by a Clubria member>
 npx convex env set INFISICAL_PROJECT_ID <project id>
 npx convex env set INFISICAL_ENVIRONMENT dev
+# Optional; defaults to `staging`. Developers and leads get this environment as
+# `.env.staging` beside `.env.dev`; candidates get `.env.dev` alone. Set it to an
+# empty string if the Infisical project has no staging environment.
+npx convex env set INFISICAL_STAGING_ENVIRONMENT staging
 npx convex env set INFISICAL_CANDIDATE_CLIENT_ID     <mi-candidate client id>
 npx convex env set INFISICAL_CANDIDATE_CLIENT_SECRET <mi-candidate client secret>
 npx convex env set INFISICAL_DEVELOPER_CLIENT_ID     <mi-developer client id>
@@ -93,16 +97,40 @@ with universal auth, already created:
 | Identity | Access |
 |---|---|
 | `mi-candidate` | the subset of dev paths a candidate may read |
-| `mi-developer` | all dev paths |
+| `mi-developer` | all dev paths, in both `dev` and `staging` |
 
 Path scoping is enforced by Infisical's own RBAC. riabuild only chooses which identity
 to authenticate as, and never sees a secret value.
+
+riabuild asks for `dev` and `staging` on behalf of a developer or a lead, and for `dev`
+alone on behalf of a candidate — one `.env.<environment>` per environment, in the
+checkout. `mi-developer` therefore needs `INFISICAL_SECRET_PATH` readable in the
+`staging` environment as well; if it is not, a developer's run fails on the staging
+export rather than degrading quietly. An org with no staging environment sets
+`INFISICAL_STAGING_ENVIRONMENT` to the empty string, and every role gets `dev` alone.
 
 This deployment points at the **self-hosted** instance, so `INFISICAL_SITE_URL` must be
 set — the code otherwise defaults to Infisical Cloud, where these identities do not
 exist and the login returns 401. Convex's servers can reach it; that was verified rather
 than assumed, since an instance reachable from a developer laptop is not necessarily
 reachable from eu-west-1.
+
+### Deploying the dev/staging split onto an existing deployment
+
+Two steps, and the second is not optional on a deployment that has ever saved org config:
+
+```sh
+npx convex env set INFISICAL_STAGING_ENVIRONMENT staging
+npx convex run org:denyEveryDotenvFile --prod
+```
+
+The migration adds `Read(./.env.*)` to the org's Claude Code deny list. Without it,
+`Read(./.env)` — an exact path — covers neither `.env.dev` nor `.env.staging`, and the
+secrets riabuild has just brokered are readable by every Claude Code account.
+`org:backfillClaudeDefaults` does **not** cover this: it fills keys that are absent, and
+`permissions.deny` is present on every stored row, so it reports success and changes
+nothing. See "Changing `DEFAULT_CLAUDE_SETTINGS` reaches nobody on its own" in
+`../riabuild-web/CLAUDE.md`.
 
 ### `INFISICAL_SECRET_PATH` is not `/`
 
@@ -113,7 +141,8 @@ succeeds and exports **zero** secrets, which surfaces as riabuild's "Infisical r
 no secrets" failure rather than anything mentioning paths.
 
 It is set to `/dev-env`, which holds the 15 entries that make up a developer's
-`.env.local`.
+`.env.dev`. The same path is read in each environment, so `mi-developer` needs
+`/dev-env` readable in `staging` too.
 
 ### Shorten the access token TTL
 

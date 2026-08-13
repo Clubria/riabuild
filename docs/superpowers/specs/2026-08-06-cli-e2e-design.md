@@ -114,7 +114,8 @@ What is still exercised is everything it produces.
    versions, a checkout whose `origin` is the repository the *server* named,
    valid `org-settings.json` carrying this deployment's marker, a Claude Code
    account with its launchers in place and no retired `c` launcher beside them,
-   and a `.env.local` that parses, carries brokered secrets and is git-ignored.
+   and a `.env.dev` and `.env.staging` that each parse, carry the brokered
+   secrets of the environment they are named after, and are git-ignored.
 3. No secret was written anywhere under `~/.riabuild`.
 4. The stub saw both the broker call and the CLI's fetch, and was never asked for
    anything it does not implement.

@@ -13,7 +13,7 @@ import { DEVICE_CODE_TTL_MS, POLL_INTERVAL_SECONDS } from "./cliAuth";
 import { meetsMinimum } from "./lib/version";
 import { ApiFailure, apiError, fail, jsonResponse } from "./lib/responses";
 import { checkOrgMembership, orgLogin } from "./github";
-import { brokerToken } from "./infisical";
+import { brokerToken, environmentsForRole } from "./infisical";
 import { RETIRED_DEFAULT_PROJECT_PATH, type OrgConfig } from "./org";
 
 const http = httpRouter();
@@ -455,7 +455,7 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      await authenticate(ctx, req);
+      const { member } = await authenticate(ctx, req);
       const config = await loadConfig(ctx);
       return jsonResponse({
         repoSlug: config.repoSlug,
@@ -466,6 +466,11 @@ http.route({
         minCliVersion: config.minCliVersion,
         latestCliVersion: config.latestCliVersion,
         secretsUpdatedAt: config.secretsUpdatedAt,
+        // The same list `/secrets/token` returns. It is here as well because
+        // the CLI's `check()` has to know which `.env.<name>` files ought to
+        // exist on every run, and brokering a token to find out would hit
+        // Infisical and write an audit row for a question nobody asked.
+        secretEnvironments: environmentsForRole(member.role),
       });
     }),
   ),
@@ -577,6 +582,9 @@ http.route({
           identity: broker.identity,
           role: member.role,
           environment: broker.environment,
+          // Which environments one credential opened is the part worth being
+          // able to answer later; `environment` alone cannot say "and staging".
+          environments: broker.environments.join(","),
         },
       });
 
@@ -584,7 +592,9 @@ http.route({
         token: broker.token,
         expiresAt: broker.expiresAt,
         projectId: broker.projectId,
+        // The base environment alone, for CLIs released before `environments`.
         environment: broker.environment,
+        environments: broker.environments,
         secretPath: broker.secretPath,
         siteUrl: broker.siteUrl,
         secretsUpdatedAt: config.secretsUpdatedAt,

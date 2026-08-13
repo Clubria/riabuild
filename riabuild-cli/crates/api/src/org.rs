@@ -23,6 +23,16 @@ pub struct OrgConfig {
     pub latest_cli_version: String,
     #[serde(rename = "secretsUpdatedAt", default)]
     pub secrets_updated_at: u64,
+    /// The Infisical environments this developer may pull, which is also the
+    /// set of `.env.<name>` files their checkout is expected to have.
+    ///
+    /// It is served here as well as by `/api/v1/secrets/token` because
+    /// `env_local::check()` runs on every `riabuild --check` and must not
+    /// broker a credential to learn what it is looking for: brokering reaches
+    /// Infisical and writes an audit row. Empty means the deployment predates
+    /// the field, which the task reports rather than guesses around.
+    #[serde(rename = "secretEnvironments", default)]
+    pub secret_environments: Vec<String>,
 }
 
 /// Refuses anything that is not digits and dots — `^\d+(\.\d+)*$`, the same
@@ -133,7 +143,30 @@ mod tests {
             min_cli_version: "0.1.0".into(),
             latest_cli_version: "0.1.0".into(),
             secrets_updated_at: 0,
+            secret_environments: vec!["dev".into()],
         }
+    }
+
+    #[test]
+    fn a_config_from_a_deployment_without_the_field_parses() {
+        // /api/v1 is add-only in both directions: a CLI carrying this field
+        // still has to read a deployment that has not been updated yet.
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"repoSlug":"Clubria/ai-builders-hub","minCliVersion":"1.0.0",
+                "latestCliVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert!(config.secret_environments.is_empty());
+    }
+
+    #[test]
+    fn the_environment_list_is_read_when_the_deployment_sends_one() {
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"repoSlug":"Clubria/ai-builders-hub","minCliVersion":"1.0.0",
+                "latestCliVersion":"1.0.0","secretEnvironments":["dev","staging"]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.secret_environments, ["dev", "staging"]);
     }
 
     #[test]

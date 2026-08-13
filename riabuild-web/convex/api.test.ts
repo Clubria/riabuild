@@ -566,6 +566,34 @@ describe("org config and claude settings", () => {
     expect((await response.json()).repoSlug).toBe("Clubria/ai-builders-hub");
   });
 
+  test("config names the environments the CLI must have on disk", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(token),
+    });
+    // `check()` runs on every `riabuild --check` and must not broker a token to
+    // learn which files it is looking for — brokering hits Infisical and writes
+    // an audit row. So the list is served here too.
+    expect((await response.json()).secretEnvironments).toEqual([
+      "dev",
+      "staging",
+    ]);
+  });
+
+  test("a candidate's config names dev alone", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(token),
+    });
+    // Otherwise `check()` would demand a `.env.staging` that `apply()` is never
+    // going to be allowed to write — a task that can never go green.
+    expect((await response.json()).secretEnvironments).toEqual(["dev"]);
+  });
+
   test("the retired checkout path is still sent, so older CLIs can parse this", async () => {
     const t = setup();
     const { rowId } = await seedMember(t);
@@ -780,7 +808,7 @@ describe("org config and claude settings", () => {
   /** Exactly what an org that saved before the permission keys existed holds. */
   const preBypassSettings = JSON.stringify({
     permissions: {
-      deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+      deny: ["Read(./.env)", "Read(./.env.*)", "Bash(git push --force:*)"],
     },
     env: { CLUBRIA_ORG: "1" },
   });
@@ -865,6 +893,77 @@ describe("org config and claude settings", () => {
     expect(settings.permissions.deny).toEqual([]);
     // The sibling key it never answered still arrives.
     expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+  });
+
+  test("an org still denying dotenv reads is taught the new filenames", async () => {
+    // riabuild used to write one `.env.local` and now writes `.env.dev` and
+    // `.env.staging`. `Read(./.env)` is an exact path, so neither new file is
+    // covered — and `backfillClaudeDefaults` cannot help, because it only adds
+    // keys that are *absent* and `permissions.deny` is present on every stored
+    // row. Without this migration the secrets riabuild just wrote would be
+    // readable by every Claude Code account on every existing deployment.
+    const t = setup();
+    await seedOrgConfig(
+      t,
+      JSON.stringify({
+        permissions: {
+          deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+        },
+      }),
+    );
+
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(true);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings.permissions.deny).toContain("Read(./.env.*)");
+    // Additive only: nothing the org already had is removed, including the
+    // now-redundant exact entry for the file riabuild no longer writes.
+    expect(settings.permissions.deny).toContain("Read(./.env.local)");
+    expect(settings.permissions.deny).toContain("Bash(git push --force:*)");
+    // The CLI re-fetches by comparing this; leaving it would change the
+    // database and nobody's laptop.
+    expect(row.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
+  });
+
+  test("an org that removed its dotenv denials is left alone", async () => {
+    // The same rule the defaults backfill follows: an emptied deny list is a
+    // decision, and putting an entry back one element at a time undoes it.
+    // This migration teaches orgs the new *filenames*; it does not re-argue
+    // whether dotenv files should be denied at all.
+    const t = setup();
+    const chosen = { permissions: { deny: ["Bash(git push --force:*)"] } };
+    await seedOrgConfig(t, JSON.stringify(chosen));
+
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(false);
+
+    const { row, settings } = await storedSettings(t);
+    expect(settings).toEqual(chosen);
+    expect(row.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("running the dotenv migration twice is a no-op the second time", async () => {
+    const t = setup();
+    await seedOrgConfig(
+      t,
+      JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }),
+    );
+
+    await t.mutation(internal.org.denyEveryDotenvFile, {});
+    const { row: first } = await storedSettings(t);
+    const second = await t.mutation(internal.org.denyEveryDotenvFile, {});
+
+    expect(second.updated).toBe(false);
+    const { row } = await storedSettings(t);
+    expect(row.claudeSettingsUpdatedAt).toBe(first.claudeSettingsUpdatedAt);
+  });
+
+  test("a deployment with no stored config needs no dotenv migration", async () => {
+    // It is served DEFAULT_CLAUDE_SETTINGS, which already carries the glob.
+    const t = setup();
+    const result = await t.mutation(internal.org.denyEveryDotenvFile, {});
+    expect(result.updated).toBe(false);
   });
 
   test("running the defaults backfill twice is a no-op the second time", async () => {
@@ -1003,6 +1102,56 @@ describe("secret brokering", () => {
       clientId: "cand-id",
       clientSecret: "cand-secret",
     });
+  });
+
+  test("a developer is told to pull dev and staging", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    const body = await response.json();
+    expect(body.environments).toEqual(["dev", "staging"]);
+    // Still the base environment on its own, because a CLI released before
+    // `environments` existed reads this field and nothing else.
+    expect(body.environment).toBe("dev");
+  });
+
+  test("a candidate is told to pull dev alone", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "candidate" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    expect((await response.json()).environments).toEqual(["dev"]);
+  });
+
+  test("the audit entry records every environment that was brokered", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const token = await issueSession(t, rowId);
+    stubUpstreams({ membership: 204 });
+
+    await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+
+    const meta = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("auditLog").collect();
+      return rows.find((row) => row.action === "secrets.token_brokered")?.meta;
+    });
+    // Which environments a credential opened is the part worth being able to
+    // answer later; the single `environment` field cannot say "and staging".
+    expect(meta?.environments).toBe("dev,staging");
   });
 
   test("leaving the GitHub org ends access, whatever Convex says", async () => {
