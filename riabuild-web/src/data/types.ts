@@ -37,6 +37,17 @@ export type Session = {
   lastUsedAt: number;
   expiresAt: number;
   revokedAt: number | null;
+  /**
+   * How this session came to exist. `device` is the usual one — a person typed
+   * a code into this dashboard and approved it. `delegated` means another of
+   * their machines asked for it on a server's behalf, which is what
+   * `riabuild remote` does and the only sign-in nobody approved by hand.
+   *
+   * Always one of the two here: `sessions.ts` resolves the absent case before
+   * this reaches the page, so nothing in `src/` has to know that older rows
+   * predate the field.
+   */
+  origin: "device" | "delegated";
 };
 
 export type AuditEntry = {

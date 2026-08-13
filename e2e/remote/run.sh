@@ -59,15 +59,18 @@
 #      or `--no-keyring`-equivalent handling, for it to actually store).
 #   b. `POST` in the stub. `stub_web.py` implements only `do_GET` and
 #      `do_DELETE`, so a POST gets BaseHTTPRequestHandler's stock 501.
-#   c. Something to approve the device code. This used to read "an answer to
-#      the loopback browser callback", which #30 made obsolete: `auth::login`
-#      no longer opens a local port, it POSTs `/api/v1/cli/device` and polls
-#      `/api/v1/cli/token` until a human approves the code in the dashboard.
-#      So the stub needs both endpoints *and* has to play the approving human
-#      — or `session::ensure` needs a seam this test can enter through.
+#   c. A reply to that POST. This item has shrunk twice. It first read "an
+#      answer to the loopback browser callback", which #30 made obsolete when
+#      `auth::login` stopped opening a local port. It then read "both the
+#      device and token endpoints, *and* something to play the approving
+#      human" — a stub that has to impersonate a person clicking approve.
+#      That is now gone too: signing a server in is one authenticated
+#      `POST /api/v1/cli/sessions`, so the stub needs one `do_POST` returning
+#      `{token, sessionId, expiresAt}` and no notion of a human at all.
 #
 # None of that is written yet, on purpose: it is a second piece of work, not
-# a line to sneak into this file.
+# a line to sneak into this file. It is, however, now small enough to be
+# worth doing — closing (b) and (c) is one handler.
 #
 # WHERE IT ACTUALLY STOPS TODAY, which is further than any of the above
 # predicted. v2026.08.10 publishes the musl checksum, so the install now
@@ -89,7 +92,7 @@
 #      the assertion was about to compare against, so they agreed with
 #      themselves.
 #
-# It now stops at (b): the CLI POSTs `/api/v1/cli/device` and the stub
+# It now stops at (b): the CLI POSTs `/api/v1/cli/sessions` and the stub
 # answers 501. The `known_gap` check below correctly refuses to forgive that,
 # and this paragraph is the reminder — the same role the previous one played,
 # now one stage further along.
@@ -361,19 +364,26 @@ known_gap() {
 
   # Branch 3, and the one that fires today. v2026.08.10 publishes the musl
   # checksum, so the install completes and the run reaches `session::ensure`,
-  # which signs in — and `stub_web.py` implements only `do_GET`/`do_DELETE`,
-  # so the device-code POST gets BaseHTTPRequestHandler's stock 501. That is
-  # item (b) in this file's header: a limitation of this harness, not of
-  # riabuild.
+  # which asks riabuild-web to sign the server in — and `stub_web.py`
+  # implements only `do_GET`/`do_DELETE`, so that POST gets
+  # BaseHTTPRequestHandler's stock 501. That is item (b) in this file's
+  # header: a limitation of this harness, not of riabuild.
+  #
+  # The path is `/api/v1/cli/sessions`, not `/api/v1/cli/device`: a laptop no
+  # longer runs a second device-code flow to sign a server in, it asks under
+  # its own token. Note the 501 still reads as a 501 — `auth::for_server`
+  # rewrites only a 404, because only a 404 means "this dashboard has no such
+  # endpoint", and swallowing every status would hide a real outage behind a
+  # sentence about deploying.
   #
   # Both greps, and the endpoint named exactly. A bare "501" would forgive any
   # unimplemented method on any path, including one riabuild had started
   # calling by mistake — and the whole purpose of this function is that a
   # non-start must never be mistaken for a tracked gap. When the stub grows a
-  # `do_POST` and something to approve the code, this branch stops matching on
-  # its own and the five assertions below start running.
+  # `do_POST`, this branch stops matching on its own and the five assertions
+  # below start running.
   grep -q "replied with HTTP 501" "$work/ada.log" \
-    && grep -q "POST /api/v1/cli/device.* 501" "$work/stub_web.log" 2>/dev/null \
+    && grep -q "POST /api/v1/cli/sessions.* 501" "$work/stub_web.log" 2>/dev/null \
     && return 0
 
   # Branch 4: item (a), and the one a GitHub runner hits. `session::ensure`

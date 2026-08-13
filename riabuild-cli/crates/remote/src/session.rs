@@ -125,16 +125,6 @@ pub fn gitconfig(name: &str, email: &str) -> String {
     format!("[user]\n\tname = {name}\n\temail = {email}\n")
 }
 
-/// How long a session this module mints is good for.
-///
-/// Mirrors the 90 days riabuild-web itself mints a CLI session for (the same
-/// number `tasks::login::SESSION_TTL_MS` mirrors, for the laptop's own
-/// session) — not a value this file is free to choose, since a shorter one
-/// here would only make `ensure` re-mint more often than the server actually
-/// requires, and a longer one would let it believe a token is live well past
-/// the point the server has stopped honouring it.
-const SESSION_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-
 /// Whether the store's record of this session's expiry is recent enough that
 /// probing the server for liveness is worth the round trip at all.
 ///
@@ -169,9 +159,8 @@ pub async fn ensure(
     api: &ApiClient,
     member: &Member,
     // Only for the `ApiClient` that probes a cached token below. There is no
-    // `web_url` beside it any more: `auth::login` builds no dashboard link, the
-    // server returns the verification URL because it is the thing that knows
-    // where the dashboard is deployed.
+    // `web_url` beside it: nothing on this path builds a dashboard link any
+    // more, because nothing on this path sends the developer to one.
     version: &str,
     store: &mut super::store::Store,
 ) -> Result<()> {
@@ -208,18 +197,20 @@ pub async fn ensure(
         Some(token) => token,
         None => {
             ui.heading(&format!("Signing {} in to riabuild", remote.name));
-            ui.note("Approve it in your browser.");
-            // Laptop's browser, server's hostname as the label: the dashboard
-            // lists this session as its own revocable device, distinct from
-            // the laptop's. The heading above is why `auth::login` prints none
-            // of its own — "Signing this machine in" would be a lie here.
+            // No browser, and nothing for the developer to approve. This
+            // laptop is already signed in, and `auth::for_server` asks
+            // riabuild-web to mint a second session on the server's behalf
+            // under that authority — so setting up a server costs the person
+            // doing it nothing beyond the sign-in they already did.
             //
-            // The `member` the grant carries is dropped on purpose: it
-            // describes the developer approving in the browser, who is the
-            // same person `ensure` was already handed as `member`.
-            let auth::Session {
-                token, session_id, ..
-            } = auth::login(api, runner.as_ref(), ui, &remote.host).await?;
+            // The server's hostname is the label, so the dashboard lists this
+            // session as its own revocable device rather than a second copy of
+            // the laptop, which is what `riabuild remote forget` relies on.
+            let auth::ServerSession {
+                token,
+                session_id,
+                expires_at,
+            } = auth::for_server(api, &remote.host).await?;
             keychain.set(&token).await?;
             // Recorded so the check above can skip the round trip next time,
             // and so `riabuild remote list` can show it — which requires
@@ -227,8 +218,12 @@ pub async fn ensure(
             // `session_id` is what lets `riabuild remote forget` name this
             // exact session when it revokes it through
             // `DELETE /api/v1/cli/sessions/<id>` — see `forget::forget_remote`.
+            //
+            // The expiry is the server's own answer rather than a TTL computed
+            // here, which is what removes the last copy of riabuild-web's 90
+            // days from this file.
             if let Some(saved) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
-                saved.session_expires_at = riabuild_paths::config::now_millis() + SESSION_TTL_MS;
+                saved.session_expires_at = expires_at;
                 saved.session_id = session_id;
             }
             super::store::persist_one(paths, store, &remote.name).await?;
@@ -338,7 +333,10 @@ mod tests {
 
     #[test]
     fn a_record_expiring_well_in_the_future_is_worth_probing() {
-        let far_future = riabuild_paths::config::now_millis() + SESSION_TTL_MS;
+        // Ninety days, the same order as the expiry riabuild-web hands back —
+        // written out rather than shared with a constant, because this file no
+        // longer owns a copy of that number and should not grow one back.
+        let far_future = riabuild_paths::config::now_millis() + 90 * 24 * 60 * 60 * 1000;
         assert!(!expires_soon(&record_expiring_at(far_future)));
     }
 

@@ -17,7 +17,12 @@ export type ApiErrorCode =
   | "not_configured"
   | "org_check_unavailable"
   | "upstream_error"
-  | "session_unknown";
+  | "session_unknown"
+  /**
+   * A session that was itself minted by another machine asked to mint a third.
+   * One hop only — see `sessions.delegate`.
+   */
+  | "delegation_not_permitted";
 
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

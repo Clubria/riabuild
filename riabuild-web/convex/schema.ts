@@ -57,6 +57,33 @@ export default defineSchema({
     lastUsedAt: v.number(),
     expiresAt: v.number(),
     revokedAt: v.optional(v.number()),
+    /**
+     * How this session came into existence: approved by a human in a browser
+     * (`device`), or minted by another session through
+     * `POST /api/v1/cli/sessions` (`delegated`) — which is how a laptop signs
+     * a server in without sending the developer to riabuild.clubria.com/cli a
+     * second time.
+     *
+     * Optional, and **absent means `device`**. Every row written before
+     * delegation existed was a browser approval, so the absent case is not an
+     * unknown to be treated carefully — it is the answer. Making it required
+     * would mean backfilling every live session to record something already
+     * true of all of them.
+     *
+     * It is read for exactly one decision: only a `device` session may
+     * delegate. A server's token is readable by every co-tenant sharing that
+     * Unix account, and a token that can mint tokens turns one leaked
+     * credential into an unlimited supply of them — including ones minted
+     * after `riabuild remote forget` revoked the original, which is the
+     * guarantee the whole on-disk-token amendment rests on.
+     */
+    origin: v.optional(v.union(v.literal("device"), v.literal("delegated"))),
+    /**
+     * The session that minted this one. Never used to authorise anything —
+     * `origin` alone decides that — but it is what makes a delegation
+     * readable after the fact: which laptop signed this server in.
+     */
+    delegatedFrom: v.optional(v.id("cliSessions")),
   })
     .index("by_tokenHash", ["tokenHash"])
     .index("by_memberId", ["memberId"]),

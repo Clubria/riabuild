@@ -345,6 +345,91 @@ http.route({
 });
 
 /* -------------------------------------------------------------------------- */
+/* POST /api/v1/cli/sessions — a signed-in laptop signs a server in            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Delegation: the one way a riabuild session is created without a human
+ * approving a device code.
+ *
+ * `riabuild remote` needs a session for the server it is provisioning, and it
+ * runs on a laptop that signed in minutes ago. It used to get one by driving
+ * the whole device-code flow a second time — printing a second code, opening a
+ * second browser tab, waiting for a second approval — which asked the
+ * developer to prove, again, the thing the bearer token on this very request
+ * already proves. The server still cannot sign itself in; nothing here gives
+ * it a way to. Its laptop asks on its behalf.
+ *
+ * Every gate the browser flow had is still here, and two are stricter:
+ *
+ * - the caller must hold a live session for an active member (`authenticate`);
+ * - it must still be in the GitHub org, re-checked against GitHub on this
+ *   request — the browser flow only ever checked at sign-in, which may have
+ *   been months ago;
+ * - and the caller's own session must be a `device` one. A delegated session
+ *   cannot delegate. See `sessions.delegate`.
+ */
+http.route({
+  path: "/api/v1/cli/sessions",
+  method: "POST",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const config = await loadConfig(ctx);
+      enforceMinVersion(req, config);
+      const { member, sessionId } = await authenticate(ctx, req);
+      // Non-negotiable, as on /secrets/token: this hands out a live 90-day
+      // credential, so a Convex row cannot outvote GitHub.
+      await requireOrgMembership(member.githubLogin);
+
+      const body: unknown = await req.json().catch(() => null);
+      const rawLabel = (body as { deviceLabel?: unknown } | null)?.deviceLabel;
+      if (rawLabel !== undefined && typeof rawLabel !== "string") {
+        fail(
+          400,
+          "bad_request",
+          "riabuild sent a malformed request for a server session.",
+          "Run `riabuild remote` again.",
+        );
+      }
+
+      const deviceLabel = (rawLabel ?? "").slice(0, 80) || "unknown device";
+      const cliVersion =
+        (req.headers.get("x-riabuild-cli-version") ?? "").slice(0, 32) ||
+        "unknown";
+
+      const token = randomToken(32);
+      const result = await ctx.runMutation(internal.sessions.delegate, {
+        parentSessionId: sessionId,
+        tokenHash: await sha256Hex(token),
+        deviceLabel,
+        cliVersion,
+      });
+
+      if (result.status !== "ok") {
+        // 403 rather than 401: this session is valid and will stay valid, so
+        // re-authenticating would succeed and change nothing. The CLI has to
+        // stop and say where to run the command instead.
+        fail(
+          403,
+          "delegation_not_permitted",
+          "This machine's riabuild session was itself signed in by another machine, so it cannot sign a third one in.",
+          "Run `riabuild remote` from your own laptop.",
+        );
+      }
+
+      return jsonResponse({
+        token,
+        // The handle `riabuild remote forget` revokes this by, through
+        // `DELETE /api/v1/cli/sessions/<id>`.
+        sessionId: result.sessionId,
+        expiresAt: result.expiresAt,
+        member: memberPayload(member),
+      });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
 /* GET /api/v1/me — profile, role, status                                      */
 /* -------------------------------------------------------------------------- */
 
