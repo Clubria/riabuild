@@ -8,10 +8,15 @@
 //!
 //! What it removes is reconstructible by design — `check()` is authoritative,
 //! so `state.json` is a cache, and every toolchain is a download away. What it
-//! does *not* touch is the developer's checkout (it lives outside the tree) and
-//! their riabuild sign-in (that token is in the keychain, never here). Their
-//! Claude Code sign-ins do go: each account's login is scoped to the config
-//! directory being removed, so `warnings` counts them and says so.
+//! does *not* touch is the developer's checkout, which lives outside the tree.
+//! Their riabuild sign-in usually survives too, because the token is in the
+//! keychain — but on a machine with no keyring it is `session.token` inside the
+//! tree, and a reset there signs them out. That is the right outcome (a reset
+//! is "start over", and `login` will simply ask again), and it is not worth a
+//! special case to preserve; it is noted because "your sign-in is safe" is no
+//! longer true everywhere. Their Claude Code sign-ins do go: each account's
+//! login is scoped to the config directory being removed, so `warnings` counts
+//! them and says so.
 
 use anyhow::Result;
 use riabuild_paths::{Paths, contract_tilde};

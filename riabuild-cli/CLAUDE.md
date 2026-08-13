@@ -169,7 +169,43 @@ minted for that server alone, it is labelled and listed in the dashboard, and
 `riabuild remote forget` revokes it. Laptops are unchanged, and the Infisical
 credential is still brokered per use and never written down.
 
-A **server's SSH password** is the second, and it is the same exception widened
+A **headless Linux machine's own session token** is the second, and it is the
+first exception widened from "a server riabuild manages" to "any machine with no
+keyring". `secret-tool` being installed is not the same as a Secret Service
+answering: `libsecret-tools` arrives as a transitive dependency all over the
+place, and a box with no D-Bus session bus has the binary and nothing listening.
+Such a machine used to have *no* branch at all — it was handed the keyring
+store, ran the whole device-code flow, and failed on the write, discarding a
+session the developer had just approved in a browser and printing `secret-tool:
+Cannot autolaunch D-Bus without X11 $DISPLAY` under "it is a bug in riabuild".
+It now gets `~/.riabuild/session.token` at 0600 in a directory at 0700, the same
+`FileKeychain` a managed server has always used.
+
+The design spec for Linux support ruled this out, on the grounds that
+"`RIABUILD_TOKEN` already covers the headless case". It does not and never did:
+`RIABUILD_TOKEN` is a CI and e2e hook, the dashboard has no screen that shows a
+developer a token to copy, and the string never appears in riabuild-web at all.
+That bullet is corrected in the spec rather than left standing.
+
+The **cache of a server's session on a keyring-less laptop** is the same
+widening once more, at `~/.riabuild/remote-sessions/<hash>`. `riabuild remote`
+reads that cache so a second run finds the server's token without re-minting;
+without a fallback it errored, and `riabuild remote` was unusable from any
+laptop with no libsecret — `e2e/remote/run.sh` carried it as "known gap (a)".
+Storing it is also the *conservative* option: the alternative is not "no token
+on disk", it is a fresh 90-day session minted on every run and recorded nowhere
+this laptop can revoke it. `riabuild remote forget` deletes it with the rest.
+
+`keychain::keyring_answers` owns the "is there a keyring here?" question and is
+the only place that decides it — `runner.which("secret-tool")` is not an answer
+to it, and reintroducing that test is how this bug comes back. All three call
+sites (`for_platform`, `for_password`, `for_account`) ask it; a fourth that
+asks `which` instead will look correct, pass CI, and fail on a server.
+`describe()` must name where the token really went: `provision.rs` prints it,
+and it is the only line telling the developer their token is in a file rather
+than a keyring.
+
+A **server's SSH password** is the third, and it is the same exception widened
 to cover a keyring-less *laptop*. `riabuild remote` falls back to a password when
 riabuild's key cannot sign in, and one run opens around ten SSH connections — so
 the password is asked for once and kept, under `remote-password:<hash>`. The
@@ -179,7 +215,8 @@ with neither — a container, a CI runner, a minimal distro — gets
 because the alternative there is not "no password on disk", it is riabuild asking
 again at every connection. `riabuild remote forget` deletes it beside the
 session. `keychain::select_password_store` owns that choice and is the only place
-that decides it. What the invariant was written to protect — the Infisical org
+that decides it — and it asks `keyring_answers`, not `which`, for the same
+reason the session token does. What the invariant was written to protect — the Infisical org
 credential — is untouched and still brokered per use.
 
 **`security(1)` takes the token in argv, and that is not an oversight.** Every other
@@ -315,7 +352,7 @@ crates form a straight line, each depending only on those above it:
 | `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
 | `runner` | `CommandRunner` — all subprocesses. `subdue` is the line filter a subdued child's output goes through; `pty` is the terminal it gets instead of riabuild's own | theme |
 | `paths` | path resolution (trait), `config` (`~/.riabuild` and state), `filelock` (the lock both are read and written under) | ui |
-| `keychain` | secret storage: the trait, the two platform CLIs, the server's file store | runner, ui |
+| `keychain` | secret storage: the trait, the two platform CLIs, the file store for machines with no keyring, and `keyring_answers` — whether a Secret Service actually replies | runner, ui |
 | `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over the SSH reverse-forward. `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the forward up and proves it carries traffic | gh-session, paths, runner, ui |

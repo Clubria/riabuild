@@ -12,20 +12,52 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-/// A server's own session, in the developer's namespace at 0600.
+/// A secret in a 0600 file, for a machine with nowhere better to put one.
 ///
-/// The one exception to "no secrets in ~/.riabuild", argued in the remote mode
-/// design: a server has no keyring, the token is minted for that server alone,
-/// it is labelled and listed in the dashboard, and `riabuild remote forget`
-/// revokes it. What the invariant exists to protect — the Infisical credential —
-/// is still brokered per use and still never written down.
+/// Two machines reach it, and [`describe`](Keychain::describe) must say which,
+/// because `provision.rs` prints that sentence to the developer and it is the
+/// only thing on screen that says where their token went. A store that names
+/// the wrong place is the shape of an earlier bug here — `scope.rs` still
+/// carries the note about a laptop whose keychain reported itself as "this
+/// server's riabuild namespace" — so the description is a constructor
+/// argument rather than one string that covers both.
+///
+/// - [`server_namespace`](Self::server_namespace): a managed server's own
+///   session. The original exception to "no secrets in ~/.riabuild", argued in
+///   the remote mode design: a server has no keyring, the token is minted for
+///   that server alone, it is labelled and listed in the dashboard, and
+///   `riabuild remote forget` revokes it.
+/// - [`keyringless_machine`](Self::keyringless_machine): a Linux machine with
+///   no Secret Service answering. The same exception, widened the same way the
+///   remote-password design already widened it for an SSH password, and for
+///   the identical reason: the alternative on such a machine is not "no token
+///   on disk", it is that riabuild cannot run there at all.
+///
+/// What the invariant exists to protect — the Infisical org credential — is
+/// untouched by either: it is still brokered per use and still never written
+/// down.
 pub struct FileKeychain {
     path: PathBuf,
+    description: &'static str,
 }
 
 impl FileKeychain {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    /// A managed server's own session token, in the developer's namespace.
+    pub fn server_namespace(path: PathBuf) -> Self {
+        Self {
+            path,
+            description: "this server's riabuild namespace",
+        }
+    }
+
+    /// A machine whose keyring does not answer. Named for the *reason* rather
+    /// than the path, because that reason is what the developer needs in order
+    /// to know this is not where riabuild would normally have put it.
+    pub fn keyringless_machine(path: PathBuf) -> Self {
+        Self {
+            path,
+            description: "a private file, because this machine has no keyring",
+        }
     }
 }
 
@@ -58,7 +90,7 @@ impl Keychain for FileKeychain {
     }
 
     fn describe(&self) -> &'static str {
-        "this server's riabuild namespace"
+        self.description
     }
 }
 
@@ -140,7 +172,7 @@ mod tests {
     async fn a_server_keeps_its_session_in_a_file_it_owns() {
         let home = TempDir::new().expect("tempdir");
         let path = home.path().join("session.token");
-        let keychain = FileKeychain::new(path.clone());
+        let keychain = FileKeychain::server_namespace(path.clone());
 
         assert_eq!(keychain.get().await.expect("read"), None);
         keychain.set("rb_live_token").await.expect("write");
@@ -161,7 +193,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = TempDir::new().expect("tempdir");
         let path = home.path().join("session.token");
-        FileKeychain::new(path.clone())
+        FileKeychain::server_namespace(path.clone())
             .set("rb_live_token")
             .await
             .expect("write");
@@ -189,7 +221,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("loosen permissions");
 
-        let keychain = FileKeychain::new(path.clone());
+        let keychain = FileKeychain::server_namespace(path.clone());
         keychain.set("rb_live_token").await.expect("write");
 
         assert_eq!(
@@ -251,7 +283,7 @@ mod tests {
         std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o777))
             .expect("loosen permissions");
 
-        FileKeychain::new(namespace.join("session.token"))
+        FileKeychain::server_namespace(namespace.join("session.token"))
             .set("rb_live_token")
             .await
             .expect("write");
@@ -269,9 +301,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_file_store_says_which_machine_it_is() {
+        // `provision.rs` prints `describe()`, and it is the only line telling a
+        // developer where their token went. One string covering both callers
+        // would put "this server's riabuild namespace" on a laptop — which is
+        // the exact dishonesty `scope.rs` still carries a note about.
+        let path = PathBuf::from("/home/ada/.riabuild/session.token");
+        assert_eq!(
+            FileKeychain::server_namespace(path.clone()).describe(),
+            "this server's riabuild namespace"
+        );
+        assert_eq!(
+            FileKeychain::keyringless_machine(path).describe(),
+            "a private file, because this machine has no keyring"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_keyringless_machines_token_is_as_private_as_a_servers() {
+        // The fallback is a widening of "no secrets in ~/.riabuild", so it has
+        // to carry the same protection the original exception was granted on:
+        // 0600, in a directory at 0700. Same code path as the server store, and
+        // this asserts it rather than assuming the shared constructor implies
+        // it.
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().expect("tempdir");
+        let dir = home.path().join("riabuild");
+        let path = dir.join("session.token");
+        FileKeychain::keyringless_machine(path.clone())
+            .set("rb_live_token")
+            .await
+            .expect("write");
+
+        let file = tokio::fs::metadata(&path).await.expect("stat file");
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+        let parent = tokio::fs::metadata(&dir).await.expect("stat dir");
+        assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[tokio::test]
     async fn writing_the_token_twice_replaces_it() {
         let home = TempDir::new().expect("tempdir");
-        let keychain = FileKeychain::new(home.path().join("session.token"));
+        let keychain = FileKeychain::server_namespace(home.path().join("session.token"));
         keychain.set("first").await.expect("write");
         keychain.set("second").await.expect("write");
         assert_eq!(

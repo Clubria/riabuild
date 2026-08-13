@@ -61,8 +61,15 @@ pub trait Paths: Send + Sync {
     fn org_settings_file(&self) -> PathBuf {
         self.root().join("org-settings.json")
     }
-    /// A server's own riabuild session. Never used on a laptop, where the
-    /// platform keychain holds it instead.
+    /// This riabuild's own session, when it goes in a file rather than a
+    /// keyring. Two machines reach it, and the root is what tells them apart: a
+    /// **managed server**, where the root is the developer's namespace under
+    /// `.riabuild-remote/<member-id>`, and a **headless machine** with no
+    /// Secret Service answering, where it is the ordinary `~/.riabuild`.
+    ///
+    /// Not used where there *is* a keyring — see `keychain::select`, which owns
+    /// the decision, and `keychain::keyring_answers`, which owns the question
+    /// the second case turns on.
     fn session_token_file(&self) -> PathBuf {
         self.root().join("session.token")
     }
@@ -150,6 +157,19 @@ pub trait Paths: Send + Sync {
     /// amended "No secrets in `~/.riabuild/`" note in `CLAUDE.md`.
     fn remote_password_file(&self, hash: &str) -> PathBuf {
         self.ssh_dir().join("passwords").join(hash)
+    }
+    /// The laptop's cache of one *server's* session token, on a laptop with no
+    /// keyring to hold it. Keyed by `Remote::hash()`, so several servers never
+    /// collide and `remote forget` deletes exactly one.
+    ///
+    /// Separate from [`remote_password_file`](Paths::remote_password_file)
+    /// because they are different secrets for the same server — a riabuild
+    /// bearer token and a Unix password — and `forget` deletes them
+    /// individually. Separate from
+    /// [`session_token_file`](Paths::session_token_file) because that one is
+    /// *this* machine's own session: one file per laptop, not per server.
+    fn remote_session_file(&self, hash: &str) -> PathBuf {
+        self.root().join("remote-sessions").join(hash)
     }
 }
 

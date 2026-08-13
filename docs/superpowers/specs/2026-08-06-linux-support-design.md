@@ -466,6 +466,33 @@ healthy in the workflow log and fails on the developer's first command.
 - musl-vs-glibc *choice* — riabuild ships static musl only
 - Arch, Alpine, Nix, or Snap packaging
 - Replacing Homebrew as the macOS distribution channel
-- A file-based fallback for machines with no keyring. `RIABUILD_TOKEN` already covers the
+- ~~A file-based fallback for machines with no keyring. `RIABUILD_TOKEN` already covers the
   headless case, and writing a token to `~/.riabuild/` would break an invariant the whole
-  brokering design rests on.
+  brokering design rests on.~~
+
+  **Reversed.** Both halves of that reasoning were wrong, and the second only
+  looked right because of the first.
+
+  `RIABUILD_TOKEN` never covered the headless case. It is a CI and e2e hook —
+  the string does not appear anywhere in riabuild-web, and the dashboard has no
+  screen that shows a developer a token to copy. There was no way for a human to
+  obtain the value this bullet told them to set. A developer who ran riabuild on
+  a Linux server got a browser approval, a discarded token, and
+  `secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY` presented as a
+  riabuild bug to report to their team lead.
+
+  And the invariant is not what this would have broken. What "no secrets in
+  `~/.riabuild/`" protects is the **Infisical org credential**, which is still
+  brokered per use and still never written down. A session token for one machine,
+  at 0600, is the same object the remote-mode design already sanctioned writing to
+  a server's namespace and the remote-password design already widened to a
+  keyring-less laptop — both for the argument that applies here unchanged: the
+  alternative is not "no token on disk", it is that riabuild does not run on that
+  machine at all.
+
+  A related mistake shipped alongside this one: "has this machine a keyring?" was
+  implemented as `which("secret-tool")`. libsecret is a *client* for a D-Bus
+  Secret Service, so the binary being present says nothing about a service being
+  reachable — which is why the failure surfaced at the write rather than at the
+  decision. `keychain::keyring_answers` now probes the service, and the
+  "No secrets in `~/.riabuild/`" note in `riabuild-cli/CLAUDE.md` carries the rule.

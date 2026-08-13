@@ -78,13 +78,16 @@ not shareable. The CLI can neither add nor remove a shared server; what
 `riabuild remote forget shared-<name>` removes is this laptop's own traces. See
 `docs/superpowers/specs/2026-08-12-shared-servers-design.md`.
 
-Two secrets riabuild *does* keep are named exceptions, both local to one machine and
-one server, and neither is brokered: a server's own session token, and the SSH password
+Two secrets riabuild *does* keep are named exceptions, both local to one machine, and
+neither is brokered: **this machine's own riabuild session token**, and the SSH password
 for a server riabuild's key cannot sign in to. Both go in the OS keychain where there is
-one and a 0600 file where there is not, and `riabuild remote forget` deletes both. See
-"No secrets in `~/.riabuild/`" in `riabuild-cli/CLAUDE.md` for the reasoning and the
-storage rules. Nothing here loosens the sentence above it: the Infisical credential is
-still minted per use and still never written down.
+one and a 0600 file where there is not — and "where there is not" includes a headless
+Linux box whose `secret-tool` is installed but has no D-Bus session bus to talk to, which
+is an ordinary machine to run a provisioner on and not a misconfiguration. `riabuild
+remote forget` deletes a server's copies of both. See "No secrets in `~/.riabuild/`" in
+`riabuild-cli/CLAUDE.md` for the reasoning and the storage rules. Nothing here loosens the
+sentence above it: the Infisical credential is still minted per use and still never
+written down.
 
 **Identity is GitHub, authorization is Convex.** Membership in the Clubria GitHub org
 gates access at all; `members.role` decides how much. Every secret-brokering request

@@ -139,8 +139,9 @@ pub(crate) async fn retire_identity(
     let account = keychain::for_account(
         runner.clone(),
         &keychain::remote_account(&remote.hash()),
-        None,
-    );
+        paths.remote_session_file(&remote.hash()),
+    )
+    .await;
     account.delete().await?;
 
     // The session and the password are two accounts for one server (see

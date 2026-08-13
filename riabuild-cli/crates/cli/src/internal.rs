@@ -108,7 +108,7 @@ pub(crate) async fn askpass(
     use riabuild_remote::askpass::{ACCOUNT_VAR, answer, store};
 
     let account = std::env::var(ACCOUNT_VAR).unwrap_or_default();
-    let store = store(runner, paths, &account)?;
+    let store = store(runner, paths, &account).await?;
     let answer = answer(store.as_ref(), prompt, riabuild_ui::secret::ask_secret).await?;
 
     if let Some(why) = answer.not_saved {
