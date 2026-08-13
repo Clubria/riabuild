@@ -20,7 +20,7 @@
 //! ever confirmed. With it, riabuild refuses that key and says so.
 
 use crate::ApiClient;
-use crate::openssh::public_half;
+use crate::openssh::{canonical, public_half};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -116,7 +116,13 @@ fn usable(wire: &WireKey) -> Result<IssuedKey, String> {
         key_type: derived.key_type,
         public_key: derived.public_key,
         fingerprint: derived.fingerprint,
-        private_key: wire.private_key.clone(),
+        // Re-emitted, never passed through. `public_half` had to normalise the
+        // framing away to read this key at all, and treating that as a claim
+        // that the original bytes were usable is what shipped broken: a key
+        // with CRLF endings, no trailing newline, an unwrapped body or indented
+        // lines validates here and is then refused by `ssh-add` with
+        // `error in libcrypto`. See `openssh::canonical`.
+        private_key: canonical(&wire.private_key).map_err(|why| format!("{label:?}: {why}"))?,
     })
 }
 
@@ -179,7 +185,31 @@ mod tests {
         assert_eq!(key.key_type, "ssh-ed25519");
         assert_eq!(key.public_key, ED25519_PUBLIC);
         assert_eq!(key.fingerprint, ED25519_FINGERPRINT);
+        // Canonical, not the wire string — see `openssh::canonical`. Equal
+        // here only because the fixture is already what ssh-keygen writes.
         assert_eq!(key.private_key, ED25519_PRIVATE);
+    }
+
+    #[test]
+    fn a_key_the_row_stored_with_broken_framing_is_repaired_rather_than_passed_on() {
+        // The bug a developer hit against a real server: riabuild validated the
+        // key, then handed `ssh-add` the bytes it had been given, and OpenSSH
+        // refused them with `error in libcrypto`. Both halves matter here — the
+        // row must still be accepted (the key is fine), and what comes out must
+        // be what `ssh-keygen` would have written.
+        let mangled = ED25519_PRIVATE.trim_end().replace('\n', "\r\n");
+        let key = usable(&WireKey {
+            private_key: mangled,
+            ..wire()
+        })
+        .expect("a key with odd framing is still a usable key");
+
+        assert_eq!(key.private_key, ED25519_PRIVATE);
+        assert!(
+            key.private_key
+                .ends_with("-----END OPENSSH PRIVATE KEY-----\n")
+        );
+        assert!(!key.private_key.contains('\r'));
     }
 
     #[test]
