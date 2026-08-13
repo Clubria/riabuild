@@ -422,8 +422,19 @@ one. The launchers are the only thing that names a config directory — `CLAUDE_
 deliberately **not** exported into the environment shell, so a `claude` started outside a
 launcher cannot land in an account by accident, and one exported value cannot quietly make
 all nine share a directory. `riabuild claude list|new|delete|primary` manages the list,
-every environment shell opens with the account box, and the org's Claude settings and the
-checkout's trust apply to every account, never just the first.
+every environment shell opens with the account box, and the org's Claude settings, the
+checkout's trust, and the plugins the checkout declares apply to every account, never just
+the first.
+
+**Trust is the only gate Claude Code puts in front of a checkout's settings, and the
+plugins ride on it.** `hasTrustDialogAccepted` — keyed by the checkout's *git root*, which
+is why a subdirectory and a `.claude/worktrees/` worktree both inherit it — is what the
+dialog writes and all it writes. Once it is set, the `extraKnownMarketplaces` and
+`enabledPlugins` in the checkout's `.claude/settings.json` are installed by a background
+pass with no second dialog. `claude_plugins` does that installation up front only because
+the background pass lands *during* the first session and a plugin is loaded on the next
+one — not because there is another prompt to suppress. Do not go looking for a
+plugin-trust key; there isn't one.
 
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
 
