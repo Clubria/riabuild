@@ -110,7 +110,7 @@ sequence in it, and prints what is left as dimmed lines. That is why `runner/pty
 through `AsyncFd` and never a blocking read — a subdued `sudo apt-get` holds this loop for
 as long as the developer takes to type a password, and a blocking read would hold the
 reactor with it. The handoff remains the default and the rule everywhere `subdued` is
-`None`, which is every site except apt, dnf, `gh auth login`, and `ssh-copy-id`.
+`None`, which is every site except apt, dnf, and `gh auth login`.
 
 Three things are synchronous because they are not IO, and are not exceptions to anything:
 `paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
@@ -475,7 +475,7 @@ terminal. riabuild does not trust a third-party program to keep a tidy terminal,
 rcfile text does, and for the same reason it is `ctx.ui.theme()` that gets passed.
 
 Subduing is for the commands riabuild runs *at* the developer — apt, dnf,
-`gh auth login`, `ssh-copy-id`. Not the environment shell, not `ssh`/`mosh`, not
+`gh auth login`. Not the environment shell, not `ssh`/`mosh`, not
 `claude`: that is the developer's workspace, not riabuild's output. Not the clipboard
 shim either, where riabuild is impersonating `xclip` and its stdout is a payload rather
 than a page. Design:

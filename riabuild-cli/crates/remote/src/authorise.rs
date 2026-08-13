@@ -5,34 +5,29 @@
 //! kept its security-rationale comments over trimming further, so this is a
 //! second file rather than a third trim pass.
 //!
+//! This file decides *whether* to install the key and what to say about the
+//! outcome; `copy` is what actually installs it, and its module doc holds the
+//! argument for riabuild writing its own `ssh-copy-id` rather than running
+//! the one on the machine.
+//!
 //! ## What a password means here
 //!
 //! This is the one step in remote mode that can end up talking to a server
 //! that only knows a password for the developer, not riabuild's new key yet.
 //!
-//! `authorise` still never prompts for that password itself: it hands the
-//! terminal to `ssh-copy-id` via [`CommandRunner::run_interactive`], the same
-//! handoff `main.rs` uses for the environment shell, and `ssh-copy-id` execs
-//! the real `ssh`, which does its own prompting and returns only an exit
-//! code. What changed is where that prompt is *answered* — `askpass` puts
-//! riabuild on the other end of it, so the password is asked for once rather
-//! than at each of the ten connections one `riabuild remote` opens. The
-//! argument for that, and against the `sshpass`-shaped alternative this file
-//! used to rule out, is in `askpass`'s module doc rather than repeated here.
+//! `authorise` never prompts for that password itself. The copy is an
+//! ordinary captured `ssh` carrying `askpass`'s environment, so `ssh` asks
+//! the helper and reads the answer off its stdout pipe: nothing is typed at
+//! this process, nothing lands in an argument vector, and the password is
+//! asked for once rather than at each of the ten connections one `riabuild
+//! remote` opens. The argument for that, and against the `sshpass`-shaped
+//! alternative this file used to rule out, is in `askpass`'s module doc
+//! rather than repeated here.
 //!
-//! That handoff is **subdued**: `ssh-copy-id` runs under a pty riabuild owns,
-//! and its output is filtered down to dimmed lines rather than printed over
-//! riabuild's own. The filter is on the *output* direction only.
-//!
-//! Which leaves one thing worth being exact about. On the `askpass` path
-//! nothing is typed here at all — `ssh` asks the helper and reads the answer
-//! off its stdout pipe, so the pty carries no password in either direction. On
-//! an OpenSSH older than 8.4, which ignores `SSH_ASKPASS_REQUIRE` and prompts
-//! on the terminal itself, that terminal is now riabuild's pty, so the
-//! keystrokes pass through riabuild's process on their way to the child. They
-//! are forwarded verbatim and immediately; no copy is kept and nothing
-//! inspects them. The password still exists only in the child's memory and the
-//! terminal driver's, never in any `String` this crate owns, so there is
+//! On an OpenSSH older than 8.4, which ignores `SSH_ASKPASS_REQUIRE`, `ssh`
+//! prompts on the terminal itself — it opens `/dev/tty` directly, so it
+//! reaches the developer whether or not riabuild is capturing the child's
+//! stdio, and the password still exists only in `ssh`'s own memory. There is
 //! nothing here for a log line, an error message, or `Failure::detail` to
 //! accidentally include.
 //!
@@ -43,25 +38,36 @@
 //! `password` or `keyboard-interactive`, and that answer divides everything
 //! below it:
 //!
-//! - A server offering **neither** must not be handed to `ssh-copy-id` —
-//!   there is no password to ask for, so a prompt would be a lie. That is a
-//!   hard failure with the key as a line to paste by hand, and so are the two
+//! - A server offering **neither** must not be handed to the copy — there is
+//!   no password to ask for, so a prompt would be a lie. That is a hard
+//!   failure with the key as a line to paste by hand, and so are the two
 //!   other cases where nothing riabuild could do next would work: a public key
 //!   that is missing, and a host key that does not match the pin.
-//! - Past that guard, a way in exists. `ssh-copy-id` being absent, exiting
-//!   non-zero, or succeeding while the key *still* cannot sign in are all
-//!   real, ordinary outcomes — an `AuthorizedKeysFile` pointing elsewhere, a
-//!   home directory on a mode sshd will not trust, an
-//!   `AuthenticationMethods publickey,password` policy — and none of them
-//!   means the developer cannot reach the machine. They warn, keep the
-//!   paste-this-line remedy, and return `Ok`. Every later `ssh` falls back to
-//!   the password on its own: `IdentitiesOnly=yes` restricts which *keys* are
-//!   offered, never which *methods*.
+//! - Past that guard, a way in exists. The copy failing, or succeeding while
+//!   the key *still* cannot sign in, are both real, ordinary outcomes — an
+//!   `AuthorizedKeysFile` pointing elsewhere, a home directory on a mode sshd
+//!   will not trust, an `AuthenticationMethods publickey,password` policy —
+//!   and neither means the developer cannot reach the machine. They warn and
+//!   return `Ok`. Every later `ssh` falls back to the password on its own:
+//!   `IdentitiesOnly=yes` restricts which *keys* are offered, never which
+//!   *methods*.
 //!
-//! Stopping there was the bug this replaces. It stopped a developer who had a
-//! working way onto the server, at the point where every remaining step —
+//! Stopping there was an earlier bug this replaced. It stopped a developer who
+//! had a working way onto the server, at the point where every remaining step —
 //! installing the server's riabuild, minting its session, lending it a GitHub
 //! sign-in — would have succeeded.
+//!
+//! ## Which warning
+//!
+//! There are two, and they are not interchangeable. When riabuild has just
+//! written the line, the remedy is the key and where it goes. When the line
+//! was **already there** and the server refuses it anyway, that remedy is
+//! worse than useless: it tells a developer to paste a key they have pasted
+//! before, which is what riabuild did on every run for as long as
+//! `ssh-copy-id` was the thing deciding whether the key was installed. That
+//! case names the server-side settings that can produce it instead.
+
+mod copy;
 
 use super::Remote;
 use super::host_key::entry_host;
@@ -134,50 +140,6 @@ fn stale_pin(remote: &Remote, paths: &dyn Paths, stderr: String) -> anyhow::Erro
     .into()
 }
 
-/// Makes sure the developer's own `~/.ssh` exists, at mode 0700.
-///
-/// Not riabuild's `ssh_dir()` — that one is `~/.riabuild/ssh` and riabuild
-/// creates it itself. This is the real one, and it belongs to `ssh-copy-id`:
-/// it builds its temporary directory *under* `~/.ssh` and fails outright if
-/// there is nothing to build it under, with
-///
-/// ```text
-/// mktemp: failed to create directory via template '…/.ssh/ssh-copy-id.XXXXXXXXXX'
-/// ssh-copy-id: ERROR: failed to create required temporary directory under ~/.ssh
-/// ```
-///
-/// which says nothing about riabuild and gives a developer nothing to do.
-///
-/// On any laptop that has cloned over SSH or run `ssh` once, `~/.ssh` is
-/// already there — which is exactly why this went unnoticed until the remote
-/// e2e ran against a container whose home directory was fresh. riabuild's
-/// whole claim is to be the *first* thing a developer runs, and a machine
-/// that has never opened an SSH connection has no `~/.ssh` at all.
-///
-/// 0700 at creation rather than created-then-chmod: `ssh` refuses to use a
-/// key directory other users can read, so a directory made at the umask
-/// would be a second failure, later, from a different tool, with a different
-/// message.
-async fn ensure_dot_ssh(paths: &dyn Paths) -> Result<()> {
-    let dot_ssh = paths.home().join(".ssh");
-    if tokio::fs::metadata(&dot_ssh).await.is_ok() {
-        // Already there. Its mode is the developer's business — repairing it
-        // would be riabuild changing something it did not create.
-        return Ok(());
-    }
-
-    let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(&dot_ssh).await.map_err(|error| {
-        Failure::new(
-            "preparing this machine to authorise a key",
-            "Create it yourself with `mkdir -p ~/.ssh && chmod 700 ~/.ssh`, then run `riabuild remote` again.",
-        )
-        .detail(format!("could not create {}: {error}", dot_ssh.display()))
-    })?;
-    Ok(())
-}
-
 /// Can riabuild's own key sign in, without a password and without falling
 /// back to the developer's own agent or default identities?
 ///
@@ -221,10 +183,13 @@ pub async fn can_sign_in(
 
 /// Installs riabuild's public key on the server, if it is not already there.
 ///
-/// Idempotent, same rule as `ensure_key`: the first thing this does is check
-/// whether riabuild's key already works, and if so it returns immediately
-/// without touching the server again — a second `riabuild remote` against an
-/// already-authorised box is a no-op here, not a repeat `ssh-copy-id` run.
+/// Idempotent twice over, and it needs to be. The first check is whether
+/// riabuild's key already *works*, which returns immediately without touching
+/// the server — the same rule as `ensure_key`. The second lives in [`copy`]
+/// and asks whether the line is already in the file, which is the only one of
+/// the two that still answers usefully on a server that does not honour
+/// `authorized_keys`: there, the first check says no on every run forever, so
+/// without the second, every run appends another identical line.
 ///
 /// See the module doc for why a password, when one exists, never passes
 /// through riabuild's own hands.
@@ -315,72 +280,58 @@ pub async fn authorise(
         .iter()
         .any(|method| method == "password" || method == "keyboard-interactive");
     if !interactive {
-        // Nothing to prompt for: a publickey-only server would make
-        // `ssh-copy-id` sit on a prompt nobody can answer.
+        // Nothing to prompt for: a publickey-only server would leave the copy
+        // sitting on a prompt nobody can answer.
         return Err(paste()
             .detail("that server accepts keys only, so there is no password to ask you for")
             .into());
     }
-    if runner.which("ssh-copy-id").is_none() {
-        // `ssh-copy-id` ships with the OpenSSH client on both platforms
-        // riabuild targets, but a machine can still be missing it. Not fatal:
-        // it is the tool that makes the *key* work, and the server has just
-        // said it will take a password, so the developer still gets in — they
-        // are only left installing the key by hand.
-        carry_on("ssh-copy-id is not installed on this machine");
-        return Ok(());
-    }
-
-    ensure_dot_ssh(paths).await?;
 
     ui.working("Authorised", "installing the key");
-    // Built explicitly rather than by extending `ssh_options`, which carries
-    // its own `-i` for the private key: `ssh-copy-id` parses `-i` with its
-    // own getopt and would see two. Deliberately without `IdentitiesOnly` —
-    // an existing key or the agent may be what proves who we are on a server
-    // with password auth disabled for everyone but the developer already
-    // trusted there.
-    let args = vec![
-        "-i".to_string(),
-        public_key_path.to_string_lossy().into_owned(),
-        "-p".to_string(),
-        remote.port.to_string(),
-        "-F".to_string(),
-        "/dev/null".to_string(),
-        "-o".to_string(),
-        format!(
-            "UserKnownHostsFile={}",
-            paths.known_hosts_file().to_string_lossy()
-        ),
-        "-o".to_string(),
-        "StrictHostKeyChecking=yes".to_string(),
-        remote.target(),
-    ];
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // Subdued: `ssh-copy-id` prints through riabuild rather than over it. On
-    // top of the askpass environment, not instead of it — the helper is what
-    // answers the password prompt, and the pty is only what the child draws on.
-    // See the module doc for what that does and does not mean for keystrokes.
-    let code = runner
-        .run_interactive(
-            "ssh-copy-id",
-            &refs,
-            &RunOptions {
-                subdued: Some(ui.theme()),
-                ..super::askpass::run_options(remote, paths)
-            },
-        )
-        .await?;
-    if code != 0 {
-        carry_on("ssh-copy-id could not install it");
+    let installed = match copy::install_key(remote, paths, runner.clone(), &public_key).await {
+        Ok(installed) => installed,
+        Err(error) => {
+            // A read-only home, a full disk, a connection that dropped. Not
+            // fatal: the server has just said it will take a password, so
+            // this costs the developer a key rather than the machine.
+            carry_on(&format!(
+                "riabuild could not add it to authorized_keys there ({error})"
+            ));
+            return Ok(());
+        }
+    };
+
+    if installed == copy::Installed::AlreadyThere {
+        // Nothing was written, so nothing can have changed the answer
+        // `can_sign_in` gave at the top of this function — re-probing would
+        // spend another connection, and on the very server this branch exists
+        // for, another password round trip, to be told the same thing.
+        //
+        // This warning deliberately does *not* end in `paste`'s remedy. The
+        // line is already in the file: telling the developer to add it is how
+        // they end up pasting a key they have pasted before, and it is what
+        // riabuild itself did on every run for as long as `ssh-copy-id` was
+        // the thing deciding whether the key was installed.
+        ui.warn(&format!(
+            "riabuild's key is already in ~/.ssh/authorized_keys on {host}, and that \
+             server still refuses it — so riabuild has left the file alone rather than \
+             adding another copy of the same line.\n    \
+             The rest of this run will use {target}'s password instead; riabuild asks \
+             for it once and remembers it.\n    \
+             Something on {host} is not honouring that file. The usual causes are an \
+             `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
+             `AuthenticationMethods` that needs more than a key, or a home directory \
+             whose mode `StrictModes` rejects.",
+            host = remote.host,
+            target = remote.target(),
+        ));
         return Ok(());
     }
 
     if !can_sign_in(remote, paths, runner).await? {
-        // `ssh-copy-id` exited 0, so the line reached `authorized_keys` and
-        // sshd still refused it. Ordinary causes: `AuthorizedKeysFile` points
-        // somewhere else, the account's home is on a mode sshd will not
-        // trust, or the policy is `AuthenticationMethods publickey,password`.
+        // The line reached `authorized_keys` just now and sshd still refuses
+        // it — same causes as the branch above, but this run is the one that
+        // put it there, so the developer is hearing it for the first time.
         // None of them is a reason to stop a developer whose password works.
         carry_on("the key was copied, but signing in with it still does not work");
         return Ok(());
@@ -405,74 +356,6 @@ mod tests {
         }
     }
 
-    /// The laptop riabuild claims to be the first thing run on: one that has
-    /// never opened an SSH connection, so it has no `~/.ssh` at all.
-    /// `ssh-copy-id` builds its temporary directory under that path and exits
-    /// with `failed to create required temporary directory under ~/.ssh` when
-    /// it is missing — a message with riabuild nowhere in it and nothing in it
-    /// for a developer to do.
-    #[tokio::test]
-    async fn a_machine_that_has_never_used_ssh_gets_the_directory_ssh_copy_id_needs() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        let dot_ssh = home.path().join(".ssh");
-        assert!(
-            !dot_ssh.exists(),
-            "the point of the test is that it is absent"
-        );
-
-        ensure_dot_ssh(&paths).await.expect("creates it");
-
-        let mode = tokio::fs::metadata(&dot_ssh)
-            .await
-            .expect("created")
-            .permissions()
-            .mode()
-            & 0o777;
-        // `ssh` refuses a key directory others can read, so creating it at the
-        // umask would only move the failure to a later tool with a different
-        // message.
-        assert_eq!(mode, 0o700, "created at {mode:o}, not 0700");
-    }
-
-    /// An existing `~/.ssh` is the developer's, including its mode. Repairing
-    /// it would be riabuild changing something it did not create — and on a
-    /// normal laptop this is the case that always runs.
-    #[tokio::test]
-    async fn an_existing_ssh_directory_is_left_exactly_as_it_was() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        let dot_ssh = home.path().join(".ssh");
-        tokio::fs::create_dir_all(&dot_ssh).await.expect("mkdir");
-        tokio::fs::set_permissions(&dot_ssh, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod");
-        tokio::fs::write(dot_ssh.join("config"), "Host *\n")
-            .await
-            .expect("write");
-
-        ensure_dot_ssh(&paths).await.expect("no-op");
-
-        let mode = tokio::fs::metadata(&dot_ssh)
-            .await
-            .expect("still there")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o755,
-            "riabuild must not chmod what it did not create"
-        );
-        assert!(
-            dot_ssh.join("config").exists(),
-            "and must not disturb what is in it"
-        );
-    }
-
     /// Writes the `.pub` file `authorise` expects to find already generated
     /// by `ensure_key` — every scenario past the "key already works" early
     /// return needs this, now that a missing key is a distinct, actionable
@@ -486,7 +369,7 @@ mod tests {
                 .identity_dir()
                 .join(remote().hash())
                 .with_extension("pub"),
-            "ssh-ed25519 AAAA riabuild",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild",
         )
         .await
         .expect("write pub");
@@ -629,12 +512,11 @@ mod tests {
             "the remedy must name the file and the line to clear: {}",
             failure.action
         );
-        assert!(
-            !fake
-                .calls()
-                .iter()
-                .any(|call| call.starts_with("ssh-copy-id")),
-            "ssh-copy-id cannot help across a refused host key"
+        assert_eq!(
+            copy_attempts(&fake),
+            0,
+            "nothing can be installed across a refused host key: {:?}",
+            fake.calls()
         );
     }
 
@@ -652,7 +534,7 @@ mod tests {
                 .identity_dir()
                 .join(remote().hash())
                 .with_extension("pub"),
-            "ssh-ed25519 AAAA riabuild",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild",
         )
         .await
         .expect("write pub");
@@ -688,15 +570,14 @@ mod tests {
         );
         assert!(
             failure.detail.contains("keys only"),
-            "the reason must distinguish this from a missing ssh-copy-id: {}",
+            "the reason must distinguish this from a failed copy: {}",
             failure.detail
         );
-        assert!(
-            !fake
-                .calls()
-                .iter()
-                .any(|call| call.starts_with("ssh-copy-id")),
-            "ssh-copy-id cannot help here and must not be run"
+        assert_eq!(
+            copy_attempts(&fake),
+            0,
+            "there is no password to ask for, so nothing may be attempted: {:?}",
+            fake.calls()
         );
     }
 
@@ -709,12 +590,7 @@ mod tests {
         authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
             .await
             .expect("already fine");
-        assert!(
-            !fake
-                .calls()
-                .iter()
-                .any(|call| call.starts_with("ssh-copy-id"))
-        );
+        assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
 
     /// The refusal a server that will take a password gives, used by every
@@ -732,6 +608,24 @@ mod tests {
                 "",
                 TAKES_A_PASSWORD,
             )
+    }
+
+    /// The server-side exit status meaning "the key was already there",
+    /// shared with the half that emits it rather than written as a literal
+    /// here — this is the contract between the two, and a test holding its
+    /// own copy of it would keep passing after the contract changed.
+    use copy::ALREADY_THERE;
+
+    /// How many times `authorise` asked the server to install the key.
+    ///
+    /// The copy is an ordinary `ssh` now rather than a separately-named
+    /// program, so it is told apart from the probes around it by the file it
+    /// names — which is also the thing worth counting.
+    fn copy_attempts(fake: &FakeRunner) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|call| call.contains("authorized_keys"))
+            .count()
     }
 
     /// The one warning `authorise` printed, or a panic naming what it did
@@ -752,7 +646,7 @@ mod tests {
             "the warning must still say where the key goes: {warning}"
         );
         assert!(
-            warning.contains("ssh-ed25519 AAAA riabuild"),
+            warning.contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild"),
             "…and must still carry the key itself: {warning}"
         );
         assert!(
@@ -761,57 +655,105 @@ mod tests {
         );
     }
 
+    /// The reported bug, from this side of it. A server that does not honour
+    /// `authorized_keys` fails [`can_sign_in`] on every run, so `authorise`
+    /// reaches the copy step on every run — that part is correct and stays.
+    /// What must not happen is a second identical line, which is what
+    /// `ssh-copy-id` did daily, because it decided "already installed?" by
+    /// trying to log in and that answer is no on such a server forever.
     #[tokio::test]
-    async fn the_copy_prints_through_riabuild_and_keeps_its_askpass_environment() {
+    async fn a_key_already_in_authorized_keys_is_not_appended_again() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
         write_public_key(&paths).await;
-        let fake = Arc::new(a_server_that_takes_a_password().with("ssh-copy-id", 0, "", ""));
+        let fake = Arc::new(a_server_that_takes_a_password().containing(
+            "authorized_keys",
+            ALREADY_THERE,
+            "",
+            "",
+        ));
+        let ui = Ui::new(true);
+
+        authorise(&remote(), &paths, fake.clone(), &ui)
+            .await
+            .expect("a password is still a way in");
+
+        assert_eq!(
+            copy_attempts(&fake),
+            1,
+            "one look at the file, and no second write: {:?}",
+            fake.calls()
+        );
+
+        let warning = the_one_warning(&ui);
+        assert!(
+            warning.contains("already in"),
+            "the developer has to be told the line is there, or the advice \
+             below it makes no sense: {warning}"
+        );
+        assert!(
+            !warning.to_lowercase().contains("add this line"),
+            "telling them to paste a key that is already in the file is what \
+             this whole change is about: {warning}"
+        );
+        assert!(
+            warning.contains("AuthorizedKeysFile"),
+            "…and pointed at what could actually be wrong on the server: {warning}"
+        );
+    }
+
+    /// Nothing changed on the server, so nothing can have changed the answer
+    /// to "can this key sign in?" — and each probe is a full connection that,
+    /// on the very server this path exists for, costs the developer a
+    /// password round trip.
+    #[tokio::test]
+    async fn a_key_that_was_already_there_is_not_probed_a_second_time() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+        let fake = Arc::new(a_server_that_takes_a_password().containing(
+            "authorized_keys",
+            ALREADY_THERE,
+            "",
+            "",
+        ));
 
         authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
             .await
-            .expect("a password is a way in");
+            .expect("a password is still a way in");
 
-        // The copy is the only command here that draws on the terminal; the
-        // probes around it are captured, so nothing else asks for a pty.
-        let subdued = fake.subdued_calls();
-        assert_eq!(subdued.len(), 1, "{subdued:?}");
-        assert!(subdued[0].starts_with("ssh-copy-id"), "{subdued:?}");
-
-        // And subduing is layered *onto* the askpass environment rather than
-        // replacing it. A `RunOptions` built with `..Default::default()`
-        // instead of `..askpass::run_options(…)` would compile, pass every
-        // other test in this file, and put the password prompt back on the
-        // developer at all ten connections.
-        let env = fake.env_of("ssh-copy-id");
-        assert!(
-            env.iter().any(|(key, _)| key == "SSH_ASKPASS"),
-            "the copy lost its askpass helper: {env:?}"
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.starts_with("ssh -o BatchMode=yes"))
+                .count(),
+            1,
+            "only the opening probe: {:?}",
+            fake.calls()
         );
     }
 
     #[tokio::test]
     async fn a_key_that_will_not_sign_in_after_copying_warns_instead_of_stopping() {
-        // The reported bug. `ssh-copy-id` exits 0 — the line reached
-        // `authorized_keys` — and sshd still refuses it. The developer's
-        // password works, every remaining step would have succeeded, and
-        // riabuild used to stop there.
+        // The copy succeeded — the line reached `authorized_keys` — and sshd
+        // still refuses it. The developer's password works, every remaining
+        // step would have succeeded, and riabuild used to stop there.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
         write_public_key(&paths).await;
         // The same refusal before and after the copy: the fake answers both
         // `BatchMode` probes identically, so the post-copy recheck fails.
-        let fake = Arc::new(a_server_that_takes_a_password().with("ssh-copy-id", 0, "", ""));
+        let fake =
+            Arc::new(a_server_that_takes_a_password().containing("authorized_keys", 0, "", ""));
         let ui = Ui::new(true);
 
         authorise(&remote(), &paths, fake.clone(), &ui)
             .await
             .expect("a password is a way in, so this must not stop the run");
 
-        assert!(
-            fake.calls()
-                .iter()
-                .any(|call| call.starts_with("ssh-copy-id")),
+        assert_eq!(
+            copy_attempts(&fake),
+            1,
             "only meaningful if the copy was actually attempted: {:?}",
             fake.calls()
         );
@@ -824,40 +766,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_ssh_copy_id_warns_rather_than_ending_the_run() {
-        // `ssh-copy-id` is what makes the *key* work. The server has just said
-        // it takes a password, so its absence costs the developer a key, not
-        // the machine.
+    async fn a_copy_that_fails_warns_rather_than_ending_the_run() {
+        // A read-only home, a full disk, a connection that dropped. The
+        // server has just said it takes a password, so this costs the
+        // developer a key, not the machine.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
         write_public_key(&paths).await;
-        // FakeRunner::which only knows programs that have been stubbed, so
-        // not stubbing `ssh-copy-id` is what makes it missing here.
-        let fake = Arc::new(a_server_that_takes_a_password());
-        let ui = Ui::new(true);
-
-        authorise(&remote(), &paths, fake, &ui)
-            .await
-            .expect("a missing ssh-copy-id is not a missing way in");
-
-        let warning = the_one_warning(&ui);
-        assert!(
-            warning.contains("ssh-copy-id is not installed"),
-            "{warning}"
-        );
-        assert_carries_the_remedy(&warning);
-    }
-
-    #[tokio::test]
-    async fn an_ssh_copy_id_that_fails_warns_rather_than_ending_the_run() {
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        write_public_key(&paths).await;
-        let fake = Arc::new(a_server_that_takes_a_password().with(
-            "ssh-copy-id",
+        let fake = Arc::new(a_server_that_takes_a_password().containing(
+            "authorized_keys",
             1,
             "",
-            "could not write",
+            "Read-only file system",
         ));
         let ui = Ui::new(true);
 
@@ -866,44 +786,18 @@ mod tests {
             .expect("a failed copy is not a missing way in");
 
         let warning = the_one_warning(&ui);
-        assert!(warning.contains("could not install it"), "{warning}");
+        assert!(warning.contains("could not add it"), "{warning}");
         assert_carries_the_remedy(&warning);
     }
 
     #[tokio::test]
-    async fn ssh_copy_id_is_told_which_helper_answers_its_password_prompt() {
-        // Without this the developer types the password at `ssh-copy-id`, and
-        // then again at every connection after it — which is the outcome the
-        // saved password exists to prevent, arriving one step late.
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        write_public_key(&paths).await;
-        let fake = Arc::new(a_server_that_takes_a_password().with("ssh-copy-id", 0, "", ""));
-
-        let _ = authorise(&remote(), &paths, fake.clone(), &Ui::new(true)).await;
-
-        let env = fake.env_of("ssh-copy-id");
-        assert!(
-            !env.is_empty(),
-            "ssh-copy-id ran with no environment at all"
-        );
-        let expected = super::super::askpass::ssh_env(&remote(), &paths);
-        for (key, value) in expected {
-            assert!(
-                env.contains(&(key.clone(), value.clone())),
-                "ssh-copy-id must carry {key}={value}: {env:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_key_that_works_after_ssh_copy_id_is_reported_as_success() {
-        // The success branch (`ui.applied("Authorised"); Ok(())`) had no
-        // coverage: every other test's `BatchMode=yes` probe returns the
-        // same fixed response both times it's called, so the post-copy
-        // recheck could never see a different, successful answer. `.then()`
-        // queues a distinct response per call to the same key: the first
-        // probe (before `ssh-copy-id`) fails, the second (after) succeeds.
+    async fn a_key_that_works_after_being_installed_is_reported_as_success() {
+        // The success branch (`ui.applied("Authorised"); Ok(())`) needs a
+        // `BatchMode=yes` probe that answers differently before and after the
+        // copy, which a single `with` stub cannot express — every other test
+        // in this file returns the same fixed response both times, so the
+        // recheck could never see a successful answer. `.then()` queues one
+        // response per call: the first probe fails, the second succeeds.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
         write_public_key(&paths).await;
@@ -922,31 +816,19 @@ mod tests {
                     "",
                     "Permission denied (publickey,password).",
                 )
-                .with("ssh-copy-id", 0, "", ""),
+                .containing("authorized_keys", 0, "", ""),
         );
+        let ui = Ui::new(true);
 
-        authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
+        authorise(&remote(), &paths, fake.clone(), &ui)
             .await
-            .expect("the key works after ssh-copy-id, so this must succeed");
+            .expect("the key works once installed, so this must succeed");
 
-        let copy_call = fake
-            .calls()
-            .into_iter()
-            .find(|call| call.starts_with("ssh-copy-id"))
-            .expect("ssh-copy-id ran");
-        // The full argument vector, not just the program name: a regression
-        // dropping `UserKnownHostsFile` or `StrictHostKeyChecking=yes` would
-        // silently let `ssh-copy-id` trust afresh instead of routing through
-        // Task 15's pinned host key, and a `starts_with` check alone would
-        // not notice.
-        let expected_key = key_path(&remote(), &paths).with_extension("pub");
-        assert_eq!(
-            copy_call,
-            format!(
-                "ssh-copy-id -i {} -p 2222 -F /dev/null -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes ada@build-01.fly.dev",
-                expected_key.to_string_lossy(),
-                paths.known_hosts_file().to_string_lossy(),
-            )
+        assert_eq!(copy_attempts(&fake), 1, "{:?}", fake.calls());
+        assert!(
+            ui.warned().is_empty(),
+            "a key that works is not something to warn about: {:?}",
+            ui.warned()
         );
     }
 
@@ -978,10 +860,10 @@ mod tests {
         );
         assert!(
             !fake.calls().iter().any(|call| {
-                call.starts_with("ssh-copy-id")
+                call.contains("authorized_keys")
                     || call.starts_with("ssh -o PreferredAuthentications")
             }),
-            "a missing key must fail before probing the server or running ssh-copy-id: {:?}",
+            "a missing key must fail before probing the server or writing anything: {:?}",
             fake.calls()
         );
     }
