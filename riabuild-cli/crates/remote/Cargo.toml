@@ -23,6 +23,7 @@ riabuild-runner.workspace = true
 riabuild-tasks.workspace = true
 riabuild-theme.workspace = true
 riabuild-ui.workspace = true
+riabuild-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }

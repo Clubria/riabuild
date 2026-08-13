@@ -258,6 +258,19 @@ makes every launch attempt an upgrade that cannot change anything. Local builds 
 `9999.0.0-dev`, above every real date, so working on riabuild never makes riabuild replace
 the binary being worked on. See `../docs/releasing.md`.
 
+**A server is never given a riabuild older than the laptop provisioning it.**
+`remote::install::version_for_server` picks the newer of this laptop's own version and the
+org's `latestCliVersion`, and a local build — which names no release anyone could download
+— takes the org's answer. The two are halves of one protocol: the laptop runs `internal
+gh-sweep` and `internal seed-github` on the server, sets its `RIABUILD_ROOT`, and reads its
+exit code, and only the matched pair is ever tested. Reading `latestCliVersion` alone put
+an *older* riabuild on the server every time a laptop was ahead of the org pin — including
+for minutes after every release, since the workflow publishes the Homebrew formula well
+before the job that moves that field. The symptom is not a version error: it is whichever
+bugs the older build still had, reappearing on a laptop that carries the fixes, with
+nothing in the terminal naming a version. That is why `connect` says out loud when the
+server will run something other than what the laptop is running.
+
 **Self-update asks what owns the binary, never what is installed.** `update.rs` runs
 `dpkg -S` and then `rpm -qf` against the running executable. A Fedora machine can have
 `apt` on it, and a riabuild built with `cargo` is owned by nothing — `sudo apt-get install
