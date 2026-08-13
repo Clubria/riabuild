@@ -274,6 +274,7 @@ fn holds_gh_session_marker(cli: &Cli) -> bool {
 /// including an error, not just the successful paths dotted through the
 /// match below.
 async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
+    keep_current(cli, ctx).await?;
     remember_project(cli, ctx).await?;
 
     match &cli.command {
@@ -321,6 +322,45 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
     }
 
     provision(ctx, cli).await
+}
+
+/// Replaces this binary with the release the org publishes, before the command
+/// the developer typed runs.
+///
+/// Every command, not just the setup flow: a developer who lives in `riabuild
+/// remote` and `riabuild claude` would otherwise never run the one command
+/// that updates riabuild, and go on driving servers from a build months old.
+/// [`update::applies_to`] holds the four exceptions and the reasoning for
+/// them.
+///
+/// Placed at the top of `run_inner` rather than in `run`, so that a mandatory
+/// upgrade that *fails* still returns through the caller that closes a remote
+/// scope's GitHub session. An upgrade that succeeds never returns at all —
+/// `upgrade_and_reexec` execs — which is safe here for the reason
+/// [`update::action_for`] gives: the runs that hold that session are servers,
+/// and servers do not update.
+///
+/// The connect is soft, and that is the whole difference between this and the
+/// check `provision` used to own. `riabuild claude list` is documented to work
+/// with no riabuild session, no network, and a machine nothing has
+/// provisioned; a laptop that cannot reach riabuild-web has no floor to be
+/// below, so there is nothing to decide and nothing worth saying. The flows
+/// that genuinely need the API still call `connect` themselves and still fail
+/// loudly when it cannot answer.
+async fn keep_current(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
+    if !update::applies_to(cli.command.as_ref()) {
+        return Ok(());
+    }
+    // Swallowed on purpose, and only here: whatever riabuild-web could not
+    // tell us, "you are running an old riabuild" is not something to guess at,
+    // and it is never worth failing a command over.
+    if ctx.connect().await.is_err() {
+        return Ok(());
+    }
+    if let update::Action::Upgrade { to, mandatory } = update::action_for(ctx) {
+        update::upgrade_and_reexec(ctx.runner.as_ref(), &ctx.ui, &to, mandatory).await?;
+    }
+    Ok(())
 }
 
 /// Remembers `--project`, unless the path names a directory on a *server*.

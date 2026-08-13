@@ -177,7 +177,24 @@ impl Ctx {
     /// exists to fix exactly that. Anything else (suspended, removed from the
     /// org) is surfaced immediately, because no amount of provisioning will
     /// help.
+    ///
+    /// Idempotent within a run, and that is load-bearing rather than tidy:
+    /// every command now connects once at startup so `update` can read the
+    /// version floor, and the four flows that connect for themselves
+    /// (`provision`, `remote`, `remote forget`, `login`) must keep doing so —
+    /// none of them may depend on its caller having connected first. Without
+    /// this guard each of them pays for a second `me` and a second
+    /// `org/config` on every run.
+    ///
+    /// The team configuration is the thing to test for. It is set only here
+    /// and in `login::apply`, always together with `member`, and always by a
+    /// live request — so holding one means the question this method asks has
+    /// already been answered. A machine with no session leaves it `None` and
+    /// is asked again, which is exactly what the sign-in flow needs.
     pub async fn connect(&mut self) -> Result<()> {
+        if self.org.is_some() {
+            return Ok(());
+        }
         let Some(token) = self.keychain.get().await? else {
             return Ok(());
         };
@@ -369,7 +386,28 @@ pub fn registry() -> Vec<Box<dyn Task>> {
 #[cfg(test)]
 mod tests {
     use crate::testing::ctx_with;
+    use riabuild_keychain::MemoryKeychain;
     use riabuild_runner::FakeRunner;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_second_connect_in_one_run_does_no_work() {
+        // Every command now connects once at startup, and four of them
+        // (`provision`, `remote`, `remote forget`, `login`) still call
+        // `connect` themselves — as they must, since none of them may depend
+        // on its caller having done it. Without this, each of those pays for a
+        // second `me` and a second `org/config` on every run.
+        //
+        // "Did no work" is only observable as "never read the keychain", which
+        // is the first thing `connect` would do.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        assert!(ctx.org.is_some(), "the test ctx starts already connected");
+        ctx.keychain = Arc::new(MemoryKeychain::unreadable());
+
+        ctx.connect()
+            .await
+            .expect("a connect with the team configuration already loaded");
+    }
 
     #[tokio::test]
     async fn claude_is_the_one_riabuilds_node_installed() {

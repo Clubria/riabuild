@@ -158,6 +158,7 @@ impl Keychain for EnvKeychain {
 #[derive(Default)]
 pub struct MemoryKeychain {
     token: std::sync::Mutex<Option<String>>,
+    unreadable: bool,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -165,6 +166,20 @@ impl MemoryKeychain {
     pub fn with_token(token: &str) -> Self {
         Self {
             token: std::sync::Mutex::new(Some(token.to_string())),
+            unreadable: false,
+        }
+    }
+
+    /// A store that answers every read with an error — a locked keyring, or a
+    /// `secret-tool` with no session bus behind it.
+    ///
+    /// Written for the tests that prove a path never *reaches* the keychain:
+    /// "did no work" is otherwise invisible, and asserting it against a store
+    /// that succeeds asserts nothing.
+    pub fn unreadable() -> Self {
+        Self {
+            token: std::sync::Mutex::new(None),
+            unreadable: true,
         }
     }
 }
@@ -173,6 +188,9 @@ impl MemoryKeychain {
 #[async_trait]
 impl Keychain for MemoryKeychain {
     async fn get(&self) -> Result<Option<String>> {
+        if self.unreadable {
+            anyhow::bail!("this keychain cannot be read");
+        }
         Ok(self.token.lock().unwrap().clone())
     }
 
