@@ -553,10 +553,10 @@ for task in login github_cli infisical_cli toolchain project repo_status \
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
 
-# The three tasks the sign-in gates. `claude_accounts` is only recorded once
-# account 1 is actually signed in; `claude_trust` and `claude_onboarding` both
-# write per-account state into a `.claude.json` that has no account to belong to
-# yet, so neither runs at all.
+# The four tasks the sign-in gates. `claude_accounts` is only recorded once
+# account 1 is actually signed in; `claude_trust`, `claude_onboarding` and
+# `claude_agents_view` all write per-account state into a `.claude.json` that has
+# no account to belong to yet, so none of them runs at all.
 #
 # Short of the sign-in this asserts their *absence*, which is the more valuable
 # half of the pair: "never record a success we have not verified" is the invariant
@@ -566,7 +566,7 @@ done
 # sign-in and left the developer with an account they cannot use — and a recorded
 # claude_onboarding would mean it skipped the one write that keeps Claude Code
 # from interviewing them on first launch.
-for task in claude_accounts claude_trust claude_onboarding; do
+for task in claude_accounts claude_trust claude_onboarding claude_agents_view; do
   if [ "$SIGN_IN" = done ]; then
     check_contains "task recorded: $task" "$STATE" "\"$task\""
   else
@@ -665,12 +665,19 @@ else
   # A real second run stops at the sign-in again and never reaches the code that
   # writes the run log, so there is no `applied=[]` to read. `--check` runs every
   # task's status and applies nothing, so it completes — and what it must report
-  # is the three tasks the sign-in blocks and *nothing else*. That is the same
+  # is the four tasks the sign-in blocks and *nothing else*. That is the same
   # claim `applied=[]` makes, minus the one item this environment cannot supply.
   #
-  # Three, not two: `claude_trust` and `claude_onboarding` both write per-account
-  # state into a `.claude.json` that only exists once an account does, so a
-  # missing sign-in blocks both.
+  # Four, not one: `claude_trust`, `claude_onboarding` and `claude_agents_view`
+  # each write per-account state into a `.claude.json` that only exists once an
+  # account does, so a missing sign-in blocks all three. `claude_plugins` sits in
+  # the same wave and is *not* here, because it answers Satisfied for a checkout
+  # that declares no plugins — which is the shape of this one.
+  #
+  # The order is the engine's, not alphabetical: within a dependency wave, tasks
+  # run in registry declaration order. A reordering of `registry()` that is
+  # otherwise harmless will fail here, and that is the assertion doing its job —
+  # the order a developer watches scroll past is part of the interface.
   #
   # Their reason is "first run", not "account 1 is not signed in": `status_for`
   # answers a task with no state record without calling `check()` at all. Which
@@ -684,10 +691,10 @@ else
   AFTER="$(last_run_log)"
   info "$AFTER"
   OUTSTANDING="$(applied_ids "$AFTER")"
-  if [ "$OUTSTANDING" = "claude_accounts,claude_trust,claude_onboarding" ]; then
-    pass "the sign-in and the two tasks that depend on it are all that is outstanding"
+  if [ "$OUTSTANDING" = "claude_accounts,claude_trust,claude_onboarding,claude_agents_view" ]; then
+    pass "the sign-in and the three tasks that depend on it are all that is outstanding"
   else
-    fail "expected only claude_accounts,claude_trust,claude_onboarding outstanding — got [$OUTSTANDING]"
+    fail "expected only claude_accounts,claude_trust,claude_onboarding,claude_agents_view outstanding — got [$OUTSTANDING]"
   fi
 fi
 
@@ -717,13 +724,13 @@ else
   check "pnpm is back" test -x "$RIA_HOME/bin/pnpm"
   REPAIRED="$(riabuild --check --no-shell 2>&1)" || fail "a --check after the repair did not exit 0"
   REMAINING="$(applied_ids "$(last_run_log)")"
-  # Back to exactly the three the sign-in blocks: the toolchain was repaired, and
+  # Back to exactly the four the sign-in blocks: the toolchain was repaired, and
   # nothing that depends on it was left needing a re-run. login, github_cli and
   # project depend on nothing that moved and must not appear either.
-  if [ "$REMAINING" = "claude_accounts,claude_trust,claude_onboarding" ]; then
+  if [ "$REMAINING" = "claude_accounts,claude_trust,claude_onboarding,claude_agents_view" ]; then
     pass "the toolchain is correct again and nothing else was disturbed"
   else
-    fail "after the repair, expected only claude_accounts,claude_trust,claude_onboarding — got [$REMAINING]"
+    fail "after the repair, expected only claude_accounts,claude_trust,claude_onboarding,claude_agents_view — got [$REMAINING]"
     printf '%s\n' "$REPAIRED" | sed 's/^/         | /' >&2
   fi
 fi

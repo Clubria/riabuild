@@ -50,6 +50,17 @@ export const DEFAULT_STATUS_LINE = {
  * Trusting the checkout is deliberately *not* here: `hasTrustDialogAccepted` is
  * per-project state in `.claude.json`, not a settings key, and no settings file
  * can express it. `claude_trust` in the CLI does that half.
+ *
+ * Opening on the agents view is *not* here for the same reason, and it is the
+ * one most likely to be added by mistake, because `/config` presents it beside
+ * settings that do belong in a settings file. `defaultToAgentsView` is global
+ * config in `.claude.json` — Claude Code reads it as
+ * `getGlobalConfig().defaultToAgentsView === true` and it is absent from the
+ * settings schema (verified against 2.1.231) — so a key of that name saved here
+ * would be served to every laptop, layered by every launcher, and read by
+ * nothing. `claude_agents_view` in the CLI does it. The same is true of
+ * `--exclude-dynamic-system-prompt-sections`, which has no settings key at all
+ * and is passed on the launcher's command line by `tasks::shims`.
  */
 export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
   {

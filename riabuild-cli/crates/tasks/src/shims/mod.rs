@@ -6,12 +6,19 @@
 //! layered over it.
 //!
 //! ```sh
-//! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude --settings ~/.riabuild/org-settings.json
+//! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
+//!   --settings ~/.riabuild/org-settings.json \
+//!   --exclude-dynamic-system-prompt-sections
 //! ```
 //!
 //! `--settings` layers over the account's own settings, so org policy is always
 //! current, removals take effect, and developer edits survive. Nothing is merged
 //! into anyone's `settings.json`.
+//!
+//! `--exclude-dynamic-system-prompt-sections` is a flag and not a settings key
+//! because Claude Code offers no settings key for it: it is read off argv
+//! (`excludeDynamicSections`) and appears nowhere in the settings schema, so the
+//! launcher is the only place riabuild can turn it on for the whole team.
 //!
 //! `CLAUDE_CONFIG_DIR` is present in the Claude Code binary (verified against
 //! 2.1.221) but is **not** in the public settings documentation. Undocumented
@@ -34,6 +41,28 @@ use crate::Ctx;
 use anyhow::Result;
 use riabuild_fetch::archive::make_executable;
 use std::path::Path;
+
+/// Moves the per-machine half of the system prompt into the first user message.
+///
+/// The sections it moves — working directory, environment info, memory paths,
+/// git status — are the ones that differ on every laptop, and they sit in the
+/// part of the prompt the API caches. Moving them out leaves every Clubria
+/// developer's Claude Code opening against a system prompt that differs only
+/// where the *org's* settings differ, so the cache one developer warms is one
+/// the next can reuse. Nothing is dropped; it arrives as the first user message
+/// instead.
+///
+/// A flag rather than a settings key because Claude Code offers no key: it
+/// reaches the session as `excludeDynamicSections` off parsed argv and is absent
+/// from the settings schema, so `org-settings.json` could carry the name and
+/// change nothing. Verified against 2.1.231.
+///
+/// Passed unconditionally, which is safe on two counts. It arrived in Claude
+/// Code 2.1.98, well below the 2.1.223 floor `claude_accounts` already enforces
+/// and repairs, so no launcher will meet a binary that rejects it — and it is a
+/// global option, accepted ahead of a subcommand exactly as `--settings` is, so
+/// `claude-2 auth login` still works.
+const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 
 /// One account's launcher: `claude`, or `claude-<n>`.
 pub fn launcher_script(
@@ -88,13 +117,14 @@ if [ ! -x "$claude_binary" ]; then
   claude_binary=claude
 fi
 if [ -f "{settings}" ]; then
-  exec "$claude_binary" --settings "{settings}" "$@"
+  exec "$claude_binary" --settings "{settings}" {flag} "$@"
 fi
-exec "$claude_binary" "$@"
+exec "$claude_binary" {flag} "$@"
 "#,
         config_dir = config_dir.display(),
         bin_dir = bin_dir.display(),
         settings = org_settings.display(),
+        flag = STATIC_SYSTEM_PROMPT,
     )
 }
 
@@ -390,7 +420,38 @@ mod tests {
         // that has not fetched settings yet. Losing it would still satisfy
         // `the_launcher_can_never_exec_itself` (which only checks the exec
         // inside the `if`) while the launcher silently exited 0 doing nothing.
-        assert!(script.contains(r#"exec "$claude_binary" "$@""#), "{script}");
+        assert!(
+            script.contains(&format!(
+                r#"exec "$claude_binary" {STATIC_SYSTEM_PROMPT} "$@""#
+            )),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn every_exec_moves_the_per_machine_prompt_sections_out_of_the_cache() {
+        // Asserted on *every* exec rather than on the script text, because the
+        // two are reached under opposite conditions: the first runs on a
+        // machine that has fetched the org settings, the second on one that has
+        // not. A flag on only one of them is a cache that half the team shares
+        // and the other half does not, with nothing to see in either terminal.
+        let script = script();
+        let execs: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("exec "))
+            .collect();
+        assert_eq!(execs.len(), 2, "{script}");
+        for exec in execs {
+            assert!(exec.contains(STATIC_SYSTEM_PROMPT), "{exec}");
+            // Ahead of `"$@"`, so a developer's own trailing arguments still
+            // reach Claude Code as arguments rather than landing after a flag
+            // that has already consumed the line.
+            assert!(
+                exec.find(STATIC_SYSTEM_PROMPT) < exec.find(r#""$@""#),
+                "{exec}"
+            );
+        }
     }
 
     #[test]
@@ -733,15 +794,21 @@ mod tests {
         );
     }
 
-    /// Every launcher passes `--settings` unconditionally, so `claude-2 auth
-    /// login` — which the account box tells developers to run — depends on a
-    /// global flag being accepted ahead of a subcommand.
+    /// Every launcher passes `--settings` and
+    /// `--exclude-dynamic-system-prompt-sections` unconditionally, so `claude-2
+    /// auth login` — which the account box tells developers to run — depends on
+    /// both being accepted ahead of a subcommand.
+    ///
+    /// Both are asserted in one invocation because that is the argument line a
+    /// launcher actually builds; a test that passed them separately would not
+    /// cover the pair. If this ever fails, the launcher — not the developer's
+    /// command — is what broke.
     ///
     /// Deliberately `#[ignore]`d: only a real `claude` can say whether its
     /// argument parser still allows this, and the shims are generated on the
     /// assumption that it does.
     #[tokio::test]
-    #[ignore = "needs a real Claude Code install; records that --settings is accepted ahead of a subcommand, which every launcher assumes"]
+    #[ignore = "needs a real Claude Code install; records that the launcher's global flags are accepted ahead of a subcommand, which every launcher assumes"]
     async fn settings_flag_survives_a_subcommand() {
         use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
         let runner = RealRunner;
@@ -759,6 +826,7 @@ mod tests {
                 &[
                     "--settings",
                     &settings.to_string_lossy(),
+                    STATIC_SYSTEM_PROMPT,
                     "auth",
                     "status",
                     "--json",

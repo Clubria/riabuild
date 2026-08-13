@@ -426,6 +426,19 @@ every environment shell opens with the account box, and the org's Claude setting
 checkout's trust, and the plugins the checkout declares apply to every account, never just
 the first.
 
+**Three things riabuild wants cannot be settings, and each has its own home.**
+`hasTrustDialogAccepted`, `hasCompletedOnboarding` and `defaultToAgentsView` are all
+`.claude.json` state that `--settings` cannot express, so `claude_trust`,
+`claude_onboarding` and `claude_agents_view` write them per account — and
+`--exclude-dynamic-system-prompt-sections` has no key of any kind, so the launcher passes
+it on the command line. Before adding anything to the dashboard's settings JSON, check it
+is a settings key at all: one that is not gets served to every laptop and read by nobody.
+
+`claude_agents_view` is also the one task that **offers** rather than imposes. It writes
+the key only where the account has no answer, because `/config` persists a developer's
+`false` and a task that asserted `true` every run would silently overrule them on every
+`riabuild`. Trust and onboarding are facts nobody wants undone; a view is not.
+
 **Trust is the only gate Claude Code puts in front of a checkout's settings, and the
 plugins ride on it.** `hasTrustDialogAccepted` — keyed by the checkout's *git root*, which
 is why a subdirectory and a `.claude/worktrees/` worktree both inherit it — is what the
