@@ -14,7 +14,7 @@
 
 use crate::{
     Remote, Request, askpass, authorise, channel, env_command, env_prefix, host_key, identity,
-    install, resolve_home, seed, session, shell, ssh_once, store,
+    install, issued, resolve_home, seed, session, shell, ssh_once, store,
 };
 use anyhow::{Result, anyhow};
 use riabuild_paths::Paths;
@@ -147,12 +147,34 @@ pub(super) async fn connect_and_setup(
     // server, which is the case the flag exists for. `ensure_key` and
     // `trust_host` above stay put for the same reason: a key pair and a
     // `known_hosts` line are this laptop's own files, not the server's.
+    // Constructed here and asked for nothing yet. Every fetch and every agent
+    // it could start happens behind `authorise`'s `can_sign_in` early return,
+    // so a server this laptop has already set up costs exactly nothing — see
+    // `issued`'s module doc.
+    let mut issued = issued::Issued::new(&ctx.api);
     if request.check {
         if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
-            ctx.ui.note(
-                "--check: riabuild's key is not authorised on that server yet, so there is \
-                 nothing here to check. Run `riabuild remote` without --check to install it.",
-            );
+            // Probing is a read, so it is allowed on this path — and it is the
+            // difference between a developer knowing to run without `--check`
+            // and a developer filing a ticket. A server riabuild cannot reach
+            // at all and one it can reach with an issued key look identical
+            // without it.
+            let entry = issued
+                .working(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui)
+                .await
+                .map(|entry| entry.label.clone());
+            match entry {
+                Some(label) => ctx.ui.note(&format!(
+                    "--check: riabuild's key is not authorised on that server yet, but the \
+                     {label} key issued to you can sign in. Run `riabuild remote` without \
+                     --check to finish setting it up.",
+                )),
+                None => ctx.ui.note(
+                    "--check: riabuild's key is not authorised on that server yet, so there is \
+                     nothing here to check. Run `riabuild remote` without --check to install it.",
+                ),
+            }
+            issued.stop().await;
             return Ok(0);
         }
     } else {
@@ -164,7 +186,21 @@ pub(super) async fn connect_and_setup(
         // host-key pin, and its key pair are removable by hand only. A record
         // for a server that never authorised at all is the cheaper mistake.
         store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
-        authorise::authorise(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui).await?;
+        let authorised = authorise::authorise(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &ctx.ui,
+            &mut issued,
+        )
+        .await;
+        // Stopped before the `?`, so a failed `authorise` does not leave an
+        // agent holding the org's keys for the rest of the process's life.
+        // Everything past this point runs on riabuild's own key: an issued key
+        // authorises one `ssh-copy-id` and is then finished with, which is what
+        // keeps `remote forget`'s per-developer cleanup meaning anything.
+        issued.stop().await;
+        authorised?;
     }
 
     // `resolve_home` runs its own command over `ssh_once`, which is refused

@@ -43,6 +43,13 @@
 //!   failure with the key as a line to paste by hand, and so are the two
 //!   other cases where nothing riabuild could do next would work: a public key
 //!   that is missing, and a host key that does not match the pin.
+//!
+//!   **Unless a key the org issued this developer can sign in.** That is the
+//!   one thing checked before the method probe below, and the reason it comes
+//!   first: an identity that has just proved itself has already answered what
+//!   the probe asks, and a keys-only server is exactly the machine an issued
+//!   key exists for. Where the paragraph above says "no way in", it now means
+//!   no way in *and* no issued key — see `issued`.
 //! - Past that guard, a way in exists. The copy failing, or succeeding while
 //!   the key *still* cannot sign in, are both real, ordinary outcomes — an
 //!   `AuthorizedKeysFile` pointing elsewhere, a home directory on a mode sshd
@@ -198,8 +205,12 @@ pub async fn authorise(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
+    issued: &mut crate::issued::Issued<'_>,
 ) -> Result<()> {
     if can_sign_in(remote, paths, runner.clone()).await? {
+        // The early return that makes issued keys free. `issued` is untouched
+        // here, so a returning developer fetches nothing, starts no agent, and
+        // never has an org private key in this process's memory at all.
         return Ok(());
     }
 
@@ -225,32 +236,28 @@ pub async fn authorise(
             .into());
         }
     };
-    let paste = || {
-        Failure::new(
-            format!("authorising riabuild's key on {}", remote.host),
-            format!(
-                "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n    {}",
-                remote.host,
-                public_key.trim()
-            ),
-        )
-    };
-    // The same remedy as `paste`, said as a warning rather than as a stop.
-    // Deliberately built from the same `public_key`, and deliberately still
-    // naming `authorized_keys`: the developer is getting in either way, and
-    // this is how they stop being asked for a password on every future run.
-    let carry_on = |because: &str| {
-        ui.warn(&format!(
-            "riabuild's key cannot sign in to {host} yet — {because}.\n    \
-             The rest of this run will use {target}'s password instead; riabuild asks \
-             for it once and remembers it.\n    \
-             To stop being asked at all, add this line to ~/.ssh/authorized_keys on \
-             {host}:\n      {key}",
-            host = remote.host,
-            target = remote.target(),
-            key = public_key.trim(),
-        ));
-    };
+    // Asked only now, which is the whole of what makes this cheap: riabuild's
+    // own key has already failed, so this is a server that needs setting up
+    // rather than one already set up. `working` fetches and probes at most
+    // once and never returns `Err` — every ordinary failure is a `None` and
+    // the password path below is unchanged.
+    if let Some(entry) = issued
+        .working(remote, paths, runner.clone(), ui)
+        .await
+        .cloned()
+    {
+        // Note what is skipped: the `PreferredAuthentications=none` probe
+        // below. An identity that has just signed in has already answered the
+        // question that probe asks, and asking again would spend a connection
+        // to be told what we know. More importantly it is what the `!interactive`
+        // branch would refuse on — a keys-only server — and refusing there is
+        // precisely the failure this feature exists to remove.
+        ui.working(
+            "Authorised",
+            &format!("installing the key over the {} identity", entry.label),
+        );
+        return finish(remote, paths, runner, ui, &public_key, Some(&entry)).await;
+    }
 
     // What will the server actually accept? `PreferredAuthentications=none`
     // makes sshd refuse before trying any method, so its refusal names every
@@ -282,21 +289,51 @@ pub async fn authorise(
     if !interactive {
         // Nothing to prompt for: a publickey-only server would leave the copy
         // sitting on a prompt nobody can answer.
-        return Err(paste()
+        //
+        // Reached only when no issued key signed in above — which is what the
+        // whole issued-keys feature exists to change about this branch. A
+        // developer who has been issued a key for this machine never gets here.
+        return Err(paste(remote, &public_key)
             .detail("that server accepts keys only, so there is no password to ask you for")
             .into());
     }
 
     ui.working("Authorised", "installing the key");
-    let installed = match copy::install_key(remote, paths, runner.clone(), &public_key).await {
+    finish(remote, paths, runner, ui, &public_key, None).await
+}
+
+/// Installing the key and reporting what came of it — shared by the two ways
+/// in, because only the credential differs.
+///
+/// `entry` is `Some` when an issued key is what authenticates the copy, and
+/// `None` when the account password is. Every branch below is identical either
+/// way: the same script runs on the server, the same three outcomes are
+/// possible, and none of them is a reason to stop a developer who has a working
+/// way onto the machine.
+async fn finish(
+    remote: &Remote,
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    ui: &Ui,
+    public_key: &str,
+    entry: Option<&crate::issued::Working>,
+) -> Result<()> {
+    let fallback = fallback(remote, entry);
+    let installed = match copy::install_key(remote, paths, runner.clone(), public_key, entry).await
+    {
         Ok(installed) => installed,
         Err(error) => {
             // A read-only home, a full disk, a connection that dropped. Not
-            // fatal: the server has just said it will take a password, so
-            // this costs the developer a key rather than the machine.
-            carry_on(&format!(
-                "riabuild could not add it to authorized_keys there ({error})"
-            ));
+            // fatal: there is a working way in — a password, or the issued key
+            // that just proved itself — so this costs the developer a key
+            // rather than the machine.
+            carry_on(
+                ui,
+                remote,
+                public_key,
+                &format!("riabuild could not add it to authorized_keys there ({error})"),
+                &fallback,
+            );
             return Ok(());
         }
     };
@@ -316,14 +353,12 @@ pub async fn authorise(
             "riabuild's key is already in ~/.ssh/authorized_keys on {host}, and that \
              server still refuses it — so riabuild has left the file alone rather than \
              adding another copy of the same line.\n    \
-             The rest of this run will use {target}'s password instead; riabuild asks \
-             for it once and remembers it.\n    \
+             {fallback}.\n    \
              Something on {host} is not honouring that file. The usual causes are an \
              `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
              `AuthenticationMethods` that needs more than a key, or a home directory \
              whose mode `StrictModes` rejects.",
             host = remote.host,
-            target = remote.target(),
         ));
         return Ok(());
     }
@@ -333,16 +368,76 @@ pub async fn authorise(
         // it — same causes as the branch above, but this run is the one that
         // put it there, so the developer is hearing it for the first time.
         // None of them is a reason to stop a developer whose password works.
-        carry_on("the key was copied, but signing in with it still does not work");
+        carry_on(
+            ui,
+            remote,
+            public_key,
+            "the key was copied, but signing in with it still does not work",
+            &fallback,
+        );
         return Ok(());
     }
     ui.applied("Authorised");
     Ok(())
 }
 
+/// "Add this line by hand", as a stop.
+///
+/// A free function rather than the closure it used to be, because [`finish`]
+/// needs the identical wording and a closure capturing `authorise`'s locals
+/// could not be reached from there. Two copies of a remedy is how the two drift
+/// apart.
+fn paste(remote: &Remote, public_key: &str) -> Failure {
+    Failure::new(
+        format!("authorising riabuild's key on {}", remote.host),
+        format!(
+            "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n    {}",
+            remote.host,
+            public_key.trim()
+        ),
+    )
+}
+
+/// What the rest of the run will use, now that riabuild's own key will not.
+///
+/// The two warnings below both have to name it, and they must not name the
+/// wrong one: telling a developer riabuild will "ask for the password once and
+/// remember it" on a server that has no password to ask for is the sentence
+/// this whole feature exists to stop printing.
+fn fallback(remote: &Remote, entry: Option<&crate::issued::Working>) -> String {
+    match entry {
+        Some(entry) => format!(
+            "the rest of this run will use the {} key issued to you",
+            entry.label
+        ),
+        None => format!(
+            "the rest of this run will use {}'s password instead; riabuild asks for it \
+             once and remembers it",
+            remote.target()
+        ),
+    }
+}
+
+/// The same remedy as [`paste`], said as a warning rather than as a stop.
+///
+/// Deliberately built from the same `public_key`, and deliberately still naming
+/// `authorized_keys`: the developer is getting in either way, and this is how
+/// they stop needing to.
+fn carry_on(ui: &Ui, remote: &Remote, public_key: &str, because: &str, fallback: &str) {
+    ui.warn(&format!(
+        "riabuild's key cannot sign in to {host} yet — {because}.\n    \
+         {fallback}.\n    \
+         To stop relying on that, add this line to ~/.ssh/authorized_keys on \
+         {host}:\n      {key}",
+        host = remote.host,
+        key = public_key.trim(),
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issued::{Issued, Working};
     use riabuild_paths::RealPaths;
     use riabuild_runner::FakeRunner;
     use riabuild_ui::Ui;
@@ -489,9 +584,15 @@ mod tests {
                 ),
         );
 
-        let error = authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
-            .await
-            .expect_err("a refused host key is not success");
+        let error = authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect_err("a refused host key is not success");
         let failure = error.downcast_ref::<Failure>().expect("a Failure");
 
         assert!(
@@ -518,6 +619,187 @@ mod tests {
             "nothing can be installed across a refused host key: {:?}",
             fake.calls()
         );
+    }
+
+    /// An issued key that has already proved itself against this server.
+    fn working() -> Working {
+        Working {
+            label: "prod-bastion".into(),
+            socket: "/tmp/riabuild-test/sock".into(),
+            public_key_path: "/tmp/riabuild-test/k17abc.pub".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keys_only_server_with_an_issued_key_installs_the_key_instead_of_failing() {
+        // The case this whole feature exists for, and a hard failure before it:
+        // `PasswordAuthentication no`, so there is no password to ask for, and
+        // riabuild used to stop and tell the developer to paste a public key
+        // into a file they may not be able to edit.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+
+        let fake = Arc::new(
+            FakeRunner::new()
+                // riabuild's own key does not work, and the server offers no
+                // password — the two facts that used to end the run here.
+                .with(
+                    "ssh -o BatchMode=yes",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                )
+                .with(
+                    "ssh -o PreferredAuthentications=none",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                )
+                // The copy, over the issued identity, and then the re-probe.
+                .containing("IdentityAgent=", 0, "", ""),
+        );
+
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(Some(working())),
+        )
+        .await
+        .expect("an issued key that works is not a failure");
+
+        let copy = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.contains("authorized_keys"))
+            .expect("the key must have been installed");
+        // Authenticated by the issued identity, and by that one alone.
+        assert!(
+            copy.contains("IdentityAgent=/tmp/riabuild-test/sock"),
+            "{copy}"
+        );
+        assert!(copy.contains("IdentitiesOnly=yes"), "{copy}");
+        assert!(copy.contains("k17abc.pub"), "{copy}");
+    }
+
+    #[tokio::test]
+    async fn an_issued_key_authorises_the_copy_and_nothing_after_it() {
+        // The bootstrap rule. If an issued key carried the whole run, every
+        // developer would reach the server as one fingerprint and `remote
+        // forget` would have no line of their own to remove. It authenticates
+        // the copy; riabuild's own key does the rest.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with(
+                    "ssh -o BatchMode=yes",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                )
+                .with(
+                    "ssh -o PreferredAuthentications=none",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                )
+                .containing("IdentityAgent=", 0, "", ""),
+        );
+
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(Some(working())),
+        )
+        .await
+        .expect("authorised");
+
+        // Exactly one connection carries the issued identity: the copy. The
+        // sign-in probe that follows it must not, or riabuild would be
+        // reporting the issued key's access as its own.
+        let over_issued = fake
+            .calls()
+            .iter()
+            .filter(|call| call.contains("IdentityAgent="))
+            .count();
+        assert_eq!(over_issued, 1, "{:?}", fake.calls());
+    }
+
+    #[tokio::test]
+    async fn no_issued_key_leaves_the_keys_only_failure_exactly_as_it_was() {
+        // The old behaviour has to survive untouched for the servers this
+        // feature does not reach — which is most of them.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with(
+                    "ssh -o BatchMode=yes",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                )
+                .with(
+                    "ssh -o PreferredAuthentications=none",
+                    255,
+                    "",
+                    "Permission denied (publickey).",
+                ),
+        );
+
+        let error = authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect_err("must still fail");
+
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(failure.detail.contains("keys only"), "{}", failure.detail);
+    }
+
+    #[tokio::test]
+    async fn a_server_riabuilds_own_key_already_reaches_never_asks_about_issued_keys() {
+        // The property that makes this feature free for a returning developer.
+        // `Issued::preset(Some(…))` would answer instantly if asked, so the
+        // only way the issued identity can be absent from every call is that
+        // `authorise` returned before asking.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        write_public_key(&paths).await;
+
+        let fake = Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 0, "", ""));
+
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(Some(working())),
+        )
+        .await
+        .expect("already authorised");
+
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|call| !call.contains("IdentityAgent=")),
+            "an already-authorised server must not reach for an issued key: {:?}",
+            fake.calls()
+        );
+        assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
 
     #[tokio::test]
@@ -554,9 +836,15 @@ mod tests {
                     "Permission denied (publickey).",
                 ),
         );
-        let error = authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
-            .await
-            .expect_err("must not claim success");
+        let error = authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect_err("must not claim success");
 
         // `Failure`'s Display is "{attempting} — {action}" and does not include
         // `detail`, so asserting on the formatted error cannot tell the three
@@ -587,9 +875,15 @@ mod tests {
         let paths = RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 0, "", ""));
 
-        authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
-            .await
-            .expect("already fine");
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("already fine");
         assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
 
@@ -674,9 +968,15 @@ mod tests {
         ));
         let ui = Ui::new(true);
 
-        authorise(&remote(), &paths, fake.clone(), &ui)
-            .await
-            .expect("a password is still a way in");
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &ui,
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("a password is still a way in");
 
         assert_eq!(
             copy_attempts(&fake),
@@ -718,9 +1018,15 @@ mod tests {
             "",
         ));
 
-        authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
-            .await
-            .expect("a password is still a way in");
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("a password is still a way in");
 
         assert_eq!(
             fake.calls()
@@ -747,9 +1053,15 @@ mod tests {
             Arc::new(a_server_that_takes_a_password().containing("authorized_keys", 0, "", ""));
         let ui = Ui::new(true);
 
-        authorise(&remote(), &paths, fake.clone(), &ui)
-            .await
-            .expect("a password is a way in, so this must not stop the run");
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &ui,
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("a password is a way in, so this must not stop the run");
 
         assert_eq!(
             copy_attempts(&fake),
@@ -781,7 +1093,7 @@ mod tests {
         ));
         let ui = Ui::new(true);
 
-        authorise(&remote(), &paths, fake, &ui)
+        authorise(&remote(), &paths, fake, &ui, &mut Issued::preset(None))
             .await
             .expect("a failed copy is not a missing way in");
 
@@ -820,9 +1132,15 @@ mod tests {
         );
         let ui = Ui::new(true);
 
-        authorise(&remote(), &paths, fake.clone(), &ui)
-            .await
-            .expect("the key works once installed, so this must succeed");
+        authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &ui,
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("the key works once installed, so this must succeed");
 
         assert_eq!(copy_attempts(&fake), 1, "{:?}", fake.calls());
         assert!(
@@ -847,9 +1165,15 @@ mod tests {
             "Permission denied (publickey,password).",
         ));
 
-        let error = authorise(&remote(), &paths, fake.clone(), &Ui::new(true))
-            .await
-            .expect_err("a missing public key must not read as success");
+        let error = authorise(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect_err("a missing public key must not read as success");
 
         let failure = error.downcast_ref::<Failure>().expect("a Failure");
         assert!(

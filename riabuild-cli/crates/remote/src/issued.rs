@@ -45,7 +45,9 @@ pub struct Working {
 
 /// The issued keys for one `riabuild remote`, fetched at most once.
 pub struct Issued<'a> {
-    api: &'a ApiClient,
+    /// `None` only in this crate's own tests — see [`Issued::preset`]. There is
+    /// no production path that reaches `working` without a client.
+    api: Option<&'a ApiClient>,
     agent: Option<Agent>,
     /// `None` until [`working`](Issued::working) has been asked; `Some(None)`
     /// once it has been asked and the answer was "no key gets in".
@@ -59,9 +61,25 @@ pub struct Issued<'a> {
 impl<'a> Issued<'a> {
     pub fn new(api: &'a ApiClient) -> Self {
         Issued {
-            api,
+            api: Some(api),
             agent: None,
             answer: None,
+        }
+    }
+
+    /// An `Issued` whose answer is already decided, so nothing is fetched and
+    /// no agent is started.
+    ///
+    /// `#[cfg(test)]`, and deliberately so: `authorise`'s tests need to drive
+    /// both sides of the issued-key branch, and the alternative — a real
+    /// `ApiClient` pointed at an unreachable URL — would put a network attempt
+    /// and its timeout into every test in that file.
+    #[cfg(test)]
+    pub(crate) fn preset(answer: Option<Working>) -> Issued<'static> {
+        Issued {
+            api: None,
+            agent: None,
+            answer: Some(answer),
         }
     }
 
@@ -91,7 +109,10 @@ impl<'a> Issued<'a> {
         runner: Arc<dyn CommandRunner>,
         ui: &Ui,
     ) -> Option<Working> {
-        let fetched = match fetch_issued(self.api).await {
+        // `?` on an `Option` in a function returning `Option`: no client means
+        // no keys, which is only reachable from this crate's own tests.
+        let api = self.api?;
+        let fetched = match fetch_issued(api).await {
             Ok(fetched) => fetched,
             Err(error) => {
                 // A note rather than a warning: on the overwhelming majority of
