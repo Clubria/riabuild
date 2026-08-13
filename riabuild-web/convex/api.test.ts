@@ -89,7 +89,9 @@ describe("member ids", () => {
     // below for Infisical — which is out of scope here.
     const t = setup();
     const { rowId } = await seedMember(t);
-    const member = await t.run(async (ctx) => await ctx.db.get("members", rowId));
+    const member = await t.run(
+      async (ctx) => await ctx.db.get("members", rowId),
+    );
     expect(member?.memberId).toMatch(UUID);
   });
 
@@ -732,12 +734,12 @@ describe("org config and claude settings", () => {
       });
     });
 
-    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
-      true,
-    );
-    expect((await t.mutation(internal.org.backfillStatusLine, {})).updated).toBe(
-      false,
-    );
+    expect(
+      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
+    ).toBe(true);
+    expect(
+      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
+    ).toBe(false);
 
     const entries = await t.run(async (ctx) =>
       ctx.db
@@ -1086,7 +1088,10 @@ describe("member administration", () => {
     const promotion = entries.find(
       (entry) => entry.action === "member.role_changed",
     );
-    expect(promotion?.meta).toMatchObject({ from: "candidate", to: "developer" });
+    expect(promotion?.meta).toMatchObject({
+      from: "candidate",
+      to: "developer",
+    });
   });
 
   test("a lead cannot demote themselves into locking everyone out", async () => {
@@ -1244,6 +1249,108 @@ describe("member administration", () => {
   });
 });
 
+describe("announcing a release", () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  /** Stands in for api.github.com, and records how it was asked. */
+  function stubGithub(options: {
+    status: number;
+    body?: unknown;
+    rateLimitRemaining?: string;
+  }) {
+    const calls: { url: string; authorization: string | null }[] = [];
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      const headers = new Headers(init?.headers);
+      calls.push({ url, authorization: headers.get("authorization") });
+      return new Response(
+        options.body === undefined ? null : JSON.stringify(options.body),
+        {
+          status: options.status,
+          headers: {
+            "x-ratelimit-remaining": options.rateLimitRemaining ?? "4999",
+          },
+        },
+      );
+    };
+    return calls;
+  }
+
+  test("the release check is authenticated with the org token", async () => {
+    // Not for permission — the repository is public and this read works
+    // signed out. For the rate limit: unauthenticated api.github.com allows
+    // 60 requests an hour per IP, and a Convex deployment shares its egress
+    // addresses, so a signed-out check is refused for traffic riabuild never
+    // made. That is what stranded v2026.08.12.1 on the shelf while every
+    // machine kept installing the release before it.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    const calls = stubGithub({ status: 200, body: { draft: false } });
+
+    const result = await t.action(api.release.publishCliVersion, {
+      version: "2026.08.12.1",
+    });
+
+    expect(result).toEqual({ updated: true, latestCliVersion: "2026.08.12.1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/releases/tags/v2026.08.12.1");
+    expect(calls[0].authorization).toBe("Bearer ghp_test");
+  });
+
+  test("a deployment with no org token still announces, unauthenticated", async () => {
+    // The token buys headroom, not permission. Losing the ability to announce
+    // a release without one would trade a rate limit for a manual step.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "");
+    const t = setup();
+    const calls = stubGithub({ status: 200, body: { draft: false } });
+
+    await t.action(api.release.publishCliVersion, { version: "2026.08.12.1" });
+
+    expect(calls[0].authorization).toBeNull();
+  });
+
+  test("a rate-limited refusal says so instead of reading as forbidden", async () => {
+    // The message the failing run left was "api.github.com returned 403",
+    // which sends whoever reads it looking for a permission they never
+    // lacked. The version must also stay put: an unverified release is not
+    // one to offer every developer.
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 403, rateLimitRemaining: "0" });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.08.12.1" }),
+    ).rejects.toThrow(/rate limit for GITHUB_ORG_TOKEN is exhausted/i);
+
+    expect((await t.query(api.org.get)).latestCliVersion).toBe("0.1.0");
+  });
+
+  test("a release GitHub has never heard of is not announced", async () => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 404 });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.09.01" }),
+    ).rejects.toThrow(/Cut the release before announcing it/i);
+  });
+
+  test("a draft release is not announced", async () => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+    const t = setup();
+    stubGithub({ status: 200, body: { draft: true } });
+
+    await expect(
+      t.action(api.release.publishCliVersion, { version: "2026.09.01" }),
+    ).rejects.toThrow(/still a draft/i);
+  });
+});
+
 describe("revoking a session", () => {
   const realFetch = globalThis.fetch;
 
@@ -1254,7 +1361,8 @@ describe("revoking a session", () => {
     vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
     globalThis.fetch = async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : input.toString();
-      if (url.includes("api.github.com")) return new Response(null, { status: 204 });
+      if (url.includes("api.github.com"))
+        return new Response(null, { status: 204 });
       throw new Error(`unexpected fetch to ${url}`);
     };
   });
@@ -1284,7 +1392,9 @@ describe("revoking a session", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ revoked: true });
 
-    const revoked = await t.run(async (ctx) => await ctx.db.get("cliSessions", victimId!));
+    const revoked = await t.run(
+      async (ctx) => await ctx.db.get("cliSessions", victimId!),
+    );
     expect(revoked?.revokedAt).toBeTruthy();
 
     // The revoked token is dead everywhere, not just on the laptop that held it.
@@ -1321,7 +1431,9 @@ describe("revoking a session", () => {
     expect(response.status).toBe(404);
     expect((await response.json()).error.code).toBe("session_unknown");
     expect(
-      await t.run(async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt),
+      await t.run(
+        async (ctx) => (await ctx.db.get("cliSessions", otherId!))?.revokedAt,
+      ),
     ).toBeFalsy();
 
     // The victim's session survives untouched — the failed attempt didn't
@@ -1350,7 +1462,10 @@ describe("revoking a session", () => {
 
   test("an org lead can revoke somebody else's session", async () => {
     const t = setup();
-    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: leadRow } = await seedMember(t, {
+      login: "lead",
+      role: "lead",
+    });
     const { rowId: devRow } = await seedMember(t, { login: "bob" });
     const caller = await issueSession(t, leadRow);
     const victim = await issueSession(t, devRow);
@@ -1409,7 +1524,10 @@ describe("revoking a session", () => {
     // token survives the first call — unlike the self-revoke case above,
     // where the second call never reaches the mutation.
     const t = setup();
-    const { rowId: leadRow } = await seedMember(t, { login: "lead", role: "lead" });
+    const { rowId: leadRow } = await seedMember(t, {
+      login: "lead",
+      role: "lead",
+    });
     const { rowId: devRow } = await seedMember(t, { login: "bob" });
     const caller = await issueSession(t, leadRow);
     await issueSession(t, devRow);
