@@ -51,7 +51,7 @@ export async function viewerMember(
 }
 
 /** Throws for anyone who is not an active lead. Used by every admin mutation. */
-async function requireLead(ctx: QueryCtx): Promise<Doc<"members">> {
+export async function requireLead(ctx: QueryCtx): Promise<Doc<"members">> {
   const member = await viewerMember(ctx);
   if (member === null) throw new Error("Not signed in.");
   if (member.status !== "active") throw new Error("Your account is suspended.");

@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// `session_id` empty, and the step whose *failure* must stop the whole
 /// function before anything local changes had no coverage at all.
 #[async_trait]
-trait Revokes: Send + Sync {
+pub(crate) trait Revokes: Send + Sync {
     async fn revoke(&self, session_id: &str) -> Result<()>;
 }
 
@@ -93,7 +93,37 @@ async fn forget_with(
     let Some(record) = store.find(name).cloned() else {
         return Err(anyhow!("there is no saved server named \"{name}\""));
     };
-    let remote: Remote = (&record).into();
+
+    retire_identity(paths, runner, ui, revokes, member_id, &record).await?;
+    super::store::forget_one(paths, store, name).await?;
+
+    ui.note(&format!("Forgot {}.", record.display_name()));
+    Ok(())
+}
+
+/// Everything [`forget_remote`] does *except* dropping the record: revoke the
+/// session, clean up on the server, delete what is local.
+///
+/// Extracted because a lead editing one of the team's server addresses produces
+/// the same situation as a forget, minus the forgetting. `Remote::hash` is
+/// taken over `user@host:port`, so an edited address is a different identity —
+/// leaving behind a key riabuild authorised on the old machine and, if this
+/// laptop ever connected, a live session on it. What has to happen to that
+/// machine is exactly this, and the record then goes on to describe the new
+/// one. See `shared::reconcile`.
+///
+/// The order is the one [`forget_remote`]'s own doc argues for, and for the
+/// same reason: revoke first, so that anything failing after it leaves a dead
+/// credential rather than a live one nothing on this laptop still records.
+pub(crate) async fn retire_identity(
+    paths: &dyn Paths,
+    runner: Arc<dyn CommandRunner>,
+    ui: &Ui,
+    revokes: &dyn Revokes,
+    member_id: &str,
+    record: &store::Record,
+) -> Result<()> {
+    let remote: Remote = record.into();
 
     // 1. Revoke first. An empty `session_id` means no session was ever
     //    minted for this server (it was only ever added, never connected
@@ -103,9 +133,9 @@ async fn forget_with(
     }
 
     // 2. Best-effort cleanup on the server itself.
-    cleanup_server_side(&remote, paths, runner.clone(), ui, &record, member_id).await;
+    cleanup_server_side(&remote, paths, runner.clone(), ui, record, member_id).await;
 
-    // 3. Local delete: the keychain items, the key pair, and the store entry.
+    // 3. Local delete: the keychain items and the key pair.
     let account = keychain::for_account(
         runner.clone(),
         &keychain::remote_account(&remote.hash()),
@@ -128,10 +158,39 @@ async fn forget_with(
         Err(error) => return Err(error.into()),
     }
 
-    super::store::forget_one(paths, store, name).await?;
-
-    ui.note(&format!("Forgot {name}."));
     Ok(())
+}
+
+/// Lets go of the machine one of the team's servers used to name, after a lead
+/// edited its address.
+///
+/// Best effort, and deliberately not fatal: the developer asked to connect to
+/// the server the leads are pointing at now, and a machine that has been
+/// decommissioned — which is the usual reason an address changes — must not
+/// stop them. What is left behind if this fails is a key line on a box nobody
+/// uses; what would be left behind if it were skipped is that plus a live
+/// session, which is why it is attempted at all.
+pub async fn retire_superseded(
+    ctx: &riabuild_tasks::Ctx,
+    member_id: &str,
+    superseded: &store::Record,
+) -> Result<()> {
+    ctx.ui.note(&format!(
+        "{} points at a different machine now. Letting go of {}@{} — the key and the session \
+         riabuild left there.",
+        superseded.display_name(),
+        superseded.user,
+        superseded.host,
+    ));
+    retire_identity(
+        ctx.paths.as_ref(),
+        ctx.runner.clone(),
+        &ctx.ui,
+        &ApiRevokes(&ctx.api),
+        member_id,
+        superseded,
+    )
+    .await
 }
 
 /// Step 1 of [`forget_remote`]: revoke this server's session.
@@ -321,6 +380,18 @@ mod tests {
         let mut record = store::record_for(&remote());
         record.home = "/home/dev".to_string();
         record.session_id = session_id.to_string();
+        store.remotes.push(record);
+        store
+    }
+
+    /// One of the team's servers, as a run that connected to it left it.
+    fn shared_store(fresh: bool) -> store::Store {
+        let mut store = store::Store::default();
+        let mut record = store::shared_record_for(&remote(), "k17abc");
+        record.name = "build-01".into();
+        record.home = "/home/dev".to_string();
+        record.session_id = SESSION_ID.to_string();
+        record.fresh = fresh;
         store.remotes.push(record);
         store
     }
@@ -649,5 +720,134 @@ mod tests {
 
         let transport = anyhow!("riabuild could not reach riabuild-web");
         assert!(!already_revoked(&transport));
+    }
+
+    #[tokio::test]
+    async fn forgetting_one_of_the_teams_servers_clears_this_laptop_and_nothing_else() {
+        // The honest reading of "the CLI cannot remove a shared server": it
+        // cannot take the machine away from the team, and it can always let go
+        // of this laptop's own key, password and session for it. The row in
+        // riabuild-web is untouched, so the server is back in the picker on the
+        // next run — with nothing of this laptop's left on it.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+        let mut store = shared_store(true);
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &revokes,
+            MEMBER_ID,
+            &mut store,
+            "shared-build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(store.find("shared-build-01").is_none());
+        assert!(!paths.identity_dir().join(remote().hash()).exists());
+        assert!(
+            fake.calls().iter().any(|call| call.contains("rm -rf")),
+            "{:?}",
+            fake.calls()
+        );
+        // The one call this must *not* make: there is no endpoint here that
+        // removes a shared server, and there must never be one.
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|call| call.contains("remotes/shared")),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_the_leads_removed_can_still_be_forgotten_by_name() {
+        // The case that keeps a removed server's session revocable. Its record
+        // is Stale — riabuild will not connect to the address in it — but the
+        // session recorded beside it may still be live, and this is the only
+        // command that can clear it.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = shared_store(false);
+        assert_eq!(
+            store
+                .find("shared-build-01")
+                .expect("still findable")
+                .origin(),
+            store::Origin::Stale
+        );
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &revokes,
+            MEMBER_ID,
+            &mut store,
+            "shared-build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(store.remotes.is_empty());
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.contains("/api/v1/cli/sessions/")),
+            "the session has to be revoked, which is the whole point: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_an_edited_address_revokes_the_session_of_the_machine_being_left() {
+        // A lead edited the address, so `shared::reconcile` handed back the old
+        // copy. Everything here is aimed at the *old* machine: its session, its
+        // namespace, its key — which is why the old address is kept on the
+        // record rather than only its hash.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+        let store = shared_store(true);
+        let old = store.remotes[0].clone();
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+
+        retire_identity(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &revokes,
+            MEMBER_ID,
+            &old,
+        )
+        .await
+        .expect("retires");
+
+        assert!(
+            fake.calls().iter().any(|call| call.ends_with(SESSION_ID)),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.contains("build-01.fly.dev")),
+            "the cleanup has to be aimed at the address being left: {:?}",
+            fake.calls()
+        );
+        assert!(
+            !paths.identity_dir().join(remote().hash()).exists(),
+            "the key riabuild put on the old machine is no longer this laptop's"
+        );
     }
 }

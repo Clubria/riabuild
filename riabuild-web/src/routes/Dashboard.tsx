@@ -5,6 +5,7 @@ import { Profile } from "../components/Profile";
 import { Sessions } from "../components/Sessions";
 import { Install } from "../components/Install";
 import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
+import { SharedServers } from "../components/SharedServers";
 import { Alert, Badge, Command, Panel, Tab } from "../ui";
 
 /** What riabuild will do to the machine, stated before it does it. */
@@ -164,6 +165,11 @@ export function Dashboard({ member }: { member: Member }) {
           <Panel index="lead" title="org configuration" tone="accent">
             <ErrorBoundary label="org configuration">
               <OrgSettings />
+            </ErrorBoundary>
+          </Panel>
+          <Panel index="lead" title="the team's servers" tone="accent">
+            <ErrorBoundary label="the team's servers">
+              <SharedServers />
             </ErrorBoundary>
           </Panel>
           <Panel index="lead" title="audit log" tone="accent">

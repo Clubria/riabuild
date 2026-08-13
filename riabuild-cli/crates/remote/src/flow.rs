@@ -12,14 +12,15 @@
 
 mod connect;
 
-use super::{Request, forget, store};
+use super::{Request, forget, shared, store};
 use anyhow::{Result, anyhow};
 use riabuild_tasks::{Ctx, Status, Task};
 use riabuild_ui::Failure;
 
 /// `riabuild remote list`
 pub async fn list(ctx: &mut Ctx) -> Result<i32> {
-    let store = store::Store::load(ctx.paths.as_ref()).await;
+    let mut store = store::Store::load(ctx.paths.as_ref()).await;
+    shared::refresh_for_listing(ctx, &mut store).await;
     store::list(ctx, &store)
 }
 
@@ -65,7 +66,13 @@ pub async fn run(ctx: &mut Ctx, request: Request) -> Result<i32> {
     // departed developer fails here rather than on somebody's server.
     ensure_local_prerequisites(ctx).await?;
 
-    connect::connect_and_setup(ctx, &request, &mut store).await
+    // Before the target is resolved, because a target may name one of the
+    // team's servers and the address for it is riabuild-web's to give. A
+    // failure here is a note and an empty list, never a stop: a developer must
+    // still be able to reach the server they set up themselves.
+    let superseded = shared::refresh(ctx, &mut store).await;
+
+    connect::connect_and_setup(ctx, &request, &mut store, superseded).await
 }
 
 /// The two tasks a laptop runs before it touches a server.

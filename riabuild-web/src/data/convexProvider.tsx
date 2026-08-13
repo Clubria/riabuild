@@ -41,12 +41,16 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     api.members.auditLog,
     isLead ? { limit: 40 } : "skip",
   );
+  const sharedServers = useQuery(api.sharedServers.list, isLead ? {} : "skip");
 
   const updateProfile = useMutation(api.members.updateProfile);
   const setRole = useMutation(api.members.setRole);
   const setStatus = useMutation(api.members.setStatus);
   const revoke = useMutation(api.sessions.revoke);
   const updateOrg = useMutation(api.org.update);
+  const addSharedServer = useMutation(api.sharedServers.add);
+  const updateSharedServer = useMutation(api.sharedServers.update);
+  const removeSharedServer = useMutation(api.sharedServers.remove);
   const approveDevice = useMutation(api.cliAuth.approve);
   const denyDevice = useMutation(api.cliAuth.deny);
   /**
@@ -64,6 +68,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     membership,
     sessions: loadable(sessions),
     members: loadable(members),
+    sharedServers: loadable(sharedServers),
     auditLog: loadable(auditLog),
     orgConfig: loadable(orgConfig),
     now,
@@ -82,6 +87,15 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     },
     updateOrg: async (p: OrgUpdate) => {
       await updateOrg(p);
+    },
+    addSharedServer: async (p) => {
+      await addSharedServer(p);
+    },
+    updateSharedServer: async (p) => {
+      await updateSharedServer({ ...p, id: p.id as never });
+    },
+    removeSharedServer: async (p) => {
+      await removeSharedServer({ id: p.id as never });
     },
     signIn: async (p) => {
       await signIn("github", p?.redirectTo !== undefined ? { redirectTo: p.redirectTo } : {});

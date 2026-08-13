@@ -103,6 +103,13 @@ CLI-facing endpoints live in `convex/http.ts` and are versioned. Breaking one st
 every developer on an older Homebrew build until they upgrade — add fields, do not change
 or remove them, and bump the version prefix for anything incompatible.
 
+`GET /api/v1/remotes/shared` is the one endpoint whose answer depends on a role, and the
+dependence is a smaller list rather than a refusal: a candidate gets `{ servers: [] }` and
+a **200**, never a 403. The same command is how they reach the server they set up
+themselves, and refusing the request would take that away in order to enforce a rule about
+servers they were never going to see. It ships an address and nothing else — the key, the
+password and the session for one of those servers stay on the laptop that made them.
+
 Read `.claude/skills/riabuild-api/SKILL.md` before adding an endpoint. It covers session
 authentication, org re-verification, audit logging, and the error shape the CLI expects.
 

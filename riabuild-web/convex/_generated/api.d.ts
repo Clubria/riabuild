@@ -23,6 +23,7 @@ import type * as members from "../members.js";
 import type * as org from "../org.js";
 import type * as release from "../release.js";
 import type * as sessions from "../sessions.js";
+import type * as sharedServers from "../sharedServers.js";
 
 import type {
   ApiFromModules,
@@ -46,6 +47,7 @@ declare const fullApi: ApiFromModules<{
   org: typeof org;
   release: typeof release;
   sessions: typeof sessions;
+  sharedServers: typeof sharedServers;
 }>;
 
 /**
