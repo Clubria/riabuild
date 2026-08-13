@@ -8,7 +8,7 @@
 //! printed one of its own puts it at the top of a fresh mosh screen where
 //! there is nothing above it to separate from.
 
-use super::{Remote, askpass, identity};
+use super::{NO_TMUX, Remote, askpass, identity};
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
@@ -85,6 +85,16 @@ pub async fn open(
             "--".to_string(),
             // mosh `execvp`s this with no shell, so it is handed a complete
             // argv-shaped command rather than something needing parsing.
+            //
+            // `env` wraps the login shell rather than riding inside `command`,
+            // and that is the whole point of this line: `-l` makes `/bin/sh`
+            // read the account's profile, which on a cloudcli box is where the
+            // tmux `exec` lives. `command` already carries `CLOUDCLI_NO_TMUX`
+            // from `env_prefix`, but that `env` does not run until the profile
+            // has already had its say — so this session would open inside tmux
+            // and the copy further in would arrive too late to stop it.
+            "env".to_string(),
+            format!("{}={}", NO_TMUX.0, NO_TMUX.1),
             "/bin/sh".to_string(),
             "-lc".to_string(),
             command.to_string(),
@@ -122,6 +132,14 @@ pub async fn open(
         ));
     }
 
+    // No `env` wrapper here, and no `SetEnv` either. `ssh host <command>` runs
+    // the account's shell non-interactively and non-login, so the profile that
+    // starts tmux is never read on this path at all; the copy `env_prefix` puts
+    // inside `command` is in place well before riabuild spawns the developer's
+    // bash. `-o SetEnv=` would be the only way to get in front of a `.bashrc`
+    // that starts tmux with no interactivity guard, and it does nothing without
+    // a matching `AcceptEnv` on the server while failing outright on an ssh
+    // older than 7.8 — a certain cost against a hypothetical gain.
     let mut args = vec!["-t".to_string()];
     args.extend(identity::ssh_options(remote, paths, true));
     args.push("-o".to_string());
@@ -174,6 +192,44 @@ mod tests {
             fake.calls().iter().any(|call| call.starts_with("mosh ")),
             "{:?}",
             fake.calls()
+        );
+    }
+
+    /// The one place `env_prefix`'s copy arrives too late.
+    ///
+    /// mosh runs `/bin/sh -lc <command>`, and `-l` reads the account's profile
+    /// — which on a cloudcli box is where the tmux `exec` lives. By the time
+    /// the `env` inside `command` runs, the session is already in a pane. So
+    /// the assertion is about *order*, not presence: the variable has to be set
+    /// on the outside of `/bin/sh`, before that shell reads anything.
+    #[tokio::test]
+    async fn the_login_shell_mosh_starts_is_told_not_to_start_tmux() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
+                .with("mosh", 0, "", ""),
+        );
+
+        open(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "env 'RIABUILD_ROOT=/home/dev/.riabuild-remote/abc' riabuild shell",
+        )
+        .await
+        .expect("opens");
+
+        let mosh = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("mosh "))
+            .expect("mosh ran");
+        assert!(
+            mosh.contains("env CLOUDCLI_NO_TMUX=1 /bin/sh -lc"),
+            "the login shell must start with it already set: {mosh}"
         );
     }
 
