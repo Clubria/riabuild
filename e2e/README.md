@@ -36,14 +36,15 @@ One thing: `app.infisical.com`, by `infisical-stub.mjs`. Convex, GitHub, the
 Node tarball, the `gh` and `infisical` downloads and npm are all the real thing.
 
 Everything between the two calls the stub answers — brokering, the short-lived
-token, the environment-not-arguments handoff, writing and git-ignoring
-`.env.local` — is riabuild's own code, running unmodified. Using a real Infisical
+token, the environment-not-arguments handoff, writing and git-ignoring one
+`.env.<environment>` per environment the developer may see — is riabuild's own
+code, running unmodified. Using a real Infisical
 machine identity instead would put the credential that unlocks every dev secret
 into GitHub Actions in order to test code we already own.
 
 The stub returns a loud `501` for any path it does not implement, so an Infisical
 CLI change surfaces as *"the stub does not implement GET /api/v5/…"* rather than
-as an empty `.env.local` and a passing run. It moved from `/api/v3/secrets/raw`
+as an empty `.env.dev` and a passing run. It moved from `/api/v3/secrets/raw`
 to `/api/v4/secrets` once already.
 
 ## The one step CI cannot finish

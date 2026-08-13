@@ -19,7 +19,12 @@ export type BrokerResult =
       expiresAt: number;
       identity: string;
       projectId: string;
+      /**
+       * The base environment, kept for CLIs released before `environments`
+       * existed. It is always `environments[0]`.
+       */
       environment: string;
+      environments: string[];
       secretPath: string;
       siteUrl: string;
     }
@@ -49,6 +54,31 @@ export function identityForRole(role: Role): {
   };
 }
 
+/**
+ * The Infisical environments this role may pull, in the order the CLI writes
+ * them. The CLI turns each name into `.env.<name>` in the checkout.
+ *
+ * This is the same split `identityForRole` makes, and for the same reason: a
+ * candidate is brokered through the narrower machine identity, so naming
+ * staging on their behalf would buy nothing but an Infisical denial their
+ * developer cannot act on. Infisical's RBAC remains the gate — this list only
+ * decides what riabuild *asks* for.
+ *
+ * The list is data, not a path. It carries environment names; deciding what a
+ * file is called from one is the CLI's job, so that a value chosen on the
+ * server can never name a location on a laptop.
+ */
+export function environmentsForRole(role: Role): string[] {
+  const base = process.env.INFISICAL_ENVIRONMENT ?? "dev";
+  if (role === "candidate") return [base];
+
+  // An org with no staging environment sets this empty rather than having
+  // every developer's run fail against an environment Infisical does not have.
+  const staging = process.env.INFISICAL_STAGING_ENVIRONMENT ?? "staging";
+  if (!staging || staging === base) return [base];
+  return [base, staging];
+}
+
 export function siteUrl(): string {
   return (
     process.env.INFISICAL_SITE_URL?.replace(/\/+$/, "") ??
@@ -61,7 +91,7 @@ export async function brokerToken(role: Role): Promise<BrokerResult> {
   const clientId = process.env[identity.clientIdVar];
   const clientSecret = process.env[identity.clientSecretVar];
   const projectId = process.env.INFISICAL_PROJECT_ID;
-  const environment = process.env.INFISICAL_ENVIRONMENT ?? "dev";
+  const environments = environmentsForRole(role);
   const secretPath = process.env.INFISICAL_SECRET_PATH ?? "/";
 
   if (!clientId || !clientSecret || !projectId) {
@@ -113,7 +143,8 @@ export async function brokerToken(role: Role): Promise<BrokerResult> {
     expiresAt: Date.now() + ttlSeconds * 1000,
     identity: identity.name,
     projectId,
-    environment,
+    environment: environments[0],
+    environments,
     secretPath,
     siteUrl: siteUrl(),
   };

@@ -67,7 +67,16 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
     theme: "auto",
     permissions: {
       defaultMode: "bypassPermissions",
-      deny: ["Read(./.env.local)", "Read(./.env)", "Bash(git push --force:*)"],
+      // `Read(./.env.*)` rather than one entry per environment: riabuild now
+      // writes `.env.dev` and `.env.staging`, and a deployment is free to name
+      // others. An exact-path entry would have to be edited in the dashboard
+      // every time one is added, and would silently leave the new file readable
+      // until someone did. `.env.local` stays covered by the same glob.
+      deny: [
+        "Read(./.env)",
+        "Read(./.env.*)",
+        "Bash(git push --force:*)",
+      ],
     },
     skipDangerousModePermissionPrompt: true,
     env: { CLUBRIA_ORG: "1" },
@@ -148,7 +157,7 @@ export const update = mutation({
     repoSlug: v.optional(v.string()),
     minCliVersion: v.optional(v.string()),
     latestCliVersion: v.optional(v.string()),
-    /** Set when secrets rotate; forces every developer's .env.local to refresh. */
+    /** Set when secrets rotate; forces every developer's .env.<environment> to refresh. */
     markSecretsRotated: v.optional(v.boolean()),
   },
   returns: v.null(),
@@ -505,5 +514,106 @@ export const backfillClaudeDefaults = internalMutation({
     });
 
     return { updated: true, added, reason: `Added ${added.join(", ")}.` };
+  },
+});
+
+/** The glob that covers every dotenv file riabuild writes, now and later. */
+const DOTENV_DENY_GLOB = "Read(./.env.*)";
+
+/** Exact-path deny entries that mean "this org wants dotenv reads denied". */
+const DOTENV_DENY_ENTRIES = ["Read(./.env)", "Read(./.env.local)"];
+
+/**
+ * Teaches an existing org the dotenv filenames riabuild writes today.
+ *
+ *     npx convex run org:denyEveryDotenvFile --prod
+ *
+ * `backfillClaudeDefaults` cannot do this and is not broken. It only fills keys
+ * that are *absent*, and `permissions.deny` is present on every stored row — so
+ * editing the array inside `DEFAULT_CLAUDE_SETTINGS` reaches fresh deployments
+ * and nowhere else. That gap became a real one when riabuild stopped writing a
+ * single `.env.local` and started writing `.env.dev` and `.env.staging`:
+ * `Read(./.env)` is an exact path, so neither new file was covered, and the
+ * secrets riabuild had just brokered were readable by every Claude Code account.
+ *
+ * Separate from the backfill, and separately named, because it does something
+ * the backfill deliberately does not: it reaches *into* an array the org
+ * already answered. Two things keep that honest.
+ *
+ * It is additive — the glob is appended and nothing is removed, including the
+ * now-redundant `Read(./.env.local)`. And it only fires on an org whose deny
+ * list still carries a dotenv entry. An org that removed them all is left
+ * exactly as it is: an emptied deny list is a decision, and this migration
+ * exists to teach an org the new *filenames*, not to re-argue whether dotenv
+ * files should be denied at all. That is the same line `backfillClaudeDefaults`
+ * draws, and the test beside it pins both sides.
+ *
+ * Safe to run twice, and safe on an org that has never been touched.
+ */
+export const denyEveryDotenvFile = internalMutation({
+  args: {},
+  returns: v.object({ updated: v.boolean(), reason: v.string() }),
+  handler: async (ctx) => {
+    const row = await ctx.db.query("orgConfig").first();
+    if (row === null) {
+      return {
+        updated: false,
+        reason: "No stored config — the served defaults already carry the glob.",
+      };
+    }
+
+    let settings: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(row.claudeSettings);
+      if (!isSettingsObject(parsed)) throw new Error("not an object");
+      settings = parsed;
+    } catch {
+      return {
+        updated: false,
+        reason:
+          "Stored settings are not a JSON object. Fix them in the dashboard first.",
+      };
+    }
+
+    const permissions = settings.permissions;
+    if (!isSettingsObject(permissions) || !Array.isArray(permissions.deny)) {
+      // Nothing to extend. `backfillClaudeDefaults` is what supplies a missing
+      // key, and it will bring the current default glob with it.
+      return {
+        updated: false,
+        reason: "No deny list to extend — run backfillClaudeDefaults instead.",
+      };
+    }
+
+    const deny = permissions.deny as unknown[];
+    if (deny.includes(DOTENV_DENY_GLOB)) {
+      return { updated: false, reason: "Already denies every dotenv file." };
+    }
+    if (!DOTENV_DENY_ENTRIES.some((entry) => deny.includes(entry))) {
+      return {
+        updated: false,
+        reason: "This org denies no dotenv reads; leaving its choice alone.",
+      };
+    }
+
+    permissions.deny = [...deny, DOTENV_DENY_GLOB];
+    await ctx.db.patch("orgConfig", row._id, {
+      claudeSettings: JSON.stringify(settings, null, 2),
+      // Moving this is the point: the CLI decides whether to re-fetch by
+      // comparing it, so a settings change that leaves it alone never lands.
+      claudeSettingsUpdatedAt: Date.now(),
+    });
+
+    // No actorId: this is a migration, not a person.
+    await writeAudit(ctx, {
+      action: "org.config_updated",
+      meta: {
+        fields: "claudeSettings",
+        via: "denyEveryDotenvFile",
+        added: DOTENV_DENY_GLOB,
+      },
+    });
+
+    return { updated: true, reason: `Added ${DOTENV_DENY_GLOB}.` };
   },
 });

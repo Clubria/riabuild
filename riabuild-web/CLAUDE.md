@@ -102,6 +102,26 @@ npx convex run org:backfillClaudeDefaults --prod
 It is additive only and safe to re-run: a key the org already answered is left alone,
 whatever its value.
 
+**"A key the org already answered" includes every array.** `fillMissing` fills keys that
+are *absent*, and `permissions.deny` is present on every stored row — so editing the
+entries inside that array reaches fresh deployments and nowhere else, and the backfill
+above reports "every default is already answered" while doing nothing. This has already
+been load-bearing once: riabuild stopped writing a single `.env.local` and started writing
+`.env.dev` and `.env.staging`, and `Read(./.env)` is an exact path, so on every existing
+deployment the secrets riabuild had just brokered were readable by every Claude Code
+account, with the backfill reporting success. Changing an entry *inside* a default array
+therefore needs its own named migration:
+
+```sh
+npx convex run org:denyEveryDotenvFile --prod
+```
+
+`denyEveryDotenvFile` is the model for that shape. It appends and never removes, and it
+fires only on an org whose deny list still carries a dotenv entry — an org that removed
+them all keeps that choice, because an emptied deny list is a decision and a migration
+that puts entries back one element at a time undoes it. Teaching an org a new *filename*
+is in scope; re-arguing whether the file should be denied is not.
+
 **The server ships data, never logic.** No endpoint returns anything the CLI will
 execute. The Claude settings may name a program riabuild installs from its own binary —
 `statusLine` names `node ~/.riabuild/claude-statusline.js` — but never carry the program.
@@ -113,12 +133,26 @@ CLI-facing endpoints live in `convex/http.ts` and are versioned. Breaking one st
 every developer on an older Homebrew build until they upgrade — add fields, do not change
 or remove them, and bump the version prefix for anything incompatible.
 
-`GET /api/v1/remotes/shared` is the one endpoint whose answer depends on a role, and the
-dependence is a smaller list rather than a refusal: a candidate gets `{ servers: [] }` and
-a **200**, never a 403. The same command is how they reach the server they set up
-themselves, and refusing the request would take that away in order to enforce a rule about
-servers they were never going to see. It ships an address and nothing else — the key, the
-password and the session for one of those servers stay on the laptop that made them.
+Three endpoints answer differently for different roles, and in every case the dependence
+is a **smaller list rather than a refusal** — a candidate gets a 200 with less in it,
+never a 403.
+
+`GET /api/v1/remotes/shared` gives a candidate `{ servers: [] }`. The same command is how
+they reach the server they set up themselves, and refusing the request would take that
+away in order to enforce a rule about servers they were never going to see. It ships an
+address and nothing else — the key, the password and the session for one of those servers
+stay on the laptop that made them.
+
+`POST /api/v1/secrets/token` and `GET /api/v1/org/config` both carry
+`environmentsForRole(member.role)`: `["dev", "staging"]` for a developer or lead,
+`["dev"]` for a candidate, which the CLI turns into one `.env.<name>` per entry. The list
+appears on **both** because they answer different questions — the broker says what the
+credential it just minted may reach, and config says which files the CLI's `check()`
+should expect to find. `check()` runs on every `riabuild --check` and must not broker a
+token to learn that, since brokering calls Infisical and writes an audit row.
+
+The names are environment names, never filenames. Deciding that `dev` becomes `.env.dev`
+is the CLI's job, so a value chosen on the server can never name a location on a laptop.
 
 Read `.claude/skills/riabuild-api/SKILL.md` before adding an endpoint. It covers session
 authentication, org re-verification, audit logging, and the error shape the CLI expects.

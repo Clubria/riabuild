@@ -89,7 +89,7 @@ a task never records a success it has not verified.
 | 7 | `claude_accounts` | Claude Code installed, and at least one account of your own, signed in |
 | 8 | `org_settings` | the team's Claude settings, cached and current |
 | 9 | `claude_trust` | every account trusts the checkout, so no modal on first launch |
-| 10 | `env_local` | `.env.local`, freshly brokered, parseable, and git-ignored |
+| 10 | `env_local` | one `.env.<environment>` per environment you may see — `.env.dev`, plus `.env.staging` for developers and leads — freshly brokered, parseable, and git-ignored |
 | 11 | `claude_statusline` | the status line script the org settings name |
 
 Then it drops you into your own shell with the environment applied, opening with a box

@@ -18,7 +18,7 @@ const MANIFEST: [string, string][] = [
   ["repo_status", "report drift — never pull for you"],
   ["claude_accounts", "Claude Code accounts of your own"],
   ["org_settings", "team policy, layered at launch"],
-  ["env_local", "secrets, brokered fresh each time"],
+  ["env_local", "secrets per environment, brokered fresh each time"],
 ];
 
 export function DASHBOARD_TABS(isLead: boolean): Tab[] {

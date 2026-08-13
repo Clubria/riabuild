@@ -94,7 +94,8 @@ Checking build-01
   ● Node and pnpm
   ● Project checkout
   ● Project secrets
-    secrets written to .env.local from the dev environment
+    secrets written to .env.dev from the dev environment
+    staging secrets written to .env.staging
 
 ● Clubria environment active on build-01 — type `exit` to leave
 ada@build-01 ~/Clubria/ada/ai-builders-hub $

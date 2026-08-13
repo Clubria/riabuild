@@ -136,7 +136,7 @@ export default defineSchema({
     defaultProjectPath: v.optional(v.string()),
     minCliVersion: v.string(),
     latestCliVersion: v.string(),
-    /** Bumped when secrets rotate; the CLI treats an older .env.local as stale. */
+    /** Bumped when secrets rotate; the CLI treats an older .env.<environment> as stale. */
     secretsUpdatedAt: v.number(),
   }),
 
