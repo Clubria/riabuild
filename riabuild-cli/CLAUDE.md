@@ -291,6 +291,22 @@ and keep a thin wrapper that supplies the real one. `paths::default_project_dir_
 pattern: `cfg!` would compile every branch but one out of the test binary, so only the
 runner's own answer could ever be asserted.
 
+**The parameter has to reach the public function, not just the decision underneath it.**
+`keychain::select` took `is_macos` from the day it was written, and the three wrappers
+around it — `for_platform`, `for_password`, `for_account` — went on asking `cfg!`
+themselves, so every test that went *through* a wrapper silently asserted "…and the host
+is Linux". Six did. They passed the `ubuntu-latest` pull-request gate for the whole life
+of the keyring-less fallback and then failed together on the release workflow's macOS
+job — which runs *after* the tag is pushed, so the first two releases that carried them
+had no binaries at all. Half-applying this pattern is worse than not applying it, because
+the extracted function looks like the coverage already exists.
+
+Each wrapper now takes `is_macos`, and `each_wrapper_passes_the_platform_it_is_actually_running_on`
+pins all three to the host's real answer. That test is not optional: a parameter without
+one *moves* the untested branch into the wrapper rather than removing it, and a wrapper
+hardcoding `false` would send every Mac to `secret-tool` while the suite stayed green on
+both hosts.
+
 **riabuild owns every tool it depends on.** Node, pnpm, Claude Code, `gh`, and
 `infisical` are downloaded, verified against a published digest, and kept under
 `~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a

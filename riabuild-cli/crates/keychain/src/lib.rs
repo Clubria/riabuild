@@ -79,8 +79,38 @@ pub async fn for_account(
     account: &str,
     keyringless_fallback: PathBuf,
 ) -> Box<dyn Keychain> {
+    for_account_on(
+        cfg!(target_os = "macos"),
+        runner,
+        account,
+        keyringless_fallback,
+    )
+    .await
+}
+
+/// `for_account` with the platform question as a parameter.
+///
+/// This is `paths::default_project_dir_on`'s shape, and it is here for the
+/// reason [`select`] is: a `cfg!(target_os = "macos")` inside the function
+/// compiles every branch but the host's out of the test binary, so a test can
+/// only ever assert what its own machine does. Pulling `select` out was half
+/// the job — the three wrappers around it still asked `cfg!` themselves, which
+/// meant every test that went *through* a wrapper silently asserted "and the
+/// host is Linux".
+///
+/// That is not a hypothetical. The tests below did exactly that, passed the
+/// `ubuntu-latest` pull-request gate for the whole life of the keyring-less
+/// fallback, and then failed six-at-once on the release workflow's macOS job —
+/// which is the only macOS runner this repository has, and runs after the tag
+/// is pushed. A test that cannot fail until release is not a gate.
+async fn for_account_on(
+    is_macos: bool,
+    runner: Arc<dyn CommandRunner>,
+    account: &str,
+    keyringless_fallback: PathBuf,
+) -> Box<dyn Keychain> {
     let answers = platform::keyring_answers(runner.as_ref()).await;
-    match select_password_store(cfg!(target_os = "macos"), answers, keyringless_fallback) {
+    match select_password_store(is_macos, answers, keyringless_fallback) {
         Choice::Macos => Box::new(SecurityCliKeychain::for_account(runner, account)),
         Choice::Linux => Box::new(SecretToolKeychain::for_account(runner, account)),
         Choice::LinuxFile(path) => Box::new(FileKeychain::keyringless_machine(path)),
@@ -253,12 +283,23 @@ pub async fn for_password(
     account: &str,
     fallback: PathBuf,
 ) -> Box<dyn Keychain> {
+    for_password_on(cfg!(target_os = "macos"), runner, account, fallback).await
+}
+
+/// `for_password` with the platform question as a parameter — see
+/// [`for_account_on`] for why every wrapper in this file has one.
+async fn for_password_on(
+    is_macos: bool,
+    runner: Arc<dyn CommandRunner>,
+    account: &str,
+    fallback: PathBuf,
+) -> Box<dyn Keychain> {
     // `keyring_answers`, not `which("secret-tool")`. This call site had the
     // same bug as `for_platform`: a laptop with the binary and no Secret
     // Service passed the old test, took the keyring branch, and failed at
     // every one of the ten SSH connections a single `riabuild remote` opens.
     let answers = platform::keyring_answers(runner.as_ref()).await;
-    match select_password_store(cfg!(target_os = "macos"), answers, fallback) {
+    match select_password_store(is_macos, answers, fallback) {
         Choice::LinuxFile(path) => Box::new(FileKeychain::keyringless_machine(path)),
         Choice::Macos => Box::new(SecurityCliKeychain::for_account(runner, account)),
         Choice::Linux => Box::new(SecretToolKeychain::for_account(runner, account)),
@@ -283,12 +324,34 @@ pub async fn for_platform(
     session_token_file: Option<PathBuf>,
     keyringless_fallback: PathBuf,
 ) -> Box<dyn Keychain> {
+    for_platform_on(
+        cfg!(target_os = "macos"),
+        runner,
+        session_token_file,
+        keyringless_fallback,
+    )
+    .await
+}
+
+/// `for_platform` with the platform question as a parameter — see
+/// [`for_account_on`] for why every wrapper in this file has one.
+///
+/// `is_macos` governs the probe as well as the choice. The two must move
+/// together: a version of this that took the parameter for `select` and left
+/// `cfg!` in `needs_probe` would still be a function whose behaviour on a
+/// macOS host differs from what any test on it can describe.
+async fn for_platform_on(
+    is_macos: bool,
+    runner: Arc<dyn CommandRunner>,
+    session_token_file: Option<PathBuf>,
+    keyringless_fallback: PathBuf,
+) -> Box<dyn Keychain> {
     let token_env = std::env::var("RIABUILD_TOKEN").ok();
     // Only Linux can answer "no", and only when neither branch above the
     // keyring question already applies — so the probe is skipped on macOS,
     // under `RIABUILD_TOKEN`, and on a managed server, none of which would
     // use the answer.
-    let needs_probe = !cfg!(target_os = "macos")
+    let needs_probe = !is_macos
         && session_token_file.is_none()
         && !token_env.as_deref().is_some_and(|value| !value.is_empty());
     let answers = if needs_probe {
@@ -297,7 +360,7 @@ pub async fn for_platform(
         false
     };
     match select(
-        cfg!(target_os = "macos"),
+        is_macos,
         token_env.as_deref(),
         session_token_file,
         answers,
@@ -367,7 +430,7 @@ mod tests {
         // anywhere it could later revoke — which is the exact outcome
         // `session::ensure` refuses to allow a server to cause.
         let fallback = PathBuf::from("/home/ada/.riabuild/remote-sessions/9f2c");
-        let store = for_account(runner_with_no_dbus(), "remote:9f2c", fallback).await;
+        let store = for_account_on(false, runner_with_no_dbus(), "remote:9f2c", fallback).await;
         assert_eq!(
             store.describe(),
             "a private file, because this machine has no keyring"
@@ -375,9 +438,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mac_laptop_caches_a_servers_session_in_the_keychain_regardless() {
+        // The same machine as the test above — `secret-tool` installed, no
+        // session bus — except that it is a Mac, where the probe's answer is
+        // not the question: `security(1)` and an unlocked login keychain are
+        // always there on the laptop `riabuild remote` runs from.
+        let fallback = PathBuf::from("/Users/ada/.riabuild/remote-sessions/9f2c");
+        let store = for_account_on(true, runner_with_no_dbus(), "remote:9f2c", fallback).await;
+        assert_eq!(store.describe(), "your macOS Keychain");
+    }
+
+    #[tokio::test]
     async fn a_laptop_with_a_keyring_still_caches_a_servers_session_in_it() {
         let fallback = PathBuf::from("/home/ada/.riabuild/remote-sessions/9f2c");
-        let store = for_account(runner_with_a_working_keyring(), "remote:9f2c", fallback).await;
+        let store = for_account_on(
+            false,
+            runner_with_a_working_keyring(),
+            "remote:9f2c",
+            fallback,
+        )
+        .await;
         assert_eq!(store.describe(), "your system keyring");
     }
 
@@ -422,7 +502,8 @@ mod tests {
         // `security` cannot open a login keychain an SSH session has not unlocked,
         // so asking the platform first would pick a store that always fails.
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
-        let remote = for_platform(
+        let remote = for_platform_on(
+            false,
             runner.clone(),
             Some(PathBuf::from("/home/dev/ns/session.token")),
             laptop_fallback(),
@@ -431,15 +512,20 @@ mod tests {
         assert_eq!(remote.describe(), "this server's riabuild namespace");
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_macos_server_still_picks_the_file_store_over_the_keychain() {
-        // Pins the *ordering* in `for_platform`, not just the outcome: on a
-        // machine where `cfg!(target_os = "macos")` is true, the file store must
-        // still win when `session_token_file` is `Some`, because a macOS server
-        // has no way to unlock its login keychain over SSH.
+        // Pins the *ordering* in `for_platform`, not just the outcome: when the
+        // platform answer is macOS, the file store must still win with a
+        // `session_token_file`, because a macOS server has no way to unlock its
+        // login keychain over SSH.
+        //
+        // This used to be `#[cfg(target_os = "macos")]`, which meant the one
+        // regression it exists to catch was only caught on the release
+        // workflow's macOS runner — after the tag. Passing `is_macos` makes it
+        // a test the pull-request gate runs.
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
-        let remote = for_platform(
+        let remote = for_platform_on(
+            true,
             runner,
             Some(PathBuf::from("/home/dev/ns/session.token")),
             laptop_fallback(),
@@ -453,7 +539,13 @@ mod tests {
         // The half of the old `a_laptop_..._never_selects_the_file_store` test
         // that survives the fallback: a machine with a keyring must still put
         // the token in it, and must never be described as a server.
-        let laptop = for_platform(runner_with_a_working_keyring(), None, laptop_fallback()).await;
+        let laptop = for_platform_on(
+            false,
+            runner_with_a_working_keyring(),
+            None,
+            laptop_fallback(),
+        )
+        .await;
         assert_eq!(laptop.describe(), "your system keyring");
     }
 
@@ -465,7 +557,7 @@ mod tests {
         // device-code flow and only discovered it had nowhere to put the token
         // *after* the developer approved the machine in a browser — surfacing a
         // raw `secret-tool:` stderr line under "it is a bug in riabuild".
-        let server = for_platform(runner_with_no_dbus(), None, laptop_fallback()).await;
+        let server = for_platform_on(false, runner_with_no_dbus(), None, laptop_fallback()).await;
         assert_eq!(
             server.describe(),
             "a private file, because this machine has no keyring",
@@ -482,7 +574,7 @@ mod tests {
         // The other way to have no keyring, and the one the old code did
         // detect — it just had nothing to offer afterwards.
         let bare: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
-        let store = for_platform(bare, None, laptop_fallback()).await;
+        let store = for_platform_on(false, bare, None, laptop_fallback()).await;
         assert_eq!(
             store.describe(),
             "a private file, because this machine has no keyring"
@@ -505,14 +597,58 @@ mod tests {
         );
     }
 
-    // The three tests above go through `for_platform`, so on this (Linux) host
-    // `cfg!(target_os = "macos")` is always `false` inside it — meaning none of
-    // them can catch a regression that swaps the remote check and the platform
-    // check in `select`, and neither can PR CI, which only runs `ubuntu-latest`
-    // (the sole macOS runner is `release.yml`'s tag-triggered job, not the
-    // pull_request gate). The tests below call `select` directly with
-    // `is_macos: true` so that exact regression is caught on any host,
-    // including this one.
+    /// Guards the wiring between each public function and the tested one —
+    /// `paths`' `the_default_matches_the_platform_it_is_running_on`, once per
+    /// wrapper.
+    ///
+    /// Without this, taking the platform out as a parameter would *move* the
+    /// untested branch rather than remove it: three `cfg!(target_os =
+    /// "macos")` call sites that no test names, where a wrapper passing a
+    /// hardcoded `false` would send every Mac to `secret-tool` and pass the
+    /// whole suite on both hosts.
+    #[tokio::test]
+    async fn each_wrapper_passes_the_platform_it_is_actually_running_on() {
+        let is_macos = cfg!(target_os = "macos");
+        let runner = runner_with_a_working_keyring;
+
+        assert_eq!(
+            for_platform(runner(), None, laptop_fallback())
+                .await
+                .describe(),
+            for_platform_on(is_macos, runner(), None, laptop_fallback())
+                .await
+                .describe(),
+        );
+        assert_eq!(
+            for_password(runner(), "remote-password:9f2c", laptop_fallback())
+                .await
+                .describe(),
+            for_password_on(
+                is_macos,
+                runner(),
+                "remote-password:9f2c",
+                laptop_fallback()
+            )
+            .await
+            .describe(),
+        );
+        assert_eq!(
+            for_account(runner(), "remote:9f2c", laptop_fallback())
+                .await
+                .describe(),
+            for_account_on(is_macos, runner(), "remote:9f2c", laptop_fallback())
+                .await
+                .describe(),
+        );
+    }
+
+    // The tests above now pass `is_macos` explicitly, so both platforms'
+    // outcomes are asserted on every host — which they were not when each
+    // wrapper asked `cfg!` itself, and PR CI only runs `ubuntu-latest` (the
+    // sole macOS runner is `release.yml`'s tag-triggered job, not the
+    // pull_request gate). The tests below call `select` directly, which is
+    // still the tightest place to pin the *ordering* of the branches: no
+    // runner, no store construction, just the decision.
 
     #[test]
     fn select_prefers_the_file_store_over_macos_even_when_is_macos_is_true() {
@@ -570,6 +706,15 @@ mod tests {
     /// It **skips** on a machine whose keyring answers, and that is not
     /// laziness — the alternative is a test that writes a token into a
     /// developer's real login keyring while they run `cargo test`.
+    ///
+    /// `is_macos: false` is the same refusal, and is why this is not simply
+    /// `cfg!(target_os = "macos")`. On a Mac the real answer would select
+    /// `security(1)` and this test would put `rb_live_token` in the login
+    /// keychain of whoever ran it. What it asserts instead — that the file
+    /// store really round-trips a token at 0600 — is a live path on macOS
+    /// too, because a macOS *server* uses that same `FileKeychain`. So the
+    /// coverage this buys on the release workflow's macOS runner is real,
+    /// not a Linux fixture wearing a Mac's clothes.
     #[tokio::test]
     async fn a_real_machine_with_no_secret_service_can_actually_keep_a_token() {
         let runner: Arc<dyn CommandRunner> = Arc::new(riabuild_runner::RealRunner);
@@ -581,7 +726,7 @@ mod tests {
         let home = tempfile::TempDir::new().expect("tempdir");
         let path = home.path().join("riabuild").join("session.token");
 
-        let store = for_platform(runner, None, path.clone()).await;
+        let store = for_platform_on(false, runner, None, path.clone()).await;
         assert_eq!(
             store.describe(),
             "a private file, because this machine has no keyring",
