@@ -5,7 +5,7 @@ use crate::accounts;
 use crate::accounts::render;
 use crate::accounts::status::{self, Identity};
 use crate::shims;
-use crate::{claude_onboarding, claude_trust};
+use crate::{claude_agents_view, claude_onboarding, claude_trust};
 use anyhow::Result;
 use riabuild_paths::contract_tilde;
 use riabuild_runner::RunOptions;
@@ -110,8 +110,24 @@ pub async fn new(ctx: &mut Ctx) -> Result<i32> {
     }
 
     settle_onboarding(ctx, &id, number).await;
+    prefer_agents_view(ctx, &id).await;
     trust(ctx, &id, number).await;
     list(ctx).await
+}
+
+/// Gives one freshly created account the team's agents-view default.
+///
+/// Here as well as in the task for the same reason onboarding is: the account is
+/// about to be used, and the next `riabuild` run is too late to decide what its
+/// first session opens on.
+///
+/// The one silent failure on this path, and deliberately so. Its two neighbours
+/// each report, because each is about to put a *dialog* in front of the
+/// developer and an unexplained dialog reads as riabuild not having worked. This
+/// one only decides which view opens: a note about it would be riabuild
+/// apologising for a preference, and the next run sets it anyway.
+async fn prefer_agents_view(ctx: &mut Ctx, id: &str) {
+    let _ = claude_agents_view::prefer_one(ctx, id).await;
 }
 
 /// Records that Claude Code's first-run setup is done for one freshly created
