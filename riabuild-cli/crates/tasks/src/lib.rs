@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod claude_accounts;
 pub mod claude_config;
 pub mod claude_onboarding;
+pub mod claude_plugins;
 pub mod claude_statusline;
 pub mod claude_trust;
 pub mod engine;
@@ -359,6 +360,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(claude_onboarding::ClaudeOnboarding),
         Box::new(env_local::EnvLocal),
         Box::new(claude_statusline::ClaudeStatusline),
+        Box::new(claude_plugins::ClaudePlugins),
     ]
 }
 
