@@ -6,8 +6,20 @@
 //! This file holds the trait every store implements and the decision of which
 //! store a given machine gets. The stores themselves live beside it: `platform`
 //! drives the macOS and Linux credential tools through `CommandRunner`, and
-//! `file` holds the one exception to the paragraph above — a server, which has
-//! no keyring to put a token in.
+//! `file` holds the exceptions to the paragraph above — the machines with no
+//! keyring to put a token in.
+//!
+//! There are two of those, and they are the same situation reached from
+//! different directions: a **managed server**, which never had a keyring an SSH
+//! session could unlock, and a **headless Linux machine** someone installed
+//! riabuild on directly, whose keyring does not answer. The second used to be
+//! unhandled — not "handled badly", unhandled: `select` had no branch for it,
+//! so such a machine was given the `secret-tool` store, signed the developer in
+//! through a browser, and then failed to keep the token it had just minted.
+//!
+//! Deciding which machine this is means asking whether a Secret Service
+//! actually replies, not whether `secret-tool` is on `PATH` — see
+//! [`platform::keyring_answers`], which is where that mistake lived.
 
 // `unwrap_used` is denied workspace-wide. In test scaffolding a panic *is* the
 // reporting mechanism for a failed precondition, so unwrapping a fixture is
@@ -55,7 +67,7 @@ pub fn for_account(
     session_token_file: Option<PathBuf>,
 ) -> Box<dyn Keychain> {
     if let Some(path) = session_token_file {
-        return Box::new(FileKeychain::new(path));
+        return Box::new(FileKeychain::server_namespace(path));
     }
     if cfg!(target_os = "macos") {
         return Box::new(SecurityCliKeychain::for_account(runner, account));
@@ -128,13 +140,16 @@ impl Keychain for MemoryKeychain {
     }
 }
 
-/// The outcome of [`select`] — which store, and (for the file store) where.
+/// The outcome of [`select`] — which store, and (for a file store) where.
 #[derive(Debug, PartialEq, Eq)]
 enum Choice {
     Env,
-    File(PathBuf),
+    /// A managed server's own session, in its namespace.
+    ServerFile(PathBuf),
     Macos,
     Linux,
+    /// A Linux machine with no Secret Service answering — see [`select`].
+    LinuxFile(PathBuf),
 }
 
 /// The ordering decision itself, as a pure function of inputs rather than of
@@ -151,18 +166,39 @@ enum Choice {
 /// store at all. A server comes next, *before* any platform question: a macOS
 /// server has `security(1)` and a login keychain an SSH session cannot unlock, so
 /// asking the platform first would pick a store that always fails.
-fn select(is_macos: bool, token_env: Option<&str>, session_token_file: Option<PathBuf>) -> Choice {
+///
+/// `keyring_answers` is the last question, and only Linux asks it. A headless
+/// Linux box — a build server, a container, a minimal install — has no D-Bus
+/// session bus and so no Secret Service, and until this existed riabuild had
+/// nowhere at all to put the token there: it signed the developer in, threw the
+/// token away, and reported its own bug. So that machine gets a 0600 file, the
+/// same `FileKeychain` a managed server has always used, for the same reason
+/// `select_password_store` already falls back — the alternative is not "no
+/// token on disk", it is "riabuild does not run here".
+///
+/// macOS is not asked. `security(1)` and a login keychain are always present,
+/// and the one macOS case with no unlockable keychain — a server reached over
+/// SSH — is already caught by the `session_token_file` branch above it.
+fn select(
+    is_macos: bool,
+    token_env: Option<&str>,
+    session_token_file: Option<PathBuf>,
+    keyring_answers: bool,
+    keyringless_fallback: PathBuf,
+) -> Choice {
     if token_env.is_some_and(|value| !value.is_empty()) {
         return Choice::Env;
     }
     if let Some(path) = session_token_file {
-        return Choice::File(path);
+        return Choice::ServerFile(path);
     }
     if is_macos {
-        Choice::Macos
-    } else {
-        Choice::Linux
+        return Choice::Macos;
     }
+    if keyring_answers {
+        return Choice::Linux;
+    }
+    Choice::LinuxFile(keyringless_fallback)
 }
 
 /// Where a *server's SSH password* is kept, which is not quite the same
@@ -174,7 +210,7 @@ fn select(is_macos: bool, token_env: Option<&str>, session_token_file: Option<Pa
 ///   session, which has nothing to do with a Unix account's password on some
 ///   server. Honouring it here would hand `ssh` a bearer token as a password.
 /// - **A machine with no keyring falls back to a file** rather than to a store
-///   that always fails. On Linux without `secret-tool` — a container, a CI
+///   that always fails. On Linux with no Secret Service answering — a container, a CI
 ///   runner, a minimal distro — the alternative is not "no password on disk",
 ///   it is riabuild asking for the password again at every one of the ten SSH
 ///   connections a single `riabuild remote` opens. `~/.riabuild/ssh/passwords/`
@@ -185,48 +221,76 @@ fn select(is_macos: bool, token_env: Option<&str>, session_token_file: Option<Pa
 /// always there, and `riabuild remote` runs on a laptop, where that keychain is
 /// unlocked. The server case that forces `for_platform`'s file store does not
 /// arise — a server never runs `riabuild remote`.
-fn select_password_store(is_macos: bool, has_secret_tool: bool, fallback: PathBuf) -> Choice {
+fn select_password_store(is_macos: bool, keyring_answers: bool, fallback: PathBuf) -> Choice {
     if is_macos {
         return Choice::Macos;
     }
-    if has_secret_tool {
+    if keyring_answers {
         return Choice::Linux;
     }
-    Choice::File(fallback)
+    Choice::LinuxFile(fallback)
 }
 
 /// The store a saved SSH password for one server goes in. See
 /// [`select_password_store`] for why this is not [`for_account`].
-pub fn for_password(
+pub async fn for_password(
     runner: Arc<dyn CommandRunner>,
     account: &str,
     fallback: PathBuf,
 ) -> Box<dyn Keychain> {
-    let has_secret_tool = runner.which("secret-tool").is_some();
-    match select_password_store(cfg!(target_os = "macos"), has_secret_tool, fallback) {
-        Choice::File(path) => Box::new(FileKeychain::new(path)),
+    // `keyring_answers`, not `which("secret-tool")`. This call site had the
+    // same bug as `for_platform`: a laptop with the binary and no Secret
+    // Service passed the old test, took the keyring branch, and failed at
+    // every one of the ten SSH connections a single `riabuild remote` opens.
+    let answers = platform::keyring_answers(runner.as_ref()).await;
+    match select_password_store(cfg!(target_os = "macos"), answers, fallback) {
+        Choice::LinuxFile(path) => Box::new(FileKeychain::keyringless_machine(path)),
         Choice::Macos => Box::new(SecurityCliKeychain::for_account(runner, account)),
         Choice::Linux => Box::new(SecretToolKeychain::for_account(runner, account)),
-        // `select_password_store` never returns it — the session-token
-        // override has no meaning for a server's password.
+        // `select_password_store` returns neither — the session-token
+        // override and a server namespace both have no meaning for a
+        // server's SSH password.
         Choice::Env => Box::new(EnvKeychain),
+        Choice::ServerFile(path) => Box::new(FileKeychain::server_namespace(path)),
     }
 }
 
 /// Picks the right store for this machine. See [`select`] for the ordering
 /// this delegates to.
-pub fn for_platform(
+///
+/// Async because deciding now costs a `secret-tool lookup`: whether a keyring
+/// is *usable* cannot be answered by stat-ing `PATH`. Paying it here, once, at
+/// startup is the point — the choice has to be made before `login` runs, so a
+/// machine with nowhere to keep a token never reaches a browser approval whose
+/// result it would then discard.
+pub async fn for_platform(
     runner: Arc<dyn CommandRunner>,
     session_token_file: Option<PathBuf>,
+    keyringless_fallback: PathBuf,
 ) -> Box<dyn Keychain> {
     let token_env = std::env::var("RIABUILD_TOKEN").ok();
+    // Only Linux can answer "no", and only when neither branch above the
+    // keyring question already applies — so the probe is skipped on macOS,
+    // under `RIABUILD_TOKEN`, and on a managed server, none of which would
+    // use the answer.
+    let needs_probe = !cfg!(target_os = "macos")
+        && session_token_file.is_none()
+        && !token_env.as_deref().is_some_and(|value| !value.is_empty());
+    let answers = if needs_probe {
+        platform::keyring_answers(runner.as_ref()).await
+    } else {
+        false
+    };
     match select(
         cfg!(target_os = "macos"),
         token_env.as_deref(),
         session_token_file,
+        answers,
+        keyringless_fallback,
     ) {
         Choice::Env => Box::new(EnvKeychain),
-        Choice::File(path) => Box::new(FileKeychain::new(path)),
+        Choice::ServerFile(path) => Box::new(FileKeychain::server_namespace(path)),
+        Choice::LinuxFile(path) => Box::new(FileKeychain::keyringless_machine(path)),
         Choice::Macos => Box::new(SecurityCliKeychain::new(runner)),
         Choice::Linux => Box::new(SecretToolKeychain::new(runner)),
     }
@@ -254,7 +318,7 @@ mod tests {
         );
         assert_eq!(
             select_password_store(false, false, fallback.clone()),
-            Choice::File(fallback)
+            Choice::LinuxFile(fallback)
         );
     }
 
@@ -265,10 +329,13 @@ mod tests {
         // `select` *does* return `Env` for it, so this is a real difference
         // between the two decisions rather than a restatement.
         let fallback = PathBuf::from("/tmp/pw");
-        assert_eq!(select(false, Some("rb_live_token"), None), Choice::Env);
-        for (is_macos, has_secret_tool) in [(true, true), (false, true), (false, false)] {
+        assert_eq!(
+            select(false, Some("rb_live_token"), None, true, fallback.clone()),
+            Choice::Env
+        );
+        for (is_macos, keyring_answers) in [(true, true), (false, true), (false, false)] {
             assert_ne!(
-                select_password_store(is_macos, has_secret_tool, fallback.clone()),
+                select_password_store(is_macos, keyring_answers, fallback.clone()),
                 Choice::Env
             );
         }
@@ -285,8 +352,32 @@ mod tests {
         assert_ne!(remote_account("aaaa"), remote_account("bbbb"));
     }
 
-    #[test]
-    fn a_server_never_reaches_for_a_keyring() {
+    /// A laptop whose keyring answers: `secret-tool` is on `PATH` and a
+    /// `lookup` for the probe account misses *quietly* — exit 1, nothing on
+    /// stderr, which is what a real Secret Service does for an item it does
+    /// not hold.
+    fn runner_with_a_working_keyring() -> Arc<dyn CommandRunner> {
+        Arc::new(FakeRunner::new().with("secret-tool lookup", 1, "", ""))
+    }
+
+    /// A headless server: the binary is installed — `libsecret-tools` rides in
+    /// as a transitive dependency all over the place — and there is no session
+    /// bus for it to talk to. This is the exact stderr a developer reported.
+    fn runner_with_no_dbus() -> Arc<dyn CommandRunner> {
+        Arc::new(FakeRunner::new().with(
+            "secret-tool lookup",
+            1,
+            "",
+            "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY",
+        ))
+    }
+
+    fn laptop_fallback() -> PathBuf {
+        PathBuf::from("/home/ada/.riabuild/session.token")
+    }
+
+    #[tokio::test]
+    async fn a_server_never_reaches_for_a_keyring() {
         // A macOS server is what makes this a rule rather than a preference:
         // `security` cannot open a login keychain an SSH session has not unlocked,
         // so asking the platform first would pick a store that always fails.
@@ -294,30 +385,84 @@ mod tests {
         let remote = for_platform(
             runner.clone(),
             Some(PathBuf::from("/home/dev/ns/session.token")),
-        );
+            laptop_fallback(),
+        )
+        .await;
         assert_eq!(remote.describe(), "this server's riabuild namespace");
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn a_macos_server_still_picks_the_file_store_over_the_keychain() {
+    #[tokio::test]
+    async fn a_macos_server_still_picks_the_file_store_over_the_keychain() {
         // Pins the *ordering* in `for_platform`, not just the outcome: on a
         // machine where `cfg!(target_os = "macos")` is true, the file store must
         // still win when `session_token_file` is `Some`, because a macOS server
         // has no way to unlock its login keychain over SSH.
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
-        let remote = for_platform(runner, Some(PathBuf::from("/home/dev/ns/session.token")));
+        let remote = for_platform(
+            runner,
+            Some(PathBuf::from("/home/dev/ns/session.token")),
+            laptop_fallback(),
+        )
+        .await;
         assert_eq!(remote.describe(), "this server's riabuild namespace");
     }
 
-    #[test]
-    fn a_laptop_with_no_session_token_file_never_selects_the_file_store() {
-        // The other half of the ordering guarantee: `None` must never resolve to
-        // `FileKeychain` regardless of platform. A laptop always gets its
-        // platform keychain.
-        let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
-        let laptop = for_platform(runner, None);
-        assert_ne!(laptop.describe(), "this server's riabuild namespace");
+    #[tokio::test]
+    async fn a_laptop_with_a_working_keyring_still_uses_it() {
+        // The half of the old `a_laptop_..._never_selects_the_file_store` test
+        // that survives the fallback: a machine with a keyring must still put
+        // the token in it, and must never be described as a server.
+        let laptop = for_platform(runner_with_a_working_keyring(), None, laptop_fallback()).await;
+        assert_eq!(laptop.describe(), "your system keyring");
+    }
+
+    #[tokio::test]
+    async fn a_headless_linux_server_gets_a_file_rather_than_a_dead_keyring() {
+        // The regression test for the reported bug. `secret-tool` is installed,
+        // so the old `which`-based test said "this machine has a keyring" and
+        // riabuild picked a store whose every call fails. It then ran the whole
+        // device-code flow and only discovered it had nowhere to put the token
+        // *after* the developer approved the machine in a browser — surfacing a
+        // raw `secret-tool:` stderr line under "it is a bug in riabuild".
+        let server = for_platform(runner_with_no_dbus(), None, laptop_fallback()).await;
+        assert_eq!(
+            server.describe(),
+            "a private file, because this machine has no keyring",
+            "a machine whose keyring does not answer must not be handed the keyring store"
+        );
+        // And it must say where the token really went — never borrow the
+        // server-namespace wording, which is the shape of the earlier bug
+        // `scope.rs` documents.
+        assert_ne!(server.describe(), "this server's riabuild namespace");
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_secret_tool_at_all_also_gets_a_file() {
+        // The other way to have no keyring, and the one the old code did
+        // detect — it just had nothing to offer afterwards.
+        let bare: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
+        let store = for_platform(bare, None, laptop_fallback()).await;
+        assert_eq!(
+            store.describe(),
+            "a private file, because this machine has no keyring"
+        );
+    }
+
+    #[tokio::test]
+    async fn riabuild_token_still_wins_on_a_keyringless_machine() {
+        // CI and the e2e suite set it, and they are exactly the machines with
+        // no keyring — so the new fallback must not get in front of it.
+        // Guarded on the variable being unset, because this crate's tests
+        // share one process and `select` is what the ordering is really
+        // pinned on (see `select_prefers_env_...` below).
+        if std::env::var("RIABUILD_TOKEN").is_ok() {
+            return;
+        }
+        assert_eq!(
+            select(false, Some("rb_live_token"), None, false, laptop_fallback()),
+            Choice::Env
+        );
     }
 
     // The three tests above go through `for_platform`, so on this (Linux) host
@@ -338,20 +483,123 @@ mod tests {
         // this test fails with:
         //   assertion `left == right` failed
         //     left: Macos
-        //    right: File("/home/dev/ns/session.token")
+        //    right: ServerFile("/home/dev/ns/session.token")
         let path = PathBuf::from("/home/dev/ns/session.token");
-        assert_eq!(select(true, None, Some(path.clone())), Choice::File(path));
+        assert_eq!(
+            select(true, None, Some(path.clone()), true, laptop_fallback()),
+            Choice::ServerFile(path)
+        );
     }
 
     #[test]
     fn select_prefers_env_over_the_file_store_and_over_macos() {
         let path = PathBuf::from("/home/dev/ns/session.token");
-        assert_eq!(select(true, Some("rb_live_token"), Some(path)), Choice::Env);
+        assert_eq!(
+            select(
+                true,
+                Some("rb_live_token"),
+                Some(path),
+                true,
+                laptop_fallback()
+            ),
+            Choice::Env
+        );
     }
 
     #[test]
     fn select_falls_back_to_the_platform_keyring_with_no_server_and_no_env() {
-        assert_eq!(select(true, None, None), Choice::Macos);
-        assert_eq!(select(false, None, None), Choice::Linux);
+        assert_eq!(
+            select(true, None, None, true, laptop_fallback()),
+            Choice::Macos
+        );
+        assert_eq!(
+            select(false, None, None, true, laptop_fallback()),
+            Choice::Linux
+        );
+    }
+
+    /// The whole fix, end to end, against the real `secret-tool` on whatever
+    /// machine is running the suite — no `FakeRunner`, no canned stderr.
+    ///
+    /// This is the one test that would have caught the reported bug, and it can
+    /// run on the gate: PR CI is `ubuntu-latest`, which has no Secret Service,
+    /// which is exactly the machine class that was broken. Before the fix this
+    /// selected `SecretToolKeychain` and `set` failed; now it must select a
+    /// file store and round-trip a token through it.
+    ///
+    /// It **skips** on a machine whose keyring answers, and that is not
+    /// laziness — the alternative is a test that writes a token into a
+    /// developer's real login keyring while they run `cargo test`.
+    #[tokio::test]
+    async fn a_real_machine_with_no_secret_service_can_actually_keep_a_token() {
+        let runner: Arc<dyn CommandRunner> = Arc::new(riabuild_runner::RealRunner);
+        if platform::keyring_answers(runner.as_ref()).await {
+            // This machine has a working keyring; the fallback is not its path
+            // and probing further would mean writing to a real keychain.
+            return;
+        }
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let path = home.path().join("riabuild").join("session.token");
+
+        let store = for_platform(runner, None, path.clone()).await;
+        assert_eq!(
+            store.describe(),
+            "a private file, because this machine has no keyring",
+            "a machine with no Secret Service must not be handed the keyring store"
+        );
+
+        assert_eq!(store.get().await.expect("read"), None);
+        store.set("rb_live_token").await.expect(
+            "storing a token must succeed here — failing this is the reported bug, \
+             where riabuild signed the developer in and then had nowhere to put the token",
+        );
+        assert_eq!(
+            store.get().await.expect("read"),
+            Some("rb_live_token".to_string()),
+            "and a later run must find it, rather than minting a new session every time"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the token must not be world-readable");
+        }
+
+        store.delete().await.expect("sign out");
+        assert_eq!(store.get().await.expect("read"), None);
+    }
+
+    #[test]
+    fn only_linux_is_ever_asked_whether_its_keyring_answers() {
+        // macOS must not acquire a file fallback by the back door: `security`
+        // and a login keychain are always there, and the one Mac that cannot
+        // unlock one — a server over SSH — is caught by the branch above.
+        // Asserted with `keyring_answers: false`, the input that would flip a
+        // wrongly-ordered implementation.
+        assert_eq!(
+            select(true, None, None, false, laptop_fallback()),
+            Choice::Macos
+        );
+        assert_eq!(
+            select(false, None, None, false, laptop_fallback()),
+            Choice::LinuxFile(laptop_fallback())
+        );
+    }
+
+    #[test]
+    fn a_server_namespace_still_beats_a_keyring_that_does_not_answer() {
+        // Both branches now want a file, so the risk is not "no store" but the
+        // *wrong* file — a managed server's token landing in the keyring-less
+        // laptop path, which is not where `riabuild remote forget` looks.
+        let path = PathBuf::from("/home/dev/ns/session.token");
+        assert_eq!(
+            select(false, None, Some(path.clone()), false, laptop_fallback()),
+            Choice::ServerFile(path)
+        );
     }
 }

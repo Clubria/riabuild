@@ -117,7 +117,7 @@ pub fn classify(prompt: &str) -> Asked {
 
 /// Where this account's password is kept. Keyring wherever there is one; see
 /// `keychain::select_password_store` for the decision and why.
-pub fn store(
+pub async fn store(
     runner: Arc<dyn CommandRunner>,
     paths: &dyn Paths,
     account: &str,
@@ -136,11 +136,7 @@ pub fn store(
         ))
         .into());
     };
-    Ok(riabuild_keychain::for_password(
-        runner,
-        account,
-        paths.remote_password_file(hash),
-    ))
+    Ok(riabuild_keychain::for_password(runner, account, paths.remote_password_file(hash)).await)
 }
 
 /// The shim `SSH_ASKPASS` points at, rewritten on every run.
@@ -294,7 +290,7 @@ pub async fn forget(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<()> {
-    store(runner, paths, &account(remote))?.delete().await
+    store(runner, paths, &account(remote)).await?.delete().await
 }
 
 #[cfg(test)]
@@ -358,14 +354,15 @@ mod tests {
         assert_eq!(classify("Verification code: "), Asked::Password);
     }
 
-    #[test]
-    fn a_bad_account_is_refused_rather_than_answered() {
+    #[tokio::test]
+    async fn a_bad_account_is_refused_rather_than_answered() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
         let runner: Arc<dyn CommandRunner> = Arc::new(FakeRunner::new());
         // `.err()` rather than `expect_err`: the `Ok` side is a
         // `Box<dyn Keychain>`, which has no `Debug` for the panic message.
         let error = store(runner, &paths, "remote-password:../secrets")
+            .await
             .err()
             .expect("a traversal in the account name is not a server");
         assert!(

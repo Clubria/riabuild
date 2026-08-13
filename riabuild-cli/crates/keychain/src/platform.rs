@@ -23,6 +23,61 @@ use std::sync::Arc;
 const SERVICE: &str = "com.clubria.riabuild";
 const ACCOUNT: &str = "session-token";
 
+/// The account [`keyring_answers`] looks up. Deliberately one nothing ever
+/// stores, so the probe's answer is "does the service reply" and never "is
+/// this developer signed in" — a machine with a perfectly good keyring and no
+/// token yet must still be recognised as having one.
+const PROBE_ACCOUNT: &str = "keyring-probe";
+
+/// Whether this machine has a Secret Service that actually answers.
+///
+/// This is the question `runner.which("secret-tool").is_some()` was standing
+/// in for, and getting wrong. libsecret is a **client** for a D-Bus Secret
+/// Service; `secret-tool` being on `PATH` says nothing about whether anything
+/// is listening. `libsecret-tools` arrives as a transitive dependency of
+/// plenty of packages, so the binary is present on servers that have no
+/// session bus at all — and riabuild would then pick the keyring, run the
+/// whole device-code flow, and only discover it had nowhere to put the token
+/// *after* the developer had approved the machine in a browser.
+///
+/// A `lookup` is the probe because it is read-only: it cannot create, unlock,
+/// or overwrite anything. Its exit status alone cannot answer the question —
+/// a miss and a dead service both exit non-zero — but **stderr** can, and this
+/// was measured rather than assumed, against a real Secret Service on the bus
+/// and against both ways of not having one:
+///
+/// | machine | exit | stderr |
+/// |---|---|---|
+/// | service on the bus, item absent | 1 | *empty* |
+/// | no session bus at all | 1 | `Cannot autolaunch D-Bus without X11 $DISPLAY` |
+/// | bus, but no keyring daemon | 1 | `The name org.freedesktop.secrets was not provided…` |
+///
+/// So: a diagnostic on stderr means the call did not complete, and the rule
+/// below reads that rather than matching any of those messages as text, which
+/// would be one libsecret release or one non-English locale from breaking.
+///
+/// It fails in the safe direction. If some future libsecret did print to
+/// stderr on an ordinary miss, riabuild would keep the token in a 0600 file
+/// instead of the keyring — a visible downgrade rather than a broken machine,
+/// and `provision.rs` prints `describe()`, so the developer is told where the
+/// token went.
+pub(crate) async fn keyring_answers(runner: &dyn CommandRunner) -> bool {
+    if runner.which("secret-tool").is_none() {
+        return false;
+    }
+    let Ok(output) = runner
+        .run(
+            "secret-tool",
+            &["lookup", "service", SERVICE, "account", PROBE_ACCOUNT],
+            &RunOptions::default(),
+        )
+        .await
+    else {
+        return false;
+    };
+    output.ok() || output.stderr.trim().is_empty()
+}
+
 /// macOS: `security(1)`, which talks to the login keychain.
 pub struct SecurityCliKeychain {
     runner: Arc<dyn CommandRunner>,
@@ -187,12 +242,23 @@ impl SecretToolKeychain {
         if self.runner.which("secret-tool").is_some() {
             return Ok(());
         }
+        // Reachable only through `for_account` — a laptop caching a *server's*
+        // session. `for_platform` and `for_password` both ask
+        // `keyring_answers` first and pick a file store when the answer is no,
+        // so neither can construct this type on a machine with no keyring.
+        //
+        // The advice no longer offers `RIABUILD_TOKEN` "from the riabuild
+        // dashboard": the dashboard has never had a way to show a developer a
+        // token, and `RIABUILD_TOKEN` is a CI and e2e hook (see `EnvKeychain`).
+        // Naming it here sent developers looking for a screen that does not
+        // exist. It would also be the wrong secret anyway — this store holds a
+        // server's session, and `RIABUILD_TOKEN` is this machine's.
         Err(Failure::new(
-            "reading the riabuild token from your keyring",
-            "Install libsecret (`sudo apt install libsecret-tools`), or set RIABUILD_TOKEN \
-             to a token from the riabuild dashboard if this machine has no keyring.",
+            "reading a server's riabuild session from your keyring",
+            "Install libsecret (`sudo apt install libsecret-tools`) and run `riabuild remote` \
+             again.",
         )
-        .detail("`secret-tool` is not installed, so riabuild has nowhere to keep your token")
+        .detail("`secret-tool` is not installed, so riabuild has nowhere to cache the session")
         .into())
     }
 }
@@ -237,13 +303,24 @@ impl Keychain for SecretToolKeychain {
             )
             .await?;
         if output.ok() {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "could not save the riabuild token to your keyring: {}",
-                output.stderr.trim()
-            ))
+            return Ok(());
         }
+        // A `Failure`, not a bare `anyhow!`. This store is only ever chosen
+        // when `keyring_answers` said a Secret Service replies, so reaching
+        // here means one was there and refused — a locked keyring is the
+        // ordinary way that happens, and it is the developer's to unlock. The
+        // bare error this replaces was rendered under "it is a bug in
+        // riabuild — send this to your team lead", which sent developers to
+        // ask a colleague about a machine only they could fix.
+        Err(Failure::new(
+            "saving the riabuild token to your keyring",
+            "Unlock your login keyring and run `riabuild` again.",
+        )
+        .detail(format!(
+            "`secret-tool store` failed: {}",
+            output.stderr.trim()
+        ))
+        .into())
     }
 
     async fn delete(&self) -> Result<()> {
@@ -400,14 +477,128 @@ mod tests {
         );
     }
 
+    // `keyring_answers` — the probe that replaced `which("secret-tool")`.
+    //
+    // Every row below is a state observed against a real `secret-tool`: a
+    // mock Secret Service on a private bus for the healthy miss, and a
+    // headless box for the two failures. The table on `keyring_answers`
+    // records the measurements; these pin the decision they imply.
+
+    #[tokio::test]
+    async fn a_healthy_keyring_with_no_token_yet_still_counts_as_a_keyring() {
+        // The load-bearing one. A real Secret Service answering "I do not hold
+        // that item" exits non-zero and prints *nothing*, so exit status alone
+        // cannot tell this apart from a dead service — and if this were read as
+        // "no keyring", every fresh laptop would quietly get a file instead of
+        // the keychain.
+        let runner = FakeRunner::new().with("secret-tool lookup", 1, "", "");
+        assert!(keyring_answers(&runner).await);
+    }
+
+    #[tokio::test]
+    async fn an_existing_item_counts_as_a_keyring() {
+        let runner = FakeRunner::new().with("secret-tool lookup", 0, "rb_token\n", "");
+        assert!(keyring_answers(&runner).await);
+    }
+
+    #[tokio::test]
+    async fn a_box_with_no_dbus_session_has_no_keyring() {
+        // The reported failure, verbatim. `secret-tool` is installed here —
+        // which is exactly why `which` was the wrong question.
+        let runner = FakeRunner::new().with(
+            "secret-tool lookup",
+            1,
+            "",
+            "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY",
+        );
+        assert!(runner.which("secret-tool").is_some(), "the binary is there");
+        assert!(!keyring_answers(&runner).await);
+    }
+
+    #[tokio::test]
+    async fn a_bus_with_no_keyring_daemon_has_no_keyring() {
+        // The second way to have no Secret Service: a session bus exists and
+        // nothing has claimed `org.freedesktop.secrets` on it. Common in
+        // containers and on minimal installs.
+        let runner = FakeRunner::new().with(
+            "secret-tool lookup",
+            1,
+            "",
+            "secret-tool: The name org.freedesktop.secrets was not provided by any .service files",
+        );
+        assert!(!keyring_answers(&runner).await);
+    }
+
+    #[tokio::test]
+    async fn a_missing_secret_tool_has_no_keyring() {
+        assert!(!keyring_answers(&FakeRunner::new()).await);
+    }
+
+    #[tokio::test]
+    async fn the_probe_reads_an_account_nothing_ever_stores() {
+        // The probe must answer "does the service reply", not "is this
+        // developer signed in" — otherwise a working keyring holding no token
+        // yet would be misread as no keyring at all, on precisely the first
+        // run that needs to store one. It must also never look at, let alone
+        // disturb, the real session item.
+        let runner = FakeRunner::new().with("secret-tool lookup", 1, "", "");
+        keyring_answers(&runner).await;
+        let calls = runner.calls();
+        assert!(
+            calls.iter().any(|call| call.contains(PROBE_ACCOUNT)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.contains(ACCOUNT)),
+            "the probe must not read the real session item: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|call| !call.contains("store")
+                && !call.contains("clear")
+                && !call.contains("--unlock")),
+            "the probe must be read-only: {calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_machine_with_no_keyring_gets_a_next_action_not_a_bug_report() {
-        // A headless Linux box has no libsecret. That is an ordinary state, and
-        // the message has to name both fixes.
+        // Only `for_account` can construct this type on a keyring-less machine
+        // now, so the message is about caching a *server's* session and no
+        // longer offers `RIABUILD_TOKEN` — which was advice to go and find a
+        // screen the dashboard has never had, and would have been the wrong
+        // secret regardless. It still has to be an actionable `Failure`
+        // rather than a raw error under "it is a bug in riabuild".
         let keychain = SecretToolKeychain::new(Arc::new(FakeRunner::new()));
-        let error = keychain.get().await.unwrap_err().to_string();
-        assert!(error.contains("RIABUILD_TOKEN"), "{error}");
-        assert!(error.contains("libsecret"), "{error}");
+        let error = keychain.get().await.unwrap_err();
+        let failure = error
+            .downcast_ref::<Failure>()
+            .unwrap_or_else(|| panic!("must be the actionable Failure: {error}"));
+        assert!(failure.action.contains("libsecret"), "{}", failure.action);
+        assert!(
+            !failure.action.contains("RIABUILD_TOKEN"),
+            "the dashboard has no token to copy: {}",
+            failure.action
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyring_that_refuses_a_store_is_not_reported_as_a_riabuild_bug() {
+        // This store is only chosen when `keyring_answers` said yes, so a
+        // failing `store` means a Secret Service was there and refused —
+        // a locked keyring being the ordinary way. The developer can fix that;
+        // their team lead cannot.
+        let runner = Arc::new(FakeRunner::new().with(
+            "secret-tool store",
+            1,
+            "",
+            "secret-tool: Cannot create item: The collection is locked",
+        ));
+        let keychain = SecretToolKeychain::new(runner);
+        let error = keychain.set("rb_live_token").await.expect_err("locked");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .unwrap_or_else(|| panic!("must be the actionable Failure: {error}"));
+        assert!(failure.action.contains("Unlock"), "{}", failure.action);
     }
 
     #[tokio::test]

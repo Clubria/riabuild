@@ -124,8 +124,18 @@ async fn run(cli: Cli) -> Result<i32> {
     // A server has no keyring an SSH session can unlock, so its own session
     // lives in a file in its namespace instead — see `scope.rs`.
     let session_token_file = scope.server_session_token_file(paths.as_ref())?;
-    let keychain: Arc<dyn keychain::Keychain> =
-        Arc::from(keychain::for_platform(runner.clone(), session_token_file));
+    // The second path is for a machine that is *not* a managed server and
+    // still has no keyring: a headless Linux box someone installed riabuild on
+    // directly. Chosen here, before `login` runs, so such a machine never
+    // reaches a browser approval for a token it would then have to discard.
+    let keychain: Arc<dyn keychain::Keychain> = Arc::from(
+        keychain::for_platform(
+            runner.clone(),
+            session_token_file,
+            paths.session_token_file(),
+        )
+        .await,
+    );
 
     tokio::fs::create_dir_all(paths.root()).await?;
 

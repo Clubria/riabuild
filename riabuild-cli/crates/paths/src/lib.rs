@@ -61,8 +61,15 @@ pub trait Paths: Send + Sync {
     fn org_settings_file(&self) -> PathBuf {
         self.root().join("org-settings.json")
     }
-    /// A server's own riabuild session. Never used on a laptop, where the
-    /// platform keychain holds it instead.
+    /// This riabuild's own session, when it goes in a file rather than a
+    /// keyring. Two machines reach it, and the root is what tells them apart: a
+    /// **managed server**, where the root is the developer's namespace under
+    /// `.riabuild-remote/<member-id>`, and a **headless machine** with no
+    /// Secret Service answering, where it is the ordinary `~/.riabuild`.
+    ///
+    /// Not used where there *is* a keyring — see `keychain::select`, which owns
+    /// the decision, and `keychain::keyring_answers`, which owns the question
+    /// the second case turns on.
     fn session_token_file(&self) -> PathBuf {
         self.root().join("session.token")
     }
