@@ -1002,9 +1002,11 @@ name = "riabuild-api"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "reqwest",
  "riabuild-runner",
  "riabuild-ui",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
