@@ -201,6 +201,23 @@ That is the whole procedure. The run builds and publishes the release, updates
 `Formula/riabuild.rb`, rebuilds the apt and dnf repositories, and announces the
 version to riabuild-web so developers are actually offered it.
 
+### If only the announce job fails
+
+Everything a developer installs is already published — the release, the
+formula, and both Linux repositories are separate jobs and will be green. What
+is missing is the one field that *offers* it: the CLI reads what to upgrade to
+from `/api/v1/org/config`, never from GitHub, so until that field moves, every
+machine stays on the old build with nothing anywhere reporting a problem.
+
+Re-run the job. If it still fails, set **Latest CLI version** in the dashboard's
+lead panel — that path is gated on the lead role rather than on GitHub, so it
+works when GitHub does not. Neither can move the version backwards.
+
+This happened for `2026.08.12.1`: the check was unauthenticated, GitHub's
+sixty-an-hour budget for Convex's shared egress IP was spent, and every attempt
+returned 403 for over an hour. The check now sends `GITHUB_ORG_TOKEN`, which
+buys a five-thousand-an-hour budget of riabuild's own.
+
 **`minCliVersion` is never touched by any of this.** It is the floor below
 which the CLI refuses to run, and raising it interrupts whatever everyone is
 doing the moment they next launch riabuild. It is a deliberate decision made in
