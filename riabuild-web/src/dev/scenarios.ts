@@ -2,6 +2,7 @@ import {
   AuditEntry,
   Data,
   DeviceRequest,
+  IssuedKey,
   Member,
   OrgConfig,
   Session,
@@ -258,6 +259,50 @@ const SHARED_SERVERS: SharedServer[] = [
   },
 ];
 
+/**
+ * The keys the org issues, in the three shapes that look different on screen:
+ * one issued to several people, one issued to nobody yet, and one whose name
+ * and fingerprint are both at their limit — which is where the table runs out
+ * of room at 380px, the same reason `SHARED_SERVERS` carries a long row.
+ *
+ * An RSA fingerprint is the same 43 characters as an ed25519 one; what varies
+ * is the type chip beside it, so both are here.
+ */
+const ISSUED_KEYS: IssuedKey[] = [
+  {
+    _id: "k_bastion",
+    label: "prod-bastion",
+    keyType: "ssh-ed25519",
+    // Deliberately *not* the key `opensshKey.fixtures` holds. The interaction
+    // test pastes that one and asserts its fingerprint appears in the preview;
+    // a fixture row carrying the same fingerprint makes that assertion match
+    // two elements and prove nothing.
+    publicKey:
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPphI59nx1X/yP8/S7vZh9OrQ0JejkDp2YET7IoQTjJE",
+    fingerprint: "SHA256:XK4vR3e9a+3qNQ+nfSt+o4oy7aE8e26VUu8HvxZNZbc",
+    issuedTo: [DEVELOPER._id, LEAD._id],
+    updatedAt: NOW - 9 * DAY,
+  },
+  {
+    _id: "k_gpu",
+    label: "gpu-box",
+    keyType: "ssh-rsa",
+    publicKey: `ssh-rsa AAAAB3NzaC1yc2E${"A".repeat(340)}`,
+    fingerprint: "SHA256:MgxOF2TqJxTgu35QWHCJUOETjhUKOTGIgtmxvr0q+Hs",
+    issuedTo: [],
+    updatedAt: NOW - 180 * MINUTE,
+  },
+  {
+    _id: "k_long",
+    label: "a".repeat(32),
+    keyType: "ecdsa-sha2-nistp521",
+    publicKey: `ecdsa-sha2-nistp521 AAAAE2V${"B".repeat(200)}`,
+    fingerprint: "SHA256:9Zq7vK3mN8pR2sT5wX1yA4bC6dE0fG7hJ9kL2mN4pQ8",
+    issuedTo: [DEVELOPER._id, LEAD._id, CANDIDATE._id, SUSPENDED._id],
+    updatedAt: NOW - 5 * MINUTE,
+  },
+];
+
 const NOOP = async () => {};
 const REJECT = async (): Promise<never> => {
   throw new Error(
@@ -276,6 +321,7 @@ function base(viewer: Member | null): Data {
       value: [LEAD, DEVELOPER, CANDIDATE, SUSPENDED],
     },
     sharedServers: { state: "ready", value: SHARED_SERVERS },
+    issuedKeys: { state: "ready", value: ISSUED_KEYS },
     auditLog: { state: "ready", value: AUDIT },
     orgConfig: { state: "ready", value: ORG },
     now: NOW,
@@ -287,6 +333,10 @@ function base(viewer: Member | null): Data {
     addSharedServer: NOOP,
     updateSharedServer: NOOP,
     removeSharedServer: NOOP,
+    addIssuedKey: NOOP,
+    replaceIssuedKey: NOOP,
+    setIssuedKeyMembers: NOOP,
+    removeIssuedKey: NOOP,
     signIn: NOOP,
     signOut: NOOP,
     lookupDeviceCode: async () => PENDING_REQUEST,
@@ -433,6 +483,30 @@ export const SCENARIOS: Record<string, () => Data> = {
     },
   }),
 
+  /** No issued keys yet — what a lead sees before they paste the first one. */
+  "issued-keys-empty": () => ({
+    ...base(LEAD),
+    issuedKeys: { state: "ready", value: [] },
+  }),
+
+  /**
+   * A key riabuild-web refused. The message is the real one, for the rule most
+   * likely to be hit: a lead exporting a key from somewhere that protects it
+   * with a passphrase. It has to say what to run, because "refused" alone
+   * leaves them with a box that will not take their file and no way forward.
+   */
+  "issued-key-refused": () => ({
+    ...base(LEAD),
+    addIssuedKey: async (): Promise<never> => {
+      throw new Error(
+        "[CONVEX M(issuedKeys:create)] Uncaught Error: That key is protected by a " +
+          "passphrase, and riabuild cannot use it: nothing would be able to answer the " +
+          "prompt on a developer's machine. Remove the passphrase with " +
+          "`ssh-keygen -p -f <file>` — leaving the new one empty — and paste it again.",
+      );
+    },
+  }),
+
   "mutation-error": () => ({
     ...base(LEAD),
     updateProfile: REJECT,
@@ -443,6 +517,10 @@ export const SCENARIOS: Record<string, () => Data> = {
     addSharedServer: REJECT,
     updateSharedServer: REJECT,
     removeSharedServer: REJECT,
+    addIssuedKey: REJECT,
+    replaceIssuedKey: REJECT,
+    setIssuedKeyMembers: REJECT,
+    removeIssuedKey: REJECT,
   }),
 
   overflow: () => ({
