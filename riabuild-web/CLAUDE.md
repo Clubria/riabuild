@@ -73,7 +73,17 @@ token. The CLI fetches the actual secrets. Path scoping is enforced by Infisical
 not by our code.
 
 **Anything that changes access writes an `auditLog` entry.** Role promotion, suspension,
-session revocation.
+session revocation, delegation.
+
+**Only a browser-approved session may mint another one.** `POST /api/v1/cli/sessions` is
+how a laptop signs a *server* in without sending the developer to `/cli` a second time,
+and `cliSessions.origin` is what stops the result being a delegation chain: a session
+minted that way cannot mint. The check lives in `sessions.delegate`, next to the row it
+reads, not in the endpoint — an endpoint that forgot to ask would otherwise reopen it. A
+server's token is readable by every co-tenant sharing that Unix account, so one that could
+mint would let a leaked credential be replaced indefinitely, including after `riabuild
+remote forget` revoked it. Absent `origin` means `device`: every row predating the field
+was a browser approval.
 
 **Changing `DEFAULT_CLAUDE_SETTINGS` reaches nobody on its own.** `loadConfig` serves it
 only to a deployment with *no* `orgConfig` row, and a row appears the first time anyone

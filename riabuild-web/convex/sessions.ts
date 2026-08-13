@@ -18,6 +18,11 @@ const sessionView = v.object({
   lastUsedAt: v.number(),
   expiresAt: v.number(),
   revokedAt: v.union(v.number(), v.null()),
+  /**
+   * Resolved here rather than passed through as an optional, so the dashboard
+   * never has to know that an absent field means `device`.
+   */
+  origin: v.union(v.literal("device"), v.literal("delegated")),
 });
 
 function toSessionView(session: Doc<"cliSessions">) {
@@ -29,6 +34,7 @@ function toSessionView(session: Doc<"cliSessions">) {
     lastUsedAt: session.lastUsedAt,
     expiresAt: session.expiresAt,
     revokedAt: session.revokedAt ?? null,
+    origin: session.origin ?? ("device" as const),
   };
 }
 
@@ -176,6 +182,9 @@ export async function createSession(
     tokenHash: string;
     deviceLabel: string;
     cliVersion: string;
+    /** Absent means `device` — see the schema comment on `cliSessions.origin`. */
+    origin?: "device" | "delegated";
+    delegatedFrom?: Id<"cliSessions">;
   },
 ): Promise<Id<"cliSessions">> {
   const now = Date.now();
@@ -186,5 +195,75 @@ export async function createSession(
     cliVersion: args.cliVersion,
     lastUsedAt: now,
     expiresAt: now + SESSION_TTL_MS,
+    origin: args.origin,
+    delegatedFrom: args.delegatedFrom,
   });
 }
+
+/**
+ * Mints a second session for the member who already holds `parentSessionId`.
+ * Called only by `POST /api/v1/cli/sessions`, which does the hashing and has
+ * already authenticated the parent and re-verified org membership.
+ *
+ * This is how a laptop signs a *server* in. The developer approved one device
+ * code, in a browser, on the machine in front of them; asking them to approve
+ * a second one for the server their laptop is provisioning was a round trip
+ * that proved nothing the first one had not already proved.
+ *
+ * **One hop, and the hop is checked here rather than in `http.ts`.** The rule
+ * is a fact about the row, so it is enforced where the row is — an endpoint
+ * that forgot to ask would otherwise be a delegation chain. A delegated
+ * session lives on a server's disk under a Unix account several developers
+ * share; letting it mint would mean a co-tenant who read one token could keep
+ * minting replacements after `riabuild remote forget` revoked it, and the
+ * blast-radius argument for writing a token to that disk at all would be
+ * false.
+ */
+export const delegate = internalMutation({
+  args: {
+    parentSessionId: v.id("cliSessions"),
+    tokenHash: v.string(),
+    deviceLabel: v.string(),
+    cliVersion: v.string(),
+  },
+  returns: v.union(
+    v.object({
+      status: v.literal("ok"),
+      sessionId: v.id("cliSessions"),
+      expiresAt: v.number(),
+    }),
+    v.object({ status: v.literal("not_permitted") }),
+  ),
+  handler: async (ctx, args) => {
+    const parent = await ctx.db.get("cliSessions", args.parentSessionId);
+    // Unknown is refused rather than trusted: `authenticate` just read this
+    // row, so a miss here is not a state worth guessing at.
+    if (parent === null) return { status: "not_permitted" as const };
+    if (parent.origin === "delegated") {
+      return { status: "not_permitted" as const };
+    }
+
+    const sessionId = await createSession(ctx, {
+      memberId: parent.memberId,
+      tokenHash: args.tokenHash,
+      deviceLabel: args.deviceLabel,
+      cliVersion: args.cliVersion,
+      origin: "delegated",
+      delegatedFrom: parent._id,
+    });
+    const session = await ctx.db.get("cliSessions", sessionId);
+
+    await writeAudit(ctx, {
+      actorId: parent.memberId,
+      subjectId: parent.memberId,
+      action: "cli.session_delegated",
+      meta: { deviceLabel: args.deviceLabel, cliVersion: args.cliVersion },
+    });
+
+    return {
+      status: "ok" as const,
+      sessionId,
+      expiresAt: session?.expiresAt ?? Date.now() + SESSION_TTL_MS,
+    };
+  },
+});

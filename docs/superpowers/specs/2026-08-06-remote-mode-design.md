@@ -361,11 +361,47 @@ Saying so beats prompting for something that cannot work.
 
 The laptop mints it, and writes it down on the server.
 
-1. `riabuild remote` runs the ordinary loopback-OAuth login on the laptop, labelled after
-   the server — `build-01.fly.dev`. The dashboard lists it as its own device.
+1. `riabuild remote` asks riabuild-web for a session labelled after the server —
+   `build-01.fly.dev` — through `POST /api/v1/cli/sessions`, authenticated with the
+   laptop's own token. The dashboard lists it as its own device.
 2. The token is stored on the server at `<namespace>/session.token`, mode 0600, and a copy
    stays in the laptop's own keychain under the account `remote:<hash>`.
 3. `riabuild remote forget` **revokes** it — see below.
+
+## The laptop asks; nobody approves anything twice
+
+Step 1 originally ran the whole device-code flow a second time: a second code printed, a
+second trip to `riabuild.clubria.com/cli`, a second approval. It proved nothing. The
+laptop had signed in minutes earlier and was holding a live bearer token, and that token
+is stronger evidence than a code the same person types into the same browser on the same
+machine. So the laptop asks on the server's behalf instead:
+
+```
+POST /api/v1/cli/sessions   { deviceLabel }
+  → authenticate the caller's session, confirm the member is active
+  → re-verify org membership against GitHub
+  → refuse if the caller's own session was itself delegated
+  → mint, audit `cli.session_delegated`, return { token, sessionId, expiresAt }
+```
+
+Nothing here gives a *server* a way to sign itself in; it gives its laptop a way to ask.
+Every session still traces back to exactly one browser approval by a human.
+
+**One hop, and that is the security boundary.** A delegated session cannot delegate. Its
+token sits on a server's disk under a Unix account several developers share, so it must be
+assumed readable by a co-tenant — and a token that mints tokens turns one leaked
+credential into an unlimited supply, including replacements minted *after*
+`riabuild remote forget` revoked the original. That would make "its blast radius is that
+server" false, which is the sentence the whole on-disk-token amendment rests on. The rule
+lives in `sessions.delegate`, with the row, not in the endpoint that calls it.
+
+The dashboard says which sessions arrived this way, on the row: it is the only place a
+developer would notice a delegation they did not perform.
+
+**There is no fallback.** A riabuild-web too old to have this endpoint answers 404, and
+the CLI says so and stops — naming the deploy as the fix rather than reporting the generic
+"HTTP 404" that reads as an outage. Quietly falling back would mean the two-approval dance
+reappearing on a rolled-back dashboard with nothing explaining why.
 
 ## Revocation has to be real
 
@@ -387,10 +423,12 @@ something that does not happen. **`forget` fails loudly if revocation did not su
 rather than reporting a tidy-up it did not perform.
 
 The laptop also checks the stored token before reusing it: `sessionExpiresAt` from
-`remotes.json`, and a `GET /api/v1/me` under that token when it is close to expiry or has
-been revoked elsewhere. A server cannot re-mint for itself — the loopback flow needs a
-browser it does not have — so handing it a dead token strands it with a 401 and no way
-forward.
+`remotes.json` — riabuild-web's own `expiresAt`, recorded rather than recomputed here — and
+a `GET /api/v1/me` under that token when it is close to expiry or has been revoked
+elsewhere. A server cannot re-mint for itself: it has no browser for the device flow, and
+delegation refuses a token that was itself delegated. So handing it a dead token strands it
+with a 401 and no way forward, which is why the check happens before the write and not
+after.
 
 No browser on the server, no keyring on the server, no SSH forwarding, no broker process.
 The server can re-run `riabuild` on its own afterwards — including re-pulling rotated

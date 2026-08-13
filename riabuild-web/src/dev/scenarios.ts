@@ -117,6 +117,23 @@ const ACTIVE_SESSION: Session = {
   lastUsedAt: NOW - 12 * MINUTE,
   expiresAt: NOW + 70 * DAY,
   revokedAt: null,
+  origin: "device",
+};
+
+/**
+ * A server signed in by the laptop above, which is what `riabuild remote`
+ * produces. The label is a hostname rather than a person's machine, and the
+ * row carries the extra line saying nobody approved this one in a browser.
+ */
+const DELEGATED_SESSION: Session = {
+  _id: "s_delegated",
+  deviceLabel: "build-01.fly.dev",
+  cliVersion: "2026.08.04",
+  createdAt: NOW - 3 * DAY,
+  lastUsedAt: NOW - 40 * MINUTE,
+  expiresAt: NOW + 87 * DAY,
+  revokedAt: null,
+  origin: "delegated",
 };
 
 const EXPIRED_SESSION: Session = {
@@ -127,6 +144,7 @@ const EXPIRED_SESSION: Session = {
   lastUsedAt: NOW - 95 * DAY,
   expiresAt: NOW - 30 * DAY,
   revokedAt: null,
+  origin: "device",
 };
 
 const REVOKED_SESSION: Session = {
@@ -137,6 +155,7 @@ const REVOKED_SESSION: Session = {
   lastUsedAt: NOW - 8 * DAY,
   expiresAt: NOW + 50 * DAY,
   revokedAt: NOW - 7 * DAY,
+  origin: "device",
 };
 
 const HOSTILE_SESSION: Session = {
@@ -148,6 +167,7 @@ const HOSTILE_SESSION: Session = {
   lastUsedAt: NOW - MINUTE,
   expiresAt: NOW + 89 * DAY,
   revokedAt: null,
+  origin: "device",
 };
 
 const AUDIT: AuditEntry[] = [
@@ -328,6 +348,19 @@ export const SCENARIOS: Record<string, () => Data> = {
   "sessions-one": () => ({
     ...base(DEVELOPER),
     sessions: { state: "ready", value: [ACTIVE_SESSION] },
+  }),
+
+  /**
+   * The shape a developer sees after their first `riabuild remote`: their own
+   * laptop, and the server that laptop signed in. Both rows together, because
+   * the extra line only means anything next to a row that does not have it.
+   */
+  "sessions-delegated": () => ({
+    ...base(DEVELOPER),
+    sessions: {
+      state: "ready",
+      value: [ACTIVE_SESSION, DELEGATED_SESSION],
+    },
   }),
 
   "sessions-many": () => ({

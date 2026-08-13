@@ -32,7 +32,20 @@ export function Sessions() {
       key: "device",
       header: "device",
       grow: true,
-      render: (s) => <span className="text-fg">{s.deviceLabel}</span>,
+      // A delegated session is the one nobody approved by hand, so this line
+      // is the only place a developer could catch one they did not expect.
+      // Stated as the mechanism rather than the purpose: these are minted for
+      // servers today, and a row that said "server" would be guessing.
+      render: (s) => (
+        <span className="text-fg wrap-value">
+          {s.deviceLabel}
+          {s.origin === "delegated" && (
+            <span className="block text-fg-dim">
+              signed in by another machine
+            </span>
+          )}
+        </span>
+      ),
     },
     {
       key: "version",
