@@ -522,6 +522,26 @@ a hue: `Brand` and `Danger` share `1;31` on a sixteen-colour terminal, and a
 brand-coloured code reads as an error on exactly the old SSH sessions where the
 device-code flow is the entire interface.
 
+**A message is never laid out at the call site.** No `\n` and four spaces inside a
+format string: that fixes the indent and leaves the *wrapping* to the terminal, which
+folds at column 0, so the second half of a sentence lands under the mark instead of
+under the text. `ui::wrap` measures the terminal once (`TIOCGWINSZ` on stdout, floor 32,
+ceiling 96, 80 when there is nothing to ask) and folds; a call site passes paragraphs.
+`Detail::Prose` is folded and dimmed, `Detail::Verbatim` is printed whole and
+emphasised — and which is which is the **caller's** to say. "A line with no spaces in
+it" is the obvious rule and is wrong on the first thing riabuild prints this way: an
+SSH public key is three words, and folding between any two of them hands the developer
+something that is not a key.
+
+**Anything that prints past an unfinished task has to end its status line.**
+`Ui::working` leaves a line on screen with no newline and records its width; `applied`
+and `unresolved` *cover* it, and everything else claims it through `end_status_line`.
+`warn` did not, and warnings are on stderr where the `\r` that covers stdout cannot
+reach — so a warning raised from inside a task rendered as
+`◐ Authorised — installing the key  ▲ riabuild's key is already…`, with the task never
+resolving. A downgraded task calls `unresolved`, which is `applied`'s `▲` counterpart
+and carries the outcome plus its explanation as one block under one mark.
+
 Text printed by a generated rcfile — the shell banner, the accounts box — takes a `Theme`
 as a parameter rather than reading one, because it is rendered on this side of the
 boundary and printed on the other. Pass `ctx.ui.theme()`, not `ctx.ui.colour()`: the

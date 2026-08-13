@@ -75,7 +75,7 @@ use super::identity::{key_path, ssh_options};
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandRunner, RunOptions};
-use riabuild_ui::{Failure, Ui};
+use riabuild_ui::{Detail, Failure, Ui};
 use std::sync::Arc;
 
 /// The authentication methods sshd named in its refusal, e.g. `Permission
@@ -229,27 +229,40 @@ pub async fn authorise(
         Failure::new(
             format!("authorising riabuild's key on {}", remote.host),
             format!(
-                "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n    {}",
+                "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n{}",
                 remote.host,
                 public_key.trim()
             ),
         )
     };
-    // The same remedy as `paste`, said as a warning rather than as a stop.
+    // The same remedy as `paste`, said as a warning rather than as a stop, and
+    // said in the place the `● Authorised` would have gone — the step is over
+    // either way, and a task left at `◐` is the one outcome that is not true.
     // Deliberately built from the same `public_key`, and deliberately still
     // naming `authorized_keys`: the developer is getting in either way, and
     // this is how they stop being asked for a password on every future run.
-    let carry_on = |because: &str| {
-        ui.warn(&format!(
-            "riabuild's key cannot sign in to {host} yet — {because}.\n    \
-             The rest of this run will use {target}'s password instead; riabuild asks \
-             for it once and remembers it.\n    \
-             To stop being asked at all, add this line to ~/.ssh/authorized_keys on \
-             {host}:\n      {key}",
-            host = remote.host,
-            target = remote.target(),
-            key = public_key.trim(),
-        ));
+    let carry_on = |outcome: &str, because: &str| {
+        ui.unresolved(
+            "Authorised",
+            outcome,
+            &[
+                Detail::Prose(&format!(
+                    "riabuild's key cannot sign in to {} yet — {because}.",
+                    remote.host
+                )),
+                Detail::Prose(&format!(
+                    "The rest of this run will use {}'s password instead; riabuild asks \
+                     for it once and remembers it.",
+                    remote.target()
+                )),
+                Detail::Prose(&format!(
+                    "To stop being asked at all, add this line to ~/.ssh/authorized_keys \
+                     on {}:",
+                    remote.host
+                )),
+                Detail::Verbatim(public_key.trim()),
+            ],
+        );
     };
 
     // What will the server actually accept? `PreferredAuthentications=none`
@@ -294,9 +307,10 @@ pub async fn authorise(
             // A read-only home, a full disk, a connection that dropped. Not
             // fatal: the server has just said it will take a password, so
             // this costs the developer a key rather than the machine.
-            carry_on(&format!(
-                "riabuild could not add it to authorized_keys there ({error})"
-            ));
+            carry_on(
+                "the key could not be written to the server",
+                &format!("riabuild could not add it to authorized_keys there ({error})"),
+            );
             return Ok(());
         }
     };
@@ -312,19 +326,30 @@ pub async fn authorise(
         // they end up pasting a key they have pasted before, and it is what
         // riabuild itself did on every run for as long as `ssh-copy-id` was
         // the thing deciding whether the key was installed.
-        ui.warn(&format!(
-            "riabuild's key is already in ~/.ssh/authorized_keys on {host}, and that \
-             server still refuses it — so riabuild has left the file alone rather than \
-             adding another copy of the same line.\n    \
-             The rest of this run will use {target}'s password instead; riabuild asks \
-             for it once and remembers it.\n    \
-             Something on {host} is not honouring that file. The usual causes are an \
-             `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
-             `AuthenticationMethods` that needs more than a key, or a home directory \
-             whose mode `StrictModes` rejects.",
-            host = remote.host,
-            target = remote.target(),
-        ));
+        ui.unresolved(
+            "Authorised",
+            "the server refuses the key it already has",
+            &[
+                Detail::Prose(&format!(
+                    "riabuild's key is already in ~/.ssh/authorized_keys on {}, and that \
+                     server still refuses it — so riabuild has left the file alone rather \
+                     than adding another copy of the same line.",
+                    remote.host
+                )),
+                Detail::Prose(&format!(
+                    "The rest of this run will use {}'s password instead; riabuild asks \
+                     for it once and remembers it.",
+                    remote.target()
+                )),
+                Detail::Prose(&format!(
+                    "Something on {} is not honouring that file. The usual causes are an \
+                     `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
+                     `AuthenticationMethods` that needs more than a key, or a home \
+                     directory whose mode `StrictModes` rejects.",
+                    remote.host
+                )),
+            ],
+        );
         return Ok(());
     }
 
@@ -333,7 +358,10 @@ pub async fn authorise(
         // it — same causes as the branch above, but this run is the one that
         // put it there, so the developer is hearing it for the first time.
         // None of them is a reason to stop a developer whose password works.
-        carry_on("the key was copied, but signing in with it still does not work");
+        carry_on(
+            "the key is installed and still refused",
+            "the key was copied, but signing in with it still does not work",
+        );
         return Ok(());
     }
     ui.applied("Authorised");
