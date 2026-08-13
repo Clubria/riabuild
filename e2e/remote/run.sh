@@ -6,8 +6,9 @@
 # prompt (answered non-interactively via `--accept-host-key`, never
 # weakened), authorising a fresh key onto an account that only trusts an
 # existing one (via an ssh-agent — see the comment above `run_as`), asking
-# the server its own home directory, and riabuild-web's `/api/v1/me` and
-# `/api/v1/org/config` (through a small stand-in — see `stub_web.py`).
+# the server its own home directory, and the riabuild-web endpoints a run
+# reads — `/api/v1/me`, `/api/v1/org/config` and `/api/v1/org/claude-settings`
+# (through a small stand-in — see `stub_web.py`).
 #
 # TWO PREREQUISITES, both outside this script's control. Neither is hidden,
 # and neither is allowed to look like a pass.
@@ -32,7 +33,7 @@
 #    Until the Linux job publishes its digests, the run cannot get past the
 #    install step.
 #
-# Because of (2) the five isolation assertions at the bottom DO NOT RUN yet.
+# Because of (2) the six assertions at the bottom DO NOT RUN yet.
 # This script does not paper over that: it asserts positively, against the
 # container and this laptop's own filesystem, that the stages it claims to
 # cover actually happened — a key pair on the laptop, a host key pinned, a
@@ -43,7 +44,7 @@
 # hang as a success.
 #
 # WHAT A LINUX/MUSL CHECKSUM ALONE WILL NOT UNBLOCK. An earlier version of
-# this comment claimed the five assertions would start running the moment
+# this comment claimed the six assertions would start running the moment
 # that asset shipped, with no edit needed here. That is false, and saying so
 # is the point of this paragraph — the next step after the install is
 # `session::ensure`, and it needs three things this setup does not have:
@@ -389,7 +390,7 @@ known_gap() {
   # unimplemented method on any path, including one riabuild had started
   # calling by mistake — and the whole purpose of this function is that a
   # non-start must never be mistaken for a tracked gap. When the stub grows a
-  # `do_POST`, this branch stops matching on its own and the five assertions
+  # `do_POST`, this branch stops matching on its own and the six assertions
   # below start running.
   grep -q "replied with HTTP 501" "$work/ada.log" \
     && grep -q "POST /api/v1/cli/sessions.* 501" "$work/stub_web.log" 2>/dev/null \
@@ -500,7 +501,7 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "# the container's host key was pinned, and riabuild's key was"
   echo "# authorised on the container. Those stages ran for real."
   echo "#"
-  echo "# The five isolation assertions this test names were NOT run."
+  echo "# The six assertions this test names were NOT run."
   echo "# They need a provisioned server, which needs a session, which"
   echo "# needs the sign-in above. Nothing in CI has yet proved the"
   echo "# namespace isolation remote mode rests on."
@@ -574,9 +575,24 @@ in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
 # absence; the four assertions above it are what establish the run did real
 # work.
 test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
+# 6. the team's Claude Code settings reached each namespace
+#
+# The launcher layers this file with `--settings`, and drops the flag entirely
+# when it is not there — `claude --settings` on a missing path refuses to
+# start — so its absence is a silent downgrade to no org policy rather than an
+# error anyone would see. Nothing here had ever looked for it, and it does not
+# live where a developer would think to look on a server: `RIABUILD_ROOT`
+# points at the namespace, so the file is under `.riabuild-remote/<member>/`
+# and never at `~/.riabuild/`.
+#
+# Grepped for the marker, not merely tested for existence: an empty `{}` is a
+# valid file that would satisfy `test -f` and carry no policy at all.
+in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_A/org-settings.json"
+in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settings.json"
 
 # Names what was checked rather than claiming "all assertions passed", which
 # is how this script once reported a run that never reached the server.
-echo "remote mode e2e: five assertions passed — separate namespaces, separate"
-echo "git identities, one shared toolchain, per-developer checkouts, and no"
-echo "gh credential left behind."
+echo "remote mode e2e: six assertions passed — separate namespaces, separate"
+echo "git identities, one shared toolchain, per-developer checkouts, no"
+echo "gh credential left behind, and the team's Claude Code settings in each"
+echo "namespace."

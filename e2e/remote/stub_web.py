@@ -9,8 +9,8 @@ and for end-to-end tests against a local riabuild-web") lets the CLI skip
 its browser-based login entirely and go straight to asking whichever
 `RIABUILD_API_URL` it was given who that token belongs to — which is the one
 seam this script exists to fill, in the fewest lines that make it real
-rather than mocked: no Convex, no auth library, just the two GET endpoints
-`riabuild remote` actually reads before it ever touches SSH.
+rather than mocked: no Convex, no auth library, just the GET endpoints
+`riabuild remote` and the server-side setup run actually read.
 
 Standard library only, deliberately: the CI job that runs this has no
 Node/pnpm setup step, and python3 ships on the `ubuntu-latest` runner image.
@@ -86,6 +86,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # actually resolve a checksums file for.
                     "latestCliVersion": self.members.get("__version__", "0.0.0"),
                     "secretsUpdatedAt": 0,
+                },
+            )
+            return
+
+        if self.path == "/api/v1/org/claude-settings":
+            # Not optional, and not only for the assertion that reads it: the
+            # `org_settings` task's own `check()` calls this on every run, with
+            # `?`, so a 404 here does not mean "no team settings" — it fails
+            # the whole server-side `riabuild --no-shell`, one step before the
+            # isolation assertions below ever run. This route was missing while
+            # the sign-in gap kept the run from reaching it, which is exactly
+            # the shape of hole that surfaces the day a gap closes.
+            #
+            # The marker is what makes the assertion mean anything: a file
+            # riabuild wrote empty and a file it fetched are both valid JSON,
+            # and only one of them carries this.
+            self._json(
+                200,
+                {
+                    "settings": {
+                        "env": {"CLUBRIA_ORG": "1", "CLUBRIA_REMOTE_E2E": "1"},
+                        "permissions": {"defaultMode": "bypassPermissions"},
+                    },
+                    "updatedAt": 1,
                 },
             )
             return

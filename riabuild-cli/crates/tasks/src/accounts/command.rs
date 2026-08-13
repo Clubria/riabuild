@@ -5,7 +5,7 @@ use crate::accounts;
 use crate::accounts::render;
 use crate::accounts::status::{self, Identity};
 use crate::shims;
-use crate::{claude_agents_view, claude_onboarding, claude_trust};
+use crate::{claude_agents_view, claude_onboarding, claude_trust, org_settings};
 use anyhow::Result;
 use riabuild_paths::contract_tilde;
 use riabuild_runner::RunOptions;
@@ -109,10 +109,43 @@ pub async fn new(ctx: &mut Ctx) -> Result<i32> {
         .into());
     }
 
+    settle_org_settings(ctx, number).await;
     settle_onboarding(ctx, &id, number).await;
     prefer_agents_view(ctx, &id).await;
     trust(ctx, &id, number).await;
     list(ctx).await
+}
+
+/// Makes sure this machine has the team's Claude Code settings, before the
+/// account that is about to be launched goes looking for them.
+///
+/// The one thing here that is not per-account. `org-settings.json` serves every
+/// launcher, and until now only a provisioning run ever fetched it — so an
+/// account created on a machine that had never completed one got no org policy
+/// at all. Not as an error, either: the launcher drops `--settings` when the
+/// file is absent, because `claude --settings` on a missing path refuses to
+/// start, so the failure is a silent downgrade with a healthy-looking account
+/// list on top of it.
+///
+/// Reported only when the launcher really would find nothing. A copy riabuild
+/// could not re-confirm — no session, no network — is still a copy the launcher
+/// will layer, and the next `riabuild` run is what brings a stale one up to
+/// date; calling that "without the team's settings" would be the opposite of
+/// true. A note rather than a refusal for the same reason `trust`'s is: the
+/// account was created and signed in, and saying otherwise is the worse lie.
+async fn settle_org_settings(ctx: &mut Ctx, number: usize) {
+    let Err(error) = org_settings::ensure_cached(ctx).await else {
+        return;
+    };
+    if tokio::fs::try_exists(ctx.paths.org_settings_file())
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    ctx.ui.note(&format!(
+        "Account {number} will start without the team's Claude Code settings ({error:#}) — run `riabuild` to fetch them"
+    ));
 }
 
 /// Gives one freshly created account the team's agents-view default.
@@ -345,7 +378,7 @@ pub async fn primary(ctx: &mut Ctx, number: usize) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::ctx_with;
+    use crate::testing::{ctx_with, write_file};
     use riabuild_runner::FakeRunner;
     use riabuild_ui::Ui;
     use std::sync::Arc;
@@ -801,6 +834,61 @@ mod tests {
         assert!(
             notes.iter().any(|note| note.contains("riabuild")),
             "the note has to name what fixes it: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_account_on_a_machine_with_no_team_settings_says_so() {
+        // The launcher drops `--settings` when `org-settings.json` is not
+        // there — it has to, since `claude --settings` on a missing path
+        // refuses to start — so the account runs with no team policy at all
+        // and nothing on screen says so. `riabuild claude new` is the one
+        // command that creates an account and hands it straight over, and the
+        // only thing that has ever fetched that file is the provisioning run.
+        let (mut ctx, _home, _ids) = with_accounts(1).await;
+        ctx.ui = Ui::scripted([]);
+        assert!(
+            ctx.member.is_none(),
+            "a machine that cannot fetch is the case this reports on"
+        );
+        assert!(
+            !tokio::fs::try_exists(ctx.paths.org_settings_file())
+                .await
+                .unwrap(),
+            "this test needs a machine with no cached team settings"
+        );
+
+        assert_eq!(new(&mut ctx).await.unwrap(), 0);
+
+        let notes = ctx.ui.noted();
+        assert!(
+            notes.iter().any(|note| note.contains("team's Claude Code")),
+            "the account will start with no org policy and was not told: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("riabuild")),
+            "the note has to name what fixes it: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_copy_riabuild_could_not_re_confirm_is_not_called_missing() {
+        // The over-correction guard. A signed-out or offline machine cannot
+        // ask the server whether its copy is current — `check` says so without
+        // touching the network — but the launcher will still find a file and
+        // layer it. Warning here would tell a developer their settings are
+        // absent while they are sitting on disk, and the next `riabuild` run
+        // is what brings a stale copy up to date.
+        let (mut ctx, _home, _ids) = with_accounts(1).await;
+        ctx.ui = Ui::scripted([]);
+        write_file(&ctx.paths.org_settings_file(), r#"{"env":{}}"#).await;
+
+        assert_eq!(new(&mut ctx).await.unwrap(), 0);
+
+        let notes = ctx.ui.noted();
+        assert!(
+            !notes.iter().any(|note| note.contains("team's Claude Code")),
+            "the settings are right there: {notes:?}"
         );
     }
 
