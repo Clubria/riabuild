@@ -1,11 +1,16 @@
-# Rust
+# Rust. Per-worktree: each checkout builds its own finished binaries here.
 target/
 
-# Machine-local cargo config, used to point every worktree at one shared
-# target/. It must stay untracked: a tracked config is copied into every
+# The one compiled dependency graph every checkout and worktree shares. Written
+# at the main checkout root only, because that is where the cargo config that
+# names it lives. See riabuild-cli/CLAUDE.md.
+/shared-build/
+
+# Machine-local cargo config, which is what points them all at that one
+# shared-build/. It must stay untracked: a tracked config is copied into every
 # worktree by git, cargo then reads the worktree's own copy, and each worktree
-# gets a private target/ again — the exact thing it exists to prevent. See
-# riabuild-cli/CLAUDE.md.
+# resolves the relative build-dir against itself — handing back the private
+# dependency graphs it exists to prevent. See riabuild-cli/CLAUDE.md.
 /.cargo/
 
 # Secrets — never commit
