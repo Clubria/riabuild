@@ -129,6 +129,52 @@ jobs:
             exit 1
           fi
 
+  # The same unit tests, on the other platform riabuild ships to.
+  #
+  # `riabuild-cli` above is the whole gate for everything that is not a platform
+  # branch, and this job deliberately does not repeat its fmt, clippy or
+  # packaging checks — those answer the same on both hosts and paying for a
+  # macOS runner to hear it twice buys nothing.
+  #
+  # What it buys is the thing this repository has now been bitten by twice.
+  # `cargo test` on macOS used to run only in `release.yml`, which triggers on
+  # `v*` — *after* the tag is pushed. So a test that only fails on a Mac could
+  # not fail on a pull request: it failed on the release, with the tag already
+  # public and no binaries behind it. The keychain wrappers went that way (see
+  # "The parameter has to reach the public function" in `riabuild-cli/CLAUDE.md`),
+  # and `pump::tests` went the same way by *hanging* rather than failing, which
+  # is worse — it published nothing and reported nothing for as long as GitHub
+  # would let the job run.
+  #
+  # `e2e.yml`'s "riabuild on macOS" job is not this. It runs the end-to-end
+  # suite on `pull_request`; a green tick there has never meant a single unit
+  # test ran on a Mac.
+  cli-macos:
+    name: riabuild-cli on macOS
+    runs-on: macos-latest
+    # A hung test must be a red job, not a six-hour one. The Linux job runs the
+    # same suite in about two minutes, so this is roughly ten times the headroom
+    # a slower runner needs and still fails inside a coffee break.
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: riabuild-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: riabuild-cli
+
+      # `--test-threads` is left alone, but the timeout above is a blunt
+      # instrument: it names the job, not the test. libtest's own warning is
+      # what names the test, and it only reaches the log if the output is not
+      # still sitting in a buffer when the job is killed — hence `--nocapture`.
+      - name: Test
+        run: cargo test --workspace --all-targets -- --nocapture
+
   web:
     name: riabuild-web
     runs-on: ubuntu-latest

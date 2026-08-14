@@ -302,10 +302,21 @@ binaries at all. Half-applying this pattern is worse than not applying it, becau
 extracted function looks like the coverage already exists.
 
 **The gate has a Mac, and that is not the same as running your test on one.** `e2e.yml`'s
-"riabuild on macOS" job runs on `pull_request`, so a macOS runner is not what was missing
-— it runs the end-to-end suite, and `cargo test` on macOS happens only in `release.yml`.
-Do not read a green "riabuild on macOS" as unit-test coverage of a platform branch. The
+"riabuild on macOS" job runs on `pull_request`, so a macOS runner was never what was
+missing — it runs the end-to-end suite, and a green tick on it has never meant a single
+unit test ran on a Mac. Do not read one as unit-test coverage of a platform branch. The
 parameter is what makes that branch assertable, on every host and on every run.
+
+`ci.yml`'s **"riabuild-cli on macOS"** job is what closes the rest of the gap: the same
+`cargo test --workspace --all-targets`, on `macos-latest`, on every pull request. It was
+added after the second time this bit — `pump::tests` had a case that *hung* on macOS, and
+because `cargo test` on a Mac then ran only in `release.yml`, which triggers on `v*`, the
+first thing to notice was a release whose tag was already public and whose macOS job sat
+there for twenty-five minutes building nothing. A test that only fails on one platform has
+to be able to fail on a pull request. That job and the `timeout-minutes` on every
+compiling job in `release.yml` are two halves of one rule: **a hang must present as a red
+job, never as a slow one.** It does not repeat fmt, clippy or the packaging checks, which
+answer the same on both hosts.
 
 Each wrapper now takes `is_macos`, and `each_wrapper_passes_the_platform_it_is_actually_running_on`
 pins all three to the host's real answer. That test is not optional: a parameter without
