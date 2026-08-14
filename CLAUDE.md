@@ -42,6 +42,20 @@ gh pr checks --watch          # wait for completion — this is part of the task
 Do not push to `main`. Do not report work as done while checks are queued, running, or
 failing. If CI fails, fixing it is part of the same task, not a follow-up.
 
+**Turn on `rerere`, once per clone.** Several branches are usually in flight at a time,
+each rebasing on `main` as it moves, which means resolving the *same* conflict on every
+rebase. `rerere` records a resolution the first time and replays it after that.
+
+```sh
+git config --local rerere.enabled true
+git config --local rerere.autoUpdate true
+```
+
+`--local` writes to `.git/config` and the recorded resolutions live in `.git/rr-cache`,
+both of which sit in the shared git directory rather than in any one worktree — so a
+single run covers this clone *and* every worktree under `.claude/worktrees/`. Git cannot
+carry a config value in a commit, which is why this is written down rather than shipped.
+
 ## Architecture rules
 
 **The server ships data, never logic.** Setup tasks are compiled into the Rust binary —

@@ -33,7 +33,7 @@
 #    Until the Linux job publishes its digests, the run cannot get past the
 #    install step.
 #
-# Because of (2) the six assertions at the bottom DO NOT RUN yet.
+# Because of (2) the assertions at the bottom DO NOT RUN yet.
 # This script does not paper over that: it asserts positively, against the
 # container and this laptop's own filesystem, that the stages it claims to
 # cover actually happened — a key pair on the laptop, a host key pinned, a
@@ -44,7 +44,7 @@
 # hang as a success.
 #
 # WHAT A LINUX/MUSL CHECKSUM ALONE WILL NOT UNBLOCK. An earlier version of
-# this comment claimed the six assertions would start running the moment
+# this comment claimed the assertions would start running the moment
 # that asset shipped, with no edit needed here. That is false, and saying so
 # is the point of this paragraph — the next step after the install is
 # `session::ensure`, and it needs three things this setup does not have:
@@ -390,7 +390,7 @@ known_gap() {
   # unimplemented method on any path, including one riabuild had started
   # calling by mistake — and the whole purpose of this function is that a
   # non-start must never be mistaken for a tracked gap. When the stub grows a
-  # `do_POST`, this branch stops matching on its own and the six assertions
+  # `do_POST`, this branch stops matching on its own and the assertions
   # below start running.
   grep -q "replied with HTTP 501" "$work/ada.log" \
     && grep -q "POST /api/v1/cli/sessions.* 501" "$work/stub_web.log" 2>/dev/null \
@@ -501,7 +501,7 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "# the container's host key was pinned, and riabuild's key was"
   echo "# authorised on the container. Those stages ran for real."
   echo "#"
-  echo "# The six assertions this test names were NOT run."
+  echo "# The assertions this test names were NOT run."
   echo "# They need a provisioned server, which needs a session, which"
   echo "# needs the sign-in above. Nothing in CI has yet proved the"
   echo "# namespace isolation remote mode rests on."
@@ -530,17 +530,25 @@ echo "-- running as bob (member $MEMBER_B)"
 mkdir -p "$work/laptop-bob"
 run_as "$MEMBER_B" bob test-token-bob
 
-# 1. two namespaces, each with its own state
+# The assertions are labelled by what they check, never numbered, and no count
+# of them is stated anywhere above. Both of those are deliberate. A number in
+# prose has to be restated everywhere it is mentioned and renumbered for every
+# assertion added or removed, so a branch that changes the set collides with
+# every other branch that so much as reworded a nearby sentence — which is the
+# only conflict this file has ever actually had. The closing banner names what
+# ran instead of counting it, which is what a reader needed in the first place.
+#
+# namespaces: two, each with its own state
 in_container "test -f ~/.riabuild-remote/$MEMBER_A/state.json"
 in_container "test -f ~/.riabuild-remote/$MEMBER_B/state.json"
-# 2. a git identity per developer, and they differ
+# git identity: one per developer, and they differ
 in_container "grep -q 'ada@' ~/.riabuild-remote/$MEMBER_A/gitconfig"
 in_container "grep -q 'bob@' ~/.riabuild-remote/$MEMBER_B/gitconfig"
-# 3. one toolchain for both
+# toolchain: one, shared by both
 test "$(in_container 'ls ~/.riabuild/node | wc -l')" -eq 1
-# 4. checkouts grouped by developer, not shared
+# checkouts: grouped by developer, not shared
 in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
-# 5. no gh configuration outlives the sessions that created it
+# gh credential: none outlives the sessions that created it
 #
 # There were six assertions here. The missing one claimed to check that gh
 # config is isolated *while a session is live*, by testing that
@@ -572,10 +580,10 @@ in_container "test -d ~/Clubria/ada && test -d ~/Clubria/bob"
 # there is nowhere to look for one: the credential lives in the ephemeral
 # runtime directory for the life of the process and is reaped with it, which
 # is the property being tested. So this catches a leak and cannot catch an
-# absence; the four assertions above it are what establish the run did real
+# absence; the assertions above it are what establish the run did real
 # work.
 test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
-# 6. the team's Claude Code settings reached each namespace
+# org settings: the team's Claude Code settings reached each namespace
 #
 # The launcher layers this file with `--settings`, and drops the flag entirely
 # when it is not there — `claude --settings` on a missing path refuses to
@@ -590,9 +598,10 @@ test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_A/org-settings.json"
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settings.json"
 
-# Names what was checked rather than claiming "all assertions passed", which
-# is how this script once reported a run that never reached the server.
-echo "remote mode e2e: six assertions passed — separate namespaces, separate"
-echo "git identities, one shared toolchain, per-developer checkouts, no"
-echo "gh credential left behind, and the team's Claude Code settings in each"
-echo "namespace."
+# Names what was checked rather than counting it, and never claims "all
+# assertions passed" — that phrasing is how this script once reported a run
+# that never reached the server, and the count is what used to make every
+# branch that changed the set conflict with every other one.
+echo "remote mode e2e passed — separate namespaces, separate git identities,"
+echo "one shared toolchain, per-developer checkouts, no gh credential left"
+echo "behind, and the team's Claude Code settings in each namespace."
