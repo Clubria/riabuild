@@ -36,6 +36,62 @@ async fn has_mosh_server(
 /// port, typically. Any other code is the command's own.
 const MOSH_NO_SESSION: i32 = 5;
 
+/// Seconds between keepalives on a connection that has gone quiet.
+const ALIVE_INTERVAL: u32 = 20;
+
+/// Unanswered keepalives before ssh gives up, for the developer's shell.
+///
+/// Three minutes. Not a round number picked for tidiness: without mosh there is
+/// nothing to reconnect, so ssh giving up *is* the session ending, and whatever
+/// was running in it goes with it. A train tunnel outlasts the sixty seconds the
+/// default would allow, and the cost of tolerating it is a terminal that stops
+/// answering for as long as the network is gone — which the developer can see,
+/// and which ends by itself.
+const SESSION_TOLERANCE: u32 = 9;
+
+/// The same, for a setup run, and deliberately the shorter of the two.
+///
+/// Setup's exit code is what decides whether a shell opens at all, so a
+/// connection that will not come back has to be *reported* rather than waited
+/// on: this repository's rule is that a hang presents as a failure and never as
+/// a slow success. There is also nothing here for a developer to lose by giving
+/// up — `apply()` is safe to run twice, so the answer to a dropped setup is to
+/// run it again.
+const SETUP_TOLERANCE: u32 = 3;
+
+/// Seconds to wait for a connection to be established, per attempt.
+const CONNECT_TIMEOUT: u32 = 15;
+
+/// The options that decide how much network trouble a connection survives.
+///
+/// `TCPKeepAlive=no` is the one that looks like it is switching resilience
+/// *off*. It is not: it is on by default, it is answered by the kernel below
+/// anything riabuild can tune, and leaving it there makes the tolerance above an
+/// upper bound rather than the answer. One mechanism decides when a connection
+/// is dead, and it is the one whose numbers are written down here.
+///
+/// These live beside the two call sites rather than in
+/// [`identity::ssh_options`], which every probe, `ssh-copy-id` and issued-key
+/// check also goes through. A probe is a question with a caller waiting on it,
+/// and three minutes is the wrong answer to a question — the two paths here are
+/// the ones that carry a developer's session or a whole task DAG.
+fn resilience_options(tolerance: u32) -> Vec<String> {
+    [
+        format!("ServerAliveInterval={ALIVE_INTERVAL}"),
+        format!("ServerAliveCountMax={tolerance}"),
+        "TCPKeepAlive=no".to_string(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
+        // A lost SYN is a retry, not a failed run. ssh sleeps a second between
+        // attempts, so the bound above is what keeps this from doubling an
+        // unreachable server's wait rather than merely surviving a dropped
+        // packet.
+        "ConnectionAttempts=2".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
+}
+
 /// Provisioning: always `ssh -t`, never mosh.
 ///
 /// mosh does not propagate the remote command's exit status, so a failed setup
@@ -58,6 +114,7 @@ pub async fn run_setup(
 ) -> Result<i32> {
     let mut args = vec!["-t".to_string()];
     args.extend(identity::ssh_options(remote, paths, true, carry));
+    args.extend(resilience_options(SETUP_TOLERANCE));
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -145,8 +202,7 @@ pub async fn open(
     // older than 7.8 — a certain cost against a hypothetical gain.
     let mut args = vec!["-t".to_string()];
     args.extend(identity::ssh_options(remote, paths, true, carry));
-    args.push("-o".to_string());
-    args.push("ServerAliveInterval=20".to_string());
+    args.extend(resilience_options(SESSION_TOLERANCE));
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -169,6 +225,102 @@ mod tests {
             host: "build-01.fly.dev".into(),
             port: 22,
             user: "ada".into(),
+        }
+    }
+
+    fn ssh_call(fake: &Arc<FakeRunner>) -> String {
+        fake.calls()
+            .into_iter()
+            .find(|call| call.starts_with("ssh "))
+            .expect("an ssh call")
+    }
+
+    /// The `ssh` a fallback `open` runs, with no mosh anywhere to take the path
+    /// in front of it.
+    async fn fallback_call() -> String {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
+        open(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild shell",
+            None,
+        )
+        .await
+        .expect("falls back");
+        ssh_call(&fake)
+    }
+
+    /// The `ssh` a setup run performs.
+    async fn setup_call() -> String {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
+        run_setup(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild --no-shell",
+            None,
+        )
+        .await
+        .expect("runs");
+        ssh_call(&fake)
+    }
+
+    /// Setup is the longest-lived connection riabuild makes — the whole task DAG
+    /// runs inside it — and it carried no keepalive at all, so a network that
+    /// went silent under it left riabuild waiting on a socket nothing would ever
+    /// close. The fallback shell had one; this is the path that did not.
+    #[tokio::test]
+    async fn the_setup_run_notices_a_network_that_has_gone_silent() {
+        let call = setup_call().await;
+        assert!(call.contains("ServerAliveInterval="), "{call}");
+    }
+
+    /// The asymmetry is the point, so both are asserted in one place: collapsing
+    /// them to a single number is the tidying this test exists to fail.
+    ///
+    /// Losing an interactive session costs a developer whatever was running in
+    /// it, and freezing for three minutes costs three minutes — so the shell
+    /// rides out an outage the setup run does not. Setup is the opposite trade:
+    /// its exit code decides whether a shell opens at all, and this repository's
+    /// rule for it is that a hang must present as a failure rather than as a
+    /// slow success.
+    #[tokio::test]
+    async fn the_session_rides_out_an_outage_the_setup_run_gives_up_on() {
+        let session = fallback_call().await;
+        let setup = setup_call().await;
+
+        assert!(session.contains("ServerAliveCountMax=9"), "{session}");
+        assert!(setup.contains("ServerAliveCountMax=3"), "{setup}");
+    }
+
+    /// One mechanism decides when a connection is dead, not the minimum of two.
+    ///
+    /// `TCPKeepAlive` is on by default and is answered by the kernel, below
+    /// anything riabuild can tune — so with it left alone the tolerance set
+    /// above is an upper bound rather than the answer. Off, the `ServerAlive`
+    /// pair is the whole of the decision, which is the only way the three
+    /// minutes above means three minutes.
+    #[tokio::test]
+    async fn nothing_below_ssh_decides_when_a_connection_is_dead() {
+        assert!(fallback_call().await.contains("TCPKeepAlive=no"));
+        assert!(setup_call().await.contains("TCPKeepAlive=no"));
+    }
+
+    /// A lost packet at dial time is not a failed run, and an unreachable server
+    /// is not a two-minute wait: ssh's default is the kernel's connect timeout,
+    /// which is neither bounded by riabuild nor short enough to report.
+    #[tokio::test]
+    async fn a_dial_is_bounded_and_retried_rather_than_failing_on_one_packet() {
+        for call in [fallback_call().await, setup_call().await] {
+            assert!(call.contains("ConnectTimeout="), "{call}");
+            assert!(call.contains("ConnectionAttempts=2"), "{call}");
         }
     }
 
