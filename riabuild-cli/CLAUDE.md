@@ -564,6 +564,39 @@ riabuild flag able to clear it. The pump owns the bind now, so clearing a dead s
 ordinary `unlink` by its owner — and a socket that still *answers* is refused rather than
 taken, because taking one silently cuts a colleague's session.
 
+**The channel's `ssh` is reached by remote mode's own rules, never by an argv the
+supervisor composes.** `supervisor::Tunnel` takes `options: Vec<String>` — the list
+`identity::ssh_options` builds, the same one behind the setup run, the mosh bootstrap and
+the developer's shell — and `ssh_args` adds only what is its own: `-T`, the keepalives,
+`BatchMode=yes`. It used to take a `port` and an `identity` and build `-p`/`-i` itself,
+which looked complete and quietly reached servers by different rules than the connection
+beside it. Two omissions were fatal and neither said so:
+
+- riabuild records a host key in **its own** `known_hosts`, never `~/.ssh/known_hosts`, so
+  without `UserKnownHostsFile` the channel's `ssh` read the developer's file, did not find
+  the host, and — correctly, under `BatchMode=yes` — exited `Host key verification failed`.
+  A box the developer had once `ssh`'d to by hand worked; one only riabuild had ever
+  reached never did, which is as confusing a pair of servers as it sounds.
+- a **carried issued identity** (`IdentityAgent`) never reached it, so the servers that
+  feature exists for — the ones riabuild's own key cannot sign in to — could not carry a
+  channel at all, however well the rest of the session worked.
+
+It also opted out of `-F /dev/null`, leaving the one connection nobody watches redirectable
+by a `Host` block in `~/.ssh/config`. The rule is the one `Tunnel::command` already stated
+and this now obeys: **remote mode owns how a server is reached.** A supervisor that
+reinvents any part of it drifts from the flow it belongs to with nothing failing to
+compile.
+
+**A failure `diagnose` cannot name is still reported, once.** That gap is what hid the bug
+above for the whole life of the exec transport: `Host key verification failed` matched none
+of `diagnose`'s patterns, so the loop backed off to the ceiling and retried in silence for
+the length of every session, under a banner that said `connected`. `should_say_it_cannot_connect`
+is the whole decision — never carried anything, not yet said, past `QUIET_FAILURES` — and
+it is a predicate rather than three inline conditions because `supervise` takes an owned
+`Ui` and a test cannot read back what it printed. Unlike a named wall it keeps retrying
+afterwards: an unrecognised failure cannot be told apart from a server that is slow to come
+back.
+
 **`RIABUILD_CHANNEL_SOCKET` outlives the channel, and the shim reports that as a state
 rather than as an `errno`.** The variable is written once into the shell's environment when
 the session opens; the channel is a live resource a laptop-side process owns and can end at

@@ -226,8 +226,16 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
         Tunnel {
             host: plan.remote.host.clone(),
             user: plan.remote.user.clone(),
-            port: plan.remote.port,
-            identity: identity::key_path(plan.remote, plan.paths),
+            // The same options every other ssh in this flow is built from —
+            // riabuild's own `known_hosts`, its own key, `-F /dev/null`, and
+            // the issued identity when one is being carried. The supervisor
+            // used to compose a `-p` and an `-i` of its own, which is how the
+            // one connection nobody watches came to reach servers by different
+            // rules than the connection right beside it. `carry` in particular
+            // was never passed at all, so the servers riabuild's own key cannot
+            // sign in to — the whole reason issued keys exist — could not carry
+            // a channel however well the rest of the session worked.
+            options: identity::ssh_options(plan.remote, plan.paths, true, plan.carry),
             command: plan.pump.clone(),
             env: askpass::ssh_env(plan.remote, plan.paths),
         },

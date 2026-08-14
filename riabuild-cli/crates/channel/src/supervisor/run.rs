@@ -15,6 +15,32 @@
 //! reaching a caller that used `?` in turn is exactly how it would.
 
 use super::{Tunnel, backoff, diagnose, ssh_args};
+
+/// How many consecutive failures, with nothing ever carried, before the
+/// supervisor says out loud that it cannot reach the server.
+///
+/// Four puts it around half a minute into the backoff schedule — long enough
+/// that an ordinary reconnect after a closed lid stays silent, short enough
+/// that a channel which is never coming up says so while the developer is still
+/// wondering why paste does nothing.
+const QUIET_FAILURES: u32 = 4;
+
+/// Whether this failure is the one to say out loud.
+///
+/// A predicate rather than three conditions inline, because it is the whole of
+/// the decision and the loop around it cannot be unit-tested without an `ssh`:
+/// `supervise` takes an owned `Ui`, so a test cannot hold on to the printer it
+/// moved in and read back what was said. Extracted, every branch is reachable.
+fn should_say_it_cannot_connect(ever_carried: bool, said_so: bool, attempt: u32) -> bool {
+    // A channel that has worked and then dropped is a laptop that slept, and
+    // there is nothing for anyone to do about it.
+    !ever_carried
+        // Once per supervisor. At the backoff ceiling, "every time" is a line
+        // every thirty seconds printed over whatever the developer is doing.
+        && !said_so
+        // Late enough that an ordinary slow reconnect stays quiet.
+        && attempt >= QUIET_FAILURES
+}
 use crate::agent::Agent;
 use riabuild_runner::{CommandRunner, RunOptions};
 use riabuild_ui::{Failure, Ui};
@@ -104,6 +130,14 @@ pub async fn supervise(
     // suspends every afternoon reconnects in a second rather than inheriting
     // the ceiling from a bad week.
     let mut attempt = 0u32;
+    // Whether this channel has ever worked. A connection that dropped is a
+    // laptop that slept; one that has never carried a byte is a channel that
+    // cannot come up, and only the second is worth a message.
+    let mut ever_carried = false;
+    // The unrecognised-wall message is said once per supervisor, never once per
+    // attempt: at the backoff ceiling that would be a line every thirty seconds
+    // for the length of a session, printed over whatever the developer is doing.
+    let mut said_so = false;
 
     loop {
         let asked = *signal.borrow_and_update();
@@ -183,11 +217,39 @@ pub async fn supervise(
                 if let Some(failure) = diagnose(&stderr) {
                     return Some(report(&ui, failure));
                 }
+                // A failure `diagnose` does not recognise, repeated, with not
+                // one request ever carried. That is a wall too — it is simply
+                // one nobody has written a sentence for yet — and the loop used
+                // to retry it in silence for the length of the session while
+                // the banner overhead said "connected".
+                //
+                // Said once rather than every time, and the loop carries on
+                // rather than stopping: unlike the named walls, this one cannot
+                // be told apart from a server that is slow to come back, and
+                // giving up on a laptop that will reconnect in a minute is the
+                // worse mistake. What it buys is that the next cause of a dead
+                // channel costs one message instead of three rounds of
+                // guesswork.
+                if should_say_it_cannot_connect(ever_carried, said_so, attempt) {
+                    said_so = true;
+                    report(
+                        &ui,
+                        Failure::new(
+                            "the clipboard channel cannot reach this server",
+                            "Run `riabuild channel status` on the server to check, and \
+                             `riabuild remote` again from here to rebuild it. Everything \
+                             except paste works without it.",
+                        )
+                        .command(format!("ssh {}", args.join(" ")))
+                        .detail(stderr.trim().to_string()),
+                    );
+                }
             }
         }
 
         if carried {
             attempt = 0;
+            ever_carried = true;
         }
 
         let delay = backoff(attempt);
@@ -327,6 +389,33 @@ mod tests {
         until_spawns(&fake, 2).await;
         stop.stop();
         assert!(supervising.await.expect("join").is_none());
+    }
+
+    /// A failure nobody has written a sentence for still has to produce one.
+    ///
+    /// This is the gap that hid a real bug for the whole life of the exec
+    /// transport: the channel's `ssh` was refusing an unverifiable host key,
+    /// `diagnose` matched none of its patterns, and the loop retried in silence
+    /// for the length of every session. Three rounds of "paste does not work"
+    /// went by with nothing anywhere naming a cause.
+    #[test]
+    fn a_failure_nobody_recognises_is_still_said_once() {
+        // Silent while an ordinary reconnect might still succeed.
+        assert!(!should_say_it_cannot_connect(false, false, 0));
+        assert!(!should_say_it_cannot_connect(
+            false,
+            false,
+            QUIET_FAILURES - 1
+        ));
+        // Then said.
+        assert!(should_say_it_cannot_connect(false, false, QUIET_FAILURES));
+        // Once. At the backoff ceiling, "every time" is a line every thirty
+        // seconds printed over whatever the developer is doing.
+        assert!(!should_say_it_cannot_connect(false, true, QUIET_FAILURES));
+        // And never for a channel that has worked: that is a laptop that
+        // slept, and there is nothing for anyone to do about it.
+        assert!(!should_say_it_cannot_connect(true, false, QUIET_FAILURES));
+        assert!(!should_say_it_cannot_connect(true, false, 99));
     }
 
     /// A server with no pump is a wall: every attempt fails identically, so the
