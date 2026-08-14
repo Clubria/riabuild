@@ -68,13 +68,34 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "Releasing riabuild $version (publish=$publish)"
 
+  # One job per slice. Built one after the other in a single job these two took
+  # 491 seconds — `lto = true, codegen-units = 1` twice over — and were the
+  # release's critical path on their own, with everything downstream of them
+  # costing about two minutes between them. Split, the pair costs what the
+  # slower leg costs.
+  #
+  # `fail-fast: false` as in the Linux matrix below: one architecture failing
+  # should still report whether the other would have, because "both are broken"
+  # and "one is broken" are different releases to recover from.
   macos:
-    name: Build macOS
+    name: Build macOS ${{ matrix.arch }}
     needs: version
     runs-on: macos-latest
-    outputs:
-      sha256_aarch64: ${{ steps.package.outputs.sha256_aarch64 }}
-      sha256_x86_64: ${{ steps.package.outputs.sha256_x86_64 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+            # `file` calls this slice arm64 where the triple spells it aarch64.
+            file_arch: arm64
+            # The runners are arm64, so this is the only leg that can execute
+            # what it just built.
+            native: true
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            file_arch: x86_64
+            native: false
     defaults:
       run:
         working-directory: riabuild-cli
@@ -85,13 +106,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
+      # Keyed per target, exactly as the Linux matrix is. Two legs sharing one
+      # cache key race to save different targets into it, and whichever lands
+      # last is what both restore next release.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: riabuild-cli
+          key: ${{ matrix.target }}
 
+      # Once, on the leg whose runner can run what it compiles. This is the only
+      # `cargo test` that ever executes on a Mac — ci.yml is Linux throughout —
+      # so it stays on the release path rather than moving somewhere cheaper.
+      # There is nothing to learn from running it a second time on the same
+      # machine against the same host architecture, though, so the x86_64 leg
+      # skips it.
       - name: Test
+        if: matrix.native
         run: cargo test --workspace --all-targets
 
       # RIABUILD_VERSION is what cli.rs compiles in. Without it the binary
@@ -100,64 +132,58 @@ jobs:
       - name: Build
         env:
           RIABUILD_VERSION: ${{ env.VERSION }}
-        run: |
-          set -euo pipefail
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # `strip = "symbols"` can invalidate the ad-hoc signature rustc applies at
       # link time. An arm64 binary with a broken signature is killed by the
-      # kernel on launch with no diagnostic beyond "killed: 9", so re-sign both
-      # slices after stripping rather than hoping the toolchain preserved it.
+      # kernel on launch with no diagnostic beyond "killed: 9", so re-sign after
+      # stripping rather than hoping the toolchain preserved it.
       - name: Sign
         run: |
           set -euo pipefail
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            codesign --force --sign - "target/$target/release/riabuild"
-            codesign --verify --verbose "target/$target/release/riabuild"
-          done
+          binary="target/${{ matrix.target }}/release/riabuild"
+          codesign --force --sign - "$binary"
+          codesign --verify --verbose "$binary"
 
-      - name: Verify binaries
+      - name: Verify the binary is the architecture it claims
         run: |
           set -euo pipefail
+          binary="target/${{ matrix.target }}/release/riabuild"
+          file "$binary"
+          file "$binary" | grep -q '${{ matrix.file_arch }}'
 
-          file target/aarch64-apple-darwin/release/riabuild | grep -q 'arm64'
-          file target/x86_64-apple-darwin/release/riabuild | grep -q 'x86_64'
-
-          # The runner is arm64, so only that slice can actually be executed
-          # here. The x86_64 slice is checked structurally above and by the
-          # formula's `test do` block when Homebrew installs it on Intel.
-          actual=$(target/aarch64-apple-darwin/release/riabuild --version)
+      # Only the native slice can be executed here. The x86_64 one is checked
+      # structurally above, and by the formula's `test do` block when Homebrew
+      # installs it on an Intel Mac.
+      - name: Verify the binary reports this version
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          actual=$(target/${{ matrix.target }}/release/riabuild --version)
           if [ "$actual" != "riabuild $VERSION" ]; then
             echo "::error::Binary reports '$actual', expected 'riabuild $VERSION'."
             exit 1
           fi
 
       - name: Package
-        id: package
         run: |
           set -euo pipefail
           mkdir -p dist
+          tarball="riabuild-$VERSION-${{ matrix.target }}.tar.gz"
+          # -C so the binary sits at the root of the tarball, which is what the
+          # formula's `bin.install "riabuild"` expects.
+          tar -czf "dist/$tarball" -C "target/${{ matrix.target }}/release" riabuild
 
-          # The digests go to `$GITHUB_OUTPUT` for the formula and nowhere
-          # else. The published `riabuild-$VERSION-checksums.txt` is assembled
-          # in `publish`, once every architecture's tarball is in one
-          # directory — see the step that builds it for why it cannot be
-          # appended to here.
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            arch="${target%%-*}"
-            tarball="riabuild-$VERSION-$target.tar.gz"
-            # -C so the binary sits at the root of the tarball, which is what
-            # the formula's `bin.install "riabuild"` expects.
-            tar -czf "dist/$tarball" -C "target/$target/release" riabuild
-            sha=$(shasum -a 256 "dist/$tarball" | cut -d' ' -f1)
-            echo "sha256_$arch=$sha" >> "$GITHUB_OUTPUT"
-            echo "$sha  $tarball"
-          done
+          # Logged for whoever is reading the run, and read from here by
+          # nothing. The published checksums file is assembled in `publish` and
+          # the formula's two digests are computed in `formula`, both from the
+          # uploaded artifact — see `formula` for why a matrix job cannot hand
+          # them over as job outputs.
+          shasum -a 256 "dist/$tarball"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: riabuild-macos
+          name: riabuild-macos-${{ matrix.arch }}
           path: riabuild-cli/dist/*
 
   # Static musl, so there is no glibc floor and one build runs on every
@@ -498,13 +524,41 @@ jobs:
         with:
           ref: main
 
+      # The two darwin digests arrived as `macos` job outputs until the build
+      # became a matrix. A matrix job has *one* set of outputs shared by every
+      # leg, so both legs would write the same two keys and whichever finished
+      # last would win — quietly, and leaving a real, correctly-formed sha256
+      # for the wrong architecture in a formula that parses perfectly. Computing
+      # them here instead has no such race, and has each digest describe the
+      # bytes that were actually published rather than the ones a build job
+      # reported having.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: riabuild-macos-*
+          path: dist
+          merge-multiple: true
+
       - name: Render formula
         env:
           VERSION: ${{ needs.version.outputs.version }}
-          SHA256_AARCH64: ${{ needs.macos.outputs.sha256_aarch64 }}
-          SHA256_X86_64: ${{ needs.macos.outputs.sha256_x86_64 }}
         run: |
           set -euo pipefail
+
+          # Named explicitly rather than globbed, for the reason `publish`
+          # spells out: the failure worth catching is a *missing* tarball, and
+          # a step that works from whatever it happens to find agrees with
+          # itself no matter how little that is.
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            tarball="dist/riabuild-$VERSION-$target.tar.gz"
+            if [ ! -f "$tarball" ]; then
+              echo "::error::$tarball is missing — the macOS $target leg never uploaded it."
+              exit 1
+            fi
+          done
+
+          SHA256_AARCH64=$(sha256sum "dist/riabuild-$VERSION-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)
+          SHA256_X86_64=$(sha256sum "dist/riabuild-$VERSION-x86_64-apple-darwin.tar.gz" | cut -d' ' -f1)
+
           for placeholder in VERSION SHA256_AARCH64 SHA256_X86_64; do
             if [ -z "${!placeholder}" ]; then
               echo "::error::$placeholder came back empty from the build job."

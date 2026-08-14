@@ -15,8 +15,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which subprojects this push or pull request actually touched.
+  #
+  # Eighteen of the last thirty commits never went near `riabuild-web`, and
+  # every one of them still paid the five-and-a-half minutes the Playwright job
+  # takes — which is the whole critical path, since nothing else here runs past
+  # about three. A Rust-only change now waits for the Rust jobs and nothing
+  # else.
+  #
+  # Filtering happens per *job* rather than through `on.pull_request.paths`,
+  # which is workflow-wide and would take the whole suite away at once. A job
+  # skipped by `if:` still reports a conclusion, so it stays visible on the pull
+  # request as "skipped" instead of silently never appearing.
+  #
+  # Every filter lists this file. A change to CI itself has to be able to run
+  # the jobs it changes, and a filter that excluded its own workflow would be
+  # untestable except by merging it.
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    # `workflow_dispatch` forces everything. It exists here because an Actions
+    # incident once throttled webhooks for hours (see the trigger above), and
+    # someone reaching for the manual button during one wants the whole suite —
+    # not a subset chosen by a diff they are already unsure reached GitHub.
+    outputs:
+      cli: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.cli == 'true' }}
+      remote: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.remote == 'true' }}
+      web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
+      packaging: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.packaging == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            cli:
+              - 'riabuild-cli/**'
+              - '.github/workflows/ci.yml'
+            remote:
+              - 'riabuild-cli/**'
+              - 'e2e/remote/**'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'riabuild-web/**'
+              - '.github/workflows/ci.yml'
+            packaging:
+              - 'packaging/**'
+              - 'LICENSE'
+              - '.github/workflows/ci.yml'
+
   cli:
     name: riabuild-cli
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -131,6 +184,8 @@ jobs:
 
   web:
     name: riabuild-web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -191,6 +246,8 @@ jobs:
 
   ui:
     name: riabuild-web UI
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -211,6 +268,33 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # Half a minute of every run was re-downloading a Chromium that had not
+      # changed. Keyed on the lockfile rather than on a Playwright version
+      # string: the browser revision is chosen by the installed
+      # `@playwright/test`, so the lockfile moving is the conservative moment to
+      # fetch again. That costs an occasional needless miss and can never serve
+      # a browser build the installed Playwright would refuse.
+      - name: Cache Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('riabuild-web/pnpm-lock.yaml') }}
+
+      # Deliberately *not* skipped on a cache hit, though that is the usual
+      # recipe. `actions/cache` saves in a post step that runs even when the job
+      # failed, so an install interrupted halfway — a network blip mid-download
+      # — still writes a partial browser directory under this key. Gated on the
+      # hit, every later run would then restore that partial directory, skip the
+      # install, and fail at `browserType.launch` with an executable that is not
+      # there: a poisoned cache that repairs itself only when the lockfile
+      # happens to move.
+      #
+      # `playwright install` is idempotent and checks the revision itself, so
+      # running it unconditionally skips the download on a good cache and
+      # repairs a bad one. What is left is the apt half of `--with-deps`, which
+      # is a dozen seconds and cannot be cached anyway: those libraries live
+      # outside this path, and a browser restored without them fails at launch
+      # rather than here, where the reason would be obvious.
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
 
@@ -241,6 +325,8 @@ jobs:
 
   remote-mode:
     name: Remote mode against a container
+    needs: changes
+    if: needs.changes.outputs.remote == 'true'
     runs-on: ubuntu-latest
     # Skipped, visibly, rather than run without what it needs. Before it
     # touches a server `riabuild remote` re-verifies Clubria org membership
@@ -322,6 +408,8 @@ jobs:
   # pull request is what keeps that from being discovered at release time.
   packaging:
     name: Packaging templates
+    needs: changes
+    if: needs.changes.outputs.packaging == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -17,6 +17,25 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: process.env.CI === "true",
   retries: 0,
+
+  /**
+   * Playwright's default is *half* the logical cores, which on the four-vCPU
+   * runner meant 147 tests sharing two workers while half the machine sat idle
+   * for five minutes. Summing the reported test durations came to 566
+   * worker-seconds against a 294s wall clock, so the schedule was already 96%
+   * packed — there was no waste to reclaim, only workers to add.
+   *
+   * Three rather than four, because the count is not the only thing competing
+   * for those cores: `webServer` below runs Vite in dev mode and transforms
+   * modules on demand as each test navigates, so it needs one to itself. A
+   * fourth worker takes the suite from contended to oversubscribed, and what
+   * fails then is a visual assertion timing out somewhere unrelated to whatever
+   * change is being tested.
+   *
+   * Left at Playwright's default off CI, where the machine has other work to do
+   * and the suite is not the thing being waited on.
+   */
+  workers: process.env.CI === "true" ? 3 : undefined,
   reporter: process.env.CI === "true" ? [["github"], ["list"]] : [["list"]],
 
   use: {
