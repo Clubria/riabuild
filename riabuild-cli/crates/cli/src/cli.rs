@@ -188,6 +188,17 @@ pub enum ChannelAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Relay this server's clipboard requests to the laptop over stdio.
+    ///
+    /// Hidden: the laptop runs it over `ssh -T`, and its stdin and stdout are
+    /// the channel itself. Running it by hand does nothing useful — there is no
+    /// laptop on the other end of a terminal.
+    #[command(hide = true)]
+    Pump {
+        /// Where to bind. Defaults to the session's runtime directory.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
     /// Report whether the clipboard channel is up.
     Status,
 }

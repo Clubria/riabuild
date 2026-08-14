@@ -333,10 +333,11 @@ pub(super) async fn connect_and_setup(
         ui: &ctx.ui,
         quiet: request.quiet,
         remote_socket: channel::remote_socket(&session::namespace(&home, &member.member_id)),
-        // The probe carries the same environment every other remote invocation
-        // does, so it looks for the socket where the forward actually lands
-        // rather than where the server would have guessed.
-        probe: env_command(&prefix_refs, &binary, &["channel", "status"]),
+        // The pump carries the same environment every other remote invocation
+        // does, so it binds the socket where this session's shims look for it
+        // rather than where the server would have guessed — which, on a box
+        // several developers share, is one socket for all of them.
+        pump: env_command(&prefix_refs, &binary, &["channel", "pump"]),
         shell: env_command(&prefix_refs, &binary, &["shell"]),
     })
     .await

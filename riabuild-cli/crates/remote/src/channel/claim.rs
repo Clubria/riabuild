@@ -2,9 +2,9 @@
 //! channel instead of fighting over it.
 //!
 //! Without this, the second `riabuild remote build-01` starts its own agent and
-//! its own `ssh -N -R`, and that forward's `StreamLocalBindUnlink=yes` unlinks
-//! the socket the first one is serving. Both terminals end up with a dead
-//! channel, nothing is logged, and it reads as "paste randomly stopped
+//! its own connection, and the pump on the far end finds the first one's socket
+//! already live and refuses it. The second terminal reports a failure for a
+//! channel that is working perfectly, which reads as "paste randomly stopped
 //! working".
 //!
 //! This mirrors `gh_session`'s `sessions/<pid>` markers and its `kill -0`

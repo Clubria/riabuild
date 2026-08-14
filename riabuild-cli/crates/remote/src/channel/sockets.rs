@@ -1,15 +1,18 @@
-//! Which socket each end of the channel uses, and whether an address can hold
+//! Which socket the channel uses on the server, and whether an address can hold
 //! it.
 //!
-//! Two paths and one limit, kept together because the limit is the reason both
-//! paths are chosen the way they are: `sockaddr_un.sun_path` is small, and every
-//! way of running out of it ends with two developers sharing one socket.
+//! One path and one limit, and the limit is the reason the path is chosen the
+//! way it is: `sockaddr_un.sun_path` is small, and every way of running out of
+//! it ends with two developers sharing one socket.
+//!
+//! There is no laptop path here any more. The agent used to listen on a socket
+//! of its own for `ssh -R` to forward to; it is now served on the pump's stdio,
+//! so the only socket in the channel is the one the pump binds on the server.
 
 use crate::Remote;
 use anyhow::Result;
-use riabuild_channel::socket_path_for_create;
 use riabuild_ui::Failure;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The bytes a unix socket address has room for.
 ///
@@ -31,24 +34,6 @@ pub(super) const SUN_PATH_MAX: usize = 104;
 /// would read Ben's laptop.
 pub fn remote_socket(namespace: &str) -> String {
     format!("{namespace}/channel.sock")
-}
-
-/// One socket per server, in the directory `riabuild_channel` would have put a
-/// single one in.
-///
-/// Not the shared `channel.sock`: a `riabuild remote` to a *second* server binds
-/// that same name, and whichever of the two sessions ends first takes the socket
-/// with it — leaving the other one's forward pointing at a path nothing answers
-/// on, with no error printed anywhere. [`Remote::hash`] is the key the SSH
-/// identity and the session markers already use.
-///
-/// Both calls go through `socket_path_for_create`, which is what creates the
-/// parent at 0700 and refuses — never unlinks — a path that is a symlink or
-/// belongs to another account.
-pub(super) async fn local_socket(remote: &Remote) -> Result<PathBuf> {
-    let shared = socket_path_for_create(None).await?;
-    let ours = shared.with_file_name(format!("channel-{}.sock", remote.hash()));
-    socket_path_for_create(Some(&ours.to_string_lossy())).await
 }
 
 /// Refuses a path a unix socket address cannot hold, with the arithmetic in the

@@ -1,10 +1,10 @@
 //! The clipboard channel, for the length of one remote session.
 //!
 //! `riabuild_channel` builds the parts — the laptop's agent, the rules about
-//! which socket is ours, the supervisor that keeps `ssh -N -R` up. This file is
+//! which socket is ours, the supervisor that keeps the exec session up. This is
 //! where remote mode puts them together: the paths that are remote mode's to
 //! choose, the refcount that stops two terminals into one box from fighting
-//! over the forward, and the rule that outranks everything else here — a
+//! over the channel, and the rule that outranks everything else here — a
 //! channel that will not start costs a warning, never the shell.
 //!
 //! Inside `remote`, `channel::` is this module and the parts it drives are
@@ -22,8 +22,8 @@ use riabuild_channel::supervisor::{Stop, Tunnel, supervise};
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
 use riabuild_ui::{Failure, Ui};
-use sockets::{fits, local_socket};
-use std::path::{Path, PathBuf};
+use sockets::fits;
+use std::path::Path;
 use std::sync::Arc;
 
 /// The one line remote mode's banner gains. Rendered through `Ui` exactly as
@@ -58,9 +58,13 @@ pub struct Plan<'a> {
     pub quiet: bool,
     /// Where the forward lands on the server, from [`remote_socket`].
     pub remote_socket: String,
-    /// The server's own `riabuild channel status`, env-prefixed, so the probe
-    /// looks for the socket where the forward actually put it.
-    pub probe: String,
+    /// The server's own `riabuild channel pump`, env-prefixed, so the pump
+    /// binds the socket where this session's shims look for it.
+    ///
+    /// This *is* the transport. `ssh -T <host> <this>` is the whole of what the
+    /// channel asks a server for, which is why it works on servers that refuse
+    /// socket forwarding or have never implemented it.
+    pub pump: String,
     /// The env-prefixed `riabuild shell` this session is really here for.
     pub shell: String,
 }
@@ -100,8 +104,6 @@ struct Channel {
 struct Started {
     stop: Stop,
     tunnel: tokio::task::JoinHandle<Option<Failure>>,
-    agent: tokio::task::JoinHandle<()>,
-    local_socket: PathBuf,
 }
 
 impl Channel {
@@ -123,8 +125,8 @@ impl Channel {
 
         if !claim.owner {
             // A sibling terminal into this same server already has one. Set the
-            // environment, say so, and start nothing: a second `ssh -R` would
-            // unlink the socket the first one is serving.
+            // environment, say so, and start nothing: a second pump would find
+            // the first one's socket live and refuse it.
             //
             // The honest limit, since it is not the one the markers imply: the
             // supervisor is a task inside the *owner's* process, so a first
@@ -170,13 +172,10 @@ impl Channel {
         if let Some(started) = self.started {
             started.stop.stop();
             // Awaited, not detached: the supervisor kills its `ssh` on the way
-            // out, and the server's socket has to be free before the next
-            // session tries to bind it.
+            // out, which ends the pump, which frees the server's socket before
+            // the next session tries to bind it. There is no laptop socket to
+            // clean up any more — the agent is served on the child's stdio.
             let _ = started.tunnel.await;
-            started.agent.abort();
-            // Our own socket, and nothing answers on it now. Leaving it behind
-            // makes the next connect fail slowly instead of immediately.
-            let _ = tokio::fs::remove_file(&started.local_socket).await;
         }
         if let Some(claim) = self.claim {
             claim.close().await;
@@ -187,21 +186,13 @@ impl Channel {
 /// Everything that can go wrong, in one place, so the caller above can turn all
 /// of it into a warning.
 async fn try_start(plan: &Plan<'_>) -> Result<Started> {
+    // Still checked, and still the server's path: the pump binds it there, and
+    // a `sockaddr_un` that cannot hold it fails inside `bind()` with
+    // `ENAMETOOLONG` at best and a silent truncation at worst. What no longer
+    // needs checking is a laptop socket, because there no longer is one.
     fits(Path::new(&plan.remote_socket), plan.remote)?;
 
-    let local_socket = local_socket(plan.remote).await?;
-    fits(&local_socket, plan.remote)?;
-
     let agent = riabuild_channel::laptop_agent(plan.runner.clone(), &plan.paths.bin_dir())?;
-    let socket = local_socket.clone();
-    let agent_ui = Ui::new(plan.quiet);
-    let served = tokio::spawn(async move {
-        if let Err(error) = agent.serve(&socket).await {
-            // The bind happens inside `serve`, so this is the only place a
-            // laptop that cannot listen at all ever says so.
-            agent_ui.warn(&format!("Clipboard channel — {error}"));
-        }
-    });
 
     let stop = Stop::new();
     let tunnel = tokio::spawn(supervise(
@@ -211,21 +202,15 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
             user: plan.remote.user.clone(),
             port: plan.remote.port,
             identity: identity::key_path(plan.remote, plan.paths),
-            remote_socket: PathBuf::from(&plan.remote_socket),
-            local_socket: local_socket.clone(),
-            probe: plan.probe.clone(),
+            command: plan.pump.clone(),
             env: askpass::ssh_env(plan.remote, plan.paths),
         },
+        agent,
         Ui::new(plan.quiet),
         stop.clone(),
     ));
 
-    Ok(Started {
-        stop,
-        tunnel,
-        agent: served,
-        local_socket,
-    })
+    Ok(Started { stop, tunnel })
 }
 
 /// The channel's own failure voice.
@@ -287,7 +272,7 @@ mod tests {
             ui,
             quiet: true,
             remote_socket,
-            probe: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild channel status".into(),
+            pump: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild channel pump".into(),
             shell: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild shell".into(),
         }
     }
@@ -327,8 +312,9 @@ mod tests {
     }
 
     /// Two terminals into one server share one channel. The second must start
-    /// no tunnel of its own: `StreamLocalBindUnlink=yes` would unlink the
-    /// socket the first one is serving, and both terminals would go quiet.
+    /// no connection of its own: its pump would find the first one's socket
+    /// live and refuse it, and the second terminal would report a failure for
+    /// a channel that is working perfectly.
     #[tokio::test]
     async fn a_second_session_to_one_server_joins_the_channel_rather_than_rebuilding_it() {
         let home = tempfile::TempDir::new().expect("tempdir");
