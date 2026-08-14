@@ -19,7 +19,24 @@ use std::sync::Arc;
 ///
 /// `identities_only` is false for exactly one step — authorising the new key
 /// (Task 16) — where an existing key or the agent is what proves who we are.
-pub fn ssh_options(remote: &Remote, paths: &dyn Paths, identities_only: bool) -> Vec<String> {
+///
+/// `carry` is an issued key that has proved it can sign in **and** that this
+/// laptop's own key demonstrably cannot replace, because the server accepted the
+/// line into `authorized_keys` and still refuses it. A managed SSH gateway does
+/// exactly that. Where `carry` is `Some`, the connection offers both identities
+/// and lets the server pick; where it is `None` — which is every run against an
+/// ordinary server — nothing changes.
+///
+/// Note that a carried identity is added *beside* riabuild's own `-i`, never
+/// instead of it. `IdentitiesOnly=yes` restricts the offer to the identities
+/// named here, so both have to be named for either to be tried, and dropping
+/// riabuild's own would silently give up the key that works everywhere else.
+pub fn ssh_options(
+    remote: &Remote,
+    paths: &dyn Paths,
+    identities_only: bool,
+    carry: Option<&crate::issued::Working>,
+) -> Vec<String> {
     let mut options = vec![
         "-p".to_string(),
         remote.port.to_string(),
@@ -38,6 +55,12 @@ pub fn ssh_options(remote: &Remote, paths: &dyn Paths, identities_only: bool) ->
         "-i".to_string(),
         key_path(remote, paths).to_string_lossy().into_owned(),
     ];
+    if let Some(carry) = carry {
+        options.push("-o".to_string());
+        options.push(format!("IdentityAgent={}", carry.socket.to_string_lossy()));
+        options.push("-i".to_string());
+        options.push(carry.public_key_path.to_string_lossy().into_owned());
+    }
     if identities_only {
         options.push("-o".to_string());
         options.push("IdentitiesOnly=yes".to_string());
@@ -209,7 +232,7 @@ mod tests {
     fn ssh_options_pin_riabuilds_own_known_hosts() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
-        let options = ssh_options(&remote(), &paths, true).join(" ");
+        let options = ssh_options(&remote(), &paths, true, None).join(" ");
 
         assert!(options.contains("-p 2222"), "{options}");
         assert!(options.contains("StrictHostKeyChecking=yes"), "{options}");
@@ -221,13 +244,52 @@ mod tests {
     }
 
     #[test]
+    fn a_carried_identity_is_offered_beside_riabuilds_own_never_instead_of_it() {
+        // On a server that will not honour `authorized_keys`, riabuild's own
+        // key never works and the issued one always does. Naming only the
+        // issued key would still connect — and would quietly give up the key
+        // that works on every other server, including this one once whoever
+        // runs it fixes the file.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let carried = crate::issued::Working {
+            label: "prod-bastion".into(),
+            socket: "/run/riabuild/sock".into(),
+            public_key_path: "/run/riabuild/k1.pub".into(),
+        };
+
+        let options = ssh_options(&remote(), &paths, true, Some(&carried)).join(" ");
+
+        assert!(
+            options.contains("IdentityAgent=/run/riabuild/sock"),
+            "{options}"
+        );
+        assert!(options.contains("-i /run/riabuild/k1.pub"), "{options}");
+        // riabuild's own identity is still named, and `IdentitiesOnly=yes`
+        // means only the identities named here are offered at all.
+        assert!(
+            options.contains(&key_path(&remote(), &paths).to_string_lossy().to_string()),
+            "{options}"
+        );
+        assert!(options.contains("IdentitiesOnly=yes"), "{options}");
+    }
+
+    #[test]
+    fn an_ordinary_server_carries_nothing_and_looks_exactly_as_it_did() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let options = ssh_options(&remote(), &paths, true, None).join(" ");
+        assert!(!options.contains("IdentityAgent"), "{options}");
+    }
+
+    #[test]
     fn the_authorising_step_does_not_pin_identities_only() {
         // The common cloud-VM case is a box that already trusts the developer's
         // existing key and has password auth disabled. That key is what
         // authorises the new one, so it must still be offered.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
-        let options = ssh_options(&remote(), &paths, false).join(" ");
+        let options = ssh_options(&remote(), &paths, false, None).join(" ");
         assert!(!options.contains("IdentitiesOnly"), "{options}");
     }
 

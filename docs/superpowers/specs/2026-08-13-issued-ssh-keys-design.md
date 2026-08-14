@@ -290,6 +290,35 @@ distinguishing one developer from another. A team sharing one key directly would
 three up — every developer would appear as one fingerprint, and `forget` would have
 nothing of its own to remove.
 
+### …unless the server will not have it
+
+Amended after `ssh.cloudcli.ai`. A managed SSH gateway accepts the write to
+`authorized_keys` and authenticates against its own registry regardless, so riabuild's own
+key is installed, refused, and refused on every run thereafter. Bootstrap-only sent that
+run to the account password — meaning an issued key authorised one `ssh-copy-id` for a key
+that could never work and was then discarded, which is the whole feature achieving nothing
+on exactly the class of machine it was built for.
+
+So bootstrap is the *preference*, not an absolute. All three branches where riabuild's own
+key has been installed and still cannot sign in now carry the issued identity for the rest
+of the run rather than falling back to the password. Concretely,
+`identity::ssh_options` grows an `Option<&Working>` threaded through every `ssh` remote
+mode opens, and the carried identity is offered **beside** riabuild's own `-i`, never
+instead of it — `IdentitiesOnly=yes` restricts the offer to the identities named, so
+dropping riabuild's own would give up the key that works everywhere else, including on
+this server once whoever runs it fixes the file.
+
+Two consequences worth stating rather than discovering:
+
+- **Attribution is lost on those servers**, and only on those. They were never going to
+  provide it: the key riabuild installed is the one being ignored.
+- **The agent lives for the whole run**, so the probe's `-t 900` is wrong for a carried
+  key — an interactive shell outlasts it, and the clipboard channel's reconnect would fail
+  with nothing on screen explaining why. `Issued::hold` reloads that one key with no
+  expiry. The exposure that trades away is narrower than it sounds: the socket is in a
+  `0700` directory owned by the developer, so an orphaned agent is reachable only by them,
+  which is the footing their own `ssh-agent` already runs on.
+
 The branch that changes is the last one. A keys-only server today reaches
 `if !interactive` and fails; with an issued key that signs in, it never gets there.
 

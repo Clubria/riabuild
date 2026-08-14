@@ -88,12 +88,20 @@ fn truncated() -> String {
     "that key is truncated — it ends mid-field".to_string()
 }
 
-/// Reads a private key's public half out of it.
+/// How many base64 characters `ssh-keygen` puts on a line. Not cosmetic — see
+/// [`canonical`].
+const WRAP: usize = 70;
+
+/// The container's bytes, however the file that held them was wrapped.
 ///
-/// `Err` is a sentence, not a type: every caller turns it into one line of a
-/// refusal list beside the label of the key it refused, the same shape
-/// [`crate::remotes`] uses for a server it will not connect to.
-pub fn public_half(private_key: &str) -> Result<PublicHalf, String> {
+/// Deliberately lenient: it trims, tolerates any line ending, and filters every
+/// whitespace character out of the body, so a key that arrived through a paste
+/// box, a JSON round trip and a text column still reads.
+///
+/// That leniency is safe **only because nothing hands these bytes' original
+/// spelling onward** — see [`canonical`], which is the other half of the rule
+/// and the reason this function is private.
+fn container(private_key: &str) -> Result<Vec<u8>, String> {
     let text = private_key.trim();
     let Some(rest) = text.strip_prefix(BEGIN) else {
         return Err(format!("that is not an OpenSSH private key (no {BEGIN})"));
@@ -110,6 +118,65 @@ pub fn public_half(private_key: &str) -> Result<PublicHalf, String> {
     if bytes.len() <= MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC || bytes[MAGIC.len()] != 0 {
         return Err("that key is not in the openssh-key-v1 format".to_string());
     }
+    Ok(bytes)
+}
+
+/// The same key, written exactly the way `ssh-keygen` writes one.
+///
+/// **This is what riabuild must hand to `ssh-add`, never the string it was
+/// given.** [`container`] normalises framing away in order to read a key, and
+/// for a while riabuild treated a successful read as a claim that the original
+/// bytes were usable. They frequently are not.
+///
+/// Measured against OpenSSH 9.6, feeding `ssh-add -` a key that
+/// [`public_half`] accepts:
+///
+/// | framing | `ssh-add` |
+/// |---|---|
+/// | exactly what `ssh-keygen` writes | accepted |
+/// | no newline after the end marker | **refused** |
+/// | CRLF line endings | **refused** |
+/// | every line indented | **refused** |
+/// | body unwrapped onto one line | accepted |
+///
+/// Every refusal is the same message — `Error loading key "(stdin)": error in
+/// libcrypto` — because OpenSSH's own `openssh-key-v1` reader wants the markers
+/// on their own `\n`-terminated lines, and falls through to libcrypto's PEM
+/// reader when they are not, which then fails on a format it was never given.
+/// A developer hit exactly this against a real server.
+///
+/// The rule those rows add up to is **validate leniently, emit strictly**. This
+/// re-emits from the decoded bytes rather than repairing the string, which is
+/// lossless — the same base64 of the same container — and covers the framings
+/// nobody has measured yet along with the three that are known to bite.
+pub fn canonical(private_key: &str) -> Result<String, String> {
+    let bytes = container(private_key)?;
+    // Parsed as well as decoded, so `canonical` never launders a key
+    // `public_half` would have refused into something that looks well-formed.
+    public_half(private_key)?;
+
+    let encoded = STANDARD.encode(&bytes);
+    let mut out = String::with_capacity(encoded.len() + BEGIN.len() + END.len() + 16);
+    out.push_str(BEGIN);
+    out.push('\n');
+    for line in encoded.as_bytes().chunks(WRAP) {
+        // `encoded` is base64, so every byte is ASCII and every chunk is a
+        // valid string boundary.
+        out.push_str(std::str::from_utf8(line).map_err(|_| "unreadable base64".to_string())?);
+        out.push('\n');
+    }
+    out.push_str(END);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Reads a private key's public half out of it.
+///
+/// `Err` is a sentence, not a type: every caller turns it into one line of a
+/// refusal list beside the label of the key it refused, the same shape
+/// [`crate::remotes`] uses for a server it will not connect to.
+pub fn public_half(private_key: &str) -> Result<PublicHalf, String> {
+    let bytes = container(private_key)?;
 
     let mut reader = Reader::new(&bytes[MAGIC.len() + 1..]);
     let cipher_name = reader.string()?;
@@ -295,6 +362,74 @@ mod tests {
         let lines: Vec<&str> = ED25519_PRIVATE.trim().lines().collect();
         let truncated = format!("{}\n{}\n{}", lines[0], lines[1], lines[lines.len() - 1]);
         assert!(public_half(&truncated).is_err());
+    }
+
+    /// Framings that reach riabuild mangled, each of which `public_half`
+    /// accepts and each of which must come back out canonical.
+    ///
+    /// The first three are refused by a real `ssh-add` — measured against
+    /// OpenSSH 9.6, see [`canonical`]'s table — with `Error loading key
+    /// "(stdin)": error in libcrypto`, the error a developer reported from a
+    /// real server. The fourth OpenSSH happens to tolerate; it is normalised
+    /// anyway, because "which mangling is survivable" is not a question
+    /// riabuild should be answering case by case.
+    fn framings_that_arrive_mangled() -> Vec<(&'static str, String)> {
+        let inner: String = ED25519_PRIVATE
+            .trim()
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("-----END"))
+            .collect();
+        vec![
+            (
+                "no trailing newline",
+                ED25519_PRIVATE.trim_end().to_string(),
+            ),
+            ("CRLF", ED25519_PRIVATE.replace('\n', "\r\n")),
+            ("body on one line", format!("{BEGIN}\n{inner}\n{END}\n")),
+            (
+                "indented",
+                ED25519_PRIVATE
+                    .trim_end()
+                    .lines()
+                    .map(|line| format!("  {line}\n"))
+                    .collect(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn canonical_reproduces_byte_for_byte_what_ssh_keygen_wrote() {
+        // The base case, and what makes the repair below trustworthy: feeding
+        // canonical input through must change nothing at all.
+        assert_eq!(canonical(ED25519_PRIVATE).expect("parses"), ED25519_PRIVATE);
+        assert_eq!(canonical(RSA_PRIVATE).expect("parses"), RSA_PRIVATE);
+    }
+
+    #[test]
+    fn canonical_repairs_every_framing_that_arrives_mangled() {
+        // The bug this exists for: riabuild validated these and then handed
+        // `ssh-add` the original bytes, which OpenSSH will not read. Validating
+        // leniently is fine; *emitting* leniently is what broke.
+        for (name, mangled) in framings_that_arrive_mangled() {
+            assert!(
+                public_half(&mangled).is_ok(),
+                "{name}: the lenient parse is the premise of this test"
+            );
+            assert_eq!(
+                canonical(&mangled).expect("parses"),
+                ED25519_PRIVATE,
+                "{name} must be repaired to exactly what ssh-keygen writes"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_refuses_what_public_half_refuses() {
+        // One parse, one verdict. A key riabuild will not vouch for must not
+        // come back out of here wearing a tidy PEM wrapper.
+        assert!(canonical(ENCRYPTED_PRIVATE).is_err());
+        assert!(canonical("hello").is_err());
     }
 
     #[test]
