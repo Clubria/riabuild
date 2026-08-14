@@ -154,8 +154,21 @@ async fn write_launchers_with(ctx: &Ctx, socket: Option<&str>) -> Result<()> {
     }
     shims::write_all(ctx).await?;
     if socket.is_some_and(|socket| !socket.is_empty()) {
-        shims::write_clipboard_shims(ctx).await?;
-        shims::write_browser_shim(ctx).await?;
+        // Resolved once, before the first write: every shim below names this
+        // path, and a run that cannot answer the question must fail rather
+        // than fall back to a bare `riabuild` that resolves to some other
+        // machine's copy or to nothing.
+        let riabuild = shims::running_binary()?;
+        shims::write_clipboard_shims(ctx, &riabuild).await?;
+        shims::write_browser_shim(ctx, &riabuild).await?;
+        // And riabuild itself, so the developer whose session this is has the
+        // command too. Written here rather than beside the other owned tools
+        // because this is the condition under which riabuild is running on a
+        // machine that did not install it: a server reaches its binary through
+        // a versioned path nothing puts on `PATH`, so `riabuild claude new`
+        // there was `command not found` — or, worse, silently ran whichever
+        // riabuild a package manager had left on the box.
+        shims::write_tool(ctx, "riabuild", &riabuild).await?;
     }
     Ok(())
 }
@@ -363,6 +376,36 @@ mod tests {
                 .unwrap(),
             "BROWSER points here, so it has to exist"
         );
+
+        // riabuild is the one tool riabuild does not put on `PATH` — it lives
+        // in a versioned directory of its own — so on a server `riabuild` was
+        // `command not found`, or silently some other copy the box happened to
+        // carry. Every shim above now names the binary in full; this is what
+        // gives the developer whose session it is the command as well.
+        assert!(
+            tokio::fs::try_exists(bin.join("riabuild")).await.unwrap(),
+            "a server reaches riabuild through a path nothing else puts on PATH"
+        );
+
+        // The property the whole fix rests on: not one of these may go looking
+        // for riabuild on `PATH`, because that is what resolved to nothing on a
+        // server without a system copy and to the wrong version on one with.
+        for name in shims::CLIPBOARD_TOOLS
+            .iter()
+            .copied()
+            .chain([shims::BROWSER_TOOL, "riabuild"])
+        {
+            let script = tokio::fs::read_to_string(bin.join(name)).await.unwrap();
+            let exec = script
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("exec "))
+                .unwrap_or_else(|| panic!("{name} has no exec line:\n{script}"));
+            assert!(
+                exec.starts_with(r#"exec "/"#),
+                "{name} does not name an absolute binary: {exec}"
+            );
+        }
     }
 
     /// A laptop shadows neither: its clipboard and its browser are already the

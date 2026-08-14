@@ -59,10 +59,22 @@ server                                            laptop
 Claude Code ──BROWSER──┐
                        ├──► ~/.riabuild/bin/xdg-open
 gh auth login ──PATH───┘         │
-                                 │ exec riabuild channel open <url>
+                                 │ exec <tools>/riabuild/<version>/riabuild channel open <url>
                                  ▼
                           channel.sock ──ssh -R──► agent ──► open(1) / xdg-open(1)
 ```
+
+**The shim names riabuild in full, and a bare `riabuild` is a bug.** riabuild is the one
+tool riabuild does not put on `PATH` — `shell::riabuild_path_dirs` leads with `bin/` and
+Node's `bin/` and nothing else, while the binary itself sits in a versioned directory that
+only the invocation which started the session names. So the bare name this diagram once
+carried resolved to whatever *else* was called riabuild on the box: on a server with no
+system copy, nothing, and `$BROWSER` failed with `xdg-open: exec: riabuild: not found`
+rather than opening anything; on a server with an apt or Homebrew copy it was worse,
+because it worked — as a different version, against a channel this session owns.
+`shims::running_binary` is where the path comes from, and it is `/proc/self/exe`, so it
+survives the developer's `PATH`, the `claude` launcher's `PATH` strip, and a `$BROWSER`
+spawned from a process that sanitised its environment.
 
 The server asks; the laptop decides. `browser.open` joins `clipboard.*` in the compiled-in
 operation set, and like every other operation it is a name the laptop's binary already

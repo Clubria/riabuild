@@ -510,6 +510,42 @@ it never exists at the umask even briefly, and a path that is a symlink or owned
 another uid is refused rather than removed: unlinking is how you take over someone
 else's channel, not how you recover from a stale one.
 
+**A generated shim names the riabuild binary in full, never `riabuild`.** riabuild is the
+one tool riabuild does not put on `PATH`: it lives at
+`<tools>/riabuild/<version>/riabuild`, and `shell::riabuild_path_dirs` leads `PATH` with
+`bin/` and Node's `bin/` and nothing else. Every clipboard and browser shim used to
+`exec riabuild …` anyway, which meant each one resolved to whatever *else* was called
+riabuild on that machine. On a server with no system copy that is nothing, and
+`$BROWSER` failed with `xdg-open: 8: exec: riabuild: not found` — the error a developer
+cannot act on, because the file it names is right there and executable. On a server with
+an apt or Homebrew copy it is worse, because it works: a *different version* answers, on
+the machine the "never older than the laptop provisioning it" invariant above exists to
+keep matched, with nothing in the terminal naming a version.
+
+`shims::running_binary` is the only source of that path — `/proc/self/exe`, resolved once
+by `provision::write_launchers_with` before the first shim is written, so a run that
+cannot answer fails rather than writing three good shims and a broken one. It survives
+the developer's `PATH`, the `claude` launcher's `PATH` strip, and a `$BROWSER` spawned by
+a process that sanitised its environment; and because `upgrade_and_reexec` has already
+replaced this process by the time provisioning reaches here, it names the version that
+will actually run. `no_shim_looks_riabuild_up_on_the_path` covers every generated shim at
+once, so one added later is covered on the day it is written.
+
+The same condition now writes `bin/riabuild`, which is what makes `riabuild` a working
+command *on a server* — it was `command not found` there, or quietly the box's own copy.
+
+**Clearing `SSH_CONNECTION` is half of reaching the clipboard shims.** Claude Code's read
+path is gated on the SSH variables alone, but its *write* path runs a Linux probe that
+asks for `WAYLAND_DISPLAY` before it looks for `wl-copy` and `DISPLAY` before `xclip`. A
+headless server has neither, so the probe records "no clipboard tool here" without ever
+consulting `PATH`, and every copy leaves as the OSC 52 escape `setClipboard` returns
+unconditionally — pastes working and copies not, which is not a symptom anyone reads as
+one bug. The `claude` launcher claims `WAYLAND_DISPLAY` where riabuild's own `wl-copy` is
+what the probe will find and the machine has no display of its own. Verified against
+2.1.232; both this and the `unset` above are undocumented, so re-read them when the
+pinned Claude Code version moves. Design:
+`../docs/superpowers/specs/2026-08-07-clipboard-channel-design.md`.
+
 **The transport is `ssh -T <host> riabuild channel pump`, and it must stay that way.** The
 channel asks an SSH server to run a command and for nothing else — no `-R`, no
 `AllowStreamLocalForwarding`, no `StreamLocalBindUnlink`, no line in anyone's

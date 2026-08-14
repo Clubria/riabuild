@@ -227,6 +227,47 @@ With `SSH_CONNECTION` set, the `xclip` branch is skipped entirely and the copy l
 **OSC 52** escape sequence for the laptop's own terminal to act on. A write shim is never
 invoked, and could not be without falsifying `SSH_CONNECTION` for the whole session.
 
+**Clearing those variables turned out to be necessary and not sufficient**, and the
+correction is recorded here rather than left to be rediscovered a second time. `nativeCopy`
+above is not the whole write path: on Linux it consults a probe that asks for a *display*
+before it will look for a tool at all. Read out of 2.1.232 —
+
+```js
+async probe() {
+  const { display, waylandDisplay } = { DISPLAY, WAYLAND_DISPLAY }
+  if (waylandDisplay && await which("wl-copy")) return this.tool = "wl-copy"
+  if (display) {
+    if (await which("xclip")) return this.tool = "xclip"
+    if (await which("xsel"))  return this.tool = "xsel"
+  }
+  this.tool = null                       // ← a headless server lands here
+}
+```
+
+A server has neither variable, so the probe never reaches `which` and never sees riabuild's
+shims however far in front of `PATH` they sit. `tool` is `null`, `nativeCopy` returns
+having run nothing, and the only thing that happens is the OSC 52 the function returns
+unconditionally — which is exactly the report this section was supposed to prevent:
+*"Claude still tries to use OSC 52 for copying."*
+
+So the `claude` launcher claims `WAYLAND_DISPLAY` as well, guarded three ways: only where
+riabuild's own `wl-copy` is what the probe will find, and only on a machine with neither
+`DISPLAY` nor `WAYLAND_DISPLAY` already, so a Linux laptop with a real session keeps the
+clipboard in front of it. Wayland is the half to claim rather than X11 because `DISPLAY` is
+read by half the tools on a box — `ssh` and `sudo` reach for an askpass GUI on the strength
+of it — while `WAYLAND_DISPLAY` means something only to a Wayland client, and a headless
+server has none.
+
+**The asymmetry survives all of this, and it is why paste worked while copy did not.**
+Reading is gated on `SSH_CONNECTION` alone and image reading on nothing at all, so the read
+path has always reached the shims; only the write path asks for a display.
+
+**OSC 52 is still emitted, and that is not a failure.** It is `setClipboard`'s return
+value, unconditional, with no environment variable that suppresses it — so both paths run
+and both carry the same text to the same laptop clipboard. What the fix buys is that the
+copy no longer *depends* on the developer's terminal honouring OSC 52, and that the flavours
+OSC 52 cannot carry now travel.
+
 **And OSC 52 survives mosh.** Measured, not assumed: a real `mosh-server` → `mosh-client`
 round trip on mosh 1.4.0 relays the sequence verbatim to the client's terminal. The
 expectation going in was that mosh dropped it — the check is what changed the design.
