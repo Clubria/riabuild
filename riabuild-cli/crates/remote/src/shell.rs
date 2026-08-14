@@ -32,10 +32,6 @@ async fn has_mosh_server(
         .unwrap_or(false)
 }
 
-/// mosh exits 5 when it could not establish a session at all — a blocked UDP
-/// port, typically. Any other code is the command's own.
-const MOSH_NO_SESSION: i32 = 5;
-
 /// Seconds between keepalives on a connection that has gone quiet.
 const ALIVE_INTERVAL: u32 = 20;
 
@@ -173,11 +169,19 @@ pub async fn open(
         let code = runner
             .run_interactive("mosh", &refs, &askpass::run_options(remote, paths))
             .await?;
-        // Only mosh's own "could not connect" exit falls back. Treating *any*
-        // non-zero code as a connection failure would silently reconnect a
-        // developer who exited their shell with a non-zero status — and, on the
-        // setup path, would run the whole provisioning a second time.
-        if code != MOSH_NO_SESSION {
+        // Any non-zero code is mosh's own failure, and none of them is the
+        // developer's. mosh does not propagate the remote command's exit
+        // status — a session whose shell exits 7 still returns 0 — so there is
+        // no status here to mistake for one. Nor is there a setup run to repeat:
+        // `run_setup` is always plain `ssh`, and `open` has one caller.
+        //
+        // This was keyed to 5 and never fired. Nothing in mosh exits 5:
+        // `mosh-client` gives up after roughly nineteen seconds of silence and
+        // returns 1, the same code it uses for a bind failure and every other
+        // network exception, and the perl wrapper's own `die` paths exit 10 or
+        // 255. A server that drops the UDP session therefore cost the developer
+        // the countdown and then handed back a laptop prompt.
+        if code == 0 {
             return Ok(code);
         }
         ui.warn("mosh could not connect — falling back to ssh.");
@@ -422,6 +426,81 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("-t") && call.contains("riabuild shell")),
             "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// mosh's real "could not connect" exit is 1, and nothing exits 5.
+    ///
+    /// `mosh-client` gives up after roughly nineteen seconds of silence and
+    /// returns 1 — the same code it uses for a bind failure and for every other
+    /// network exception. A fallback keyed to 5 therefore never fires: the
+    /// developer waits out the countdown and is handed back their laptop prompt
+    /// with no shell and no explanation.
+    #[tokio::test]
+    async fn mosh_that_cannot_connect_falls_back_to_ssh() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
+                .with("mosh", 1, "", ""),
+        );
+
+        open(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild shell",
+            None,
+        )
+        .await
+        .expect("falls back");
+
+        assert!(
+            fake.calls().iter().any(|call| call.starts_with("mosh ")),
+            "mosh is still tried first: {:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("ssh -t ") && call.contains("riabuild shell")),
+            "a mosh that could not connect must be followed by an ssh session: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// The other side of the line the test above moved.
+    ///
+    /// Widening the fallback to every non-zero code is only safe while zero
+    /// still means "the session happened". A second `ssh` after a mosh the
+    /// developer simply exited would reopen a shell they had just closed.
+    #[tokio::test]
+    async fn a_mosh_session_that_ended_normally_does_not_reopen_over_ssh() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
+                .with("mosh", 0, "", ""),
+        );
+
+        open(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild shell",
+            None,
+        )
+        .await
+        .expect("opens");
+
+        assert!(
+            !fake.calls().iter().any(|call| call.starts_with("ssh -t ")),
+            "a session that ended normally must not be reopened: {:?}",
             fake.calls()
         );
     }
