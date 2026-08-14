@@ -40,7 +40,6 @@ mod run;
 pub use run::{Stop, supervise};
 
 use riabuild_ui::Failure;
-use std::path::PathBuf;
 use std::time::Duration;
 
 const BACKOFF_CEILING: Duration = Duration::from_secs(30);
@@ -48,8 +47,37 @@ const BACKOFF_CEILING: Duration = Duration::from_secs(30);
 pub struct Tunnel {
     pub host: String,
     pub user: String,
-    pub port: u16,
-    pub identity: PathBuf,
+    /// Every `ssh` option this connection needs, composed by the caller —
+    /// `remote::identity::ssh_options`, the same list the setup run, the mosh
+    /// bootstrap and the developer's own shell are built from.
+    ///
+    /// **Composed rather than assembled here, and that is load-bearing.** This
+    /// used to be a `port` and an `identity` that `ssh_args` turned into `-p`
+    /// and `-i` itself, which looked complete and was missing everything else
+    /// remote mode knows about reaching a server. Two of the omissions were
+    /// fatal and neither said so:
+    ///
+    /// - riabuild records a server's host key in **its own** `known_hosts`,
+    ///   never `~/.ssh/known_hosts`. Without `UserKnownHostsFile` the channel's
+    ///   `ssh` read the developer's file, did not find the host, and — under
+    ///   the `BatchMode=yes` below, which is right and stays — exited with
+    ///   `Host key verification failed`. A server the developer had once
+    ///   `ssh`'d to by hand worked; one only riabuild had ever reached never
+    ///   did, and the difference was invisible from either end.
+    /// - an issued identity riabuild is *carrying* (`IdentityAgent`) never
+    ///   reached this connection, so the servers that feature exists for —
+    ///   the ones riabuild's own key cannot sign in to — could never carry a
+    ///   channel at all.
+    ///
+    /// It also silently opted out of `-F /dev/null`, so a `Host` block in the
+    /// developer's `~/.ssh/config` could redirect the one connection in remote
+    /// mode that was supposed to be unredirectable.
+    ///
+    /// The rule this restores is the one `command` below already states: remote
+    /// mode owns how a server is reached, and a supervisor that reinvents any
+    /// part of it drifts from the flow it belongs to without anything failing
+    /// to compile.
+    pub options: Vec<String>,
     /// The server's own `riabuild channel pump`, environment prefix and all.
     ///
     /// A string the caller composes rather than something assembled here.
@@ -69,17 +97,19 @@ pub struct Tunnel {
 }
 
 pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         // No pty. The channel's framing is binary — a screenshot travels as raw
         // bytes — and a pty would translate newlines, expand tabs and treat
         // 0x03 as an interrupt, corrupting every payload that happened to
         // contain one. `-T` is not a tidiness flag here; without it the
         // transport does not work at all.
         "-T".into(),
-        "-i".into(),
-        tunnel.identity.display().to_string(),
-        "-p".into(),
-        tunnel.port.to_string(),
+    ];
+    // How this server is reached — the port, riabuild's own known_hosts and
+    // key, and any issued identity being carried. The caller's list, never
+    // this file's guess at it; see `Tunnel::options`.
+    args.extend(tunnel.options.iter().cloned());
+    args.extend([
         // Turns a black-hole network into an exit the supervisor can see.
         "-o".into(),
         "ServerAliveInterval=15".into(),
@@ -95,7 +125,8 @@ pub fn ssh_args(tunnel: &Tunnel) -> Vec<String> {
         // most hardened servers refuse and some SSH implementations have never
         // implemented. Nothing here needs a line in anyone's `sshd_config`.
         tunnel.command.clone(),
-    ]
+    ]);
+    args
 }
 
 /// Exponential from one second, jittered, capped at thirty.
@@ -143,6 +174,22 @@ pub fn diagnose(stderr: &str) -> Option<Failure> {
         );
     }
 
+    // The wall that hid the bug above for as long as it existed. `ssh` under
+    // `BatchMode=yes` refuses a host it cannot verify, every attempt fails
+    // identically, and none of the patterns here matched it — so the loop
+    // backed off to the ceiling and retried in silence for the whole session,
+    // with a banner overhead that said "connected". Named now so that the next
+    // reason a channel cannot come up costs a message rather than a mystery.
+    if lower.contains("host key verification failed") {
+        return Some(
+            Failure::new(
+                "the clipboard channel could not verify the server's host key",
+                "Run `riabuild remote` again to record the server's host key. Everything except paste works without it.",
+            )
+            .detail(stderr.trim().to_string()),
+        );
+    }
+
     if lower.contains("permission denied") || lower.contains("authentication failed") {
         return Some(
             Failure::new(
@@ -160,12 +207,32 @@ pub fn diagnose(stderr: &str) -> Option<Failure> {
 mod tests {
     use super::*;
 
+    /// A tunnel carrying what `remote::identity::ssh_options` really produces,
+    /// rather than the `-p`/`-i` pair this file used to invent. The options are
+    /// spelled out here because the tests below assert that they survive into
+    /// the argv — a supervisor that dropped them would still connect on a
+    /// laptop that had `ssh`'d to the box by hand, and nowhere else.
     pub(super) fn tunnel() -> Tunnel {
         Tunnel {
             host: "build-01.clubria.dev".into(),
             user: "ada".into(),
-            port: 22,
-            identity: PathBuf::from("/home/ada/.riabuild/ssh/id_ed25519"),
+            options: [
+                "-p",
+                "22",
+                "-F",
+                "/dev/null",
+                "-o",
+                "UserKnownHostsFile=/home/ada/.riabuild/ssh/known_hosts",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-i",
+                "/home/ada/.riabuild/ssh-identities/abc",
+                "-o",
+                "IdentitiesOnly=yes",
+            ]
+            .iter()
+            .map(|option| option.to_string())
+            .collect(),
             command: "env 'RIABUILD_CHANNEL_SOCKET=/home/ada/.riabuild-remote/abc/channel.sock' \
                       /home/ada/.riabuild/bin/riabuild channel pump"
                 .into(),
@@ -228,6 +295,93 @@ mod tests {
             .position(|arg| arg.contains("channel pump"))
             .expect("a command");
         assert!(command > destination, "{args:?}");
+    }
+
+    /// The bug this pins, and it was silent for the whole life of the exec
+    /// transport: the channel's `ssh` composed its own argv, so it reached a
+    /// server by different rules than the setup run and the shell right beside
+    /// it. riabuild records a host key in **its own** `known_hosts`, so without
+    /// this the channel's `ssh` read the developer's file, did not find the
+    /// host, and — correctly, under `BatchMode=yes` — refused. A box the
+    /// developer had once `ssh`'d to by hand worked; one only riabuild had ever
+    /// reached never did.
+    #[test]
+    fn the_connection_is_reached_by_remote_modes_own_rules() {
+        let args = ssh_args(&tunnel()).join(" ");
+
+        // riabuild's own known_hosts, not `~/.ssh/known_hosts`.
+        assert!(
+            args.contains("UserKnownHostsFile=/home/ada/.riabuild/ssh/known_hosts"),
+            "{args}"
+        );
+        assert!(args.contains("StrictHostKeyChecking=yes"), "{args}");
+        // The developer's own ssh config may not redirect the one connection
+        // nobody is watching.
+        assert!(args.contains("-F /dev/null"), "{args}");
+        assert!(
+            args.contains("-i /home/ada/.riabuild/ssh-identities/abc"),
+            "{args}"
+        );
+        assert!(args.contains("IdentitiesOnly=yes"), "{args}");
+        assert!(args.contains("-p 22"), "{args}");
+    }
+
+    /// A carried identity has to reach this connection too. The servers issued
+    /// keys exist for are exactly the ones riabuild's own key cannot sign in
+    /// to, so a channel offering only riabuild's key can never come up there —
+    /// however well the rest of the session works.
+    #[test]
+    fn a_carried_identity_reaches_the_channel_as_well_as_the_shell() {
+        let mut tunnel = tunnel();
+        tunnel.options.push("-o".into());
+        tunnel
+            .options
+            .push("IdentityAgent=/home/ada/.riabuild/agent/abc/agent.sock".into());
+        tunnel.options.push("-i".into());
+        tunnel
+            .options
+            .push("/home/ada/.riabuild/agent/abc/issued.pub".into());
+
+        let args = ssh_args(&tunnel).join(" ");
+        assert!(
+            args.contains("IdentityAgent=/home/ada/.riabuild/agent/abc/agent.sock"),
+            "{args}"
+        );
+        assert!(args.contains("issued.pub"), "{args}");
+    }
+
+    /// The options come before the destination, like every other `ssh` argv:
+    /// after it they are the remote command's arguments, not `ssh`'s.
+    #[test]
+    fn the_options_come_before_the_destination() {
+        let args = ssh_args(&tunnel());
+        let destination = args
+            .iter()
+            .position(|arg| arg == "ada@build-01.clubria.dev")
+            .expect("a destination");
+        let known_hosts = args
+            .iter()
+            .position(|arg| arg.starts_with("UserKnownHostsFile="))
+            .expect("the known_hosts option");
+        assert!(known_hosts < destination, "{args:?}");
+    }
+
+    /// A host key riabuild never recorded is a wall, not a blip: every attempt
+    /// fails identically. It matched none of the patterns here for the whole
+    /// life of the bug above, so the loop retried in silence for the length of
+    /// a session while the banner said "connected".
+    #[test]
+    fn an_unverifiable_host_key_is_named_rather_than_retried_in_silence() {
+        let failure = diagnose(
+            "Host key verification failed.\r\nkex_exchange_identification: Connection closed",
+        )
+        .expect("a wall");
+        assert!(failure.to_string().contains("host key"), "{failure}");
+        assert!(
+            failure.action.contains("riabuild remote"),
+            "{}",
+            failure.action
+        );
     }
 
     /// A server with no pump cannot be fixed by retrying, so it is named.
