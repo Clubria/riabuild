@@ -102,7 +102,14 @@ public half and fingerprint so a lead never needs the secret back, no route retu
 stored private key to a browser, every fetch is audited by label, the CLI holds it only in
 an `ssh-agent` riabuild owns and never on a filesystem, and it **bootstraps rather than
 replaces** — it authenticates one `ssh-copy-id`, after which this laptop's own key carries
-the run and `remote forget` still has exactly one developer's line to remove. See
+the run and `remote forget` still has exactly one developer's line to remove.
+
+Bootstrapping is the preference, not an absolute: a managed SSH gateway accepts the write
+to `authorized_keys` and then authenticates against its own registry regardless, so
+riabuild's own key can never work there. Where riabuild's key has been installed and
+*still* cannot sign in, the issued identity carries the rest of the run instead of the
+account password — which is what it is for. Attribution is what that costs, and it is only
+lost on the servers that were never going to provide it. See
 `docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md`. Nothing here loosens the
 two sentences above it either: the Infisical credential is still minted per use, and a
 developer's own account password is still their own.

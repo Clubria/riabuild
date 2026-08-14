@@ -19,8 +19,9 @@ async fn has_mosh_server(
     remote: &Remote,
     paths: &dyn Paths,
     runner: &Arc<dyn CommandRunner>,
+    carry: Option<&crate::issued::Working>,
 ) -> bool {
-    let mut args = identity::ssh_options(remote, paths, true);
+    let mut args = identity::ssh_options(remote, paths, true, carry);
     args.push(remote.target());
     args.push("command -v mosh-server".to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -53,9 +54,10 @@ pub async fn run_setup(
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     command: &str,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<i32> {
     let mut args = vec!["-t".to_string()];
-    args.extend(identity::ssh_options(remote, paths, true));
+    args.extend(identity::ssh_options(remote, paths, true, carry));
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -72,12 +74,13 @@ pub async fn open(
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     command: &str,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<i32> {
     let local_mosh = runner.which("mosh").is_some();
-    if local_mosh && has_mosh_server(remote, paths, &runner).await {
+    if local_mosh && has_mosh_server(remote, paths, &runner, carry).await {
         let ssh = format!(
             "ssh {}",
-            identity::ssh_options(remote, paths, true).join(" ")
+            identity::ssh_options(remote, paths, true, carry).join(" ")
         );
         let args = [
             format!("--ssh={ssh}"),
@@ -141,7 +144,7 @@ pub async fn open(
     // a matching `AcceptEnv` on the server while failing outright on an ssh
     // older than 7.8 — a certain cost against a hypothetical gain.
     let mut args = vec!["-t".to_string()];
-    args.extend(identity::ssh_options(remote, paths, true));
+    args.extend(identity::ssh_options(remote, paths, true, carry));
     args.push("-o".to_string());
     args.push("ServerAliveInterval=20".to_string());
     args.push(remote.target());
@@ -184,6 +187,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            None,
         )
         .await
         .expect("opens");
@@ -218,6 +222,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "env 'RIABUILD_ROOT=/home/dev/.riabuild-remote/abc' riabuild shell",
+            None,
         )
         .await
         .expect("opens");
@@ -254,6 +259,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            None,
         )
         .await
         .expect("falls back");
@@ -282,6 +288,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            None,
         )
         .await
         .expect("falls back");
@@ -318,7 +325,7 @@ mod tests {
                 .with("mosh", 0, "", ""),
         );
         let ui = Ui::new(false);
-        open(&remote(), &paths, with_mosh, &ui, "riabuild shell")
+        open(&remote(), &paths, with_mosh, &ui, "riabuild shell", None)
             .await
             .expect("opens");
         assert_eq!(ui.blanks(), 1, "mosh");
@@ -327,7 +334,7 @@ mod tests {
         // under it rather than over it.
         let without_mosh = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
         let ui = Ui::new(false);
-        open(&remote(), &paths, without_mosh, &ui, "riabuild shell")
+        open(&remote(), &paths, without_mosh, &ui, "riabuild shell", None)
             .await
             .expect("falls back");
         assert_eq!(ui.blanks(), 1, "ssh");
@@ -345,7 +352,7 @@ mod tests {
         let fake = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
         let ui = Ui::new(false);
 
-        run_setup(&remote(), &paths, fake, &ui, "riabuild --no-shell")
+        run_setup(&remote(), &paths, fake, &ui, "riabuild --no-shell", None)
             .await
             .expect("runs");
 
@@ -367,6 +374,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild --no-shell",
+            None,
         )
         .await
         .expect("runs");

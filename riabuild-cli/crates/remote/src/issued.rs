@@ -26,7 +26,7 @@ pub mod agent;
 use crate::Remote;
 use agent::Agent;
 use riabuild_api::ApiClient;
-use riabuild_api::issued::fetch_issued;
+use riabuild_api::issued::{IssuedKey, fetch_issued};
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
 use riabuild_ui::Ui;
@@ -44,11 +44,15 @@ pub struct Working {
 }
 
 /// The issued keys for one `riabuild remote`, fetched at most once.
-pub struct Issued<'a> {
-    /// `None` only in this crate's own tests — see [`Issued::preset`]. There is
-    /// no production path that reaches `working` without a client.
-    api: Option<&'a ApiClient>,
+///
+/// Every field defaults to "nothing has happened yet", which is exactly what a
+/// run that never needs an issued key should cost.
+#[derive(Default)]
+pub struct Issued {
     agent: Option<Agent>,
+    /// The key behind [`Working`], kept so [`Issued::hold`] can reload it
+    /// without a lifetime once riabuild commits to carrying it.
+    chosen: Option<IssuedKey>,
     /// `None` until [`working`](Issued::working) has been asked; `Some(None)`
     /// once it has been asked and the answer was "no key gets in".
     ///
@@ -58,11 +62,11 @@ pub struct Issued<'a> {
     answer: Option<Option<Working>>,
 }
 
-impl<'a> Issued<'a> {
-    pub fn new(api: &'a ApiClient) -> Self {
+impl Issued {
+    pub fn new() -> Self {
         Issued {
-            api: Some(api),
             agent: None,
+            chosen: None,
             answer: None,
         }
     }
@@ -75,10 +79,10 @@ impl<'a> Issued<'a> {
     /// `ApiClient` pointed at an unreachable URL — would put a network attempt
     /// and its timeout into every test in that file.
     #[cfg(test)]
-    pub(crate) fn preset(answer: Option<Working>) -> Issued<'static> {
+    pub(crate) fn preset(answer: Option<Working>) -> Issued {
         Issued {
-            api: None,
             agent: None,
+            chosen: None,
             answer: Some(answer),
         }
     }
@@ -90,13 +94,14 @@ impl<'a> Issued<'a> {
     /// on which key an agent happened to offer first.
     pub async fn working(
         &mut self,
+        api: &ApiClient,
         remote: &Remote,
         paths: &dyn Paths,
         runner: Arc<dyn CommandRunner>,
         ui: &Ui,
     ) -> Option<&Working> {
         if self.answer.is_none() {
-            let found = self.find(remote, paths, runner, ui).await;
+            let found = self.find(api, remote, paths, runner, ui).await;
             self.answer = Some(found);
         }
         self.answer.as_ref().and_then(|answer| answer.as_ref())
@@ -104,14 +109,12 @@ impl<'a> Issued<'a> {
 
     async fn find(
         &mut self,
+        api: &ApiClient,
         remote: &Remote,
         paths: &dyn Paths,
         runner: Arc<dyn CommandRunner>,
         ui: &Ui,
     ) -> Option<Working> {
-        // `?` on an `Option` in a function returning `Option`: no client means
-        // no keys, which is only reachable from this crate's own tests.
-        let api = self.api?;
         let fetched = match fetch_issued(api).await {
             Ok(fetched) => fetched,
             Err(error) => {
@@ -159,7 +162,10 @@ impl<'a> Issued<'a> {
 
         let mut working = None;
         for key in &fetched.keys {
-            let public = match agent.add(runner.clone(), key).await {
+            let public = match agent
+                .add(runner.clone(), key, Some(agent::PROBE_LIFETIME))
+                .await
+            {
                 Ok(public) => public,
                 Err(error) => {
                     ui.warn(&format!("Could not load the {} key: {error}", key.label));
@@ -173,6 +179,7 @@ impl<'a> Issued<'a> {
                         socket: agent.socket().to_path_buf(),
                         public_key_path: public,
                     });
+                    self.chosen = Some(key.clone());
                     break;
                 }
                 Ok(false) => {}
@@ -191,6 +198,30 @@ impl<'a> Issued<'a> {
         // while this agent is, and `stop` is the caller's to call either way.
         self.agent = Some(agent);
         working
+    }
+
+    /// Commits to carrying this identity for the rest of the run.
+    ///
+    /// Reloads the key with no expiry. The probe loaded it with a bounded
+    /// lifetime, which is right while riabuild is only asking a question — but
+    /// a carried identity has to survive an interactive shell, and a key that
+    /// expired mid-session would break the clipboard channel's reconnect with
+    /// nothing on screen explaining it.
+    ///
+    /// Best effort: if the reload fails the identity is still loaded under its
+    /// original lifetime, so the run continues and only a very long session
+    /// would notice.
+    pub async fn hold(&mut self, runner: Arc<dyn CommandRunner>, ui: &Ui) {
+        let (Some(agent), Some(key)) = (self.agent.as_ref(), self.chosen.as_ref()) else {
+            return;
+        };
+        if let Err(error) = agent.add(runner, key, None).await {
+            ui.warn(&format!(
+                "Could not extend the {} key for the rest of this run ({error}); a long \
+                 session may need `riabuild remote` again.",
+                key.label
+            ));
+        }
     }
 
     /// Ends the agent, if one was ever started.

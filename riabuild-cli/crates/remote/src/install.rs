@@ -33,17 +33,28 @@ struct SshCtx<'a> {
     paths: &'a dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &'a Ui,
+    /// An issued identity riabuild is carrying because its own key cannot sign
+    /// in to this server. `None` on every ordinary server — see
+    /// `identity::ssh_options`.
+    carry: Option<&'a crate::issued::Working>,
 }
 
 impl SshCtx<'_> {
     async fn ssh(&self, command: &str) -> Result<CommandOutput> {
-        ssh_once(self.remote, self.paths, self.runner.clone(), command).await
+        ssh_once(
+            self.remote,
+            self.paths,
+            self.runner.clone(),
+            command,
+            self.carry,
+        )
+        .await
     }
 
     /// Same as [`Self::ssh`], but with `stdin` piped to the command — for
     /// streaming the binary itself, which `ssh_once` has no room for.
     async fn ssh_with_stdin(&self, command: String, stdin: Vec<u8>) -> Result<CommandOutput> {
-        let mut args = identity::ssh_options(self.remote, self.paths, true);
+        let mut args = identity::ssh_options(self.remote, self.paths, true, self.carry);
         args.push(self.remote.target());
         args.push(command);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -164,12 +175,14 @@ pub async fn ensure_riabuild(
     ui: &Ui,
     home: &str,
     version: &str,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<String> {
     let ctx = SshCtx {
         remote,
         paths,
         runner,
         ui,
+        carry,
     };
     ensure_riabuild_with(&ctx, home, version, &RealDownloads).await
 }
@@ -306,7 +319,7 @@ mod tests {
     /// lets `FakeRunner::then` sequence responses to *successive* remote
     /// calls in order, regardless of which trailing command each one sends.
     fn ssh_prefix(remote: &Remote, paths: &dyn Paths) -> String {
-        let options = identity::ssh_options(remote, paths, true).join(" ");
+        let options = identity::ssh_options(remote, paths, true, None).join(" ");
         format!("ssh {options} {}", remote.target())
     }
 
@@ -330,6 +343,7 @@ mod tests {
             &Ui::new(true),
             "/home/dev",
             "2026.08.06",
+            None,
         )
         .await
         .expect_err("unsupported");
@@ -426,6 +440,7 @@ mod tests {
                 .then(&prefix, 0, &format!("{binary_digest}\n"), ""), // post-write reverify
         );
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake,

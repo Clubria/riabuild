@@ -215,8 +215,9 @@ pub async fn ssh_once(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     command: &str,
+    carry: Option<&issued::Working>,
 ) -> Result<CommandOutput> {
-    let mut args = identity::ssh_options(remote, paths, true);
+    let mut args = identity::ssh_options(remote, paths, true, carry);
     args.push(remote.target());
     args.push(command.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -249,6 +250,7 @@ pub async fn resolve_home(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     store: &mut store::Store,
+    carry: Option<&issued::Working>,
 ) -> Result<String> {
     if let Some(record) = store.find(&remote.name)
         && !record.home.is_empty()
@@ -256,7 +258,14 @@ pub async fn resolve_home(
         return Ok(record.home.clone());
     }
 
-    let output = ssh_once(remote, paths, runner, &shell_command("printf %s \"$HOME\"")).await?;
+    let output = ssh_once(
+        remote,
+        paths,
+        runner,
+        &shell_command("printf %s \"$HOME\""),
+        carry,
+    )
+    .await?;
     let home = output.trimmed().to_string();
     if !output.ok() || !home.starts_with('/') {
         return Err(Failure::new(
@@ -617,13 +626,13 @@ mod tests {
         let mut store = store::Store::default();
         store.remotes.push(store::record_for(&remote()));
 
-        let first = resolve_home(&remote(), &paths, fake.clone(), &mut store)
+        let first = resolve_home(&remote(), &paths, fake.clone(), &mut store, None)
             .await
             .expect("asks");
         assert_eq!(first, "/home/dev");
         assert_eq!(store.remotes[0].home, "/home/dev");
 
-        let second = resolve_home(&remote(), &paths, fake.clone(), &mut store)
+        let second = resolve_home(&remote(), &paths, fake.clone(), &mut store, None)
             .await
             .expect("cached");
         assert_eq!(second, "/home/dev");
@@ -659,7 +668,7 @@ mod tests {
         let mut store = store::Store::default();
         store.remotes.push(store::record_for(&remote()));
 
-        let err = resolve_home(&remote(), &paths, fake, &mut store)
+        let err = resolve_home(&remote(), &paths, fake, &mut store, None)
             .await
             .expect_err("a `~` is not an absolute path");
         assert!(
@@ -687,7 +696,7 @@ mod tests {
         let mut store = store::Store::default();
         store.remotes.push(store::record_for(&remote()));
 
-        let err = resolve_home(&remote(), &paths, fake, &mut store)
+        let err = resolve_home(&remote(), &paths, fake, &mut store, None)
             .await
             .expect_err("a relative path is not an absolute path");
         assert!(

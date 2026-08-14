@@ -71,6 +71,7 @@ async fn write_into_namespace(
     ns: &str,
     name: &str,
     contents: Vec<u8>,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<()> {
     let target = format!("{ns}/{name}");
     let script = shell_command(&format!(
@@ -78,7 +79,7 @@ async fn write_into_namespace(
         ns = shell_quote(ns),
         target = shell_quote(&target),
     ));
-    let mut args = identity::ssh_options(remote, paths, true);
+    let mut args = identity::ssh_options(remote, paths, true, carry);
     args.push(remote.target());
     args.push(script);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -163,8 +164,9 @@ pub async fn ensure(
     // more, because nothing on this path sends the developer to one.
     version: &str,
     store: &mut super::store::Store,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<()> {
-    let home = super::resolve_home(remote, paths, runner.clone(), store).await?;
+    let home = super::resolve_home(remote, paths, runner.clone(), store, carry).await?;
 
     // The laptop's own cache of this server's session, kept under an account
     // named for the server so several servers never collide on one laptop
@@ -243,6 +245,7 @@ pub async fn ensure(
         &ns,
         &session_token_name,
         token.into_bytes(),
+        carry,
     )
     .await?;
 
@@ -256,12 +259,22 @@ pub async fn ensure(
         &ns,
         "gitconfig",
         identity.into_bytes(),
+        carry,
     )
     .await?;
 
     let owner = owner_json(&member.github_login, &member.display_name(), &member.email);
     let owner_name = basename(&layout.owner_file());
-    write_into_namespace(remote, paths, &runner, &ns, &owner_name, owner.into_bytes()).await?;
+    write_into_namespace(
+        remote,
+        paths,
+        &runner,
+        &ns,
+        &owner_name,
+        owner.into_bytes(),
+        carry,
+    )
+    .await?;
 
     Ok(())
 }
@@ -354,6 +367,7 @@ mod tests {
             "/home/dev/.riabuild-remote/abc",
             "session.token",
             b"rb_live_secret_token".to_vec(),
+            None,
         )
         .await
         .expect("writes");
@@ -398,6 +412,7 @@ mod tests {
             "/home/dev/.riabuild-remote/abc",
             "session.token",
             b"token".to_vec(),
+            None,
         )
         .await
         .expect_err("no space");

@@ -254,7 +254,7 @@ mod tests {
     /// lets `FakeRunner::then` sequence responses to *successive* remote
     /// calls in order, regardless of which trailing command each one sends.
     fn ssh_prefix(remote: &Remote, paths: &dyn Paths) -> String {
-        let options = identity::ssh_options(remote, paths, true).join(" ");
+        let options = identity::ssh_options(remote, paths, true, None).join(" ");
         format!("ssh {options} {}", remote.target())
     }
 
@@ -345,6 +345,7 @@ mod tests {
         ));
         let remote = remote();
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake.clone(),
@@ -381,6 +382,7 @@ mod tests {
         );
         let remote = remote();
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake.clone(),
@@ -413,6 +415,7 @@ mod tests {
             Arc::new(FakeRunner::new().containing("mkdir -p", 1, "", "No space left on device"));
         let remote = remote();
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake,
@@ -457,6 +460,7 @@ mod tests {
                 .then(&prefix, 0, "deadbeef\n", ""),
         );
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake.clone(),
@@ -518,6 +522,7 @@ mod tests {
                 .then(&prefix, 1, REMOVE_FAILED_MARKER, ""), // rm -f ran, file survived
         );
         let ctx = SshCtx {
+            carry: None,
             remote: &remote,
             paths: &paths,
             runner: fake,
