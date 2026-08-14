@@ -72,6 +72,15 @@ jobs:
     name: Build macOS
     needs: version
     runs-on: macos-latest
+    # Every job that compiles or runs a test carries one of these, because the
+    # default is GitHub's six hours and a release is exactly where that is worst:
+    # the tag is already pushed and public, so a wedged job is not a slow release
+    # but a version that exists and can never be installed. This is what
+    # `v2026.08.14` did — one `pump::tests` case stopped answering on macOS and
+    # the job sat on it, silently, until it was cancelled by hand. Twenty-five
+    # minutes is around five times the longest this job has ever legitimately
+    # taken; it is a deadlock detector, not a performance budget.
+    timeout-minutes: 25
     outputs:
       sha256_aarch64: ${{ steps.package.outputs.sha256_aarch64 }}
       sha256_x86_64: ${{ steps.package.outputs.sha256_x86_64 }}
@@ -172,6 +181,8 @@ jobs:
     name: Build Linux ${{ matrix.arch }}
     needs: version
     runs-on: ${{ matrix.runner }}
+    # The same deadlock detector as the macOS job above, and for the same reason.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

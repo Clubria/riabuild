@@ -50,6 +50,14 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 /// rather than trusted.
 const MAX_REQUEST: u64 = MAX_PAYLOAD as u64 + 4096;
 
+/// How long [`answers`] gives a socket to say whether anything is serving on it.
+///
+/// Generous by design. Completing a connection to an `AF_UNIX` socket is the
+/// kernel's work and does not wait for the pump to `accept`, so a healthy
+/// listener answers in microseconds and any value here is slack. It is a
+/// *bound*, not a deadline anyone is expected to approach.
+const LIVENESS_PROBE: Duration = Duration::from_secs(2);
+
 /// Binds the socket and relays until the pipe closes.
 ///
 /// Returns `Ok(())` on a clean end of pipe — the laptop's session ended, which
@@ -221,7 +229,7 @@ async fn relay(
 /// them apart — the file looks identical either way.
 async fn bind(socket: &Path) -> Result<UnixListener> {
     if socket.exists() {
-        if UnixStream::connect(socket).await.is_ok() {
+        if answers(socket).await {
             return Err(Failure::new(
                 format!(
                     "another riabuild is already serving the clipboard channel at {}",
@@ -241,16 +249,74 @@ async fn bind(socket: &Path) -> Result<UnixListener> {
     UnixListener::bind(socket).with_context(|| format!("could not listen on {}", socket.display()))
 }
 
+/// Whether anything is serving on this socket — and never a question that hangs.
+///
+/// The connect is bounded because the answer is only ever used to choose
+/// between clearing a leftover and refusing to take a live one, and neither
+/// choice is worth blocking a session on. An unbounded probe is not a probe: it
+/// puts the pump's startup at the mercy of the kernel's willingness to refuse a
+/// connection, which is exactly where it was found — a stale `channel.sock` on
+/// macOS left `riabuild channel pump` waiting on a connect that never completed
+/// and never failed, so the channel came up neither working nor broken. The
+/// same stall inside `pump::tests` held a release's macOS job open for as long
+/// as GitHub allows a job to run.
+///
+/// A timeout counts as **not** serving, and that is the deliberate half. It is
+/// the direction that keeps the leftover socket this whole design exists to
+/// recover from recoverable: a pump that cannot answer a connect inside
+/// [`LIVENESS_PROBE`] is not one a shim could have used either, so treating it
+/// as live would trade a rare stolen channel for a permanently dead one. The
+/// case the refusal protects — a colleague's *working* pump — answers in
+/// microseconds and is never the one that times out.
+async fn answers(socket: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(LIVENESS_PROBE, UnixStream::connect(socket)).await,
+        Ok(Ok(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mux::read_frame;
     use tokio::io::duplex;
 
+    /// How long any one step of a pump test may take before it is a failure.
+    ///
+    /// Every await below is wrapped in [`within`], and that is not belt and
+    /// braces. These tests talk to a real socket, and `cargo test` on macOS runs
+    /// in `release.yml` — *after* the tag is pushed — so a test that stalls
+    /// there does not report a failure anybody can read: it holds the release's
+    /// macOS job open for the six hours GitHub allows, publishes nothing, and
+    /// says nothing about which test stopped. A stalled test has to be a red
+    /// one. Generous enough that a loaded three-core runner never reaches it.
+    const STEP: Duration = Duration::from_secs(20);
+
+    /// The one place a pump test is allowed to wait.
+    ///
+    /// `what` is the sentence the developer reads when it does not arrive, so it
+    /// names the thing that failed to happen rather than the call that was made.
+    async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        match tokio::time::timeout(STEP, future).await {
+            Ok(value) => value,
+            Err(_) => panic!("{what} — nothing happened for {STEP:?}"),
+        }
+    }
+
     /// Drives a pump over an in-memory pipe, standing in for the laptop.
     struct Laptop {
         reader: BufReader<tokio::io::DuplexStream>,
         writer: tokio::io::DuplexStream,
+    }
+
+    impl Laptop {
+        /// The next frame the pump sends up, or a failure naming its absence.
+        async fn frame(&mut self, what: &str) -> Frame {
+            within(what, read_frame(&mut self.reader))
+                .await
+                .expect("the pipe carried something that is not a frame")
+                .expect(what)
+        }
     }
 
     async fn pump(socket: &Path) -> (Laptop, tokio::task::JoinHandle<Result<()>>) {
@@ -264,13 +330,20 @@ mod tests {
         // is true before this pump has bound anything and a test that waited on
         // it would race the very replacement it is checking. Connecting is
         // free of side effects because `relay` drops a request with no bytes in
-        // it.
+        // it, and it goes through `answers` so one attempt cannot hang the wait.
+        let mut ready = false;
         for _ in 0..400 {
-            if UnixStream::connect(socket).await.is_ok() {
+            if answers(socket).await {
+                ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // Running on regardless is what made a stalled pump look like a stalled
+        // *laptop*: the test went on to send a request nothing was listening for
+        // and then waited for a reply that could never come. The pump not coming
+        // up is its own failure and says so here.
+        assert!(ready, "the pump never bound {}", socket.display());
 
         (
             Laptop {
@@ -311,10 +384,9 @@ mod tests {
             async move { shim(&socket, b"{\"v\":1,\"op\":\"channel.ping\"}\n").await }
         });
 
-        let frame = read_frame(&mut laptop.reader)
-            .await
-            .expect("read")
-            .expect("a frame");
+        let frame = laptop
+            .frame("the shim's request never reached the laptop")
+            .await;
         assert_eq!(frame.payload, b"{\"v\":1,\"op\":\"channel.ping\"}\n");
 
         write_frame(
@@ -327,7 +399,8 @@ mod tests {
         .await
         .expect("write");
 
-        assert_eq!(asking.await.expect("shim"), b"{\"ok\":true}\n");
+        let answered = within("the reply never reached the shim", asking).await;
+        assert_eq!(answered.expect("shim"), b"{\"ok\":true}\n");
         serving.abort();
     }
 
@@ -343,19 +416,15 @@ mod tests {
             let socket = socket.clone();
             async move { shim(&socket, b"first\n").await }
         });
-        let frame_one = read_frame(&mut laptop.reader)
-            .await
-            .expect("read")
-            .expect("a frame");
+        let frame_one = laptop.frame("the first shim's request never arrived").await;
 
         let second = tokio::spawn({
             let socket = socket.clone();
             async move { shim(&socket, b"second\n").await }
         });
-        let frame_two = read_frame(&mut laptop.reader)
-            .await
-            .expect("read")
-            .expect("a frame");
+        let frame_two = laptop
+            .frame("the second shim's request never arrived")
+            .await;
 
         assert_ne!(frame_one.id, frame_two.id, "ids must be distinct");
         assert_eq!(frame_one.payload, b"first\n");
@@ -375,8 +444,10 @@ mod tests {
             .expect("write");
         }
 
-        assert_eq!(first.await.expect("first"), b"one");
-        assert_eq!(second.await.expect("second"), b"two");
+        let one = within("the first shim was never answered", first).await;
+        let two = within("the second shim was never answered", second).await;
+        assert_eq!(one.expect("first"), b"one");
+        assert_eq!(two.expect("second"), b"two");
         serving.abort();
     }
 
@@ -396,10 +467,9 @@ mod tests {
             async move { shim(&socket, &sent).await }
         });
 
-        let frame = read_frame(&mut laptop.reader)
-            .await
-            .expect("read")
-            .expect("a frame");
+        let frame = laptop
+            .frame("the binary request never reached the laptop")
+            .await;
         assert_eq!(frame.payload, payload);
 
         write_frame(
@@ -411,7 +481,8 @@ mod tests {
         )
         .await
         .expect("write");
-        assert_eq!(asking.await.expect("shim"), payload);
+        let echoed = within("the binary reply never reached the shim", asking).await;
+        assert_eq!(echoed.expect("shim"), payload);
         serving.abort();
     }
 
@@ -425,6 +496,12 @@ mod tests {
 
         let (_first_laptop, first) = pump(&socket).await;
         first.abort();
+        // Awaited, not just asked for. `abort` schedules a cancellation and the
+        // listener's descriptor closes when the task is dropped, so a test that
+        // moved straight on would be racing a pump that is still answering —
+        // and the replacement would then refuse the socket as live rather than
+        // clear it, which is the opposite of what this test is here to pin.
+        let _ = within("the killed pump never went away", first).await;
         // The file outlives the abort — exactly the leftover a killed session
         // leaves on a real server.
         assert!(socket.exists(), "the stale socket should still be there");
@@ -434,10 +511,9 @@ mod tests {
             let socket = socket.clone();
             async move { shim(&socket, b"after\n").await }
         });
-        let frame = read_frame(&mut laptop.reader)
-            .await
-            .expect("read")
-            .expect("the replacement pump never bound the stale socket");
+        let frame = laptop
+            .frame("the replacement pump never bound the stale socket")
+            .await;
         assert_eq!(frame.payload, b"after\n");
 
         write_frame(
@@ -449,7 +525,8 @@ mod tests {
         )
         .await
         .expect("write");
-        assert_eq!(asking.await.expect("shim"), b"ok");
+        let answered = within("the replacement pump never answered the shim", asking).await;
+        assert_eq!(answered.expect("shim"), b"ok");
         second.abort();
     }
 
