@@ -44,7 +44,16 @@ jobs:
       web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
       packaging: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.packaging == 'true' }}
     steps:
+      # The whole history, which for this repository is 89 commits and 1.2 MiB.
+      # On a pull request the filter asks the API which files changed and needs
+      # no history at all, but on a push to main it has to diff against
+      # `github.event.before` — a commit a depth-1 clone does not have. The
+      # action deepens the clone itself to find it, and that is the path that
+      # breaks: not here, but on main, after the merge, where a filter that
+      # cannot see the diff decides nothing changed.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dorny/paths-filter@v3
         id: filter
