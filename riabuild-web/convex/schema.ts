@@ -23,8 +23,29 @@ export default defineSchema({
   ...authTables,
 
   members: defineTable({
-    userId: v.id("users"),
+    /**
+     * Absent means **invited and not yet arrived**: a lead picked this person
+     * out of the GitHub org and recorded their role, and possibly issued them a
+     * key, before they ever signed in. `auth.ts:upsertMember` adopts the row on
+     * their first sign-in rather than inserting a second one.
+     *
+     * This is what keeps an invited row inert. `viewerMember` looks up
+     * `by_userId` with a real user id, which `undefined` never matches, so
+     * `requireLead` and everything downstream of it are unreachable; and every
+     * `/api/v1` route needs a `cliSessions` row, which needs a sign-in. An
+     * invited `lead` is therefore a decision recorded in advance, not access
+     * granted in advance.
+     *
+     * Design: `docs/superpowers/specs/2026-08-14-inviting-members-design.md`.
+     */
+    userId: v.optional(v.id("users")),
     githubLogin: v.string(),
+    /**
+     * GitHub's numeric id. Carried by an invited row from the moment it is
+     * created — the org listing API returns it beside the login — because it is
+     * what adoption matches on: a developer can rename their GitHub account
+     * between the invitation and their first sign-in, and this cannot change.
+     */
     githubId: v.string(),
     /**
      * Immutable, ours, and independent of GitHub. Names a developer's
@@ -45,7 +66,8 @@ export default defineSchema({
     status: statusValidator,
   })
     .index("by_userId", ["userId"])
-    .index("by_githubLogin", ["githubLogin"]),
+    .index("by_githubLogin", ["githubLogin"])
+    .index("by_githubId", ["githubId"]),
 
   /** Live CLI sessions. `tokenHash` is the lookup key — the raw token is never stored. */
   cliSessions: defineTable({

@@ -74,6 +74,106 @@ export async function checkOrgMembership(
   };
 }
 
+/**
+ * Everyone in the org, so a lead can invite one of them rather than type a name.
+ *
+ * The typo is the reason this exists. A hand-typed login that is wrong produces
+ * an invited row nobody will ever adopt: it sits in the member list looking like
+ * a provisioned developer, holding an SSH key grant, while the person it was
+ * meant for signs in beside it as a fresh candidate with nothing. A list the org
+ * itself produced cannot make that row.
+ *
+ * Bounded at five pages. This is a company, not a directory, and an unbounded
+ * loop against a paginated API is a way for one slow call to hold a Convex
+ * action open until it is killed.
+ */
+const MEMBER_PAGES = 5;
+const PER_PAGE = 100;
+
+export type OrgCandidate = { login: string; githubId: string };
+
+/** What a deployment with no real org to ask about offers instead. */
+const DEV_CANDIDATES: OrgCandidate[] = [
+  { login: "devuser", githubId: "dev-1" },
+  { login: "dana", githubId: "dev-2" },
+  { login: "sam", githubId: "dev-3" },
+  { login: "priya", githubId: "dev-4" },
+  { login: "rowan", githubId: "dev-5" },
+];
+
+export const listOrgMembers = action({
+  args: {},
+  returns: v.array(v.object({ login: v.string(), githubId: v.string() })),
+  handler: async (ctx): Promise<OrgCandidate[]> => {
+    const isLead: boolean = await ctx.runQuery(internal.github.viewerIsLead, {});
+    if (!isLead) throw new Error("Only team leads can do that.");
+
+    // Same deployment-level gate as the dev sign-in provider, for the same
+    // reason: without it the invite form is unreachable locally and in
+    // Playwright, so the one flow this feature adds would be the one nobody
+    // could ever look at. Production sets neither variable.
+    if (process.env.RIABUILD_DEV_AUTH === "1") return DEV_CANDIDATES;
+
+    const token = process.env.GITHUB_ORG_TOKEN;
+    if (!token) {
+      throw new Error(
+        "GITHUB_ORG_TOKEN is not set on the riabuild deployment, so the org's members cannot be listed.",
+      );
+    }
+
+    const org = orgLogin();
+    const found: OrgCandidate[] = [];
+    for (let page = 1; page <= MEMBER_PAGES; page += 1) {
+      const response = await fetch(
+        `https://api.github.com/orgs/${encodeURIComponent(org)}/members?per_page=${PER_PAGE}&page=${page}`,
+        {
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: "application/vnd.github+json",
+            "user-agent": "riabuild-web",
+            "x-github-api-version": "2022-11-28",
+          },
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          `GitHub returned ${response.status} listing the members of ${org}.`,
+        );
+      }
+      const body = (await response.json()) as unknown;
+      if (!Array.isArray(body)) {
+        throw new Error(`GitHub returned something unexpected for ${org}.`);
+      }
+      for (const entry of body) {
+        const login = (entry as { login?: unknown }).login;
+        const id = (entry as { id?: unknown }).id;
+        if (typeof login === "string" && (typeof id === "number" || typeof id === "string")) {
+          found.push({ login, githubId: String(id) });
+        }
+      }
+      if (body.length < PER_PAGE) break;
+    }
+
+    return found.sort((a, b) =>
+      a.login.toLowerCase().localeCompare(b.login.toLowerCase()),
+    );
+  },
+});
+
+export const viewerIsLead = internalQuery({
+  args: {},
+  returns: v.boolean(),
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return false;
+    const member = await ctx.db
+      .query("members")
+      .withIndex("by_userId", (q) => q.eq("userId", userId))
+      .unique();
+    return member?.role === "lead" && member.status === "active";
+  },
+});
+
 export const viewerGithubLogin = internalQuery({
   args: {},
   returns: v.union(v.string(), v.null()),

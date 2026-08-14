@@ -3,6 +3,7 @@ import { convexAuth } from "@convex-dev/auth/server";
 import { Anonymous } from "@convex-dev/auth/providers/Anonymous";
 import { MutationCtx } from "./_generated/server";
 import { Id } from "./_generated/dataModel";
+import { claimOrCreateMember } from "./members";
 
 /**
  * GitHub only. There is no password provider and there never should be — the
@@ -117,15 +118,6 @@ function bootstrapLeads(): string[] {
     .filter((login) => login.length > 0);
 }
 
-function splitName(name: string): { firstName: string; lastName: string } {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return { firstName: "", lastName: "" };
-  return {
-    firstName: parts[0],
-    lastName: parts.slice(1).join(" "),
-  };
-}
-
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -156,76 +148,15 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
         userId = await ctx.db.insert("users", userFields);
       }
 
-      await upsertMember(ctx, { userId, githubLogin, githubId, name, email });
+      await claimOrCreateMember(ctx, {
+        userId,
+        githubLogin,
+        githubId,
+        name,
+        email,
+        isBootstrapLead: bootstrapLeads().includes(githubLogin.toLowerCase()),
+      });
       return userId;
     },
   },
 });
-
-async function upsertMember(
-  ctx: MutationCtx,
-  args: {
-    userId: Id<"users">;
-    githubLogin: string;
-    githubId: string;
-    name: string;
-    email: string;
-  },
-): Promise<void> {
-  const isBootstrapLead = bootstrapLeads().includes(
-    args.githubLogin.toLowerCase(),
-  );
-
-  const existing = await ctx.db
-    .query("members")
-    .withIndex("by_userId", (q) => q.eq("userId", args.userId))
-    .unique();
-
-  if (existing === null) {
-    const { firstName, lastName } = splitName(args.name);
-    const memberId = await ctx.db.insert("members", {
-      userId: args.userId,
-      githubLogin: args.githubLogin,
-      githubId: args.githubId,
-      memberId: crypto.randomUUID(),
-      firstName,
-      lastName,
-      email: args.email,
-      role: isBootstrapLead ? "lead" : "candidate",
-      status: "active",
-    });
-    await ctx.db.insert("auditLog", {
-      subjectId: memberId,
-      action: "member.created",
-      meta: {
-        githubLogin: args.githubLogin,
-        role: isBootstrapLead ? "lead" : "candidate",
-        source: isBootstrapLead ? "bootstrap" : "signup",
-      },
-      at: Date.now(),
-    });
-    return;
-  }
-
-  // A developer can rename their GitHub account; the numeric id cannot change.
-  // Profile fields they may have corrected in the dashboard are left alone.
-  await ctx.db.patch("members", existing._id, {
-    githubLogin: args.githubLogin,
-    githubId: args.githubId || existing.githubId,
-  });
-
-  if (isBootstrapLead && existing.role !== "lead") {
-    await ctx.db.patch("members", existing._id, { role: "lead" });
-    await ctx.db.insert("auditLog", {
-      subjectId: existing._id,
-      action: "member.role_changed",
-      meta: {
-        githubLogin: args.githubLogin,
-        from: existing.role,
-        to: "lead",
-        source: "bootstrap",
-      },
-      at: Date.now(),
-    });
-  }
-}

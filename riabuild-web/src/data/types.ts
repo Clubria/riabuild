@@ -27,6 +27,30 @@ export type Member = {
   role: Role;
   status: MemberStatus;
   joinedAt: number;
+  /**
+   * Nobody has signed in as this person yet — a lead picked them out of the
+   * GitHub org and recorded a role, and possibly a key, in advance.
+   *
+   * They are a real member row with a real id, which is why they can hold an
+   * issued key before they arrive, and why they appear in every picker beside
+   * everybody else. What they cannot do is sign anything in: the row has no
+   * user behind it until a real GitHub sign-in claims it.
+   *
+   * For an invited person `joinedAt` is when they were invited.
+   */
+  invited: boolean;
+};
+
+/**
+ * Somebody in the Clubria GitHub org, as offered to a lead who is inviting.
+ *
+ * Not a `Member` and deliberately not shaped like one: this person may have no
+ * riabuild row at all, and everything a `Member` carries — role, status, member
+ * id — is exactly what has not been decided about them yet.
+ */
+export type OrgCandidate = {
+  login: string;
+  githubId: string;
 };
 
 export type Session = {
@@ -157,6 +181,30 @@ export type Data = {
     email: string;
   }): Promise<void>;
   setRole(p: { memberId: string; role: Role }): Promise<void>;
+  /**
+   * Everyone in the GitHub org, so a lead picks a name instead of typing one.
+   *
+   * A promise rather than a `Loadable` field, like `lookupDeviceCode`: it costs
+   * a call to GitHub, and a lead who never invites anybody should never spend
+   * it. Called when the invite form opens.
+   */
+  listOrgMembers(): Promise<OrgCandidate[]>;
+  /**
+   * Records a role — and the keys they hold — before this person has ever
+   * signed in. Grants nothing on its own; the row it writes cannot authenticate
+   * anything until a real GitHub sign-in claims it.
+   */
+  inviteMember(p: {
+    githubLogin: string;
+    githubId: string;
+    role: Role;
+    issuedKeys: string[];
+  }): Promise<void>;
+  /**
+   * Withdraws an invitation, and refuses anyone who has already arrived — for
+   * them the action is `setStatus`, which also revokes their sessions.
+   */
+  withdrawInvite(p: { memberId: string }): Promise<void>;
   setStatus(p: { memberId: string; status: MemberStatus }): Promise<void>;
   revokeSession(p: { sessionId: string }): Promise<void>;
   updateOrg(p: OrgUpdate): Promise<void>;

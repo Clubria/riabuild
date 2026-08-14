@@ -209,6 +209,128 @@ test.describe("interaction states", () => {
     });
   });
 
+  /**
+   * The invite panel does not fetch the org's members until a lead asks it to,
+   * so every state past "nobody invited from here yet" only exists after a
+   * click. A scenario rendering the filled-in form at rest would be claiming it
+   * arrives without one.
+   */
+  test("listing the org turns typing a name into picking one", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto("/?scenario=lead");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+
+    // Only people with no riabuild row are offered: the fixture org holds ilya
+    // and dana, who are already members, alongside those who are not.
+    const person = page.getByLabel("person");
+    await expect(person).toBeVisible();
+    const offered = await person.locator("option").allTextContents();
+    expect(offered).toContain("priya");
+    expect(offered).not.toContain("dana");
+
+    await expect(
+      page.getByRole("button", { name: /invite @priya as developer/i }),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, { screenshot: "invite-picker" });
+  });
+
+  test("a key can be picked out before the person exists", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // The half of this feature that has no mechanism of its own: an invited row
+    // is a real member row, so the existing grant takes it.
+    await page.goto("/?scenario=lead");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    const key = page
+      .getByRole("group", { name: "keys to issue them" })
+      .getByRole("button")
+      .first();
+    await key.click();
+    await expect(key).toHaveAttribute("aria-pressed", "true");
+    await checkPage(page, info, consoleErrors, { screenshot: "invite-with-key" });
+  });
+
+  test("an org riabuild cannot list says so, and offers the retry", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // Distinct from the member list failing: the members are fine, and what is
+    // missing is the thing that makes a typo impossible.
+    await page.goto("/?scenario=invite-org-unreachable");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    await expect(page.getByText("Could not list the org's members")).toBeVisible();
+    await expect(page.getByText(/GITHUB_ORG_TOKEN is not set/)).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-org-unreachable-after-list",
+    });
+  });
+
+  test("an org with nobody left to invite says that, not nothing", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto("/?scenario=invite-nobody-left");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    await expect(
+      page.getByText("Everyone in the org is already here."),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-nobody-left-after-list",
+    });
+  });
+
+  test("a refused invitation says who it collided with", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto("/?scenario=invite-refused");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    await page.getByRole("button", { name: /invite @/i }).click();
+    await expect(page.getByText("Not invited")).toBeVisible();
+    await expect(
+      page.getByText("@priya has already been invited."),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-refused-after-invite",
+    });
+  });
+
+  test("an org that issues no keys explains the missing row", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // A lead who came here to hand somebody a key must not find the control
+    // silently absent and conclude the feature is broken.
+    await page.goto("/?scenario=invite-no-keys");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    await expect(
+      page.getByText(/The org issues no SSH keys yet/),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-no-keys-after-list",
+    });
+  });
+
+  /**
+   * The picker at its widest: a 39-character login is what GitHub permits, and
+   * an option that long is what pushes a `<select>` past the column it sits in.
+   * 380px is where that shows up.
+   */
+  test("the picker survives the longest login GitHub allows", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto("/?scenario=overflow");
+    await page.getByRole("button", { name: /list the org.s members/i }).click();
+    await expect(page.getByLabel("person")).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-picker-overflow",
+    });
+  });
+
   test("a failed lookup surfaces in a panel", async ({
     page,
     consoleErrors,

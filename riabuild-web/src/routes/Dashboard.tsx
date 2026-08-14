@@ -5,6 +5,7 @@ import { Profile } from "../components/Profile";
 import { Sessions } from "../components/Sessions";
 import { Install } from "../components/Install";
 import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
+import { Invite } from "../components/Invite";
 import { IssuedKeys } from "../components/IssuedKeys";
 import { SharedServers } from "../components/SharedServers";
 import { Alert, Badge, Command, Panel, Tab } from "../ui";
@@ -158,7 +159,12 @@ export function Dashboard({ member }: { member: Member }) {
 
       {isLead && (
         <>
-          <Panel id="lead" index="lead" title="members and roles" tone="accent">
+          <Panel id="lead" index="lead" title="invite ahead of time" tone="accent">
+            <ErrorBoundary label="the invite panel">
+              <Invite />
+            </ErrorBoundary>
+          </Panel>
+          <Panel index="lead" title="members and roles" tone="accent">
             <ErrorBoundary label="the member list">
               <Members viewerId={member._id} />
             </ErrorBoundary>

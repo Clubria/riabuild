@@ -315,7 +315,7 @@ export function IssuedKeys() {
                   <Button
                     key={member._id}
                     variant={on ? "primary" : "quiet"}
-                    aria-pressed={on}
+                    pressed={on}
                     disabled={busy !== null}
                     onClick={() =>
                       setPicked(
@@ -326,6 +326,13 @@ export function IssuedKeys() {
                     }
                   >
                     {nameOf(member)}
+                    {/* Issuing to somebody who has not arrived is the point of
+                        an invitation, not a mistake — but a lead should be able
+                        to see which of these names is a person and which is a
+                        plan. */}
+                    {member.invited && (
+                      <span className="ml-1.5 text-fg-faint">· invited</span>
+                    )}
                   </Button>
                 );
               })}
