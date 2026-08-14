@@ -168,7 +168,7 @@ pub async fn install_key(
     // come back "already there".
     let script = script(public_key)?;
 
-    let mut args = identity::ssh_options(remote, paths, false);
+    let mut args = identity::ssh_options(remote, paths, false, None);
     if let Some(entry) = entry {
         // `IdentitiesOnly=yes` here too, and it is doing work: without it the
         // agent offers every key it holds before this one, and a server with a

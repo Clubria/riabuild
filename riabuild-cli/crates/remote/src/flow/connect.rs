@@ -151,7 +151,8 @@ pub(super) async fn connect_and_setup(
     // it could start happens behind `authorise`'s `can_sign_in` early return,
     // so a server this laptop has already set up costs exactly nothing — see
     // `issued`'s module doc.
-    let mut issued = issued::Issued::new(&ctx.api);
+    let mut issued = issued::Issued::new();
+    let mut carried: Option<issued::Working> = None;
     if request.check {
         if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
             // Probing is a read, so it is allowed on this path — and it is the
@@ -160,7 +161,13 @@ pub(super) async fn connect_and_setup(
             // at all and one it can reach with an issued key look identical
             // without it.
             let entry = issued
-                .working(&remote, ctx.paths.as_ref(), ctx.runner.clone(), &ctx.ui)
+                .working(
+                    &ctx.api,
+                    &remote,
+                    ctx.paths.as_ref(),
+                    ctx.runner.clone(),
+                    &ctx.ui,
+                )
                 .await
                 .map(|entry| entry.label.clone());
             match entry {
@@ -186,22 +193,32 @@ pub(super) async fn connect_and_setup(
         // host-key pin, and its key pair are removable by hand only. A record
         // for a server that never authorised at all is the cheaper mistake.
         store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
-        let authorised = authorise::authorise(
+        // The agent is *not* stopped here. On an ordinary server `authorise`
+        // hands back `None` and everything below runs on riabuild's own key —
+        // which is what keeps `remote forget`'s per-developer cleanup meaning
+        // anything. On a server that accepted the key into `authorized_keys`
+        // and still refuses it, it hands back the issued identity instead, and
+        // that identity has to stay usable for every connection below.
+        match authorise::authorise(
             &remote,
             ctx.paths.as_ref(),
             ctx.runner.clone(),
             &ctx.ui,
+            &ctx.api,
             &mut issued,
         )
-        .await;
-        // Stopped before the `?`, so a failed `authorise` does not leave an
-        // agent holding the org's keys for the rest of the process's life.
-        // Everything past this point runs on riabuild's own key: an issued key
-        // authorises one `ssh-copy-id` and is then finished with, which is what
-        // keeps `remote forget`'s per-developer cleanup meaning anything.
-        issued.stop().await;
-        authorised?;
+        .await
+        {
+            Ok(entry) => carried = entry,
+            Err(error) => {
+                // Stopped before returning, so a failed `authorise` never
+                // leaves an agent holding the org's keys.
+                issued.stop().await;
+                return Err(error);
+            }
+        }
     }
+    let carry = carried.as_ref();
 
     // `resolve_home` runs its own command over `ssh_once`, which is refused
     // outright — before any authentication is even attempted — by a host key
@@ -215,7 +232,14 @@ pub(super) async fn connect_and_setup(
     // error instead of ever reaching the host-key prompt. Found by actually
     // running this flow against a fresh container in Task 22's e2e test,
     // which is the one place a truly new remote is ever exercised.
-    let home = resolve_home(&remote, ctx.paths.as_ref(), ctx.runner.clone(), store).await?;
+    let home = resolve_home(
+        &remote,
+        ctx.paths.as_ref(),
+        ctx.runner.clone(),
+        store,
+        carry,
+    )
+    .await?;
     // The second checkpoint: `forget`'s server-side cleanup builds its paths
     // out of `record.home` and skips entirely when that is empty, and the very
     // next step (`install::ensure_riabuild`) currently fails on every Linux
@@ -240,6 +264,7 @@ pub(super) async fn connect_and_setup(
         &ctx.ui,
         &home,
         &version,
+        carry,
     )
     .await?;
 
@@ -256,6 +281,7 @@ pub(super) async fn connect_and_setup(
             ctx.runner.clone(),
             &ctx.ui,
             &command,
+            carry,
         )
         .await?;
         return Ok(code);
@@ -270,6 +296,7 @@ pub(super) async fn connect_and_setup(
         &member,
         &ctx.cli_version,
         store,
+        carry,
     )
     .await?;
 
@@ -288,6 +315,7 @@ pub(super) async fn connect_and_setup(
         ctx.runner.clone(),
         &ctx.ui,
         &remote_binary,
+        carry,
     )
     .await?;
 
@@ -312,6 +340,7 @@ pub(super) async fn connect_and_setup(
         ctx.runner.clone(),
         &ctx.ui,
         &setup,
+        carry,
     )
     .await?;
     if code != 0 {
@@ -338,6 +367,7 @@ pub(super) async fn connect_and_setup(
         // rather than where the server would have guessed.
         probe: env_command(&prefix_refs, &binary, &["channel", "status"]),
         shell: env_command(&prefix_refs, &binary, &["shell"]),
+        carry,
     })
     .await
 }
@@ -366,15 +396,17 @@ async fn sweep_then_seed(
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     remote_binary: &str,
+    carry: Option<&issued::Working>,
 ) -> Result<()> {
     ssh_once(
         remote,
         paths,
         runner.clone(),
         &format!("{remote_binary} internal gh-sweep"),
+        carry,
     )
     .await?;
-    seed::seed_github(remote, paths, runner, ui, remote_binary).await
+    seed::seed_github(remote, paths, runner, ui, remote_binary, carry).await
 }
 
 #[cfg(test)]
@@ -1188,6 +1220,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &remote_binary,
+            None,
         )
         .await
         .expect("sweeps then seeds");
@@ -1228,9 +1261,16 @@ mod tests {
                 .with("ssh", 0, "", ""),
         );
 
-        sweep_then_seed(&remote(), &paths, fake.clone(), &Ui::new(true), "riabuild")
-            .await
-            .expect("must not fail the run");
+        sweep_then_seed(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild",
+            None,
+        )
+        .await
+        .expect("must not fail the run");
 
         assert!(
             fake.calls().iter().any(|call| call.contains("gh-sweep")),

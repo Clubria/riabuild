@@ -63,6 +63,10 @@ pub struct Plan<'a> {
     pub probe: String,
     /// The env-prefixed `riabuild shell` this session is really here for.
     pub shell: String,
+    /// An issued identity riabuild is carrying because its own key cannot sign
+    /// in to this server — see `identity::ssh_options`. `None` on every
+    /// ordinary server.
+    pub carry: Option<&'a crate::issued::Working>,
 }
 
 /// Opens the developer's shell, with a clipboard channel beside it if one can
@@ -81,6 +85,7 @@ pub async fn open_shell(plan: Plan<'_>) -> Result<i32> {
         plan.runner.clone(),
         plan.ui,
         &plan.shell,
+        plan.carry,
     )
     .await;
     // Bound rather than `?`d: the shell returning an error is still the end of
@@ -281,6 +286,7 @@ mod tests {
         remote_socket: String,
     ) -> Plan<'a> {
         Plan {
+            carry: None,
             remote,
             paths,
             runner,

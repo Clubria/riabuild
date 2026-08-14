@@ -280,7 +280,7 @@ async fn cleanup_server_side(
         redirect = ">",
     ));
 
-    let outcome = ssh_once(remote, paths, runner, &cleanup).await;
+    let outcome = ssh_once(remote, paths, runner, &cleanup, None).await;
     let succeeded = matches!(&outcome, Ok(output) if output.ok());
     if !succeeded {
         ui.warn(&format!(

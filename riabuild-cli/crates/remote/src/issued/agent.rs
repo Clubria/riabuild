@@ -46,9 +46,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How long a key stays loaded. See the module doc — this is the ceiling on
-/// what an orphaned agent can still hand out.
-const KEY_LIFETIME_SECONDS: &str = "900";
+/// How long a key stays loaded **while riabuild is only probing it**. See the
+/// module doc: this is the ceiling on what an orphaned agent can hand out in
+/// the common case, where the key is spent before the install step.
+///
+/// A key riabuild goes on to *carry* is reloaded without it — see
+/// `Issued::hold`, and [`Agent::add`] for what that trades.
+pub const PROBE_LIFETIME: &str = "900";
 
 /// How long to wait for the agent to bind its socket before giving up.
 ///
@@ -128,14 +132,35 @@ impl Agent {
     ///
     /// Returns the path to that public half — the handle every later probe
     /// uses, since an agent with several keys in it needs to be told which.
-    pub async fn add(&self, runner: Arc<dyn CommandRunner>, key: &IssuedKey) -> Result<PathBuf> {
+    /// `lifetime` is `Some` while riabuild is only *probing* — a bounded window,
+    /// because an orphaned agent must not serve the org's keys forever — and
+    /// `None` once riabuild has committed to carrying this identity for the
+    /// rest of the run. A carried key has to outlive an interactive shell,
+    /// which can be open all day, and an expiry mid-session would break the
+    /// clipboard channel's reconnect rather than anything visible.
+    ///
+    /// The exposure that buys is narrower than it sounds: the socket lives in a
+    /// `0700` directory owned by the developer, so an orphan is reachable only
+    /// by them — the same footing as the `ssh-agent` they run themselves.
+    pub async fn add(
+        &self,
+        runner: Arc<dyn CommandRunner>,
+        key: &IssuedKey,
+        lifetime: Option<&str>,
+    ) -> Result<PathBuf> {
         let public = self.dir.join(format!("{}.pub", key.id));
         tokio::fs::write(&public, format!("{}\n", key.public_key)).await?;
 
+        let mut args: Vec<&str> = Vec::new();
+        if let Some(seconds) = lifetime {
+            args.push("-t");
+            args.push(seconds);
+        }
+        args.push("-");
         let output = runner
             .run(
                 "ssh-add",
-                &["-t", KEY_LIFETIME_SECONDS, "-"],
+                &args,
                 &RunOptions {
                     // The private key, on stdin. Never an argument: see the
                     // module doc.
@@ -176,7 +201,7 @@ impl Agent {
         // Reused rather than restated, so the pinned `known_hosts`, the
         // `-F /dev/null` and the port all stay in one place. The identity it
         // names is riabuild's own, which `-i` below overrides.
-        args.extend(ssh_options(remote, paths, true));
+        args.extend(ssh_options(remote, paths, true, None));
         args.push("-o".to_string());
         args.push(format!("IdentityAgent={}", self.socket.to_string_lossy()));
         args.push("-i".to_string());
@@ -255,7 +280,10 @@ mod tests {
             .await
             .expect("start")
             .expect("an agent");
-        agent.add(fake.clone(), &key()).await.expect("add");
+        agent
+            .add(fake.clone(), &key(), Some(PROBE_LIFETIME))
+            .await
+            .expect("add");
 
         let piped = fake.stdin_text_of("ssh-add").expect("ssh-add got stdin");
         assert!(piped.contains("SECRETBODYMARKER"), "{piped}");
@@ -279,7 +307,10 @@ mod tests {
             .await
             .expect("start")
             .expect("an agent");
-        agent.add(fake.clone(), &key()).await.expect("add");
+        agent
+            .add(fake.clone(), &key(), Some(PROBE_LIFETIME))
+            .await
+            .expect("add");
 
         assert!(
             fake.calls()
@@ -329,7 +360,10 @@ mod tests {
             .await
             .expect("start")
             .expect("an agent");
-        let public = agent.add(fake.clone(), &key()).await.expect("add");
+        let public = agent
+            .add(fake.clone(), &key(), Some(PROBE_LIFETIME))
+            .await
+            .expect("add");
         assert!(
             agent
                 .probe(&remote(), &paths, fake.clone(), &public)
@@ -388,7 +422,10 @@ mod tests {
             .await
             .expect("start")
             .expect("an agent");
-        agent.add(fake.clone(), &key()).await.expect("add");
+        agent
+            .add(fake.clone(), &key(), Some(PROBE_LIFETIME))
+            .await
+            .expect("add");
 
         let dir = paths.agent_dir(&remote().hash());
         let mode = tokio::fs::metadata(&dir)

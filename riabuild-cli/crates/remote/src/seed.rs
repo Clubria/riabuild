@@ -39,6 +39,7 @@ pub async fn seed_github(
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     riabuild_path: &str,
+    carry: Option<&crate::issued::Working>,
 ) -> Result<()> {
     // The `gh` riabuild owns on *this laptop*, by absolute path, for the same
     // reason every other call site uses one: `~/.riabuild/bin` is not on `PATH`
@@ -64,7 +65,7 @@ pub async fn seed_github(
     // for several seconds reads as riabuild having hung.
     ui.note("Lending this laptop's GitHub sign-in to the server…");
 
-    let mut args = identity::ssh_options(remote, paths, true);
+    let mut args = identity::ssh_options(remote, paths, true, carry);
     args.push(remote.target());
     args.push(format!("{riabuild_path} internal seed-github"));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -142,6 +143,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "~/.riabuild/riabuild/v/riabuild",
+            None,
         )
         .await
         .expect("seeds");
@@ -188,9 +190,16 @@ mod tests {
             "not logged in",
         ));
 
-        seed_github(&remote(), &paths, fake.clone(), &Ui::new(true), "riabuild")
-            .await
-            .expect("must not fail the run");
+        seed_github(
+            &remote(),
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            "riabuild",
+            None,
+        )
+        .await
+        .expect("must not fail the run");
         assert!(!fake.calls().iter().any(|call| call.starts_with("ssh")));
     }
 }
