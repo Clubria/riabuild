@@ -612,3 +612,5 @@ there. The strip is a `tr`/`grep`/`paste` pipeline rather than a shell loop beca
 string has to run under both shells, and zsh does not word-split an unquoted `$PATH` — the
 obvious `for entry in $PATH` reads as a single element there and collapses the whole
 variable to one directory.
+
+<!-- throwaway: verifying ci.yml path filters skip the web jobs -->
