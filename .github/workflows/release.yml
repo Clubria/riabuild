@@ -81,6 +81,21 @@ jobs:
     name: Build macOS ${{ matrix.arch }}
     needs: version
     runs-on: macos-latest
+    # Every job that compiles or runs a test carries one of these, because the
+    # default is GitHub's six hours and a release is exactly where that is worst:
+    # the tag is already pushed and public, so a wedged job is not a slow release
+    # but a version that exists and can never be installed. This is what
+    # `v2026.08.14` did — one `pump::tests` case stopped answering on macOS and
+    # the job sat on it, silently, until it was cancelled by hand. Twenty-five
+    # minutes is around five times the longest this job has ever legitimately
+    # taken; it is a deadlock detector, not a performance budget.
+    #
+    # It bounds one slice rather than both since the split below, so there is
+    # more headroom than when it was written, and it stays at 25 for that same
+    # reason: the number is meant to sit far above anything legitimate, and
+    # tightening it towards a real duration is what turns a deadlock detector
+    # into a performance budget that fails on a slow runner.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -116,12 +131,15 @@ jobs:
           workspaces: riabuild-cli
           key: ${{ matrix.target }}
 
-      # Once, on the leg whose runner can run what it compiles. This is the only
-      # `cargo test` that ever executes on a Mac — ci.yml is Linux throughout —
-      # so it stays on the release path rather than moving somewhere cheaper.
-      # There is nothing to learn from running it a second time on the same
-      # machine against the same host architecture, though, so the x86_64 leg
-      # skips it.
+      # Once, on the leg whose runner can run what it compiles: there is nothing
+      # to learn from running one suite twice on one machine against one host
+      # architecture, so the x86_64 leg skips it.
+      #
+      # It stays here at all even though `ci.yml`'s `cli-macos` job now runs the
+      # same suite on macOS for every pull request. That one exists to catch a
+      # Mac-only failure *before* a tag; this one is the last gate after the tag
+      # is already public, which is the failure that job's comment describes and
+      # the reason a second run is worth its five minutes.
       - name: Test
         if: matrix.native
         run: cargo test --workspace --all-targets
@@ -198,6 +216,8 @@ jobs:
     name: Build Linux ${{ matrix.arch }}
     needs: version
     runs-on: ${{ matrix.runner }}
+    # The same deadlock detector as the macOS job above, and for the same reason.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

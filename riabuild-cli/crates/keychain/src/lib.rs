@@ -667,10 +667,13 @@ mod tests {
     }
 
     // The tests above now pass `is_macos` explicitly, so both platforms'
-    // outcomes are asserted on every host — which they were not when each
-    // wrapper asked `cfg!` itself, and the only `cargo test` this repository
-    // runs on a Mac is in `release.yml`, after the tag. (`e2e.yml`'s "riabuild
-    // on macOS" job does run on `pull_request`, but it runs the end-to-end
+    // outcomes are asserted on every host. That mattered most when the only
+    // `cargo test` this repository ran on a Mac was in `release.yml`, after the
+    // tag; `ci.yml`'s "riabuild-cli on macOS" job now runs this suite on every
+    // pull request too. Both still earn their keep — the parameter asserts the
+    // macOS branch from a Linux runner in seconds, and the macOS job catches
+    // what no parameter can, which is the host disagreeing with the assumption.
+    // (`e2e.yml`'s "riabuild on macOS" job is neither: it runs the end-to-end
     // suite, not this crate's unit tests.) The tests below call `select`
     // directly, which is still the tightest place to pin the *ordering* of the
     // branches: no runner, no store construction, just the decision.
