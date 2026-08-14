@@ -41,6 +41,20 @@ use std::sync::Arc;
 /// supervisor's own voice.
 const BANNER: &str = "Clipboard channel — connected";
 
+/// What a second terminal into the same server says instead.
+///
+/// It starts nothing — the first session owns the connection — so it cannot
+/// claim one. The wording carries the limit with it, because this is the shape
+/// the failure actually takes: the supervisor is a task inside the *owner's*
+/// process, so whichever terminal exits first takes the channel with it, and
+/// the survivor is left naming a socket path that is correct and unbound. Its
+/// paste, image paste and `xdg-open` stop; its copying appears to carry on,
+/// because Claude Code's OSC 52 escape needs no channel. `riabuild channel
+/// status` is the thing that says so, which is why it is named here rather than
+/// left to be found.
+const SHARED_BANNER: &str = "Clipboard channel — shared with this laptop's other session on this server \
+     (it ends when that one does; `riabuild channel status` reports it)";
+
 /// Everything remote mode has to tell the channel about this session.
 ///
 /// A struct rather than eight arguments, and the three strings are built by the
@@ -140,7 +154,14 @@ impl Channel {
             // rather than a new one, and the alternative is a daemon outliving
             // the shell — which remote mode does not have and should not grow
             // for paste.
-            plan.ui.satisfied(BANNER);
+            //
+            // Said in its own words rather than with `BANNER`, which asserts a
+            // connection this branch has neither made nor checked. All it knows
+            // is that a sibling *process* is alive — not that the channel it
+            // owns ever came up, and not that it still has one. Claiming
+            // "connected" there is how a developer ends up reporting paste as
+            // broken while riabuild's own banner told them it was fine.
+            plan.ui.satisfied(SHARED_BANNER);
             return Channel {
                 claim: Some(claim),
                 started: None,

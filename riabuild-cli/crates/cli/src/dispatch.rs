@@ -23,6 +23,29 @@ use riabuild_tasks::{accounts, shims};
 use riabuild_ui::Ui;
 use std::sync::Arc;
 
+/// Whether this shell was opened by `riabuild remote`.
+///
+/// The presence of the variable, never whether the socket behind it answers —
+/// those are the two different questions `channel status` exists to tell apart.
+/// A remote session with a dead channel has something to reconnect; a local
+/// shell has nothing to reconnect to, and telling its developer to "run
+/// `riabuild remote` again" would send them somewhere there is no problem.
+fn in_a_remote_session() -> bool {
+    remote_session_from(std::env::var(channel::SOCKET_ENV).ok().as_deref())
+}
+
+/// The answer with the environment supplied rather than read, so a test can
+/// drive both without mutating a variable the whole suite shares — the same
+/// wrapper-and-parameter split `socket_path_from` and `browser_for` use.
+///
+/// An empty value is not a session. It is the same rule `browser_for` applies
+/// to the same variable, and the two must agree: a session that exported an
+/// empty socket would otherwise be told to reconnect a channel that was never
+/// configured.
+fn remote_session_from(socket: Option<&str>) -> bool {
+    socket.is_some_and(|socket| !socket.is_empty())
+}
+
 /// `riabuild channel …`
 ///
 /// Handled before the setup flow: the shim runs on every Ctrl+V and must not
@@ -80,10 +103,54 @@ pub async fn channel(action: &ChannelAction, quiet: bool) -> Result<i32> {
                     ));
                     Ok(0)
                 }
+                // A shell with no `RIABUILD_CHANNEL_SOCKET` was not opened by
+                // `riabuild remote` at all, and `socket_path` answered with the
+                // runtime-directory fallback rather than with a session's path.
+                // Told apart from a channel that is down because the two have
+                // nothing in common: there is no laptop to reconnect to here,
+                // and the clipboard is already the developer's own.
+                Err(_) if !in_a_remote_session() => {
+                    ui.warn("Clipboard channel — not part of a remote session");
+                    ui.note(
+                        "This shell was not opened by `riabuild remote`, so there is no laptop \
+                         on the other end of a channel. On your own machine the clipboard and \
+                         the browser are already yours, and riabuild shadows neither.",
+                    );
+                    Ok(1)
+                }
                 Err(error) => {
-                    ui.warn(&format!("Clipboard channel — down: {error}"));
-                    ui.info(
-                        "Paste will not work until the laptop reconnects. Nothing else is affected.",
+                    // The diagnosis and the remedy rendered apart, the way
+                    // `supervisor::report` does it: `warn` takes the line that
+                    // says what is wrong, `note` folds the prose. `Ui::info`
+                    // would not fold — it is a bare `println!` — and a paragraph
+                    // through it wraps at column 0 wherever the terminal
+                    // happens to end.
+                    let failure = error.downcast_ref::<riabuild_ui::Failure>();
+                    match failure {
+                        Some(failure) => {
+                            ui.warn(&format!("Clipboard channel — down: {}", failure.attempting));
+                            for line in failure
+                                .detail
+                                .lines()
+                                .filter(|line| !line.trim().is_empty())
+                            {
+                                ui.note(line);
+                            }
+                            ui.note(&failure.action);
+                        }
+                        None => ui.warn(&format!("Clipboard channel — down: {error}")),
+                    }
+                    // The sentence that would have saved this being reported as
+                    // two unrelated bugs. Copying keeps working while everything
+                    // else stops, because Claude Code's copy always *also*
+                    // returns an OSC 52 escape and the terminal acts on that
+                    // with no channel involved — so "copy works, paste does
+                    // not" is one dead channel, not a half-broken riabuild.
+                    ui.note(
+                        "Paste, image paste and `xdg-open` all go through the channel and fail \
+                         until it is back. Copying out of Claude Code may still appear to work: \
+                         it emits an OSC 52 escape your terminal acts on by itself, which needs \
+                         no channel and carries text only.",
                     );
                     Ok(1)
                 }
@@ -149,6 +216,22 @@ mod tests {
     use clap::Parser;
 
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
+
+    /// `channel status` has to tell "there is no channel here" apart from "the
+    /// channel is down", because only one of them has anything to reconnect.
+    /// Both fail to connect, so the socket alone cannot separate them.
+    #[test]
+    fn only_a_shell_with_a_socket_is_a_remote_session() {
+        assert!(remote_session_from(Some(
+            "/home/dev/.riabuild-remote/abc/channel.sock"
+        )));
+        // A laptop: nothing exported it, and `socket_path` answered with the
+        // runtime-directory fallback rather than with any session's path.
+        assert!(!remote_session_from(None));
+        // The same rule `browser_for` applies to this variable. Disagreeing
+        // would tell a session that exported nothing to go and reconnect it.
+        assert!(!remote_session_from(Some("")));
+    }
 
     /// Builds the request the way `main` does, from a parsed command line.
     fn request_from(argv: &[&str]) -> remote::Request {

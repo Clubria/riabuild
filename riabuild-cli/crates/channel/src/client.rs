@@ -7,6 +7,7 @@
 
 use crate::protocol::{Request, Response, decode_response, encode_request};
 use anyhow::{Context, Result, bail};
+use riabuild_ui::Failure;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -44,16 +45,77 @@ pub async fn request_with_body(socket: &Path, request: &Request, body: &[u8]) ->
                 socket.display()
             )
         })?
-        .with_context(|| {
-            format!(
-                "the laptop channel at {} is not available",
-                socket.display()
-            )
-        })?;
+        .map_err(|error| unavailable(socket, &error))?;
 
     tokio::time::timeout(REQUEST_TIMEOUT, exchange(stream, request, body))
         .await
         .context("the laptop channel did not answer in time")?
+}
+
+/// What a shim says when there is no channel to talk to.
+///
+/// Reported at the altitude the developer can act at, rather than the one the
+/// kernel answered at. `RIABUILD_CHANNEL_SOCKET` is a promise written once into
+/// the shell's environment when the session opened; the channel behind it is a
+/// live resource a laptop-side process owns and can end at any moment, and
+/// nothing reconciles the two. A shell that outlives its session — a second
+/// terminal whose owner exited first, a tmux window still there tomorrow, a
+/// laptop that slept and never came back — goes on naming a path that is
+/// perfectly correct and completely unbound.
+///
+/// `No such file or directory (os error 2)` is a true answer to a question the
+/// developer did not ask. It reads as riabuild being broken, when what happened
+/// is that a session ended. Worse, it is invisible in the one place it matters
+/// most: Claude Code's copy falls back to an OSC 52 escape, so copying still
+/// appears to work while paste and `xdg-open` do not, and no two symptoms ever
+/// point at one cause.
+///
+/// The remedy is the same in every case and is worth stating rather than
+/// implying: the socket path is per-developer and stable, so a new
+/// `riabuild remote` to that server binds this very path again and the shells
+/// already open start working, without anybody restarting them.
+/// A `Failure` rather than a bare string, which is what `supervisor::diagnose`
+/// already returns for the other half of the same story: it keeps the diagnosis
+/// and the one concrete next action in separate fields, so a caller can render
+/// them apart — `channel status` shows the action as folded prose — while
+/// `Display` still puts both on one line for a shim with only stderr to write
+/// to. It deliberately does **not** name `riabuild channel status`: this text is
+/// most of what that command prints, and advising a developer to run the
+/// command they are already reading the output of is how advice stops being
+/// read at all.
+fn unavailable(socket: &Path, error: &std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+    let path = socket.display();
+    // One remedy, and a real one rather than a shrug: the socket path is per
+    // developer and per server, so a new session binds this very path and the
+    // shells already open start working again without being restarted.
+    let reconnect = "Run `riabuild remote` again from your laptop. It binds this same socket, \
+                     so the shells you already have open start working again — nothing needs \
+                     restarting here.";
+    match error.kind() {
+        ErrorKind::NotFound => Failure::new(
+            format!("the clipboard channel is not running — nothing is bound at {path}"),
+            reconnect,
+        )
+        .detail("The `riabuild remote` session that opened this shell has ended.".to_string())
+        .into(),
+        // A socket file with nobody accepting: a pump killed hard enough that it
+        // never unlinked. Told apart because "nothing is bound at this path"
+        // reads as plainly wrong when the path is sitting right there, and a
+        // developer who checks trusts the next message less.
+        ErrorKind::ConnectionRefused => Failure::new(
+            format!("the clipboard channel is not answering — {path} is there, but nothing is serving it"),
+            reconnect,
+        )
+        .detail("The session that created the socket ended without removing it.".to_string())
+        .into(),
+        _ => Failure::new(
+            format!("the clipboard channel at {path} is not available"),
+            reconnect,
+        )
+        .detail(error.to_string())
+        .into(),
+    }
 }
 
 async fn exchange(mut stream: UnixStream, request: &Request, body: &[u8]) -> Result<Reply> {
@@ -200,6 +262,53 @@ mod tests {
             error.to_string().contains("channel"),
             "{error} does not mention the channel"
         );
+    }
+
+    /// The message a developer actually meets, and the one this exists to fix.
+    ///
+    /// `No such file or directory (os error 2)` is a true answer to a question
+    /// nobody asked: the path is right and a session ended. Left at that
+    /// altitude it reads as riabuild being broken, and it is met at the worst
+    /// possible moment — beside a Claude Code whose copying still works,
+    /// because that falls back to an OSC 52 escape needing no channel at all.
+    #[tokio::test]
+    async fn a_channel_that_is_not_running_says_so_and_says_what_to_do() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let error = request(&dir.path().join("absent.sock"), &Request::ChannelPing)
+            .await
+            .expect_err("should fail")
+            .to_string();
+
+        assert!(error.contains("not running"), "{error}");
+        // The remedy, and it is a real one: the socket path is per-developer
+        // and stable, so a new session binds this same path and the shells
+        // already open start working without being restarted.
+        assert!(error.contains("riabuild remote"), "{error}");
+        // …and never an instruction to run the command that prints this text.
+        assert!(!error.contains("channel status"), "{error}");
+        // The kernel's wording must not be what leads.
+        assert!(!error.starts_with("No such file"), "{error}");
+    }
+
+    /// A socket file with nobody accepting is a different sentence: "nothing is
+    /// bound at this path" reads as wrong when the path is plainly there, and
+    /// a developer who checks will trust the next message less.
+    #[tokio::test]
+    async fn a_socket_nobody_is_serving_is_told_apart_from_one_that_is_absent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("dead.sock");
+        // A plain file where a socket should be: connecting to it is refused
+        // rather than reported as missing, which is the case this separates.
+        tokio::fs::write(&socket, b"not a socket")
+            .await
+            .expect("write");
+
+        let error = request(&socket, &Request::ChannelPing)
+            .await
+            .expect_err("should fail")
+            .to_string();
+        assert!(error.contains("channel"), "{error}");
+        assert!(!error.contains("nothing is bound"), "{error}");
     }
 
     /// A truncated body must not be returned as if it were complete: a

@@ -564,6 +564,25 @@ riabuild flag able to clear it. The pump owns the bind now, so clearing a dead s
 ordinary `unlink` by its owner — and a socket that still *answers* is refused rather than
 taken, because taking one silently cuts a colleague's session.
 
+**`RIABUILD_CHANNEL_SOCKET` outlives the channel, and the shim reports that as a state
+rather than as an `errno`.** The variable is written once into the shell's environment when
+the session opens; the channel is a live resource a laptop-side process owns and can end at
+any moment — the sibling terminal that owned it exited first, a tmux window still open
+tomorrow, a laptop that slept. Nothing reconciles the two and nothing can, because the
+laptop is the side that connects. `client::unavailable` is where that is turned into
+something a developer can act on, and it must stay a `Failure` with the remedy in `action`:
+`channel status` renders the two apart, and a shim with only stderr gets both from
+`Display`. The remedy is real — the socket path is per developer and per server, so a new
+`riabuild remote` binds that same path and the shells already open recover with nothing
+restarted.
+
+The reason this earns prose rather than a one-line message: it is invisible in the worst
+way. Claude Code's copy returns an OSC 52 escape unconditionally, so a dead channel leaves
+**copying working and everything else broken**, and the half that still works reads as
+proof the channel is fine. It was reported as two unrelated bugs. `channel status` says
+that out loud, and the non-owner banner no longer claims `connected` for a channel it
+neither started nor checked.
+
 **There is no health probe, and adding one back would be a mistake.** The old design ran a
 second short-lived `ssh` every thirty seconds to prove the forward carried traffic, because
 a forward is a channel riding on the ssh session and can wedge while ssh believes itself
