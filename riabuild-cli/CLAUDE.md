@@ -17,47 +17,105 @@ cargo run -p riabuild-cli        # `-p` because the root is a virtual manifest
 cargo test -p riabuild-remote    # one crate, one test binary, no relink of the rest
 ```
 
-## One shared `target/` across worktrees
+## One shared dependency graph, one `target/` per worktree
 
-A debug `target/` for this workspace runs to well over 2G, most of it a dependency graph
-identical on every branch. Half a dozen worktrees each building their own copy is the
-fastest way to fill a disk, so they all compile into one directory instead.
+A debug build of this workspace runs to several gigabytes, and it splits in two. The
+dependency graph is identical on every branch and is worth compiling once. The finished
+binaries are not: a debug `riabuild` alone is 170M, and it is the one file that must mean
+*this* worktree's code. Cargo separates the two, so we let it.
+
+```
+<repo>/shared-build/           one copy, every checkout and worktree
+  debug/{deps,build,incremental,.fingerprint}
+  debug/.cargo-build-lock      what makes concurrent builds serialise
+
+<repo>/riabuild-cli/target/                         the main checkout's own
+<repo>/.claude/worktrees/<wt>/riabuild-cli/target/  one per worktree
+  debug/riabuild               the binary that worktree built
+```
 
 Setup is a single **untracked** file at the *repository root* — not in a worktree.
-`.claude/hooks/ensure-shared-cargo-target.sh` writes it from a `SessionStart` hook, so a
-fresh clone is configured before anyone builds twice. It never overwrites an existing
-config, so pointing `target-dir` at another disk survives. To do it by hand:
+`.claude/hooks/ensure-shared-cargo-build-dir.sh` writes it from a `SessionStart` hook, so
+a fresh clone is configured before anyone builds twice. It never overwrites a config
+someone customised, so pointing the build at another disk survives. To do it by hand:
 
 ```sh
 mkdir -p .cargo
-printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
+printf '[build]\nbuild-dir = "shared-build"\n' > .cargo/config.toml
 ```
 
 Deleting the file opts this machine out until the next session start.
 
+`target-dir` is deliberately **absent**. Left unset it defaults to
+`<workspace-root>/target`, which is per-worktree — and that is the whole mechanism.
+Setting it, as this repo did until 2026-08-14, is what made every worktree write one
+shared `target/debug/riabuild`, so the binary you ran was whichever build finished last.
+That is also the layout CI already assumes, which is why `e2e/run.sh` and the
+`RIABUILD_BIN` values in `.github/workflows/ci.yml` name `riabuild-cli/target/...` and
+now find it locally too.
+
 Cargo finds `.cargo/config.toml` by walking up from the current directory to the
-filesystem root, and resolves a relative `target-dir` against the directory holding
+filesystem root, and resolves a relative `build-dir` against the directory holding
 `.cargo` — not against the package or the cwd. Worktrees live under `.claude/worktrees/`,
 physically inside the repository root, so they inherit that one file and every build,
-main checkout and worktree alike, lands in `<repo>/target`.
+main checkout and worktree alike, compiles into `<repo>/shared-build`.
 
 **It cannot be committed.** Git copies tracked files into every worktree, cargo reads the
-nearest config, and each worktree would then resolve `target-dir` against itself — handing
-back the private `target/` directories this exists to remove. No relative path serves both
+nearest config, and each worktree would then resolve `build-dir` against itself — handing
+back the private dependency graphs this exists to remove. No relative path serves both
 either, since a worktree sits three levels below the main checkout. The `.gitignore` entry
 for `/.cargo/` is what keeps a well-meaning `git add` from breaking it.
 
-Two consequences:
+Three consequences:
 
-- **Concurrent builds serialise.** Cargo takes an exclusive lock on the build directory,
-  so a second worktree building at the same time prints `Blocking waiting for file lock`
-  and waits. This trades wall-clock for disk.
-- **CI is unaffected.** It never sees the untracked file, so `target/` there stays at
-  `riabuild-cli/target` and the `Swatinem/rust-cache` setup in `.github/workflows/ci.yml`
-  needs no change.
+- **Concurrent builds still serialise.** The lock lives in the shared directory, so a
+  second worktree building at the same time prints `Blocking waiting for file lock` and
+  waits. This trades wall-clock for disk, as it always did.
+- **CI is unaffected.** It never sees the untracked file, so with no `build-dir` set both
+  halves land under `riabuild-cli/target` and the `Swatinem/rust-cache` setup in
+  `.github/workflows/ci.yml` needs no change.
+- **A worktree can still be handed another one's build.** See below. This is known and
+  accepted, not a bug waiting to be reported.
 
-Once it is in place the old per-worktree `riabuild-cli/target` directories are orphaned,
-and deleting them is what actually reclaims the space.
+### The part this does not fix
+
+Cargo identifies a workspace package by name, version, features and flags — **never by
+path** — and decides freshness by mtime against a dep-info file written with *relative*
+source paths. Both are deliberate: they are what lets `Swatinem/rust-cache` restore a
+cache into a differently-named CI checkout. The cost is that two worktrees of riabuild at
+the same version are, to cargo, the same package. They share one fingerprint slot in
+`shared-build`, and the one whose sources have older mtimes is declared fresh against the
+other's output — `cargo build` prints `Finished` in 0.01s and uplifts the other worktree's
+binary into this worktree's `target/`.
+
+Symptoms: a change you just made appears not to take effect, or a fix "comes back". It
+bites on the *return* visit to an older worktree, because `git worktree add` stamps
+mtime=now and a new worktree therefore rebuilds honestly.
+
+Neither cargo escape hatch is available on stable — `--artifact-dir` and
+`build.checksum-freshness` are both nightly-only as of 1.97.1. To force the rebuild, drop
+the fingerprints for riabuild's own crates; every dependency survives untouched:
+
+```sh
+rm -rf shared-build/debug/.fingerprint/riabuild*
+```
+
+Before debugging a binary that seems to have travelled through time, prove which build
+ran: `riabuild --version` and the file's mtime.
+
+### Migrating an existing machine
+
+The hook upgrades the old config in place on the next session start and prints what to do
+with the directory it orphans. `<repo>/target` held both halves; renaming it keeps the
+warm cache and skips recompiling every dependency once:
+
+```sh
+mv <repo>/target <repo>/shared-build   # keep the cache
+rm -rf <repo>/target                   # or just reclaim the space
+```
+
+The stray uplifted binaries left at `shared-build/debug/riabuild` and
+`shared-build/debug/lib*.rlib` are inert; cargo reads neither.
 
 ## Invariants
 
