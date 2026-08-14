@@ -504,7 +504,8 @@ Each has its own remedy, so each is detected separately.
 | Stale socket from a killed session | ours is unlinked; one owned by another uid is a hard stop |
 | Runtime directory not ours, or not 0700 | hard stop — the existing rule, unchanged |
 | Laptop has no clipboard tool (Linux laptop, no `wl-clipboard`/`xclip`) | names the install command, as `mosh-server` already does |
-| Channel down — lid closed, laptop gone | the shim exits 1 silently; the reason is in the shell banner, `riabuild channel status`, and the log |
+| Channel down — lid closed, laptop gone | the shim exits 1, naming the channel and the one thing that brings it back; the fuller account is in `riabuild channel status` and the log |
+| Channel down — **the session that opened this shell has ended** | the same, and it is the common case rather than the exotic one (below) |
 | Clipboard genuinely empty | identical exit 1 — deliberately indistinguishable to the caller |
 | Payload over 32 MB | the cap and the type that exceeded it |
 | Type vanished between `TARGETS` and read | served from the snapshot; a genuine miss is exit 1 |
@@ -514,6 +515,46 @@ The two middle rows are a decision, not an oversight. The caller's contract is x
 contract, and xclip has no way to say "your laptop is asleep" — Claude Code additionally
 runs its probe with `2>/dev/null`, so the shim's stderr is discarded. **All diagnostic
 value must live outside the paste path.**
+
+## The environment variable outlives the channel
+
+`RIABUILD_CHANNEL_SOCKET` is a **promise written once** into the shell's environment when
+the session opens. The channel behind it is a **live resource** owned by a laptop-side
+process, and it can end at any moment: the terminal that owned it exited first while a
+second one is still open, a tmux window is still there tomorrow, a laptop slept and never
+came back. Nothing reconciles the two, and nothing can — the laptop is the side that must
+connect, so a shell on the server can neither restart the channel nor be told by it.
+
+What that leaves is a shell naming a path that is entirely correct and completely unbound,
+and the first version of this reported it as `No such file or directory (os error 2)` — a
+true answer to a question nobody asked. It reads as riabuild being broken rather than as a
+session having ended.
+
+**It is met at the worst possible moment, and that is the part worth writing down.**
+Claude Code's copy returns an OSC 52 escape unconditionally, so with the channel dead
+*copying still works* while paste, image paste and `xdg-open` all stop. Two symptoms, no
+shared cause visible, and the one that still works is the one that looks like proof the
+channel is fine. It was reported as two unrelated bugs, which is exactly what it looks
+like.
+
+So the shim says which of the three states it is in and names the one thing that fixes it,
+and `riabuild channel status` tells apart:
+
+| State | What it means |
+|---|---|
+| no `RIABUILD_CHANNEL_SOCKET` | not a remote session at all; the clipboard here is already the developer's own |
+| set, nothing bound | the session that opened this shell has ended |
+| set, socket present, nobody accepting | that session ended without removing its socket |
+
+The remedy is the same for the last two and is a real one rather than a shrug: the socket
+path is per developer and per server, so **a new `riabuild remote` binds that very path
+again and the shells already open start working — nothing needs restarting.** That is
+worth stating out loud, because the obvious guess is that a stale shell has to be thrown
+away.
+
+A second terminal's banner says so too. It starts nothing, so it may not claim
+`connected`: it reports that it is sharing the first session's channel and that the
+channel ends when that session does.
 
 ---
 
