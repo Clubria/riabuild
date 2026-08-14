@@ -77,6 +77,10 @@ export function Members({ viewerId }: { viewerId: string }) {
       render: (m) => (
         <span className="inline-flex flex-wrap gap-1.5">
           <Badge tone={ROLE_TONE[m.role]}>{m.role}</Badge>
+          {/* The role beside it is a decision, not a live account — an invited
+              `lead` has nobody signed in as it. Without this badge that row is
+              indistinguishable from somebody who has been here for months. */}
+          {m.invited && <Badge tone="warn">invited</Badge>}
           {m.status === "suspended" && <Badge tone="danger">suspended</Badge>}
         </span>
       ),
@@ -110,40 +114,67 @@ export function Members({ viewerId }: { viewerId: string }) {
                     .finally(() => setBusy(null));
                 }}
               />
-              <Button
-                variant={suspended ? "quiet" : "danger"}
-                disabled={isSelf}
-                pending={busy === m._id}
-                pendingLabel="…"
-                title={
-                  isSelf ? "You cannot suspend your own account." : undefined
-                }
-                aria-label={`${suspended ? "Reactivate" : "Suspend"} @${m.githubLogin}`}
-                onClick={() => {
-                  setError(null);
-                  setBusy(m._id);
-                  void data
-                    .setStatus({
-                      memberId: m._id,
-                      status: suspended ? "active" : "suspended",
-                    })
-                    .catch((cause: unknown) => setError(readError(cause)))
-                    .finally(() => setBusy(null));
-                }}
-              >
-                {suspended ? "reactivate" : "suspend"}
-              </Button>
+              {/* Withdrawing and suspending are not the same act and must not
+                  look like one. Nobody has ever signed in as an invited person,
+                  so there is no session to revoke and nothing to keep a row
+                  for — while deleting somebody who *has* arrived would leave
+                  their live sessions pointing at a member that is gone. */}
+              {m.invited ? (
+                <Button
+                  variant="danger"
+                  pending={busy === m._id}
+                  pendingLabel="…"
+                  aria-label={`Withdraw the invitation for @${m.githubLogin}`}
+                  onClick={() => {
+                    setError(null);
+                    setBusy(m._id);
+                    void data
+                      .withdrawInvite({ memberId: m._id })
+                      .catch((cause: unknown) => setError(readError(cause)))
+                      .finally(() => setBusy(null));
+                  }}
+                >
+                  withdraw
+                </Button>
+              ) : (
+                <Button
+                  variant={suspended ? "quiet" : "danger"}
+                  disabled={isSelf}
+                  pending={busy === m._id}
+                  pendingLabel="…"
+                  title={
+                    isSelf ? "You cannot suspend your own account." : undefined
+                  }
+                  aria-label={`${suspended ? "Reactivate" : "Suspend"} @${m.githubLogin}`}
+                  onClick={() => {
+                    setError(null);
+                    setBusy(m._id);
+                    void data
+                      .setStatus({
+                        memberId: m._id,
+                        status: suspended ? "active" : "suspended",
+                      })
+                      .catch((cause: unknown) => setError(readError(cause)))
+                      .finally(() => setBusy(null));
+                  }}
+                >
+                  {suspended ? "reactivate" : "suspend"}
+                </Button>
+              )}
             </>
           );
         }}
         empty={
-          <Empty glyph="⌂" title="Nobody has signed in yet.">
-            Members appear here the first time they sign in with GitHub.
+          <Empty glyph="⌂" title="Nobody here yet.">
+            Members appear the first time they sign in with GitHub &mdash; or as
+            soon as you invite one above, which is the earlier of the two.
           </Empty>
         }
       />
-      <p className="mt-3 text-xs text-fg-faint">
+      <p className="mt-3 max-w-prose text-xs text-fg-faint">
         Suspending revokes that person&rsquo;s CLI sessions immediately.
+        Withdrawing takes back an invitation nobody has claimed yet, and takes
+        their issued keys with it.
       </p>
       {error !== null && (
         <div className="mt-4">

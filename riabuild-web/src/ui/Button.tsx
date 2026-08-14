@@ -45,6 +45,7 @@ export function Button({
   disabled = false,
   pending = false,
   pendingLabel,
+  pressed,
   title,
   "aria-label": ariaLabel,
 }: {
@@ -56,6 +57,17 @@ export function Button({
   disabled?: boolean;
   pending?: boolean;
   pendingLabel?: string;
+  /**
+   * A button that is on or off rather than one that does something once —
+   * picking who gets an SSH key, or which keys somebody is invited with.
+   *
+   * It exists because the callers were already trying to say this. Both passed
+   * `aria-pressed` straight through and this component's explicit prop list
+   * dropped it on the floor, so every toggle in the dashboard changed colour
+   * and announced nothing: to a screen reader they were plain buttons, and
+   * which people held a key was information only the sighted got.
+   */
+  pressed?: boolean;
   title?: string;
   "aria-label"?: string;
 }) {
@@ -98,6 +110,7 @@ export function Button({
       onClick={onClick}
       disabled={disabled || pending}
       aria-busy={pending || undefined}
+      aria-pressed={pressed}
       title={title}
       aria-label={ariaLabel}
     >

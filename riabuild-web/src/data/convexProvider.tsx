@@ -46,6 +46,9 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
 
   const updateProfile = useMutation(api.members.updateProfile);
   const setRole = useMutation(api.members.setRole);
+  const inviteMember = useMutation(api.members.invite);
+  const withdrawInvite = useMutation(api.members.removeInvite);
+  const listOrgMembers = useAction(api.github.listOrgMembers);
   const setStatus = useMutation(api.members.setStatus);
   const revoke = useMutation(api.sessions.revoke);
   const updateOrg = useMutation(api.org.update);
@@ -87,6 +90,18 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     },
     setStatus: async (p) => {
       await setStatus({ memberId: p.memberId as never, status: p.status });
+    },
+    listOrgMembers: async () => await listOrgMembers({}),
+    inviteMember: async (p) => {
+      await inviteMember({
+        githubLogin: p.githubLogin,
+        githubId: p.githubId,
+        role: p.role,
+        issuedKeys: p.issuedKeys as never[],
+      });
+    },
+    withdrawInvite: async (p) => {
+      await withdrawInvite({ memberId: p.memberId as never });
     },
     revokeSession: async (p) => {
       await revoke({ sessionId: p.sessionId as never });

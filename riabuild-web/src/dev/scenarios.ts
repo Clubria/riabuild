@@ -4,6 +4,7 @@ import {
   DeviceRequest,
   IssuedKey,
   Member,
+  OrgCandidate,
   OrgConfig,
   Session,
   SharedServer,
@@ -36,6 +37,7 @@ const LEAD: Member = {
   role: "lead",
   status: "active",
   joinedAt: NOW - 200 * DAY,
+  invited: false,
 };
 
 const DEVELOPER: Member = {
@@ -49,6 +51,7 @@ const DEVELOPER: Member = {
   role: "developer",
   status: "active",
   joinedAt: NOW - 40 * DAY,
+  invited: false,
 };
 
 const CANDIDATE: Member = {
@@ -62,6 +65,7 @@ const CANDIDATE: Member = {
   role: "candidate",
   status: "active",
   joinedAt: NOW - 2 * DAY,
+  invited: false,
 };
 
 const SUSPENDED: Member = {
@@ -75,6 +79,7 @@ const SUSPENDED: Member = {
   role: "developer",
   status: "suspended",
   joinedAt: NOW - 90 * DAY,
+  invited: false,
 };
 
 /**
@@ -95,6 +100,7 @@ const HOSTILE: Member = {
   role: "candidate",
   status: "suspended",
   joinedAt: NOW - DAY,
+  invited: false,
 };
 
 const UNICODE: Member = {
@@ -108,7 +114,59 @@ const UNICODE: Member = {
   role: "developer",
   status: "active",
   joinedAt: NOW - 10 * DAY,
+  invited: false,
 };
+
+/**
+ * Somebody a lead recorded before they ever signed in.
+ *
+ * Everything a sign-in would have filled is empty — no name, no email — which
+ * is the state the member list has to stay readable in, and the reason the row
+ * is marked rather than left to look like a developer who never filled their
+ * profile in. `joinedAt` is when they were invited.
+ */
+const INVITED: Member = {
+  _id: "m_invited",
+  memberId: "8b4d2f7a-3c6e-4915-b8d2-1f7a4c9e6b35",
+  githubLogin: "priya",
+  githubId: "7",
+  firstName: "",
+  lastName: "",
+  email: "",
+  role: "developer",
+  status: "active",
+  joinedAt: NOW - 3 * DAY,
+  invited: true,
+};
+
+/**
+ * An invited *lead*, which is the row most likely to be misread: it says lead
+ * beside a name nobody has ever authenticated. Worth looking at precisely
+ * because it is the one a reader would assume the worst about.
+ */
+const INVITED_LEAD: Member = {
+  _id: "m_invited_lead",
+  memberId: "3f9c1e5b-7d2a-4864-9c1e-5b8d3a7f2c94",
+  githubLogin: "morgan",
+  githubId: "8",
+  firstName: "",
+  lastName: "",
+  email: "",
+  role: "lead",
+  status: "active",
+  joinedAt: NOW - 6 * 60 * 60_000,
+  invited: true,
+};
+
+/** What GitHub reports when a lead asks who is in the org. */
+const ORG_CANDIDATES: OrgCandidate[] = [
+  { login: "ilya", githubId: "1" },
+  { login: "dana", githubId: "2" },
+  { login: "priya", githubId: "7" },
+  { login: "morgan", githubId: "8" },
+  { login: "wren", githubId: "9" },
+  { login: "kofi", githubId: "10" },
+];
 
 const ACTIVE_SESSION: Session = {
   _id: "s_active",
@@ -328,6 +386,9 @@ function base(viewer: Member | null): Data {
     updateProfile: NOOP,
     setRole: NOOP,
     setStatus: NOOP,
+    listOrgMembers: async () => ORG_CANDIDATES,
+    inviteMember: NOOP,
+    withdrawInvite: NOOP,
     revokeSession: NOOP,
     updateOrg: NOOP,
     addSharedServer: NOOP,
@@ -463,6 +524,66 @@ export const SCENARIOS: Record<string, () => Data> = {
     members: { state: "ready", value: [] },
   }),
 
+  /**
+   * The member list holding people nobody has signed in as. Both an invited
+   * developer and an invited lead, because the second is the row a reader would
+   * otherwise misread as a live administrator.
+   */
+  "members-invited": () => ({
+    ...base(LEAD),
+    members: {
+      state: "ready",
+      value: [LEAD, INVITED_LEAD, DEVELOPER, INVITED, CANDIDATE],
+    },
+  }),
+
+  /**
+   * Everyone GitHub reports is already here. Reached by pressing the button, so
+   * the fixture supplies only logins the base member list already holds.
+   */
+  "invite-nobody-left": () => ({
+    ...base(LEAD),
+    listOrgMembers: async () => [
+      { login: "ilya", githubId: "1" },
+      { login: "dana", githubId: "2" },
+    ],
+  }),
+
+  /**
+   * The org list could not be fetched. Its own state rather than a member-list
+   * failure: the member list is fine, and what is missing is the one thing that
+   * turns typing a name into picking one.
+   */
+  "invite-org-unreachable": () => ({
+    ...base(LEAD),
+    listOrgMembers: async (): Promise<never> => {
+      throw new Error(
+        "[CONVEX A(github:listOrgMembers)] Uncaught Error: GITHUB_ORG_TOKEN is not set " +
+          "on the riabuild deployment, so the org's members cannot be listed.",
+      );
+    },
+  }),
+
+  /** The invitation came back refused — the person is already here. */
+  "invite-refused": () => ({
+    ...base(LEAD),
+    inviteMember: async (): Promise<never> => {
+      throw new Error(
+        "[CONVEX M(members:invite)] Uncaught Error: @priya has already been invited.",
+      );
+    },
+  }),
+
+  /**
+   * Inviting with no keys to give. The panel has to say why the row of key
+   * toggles is missing rather than silently not being there — a lead who came
+   * here to hand somebody a key would otherwise think the feature was broken.
+   */
+  "invite-no-keys": () => ({
+    ...base(LEAD),
+    issuedKeys: { state: "ready", value: [] },
+  }),
+
   /** No shared servers yet — what a lead sees before they add the first one. */
   "shared-servers-empty": () => ({
     ...base(LEAD),
@@ -512,6 +633,8 @@ export const SCENARIOS: Record<string, () => Data> = {
     updateProfile: REJECT,
     setRole: REJECT,
     setStatus: REJECT,
+    inviteMember: REJECT,
+    withdrawInvite: REJECT,
     revokeSession: REJECT,
     updateOrg: REJECT,
     addSharedServer: REJECT,
@@ -525,7 +648,32 @@ export const SCENARIOS: Record<string, () => Data> = {
 
   overflow: () => ({
     ...base({ ...LEAD, ...HOSTILE, role: "lead", status: "active" }),
-    members: { state: "ready", value: [HOSTILE, UNICODE, SUSPENDED] },
+    members: {
+      state: "ready",
+      value: [
+        HOSTILE,
+        UNICODE,
+        SUSPENDED,
+        // An invited row carrying the hostile login: three badges in the state
+        // column and an unbroken 60-character name in the one beside it, which
+        // is where a table with an extra badge runs out of room first.
+        {
+          ...HOSTILE,
+          _id: "m_invited_hostile",
+          githubLogin: `invited-${"b".repeat(52)}`,
+          githubId: "99",
+          role: "lead",
+          status: "active",
+          invited: true,
+        },
+      ],
+    },
+    // A 39-character login is what GitHub actually permits, and an option that
+    // long is what widens a `<select>` past the column it sits in.
+    listOrgMembers: async () => [
+      { login: "z".repeat(39), githubId: "1001" },
+      { login: "田中さんの非常に長い名前", githubId: "1002" },
+    ],
     sessions: { state: "ready", value: [HOSTILE_SESSION, EXPIRED_SESSION] },
     orgConfig: {
       state: "ready",

@@ -65,6 +65,17 @@ export function Gallery() {
             no pending label
           </Button>
         </Row>
+        {/* A toggle rather than an action. The pair is the point: the two
+            states have to be told apart at a glance and by a screen reader, and
+            it was the second that was missing until `pressed` existed. */}
+        <Row label="pressed">
+          <Button variant="primary" pressed>
+            on
+          </Button>
+          <Button variant="quiet" pressed={false}>
+            off
+          </Button>
+        </Row>
         <Row label="as link">
           <Button variant="quiet" href="/__ui">
             href
