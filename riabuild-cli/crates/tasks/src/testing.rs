@@ -61,6 +61,28 @@ pub async fn install_owned_tools(ctx: &Ctx) {
     }
 }
 
+/// A `Ctx` shaped like a **managed server**: `root()` is a per-developer
+/// namespace under `~/.riabuild-remote/<member-id>`, and `tools_root()` stays at
+/// `~/.riabuild` where every developer on the box shares one toolchain.
+///
+/// The laptop shape every other helper here builds collapses the two into one
+/// directory, so a path that must be the *shared* one and a path that must be
+/// the *namespaced* one are indistinguishable in those tests. Anything that has
+/// to be right on a server needs this instead — `claude_statusline` is the case
+/// that proved it, having shipped for months writing its script somewhere the
+/// org settings never named.
+pub async fn ctx_on_a_server(runner: FakeRunner) -> (Ctx, TempDir) {
+    let (mut ctx, home, _) = build(runner, MemoryKeychain::with_token("rb_test_token")).await;
+    let root =
+        riabuild_paths::remote_namespace(home.path(), "550e8400-e29b-41d4-a716-446655440000");
+    tokio::fs::create_dir_all(&root)
+        .await
+        .expect("create the namespace");
+    ctx.paths = Arc::new(RealPaths::with_root(home.path(), &root));
+    ctx.server = Some("build-01".to_string());
+    (ctx, home)
+}
+
 /// Like `ctx_with`, but hands back the runner as well.
 ///
 /// Some things a task must get right are only visible in *what it ran*: that a

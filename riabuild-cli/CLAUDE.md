@@ -659,6 +659,26 @@ the first.
 it on the command line. Before adding anything to the dashboard's settings JSON, check it
 is a settings key at all: one that is not gets served to every laptop and read by nobody.
 
+**A settings value that names a path names it on every machine, so what it names goes in
+`tools_root()`.** The org settings carry `node ~/.riabuild/claude-statusline.js`. Claude
+Code runs that through a shell, so the `~` is the *account's* home wherever it lands —
+and on a server that is the shared account, not the developer's namespace.
+`claude_statusline` built its path on `root()` instead, which is the same directory on a
+laptop and `~/.riabuild-remote/<member-id>` on a server: the script went into the
+namespace, `node` was handed a path that did not exist, and remote mode had no status
+line for its whole life. Nothing errored. A status line whose command fails renders as
+*no status line*, so the only visible symptom was an absence, and `check()` reported
+satisfied because the file it looked for was the one it had written.
+
+Two lessons outlive the one file. **A path a *settings value* names cannot be built on
+`root()`**, because the settings are org-wide and `root()` is per developer — the two are
+only reconcilable where they coincide, which is exactly the machine every test was
+written on. And a test that pins such a path must assert the **whole** path: the one
+guarding this asserted the filename and the prefix separately, so both halves stayed true
+when `root()` moved out from under the command and the test that existed to connect the
+two repositories went on passing while they disagreed. `e2e/remote/run.sh` now looks for
+the script on the server, which is the only gate that could have seen it.
+
 `claude_agents_view` is also the one task that **offers** rather than imposes. It writes
 the key only where the account has no answer, because `/config` persists a developer's
 `false` and a task that asserted `true` every run would silently overrule them on every

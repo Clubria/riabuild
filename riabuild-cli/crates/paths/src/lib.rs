@@ -81,13 +81,30 @@ pub trait Paths: Send + Sync {
     fn bin_dir(&self) -> PathBuf {
         self.root().join("bin")
     }
-    /// The Claude Code status line script. It sits beside `org-settings.json`
-    /// rather than in `bin/` because it is a Node script Claude Code runs by
-    /// name, not something that belongs on `PATH`. The org settings name this
-    /// path as `node ~/.riabuild/claude-statusline.js`, so it cannot move
-    /// without them.
+    /// The Claude Code status line script. Not in `bin/`, because it is a Node
+    /// script Claude Code runs by name rather than something that belongs on
+    /// `PATH`.
+    ///
+    /// **`tools_root()`, not `root()`** — the one thing about this path that is
+    /// load-bearing. The org settings name it as `node
+    /// ~/.riabuild/claude-statusline.js`, Claude Code runs that through a shell,
+    /// and `~` is the account's home on every machine. On a laptop the two roots
+    /// coincide and either spelling works; on a server `root()` moves into
+    /// `~/.riabuild-remote/<member-id>` and only `tools_root()` stays where the
+    /// command points. Built on `root()`, as it was until 2026-08-17, the script
+    /// landed in the namespace, `node` was handed a path that did not exist, and
+    /// a status line whose command fails is simply absent — so remote mode had
+    /// none, with the task reporting satisfied throughout.
+    ///
+    /// It belongs in the shared tree on its own merits, which is why the fix is
+    /// this way round rather than a path rewritten per developer: the bytes are
+    /// compiled into the binary, so every developer on the box gets the same
+    /// ones, and this is a *program the machine runs* — the same category as the
+    /// node that runs it. Sharing it costs one write when two developers on one
+    /// server run different riabuilds, which `claude_statusline`'s byte
+    /// comparison already treats as ordinary drift.
     fn claude_statusline_file(&self) -> PathBuf {
-        self.root().join("claude-statusline.js")
+        self.tools_root().join("claude-statusline.js")
     }
     fn node_dir(&self, version: &str) -> PathBuf {
         self.tools_root().join("node").join(version)
