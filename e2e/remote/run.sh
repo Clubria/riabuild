@@ -597,6 +597,27 @@ test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
 # valid file that would satisfy `test -f` and carry no policy at all.
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_A/org-settings.json"
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settings.json"
+# status line: one script, at the path the settings above actually name
+#
+# The counterpart to those two assertions, and the case where the namespace is
+# the *wrong* answer. Those settings name `node ~/.riabuild/claude-statusline.js`;
+# Claude Code runs it through a shell, so `~` is this box's shared account. The
+# task built that path on `RIABUILD_ROOT` until 2026-08-17 and therefore wrote
+# into each namespace instead — `node` was handed a path that does not exist, and
+# a status line whose command fails renders as no status line at all. Nothing
+# errored, nothing was logged, and the task reported satisfied on both runs.
+#
+# Written here, and — like every assertion in this block — NOT RUNNING YET, for
+# reason (2) in the header. It is recorded rather than claimed: the live gate on
+# that bug is `claude_statusline`'s own unit tests, which now build a server
+# shape via `testing::ctx_on_a_server` instead of the laptop every test here had
+# been built on. This line is what starts covering it from outside the binary the
+# moment the run gets past the install step.
+in_container "test -s ~/.riabuild/claude-statusline.js"
+# and nowhere else — a copy in a namespace is byte-identical to the live script,
+# so it answers "is the script installed?" with a yes that means nothing.
+in_container "! test -e ~/.riabuild-remote/$MEMBER_A/claude-statusline.js"
+in_container "! test -e ~/.riabuild-remote/$MEMBER_B/claude-statusline.js"
 
 # Names what was checked rather than counting it, and never claims "all
 # assertions passed" — that phrasing is how this script once reported a run
@@ -604,4 +625,5 @@ in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settin
 # branch that changed the set conflict with every other one.
 echo "remote mode e2e passed — separate namespaces, separate git identities,"
 echo "one shared toolchain, per-developer checkouts, no gh credential left"
-echo "behind, and the team's Claude Code settings in each namespace."
+echo "behind, the team's Claude Code settings in each namespace, and the status"
+echo "line script at the one path those settings name."
