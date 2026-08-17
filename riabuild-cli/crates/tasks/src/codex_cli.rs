@@ -161,12 +161,20 @@ impl Task for CodexCli {
 /// it is.
 ///
 /// Named rather than folded into `check()` so the three states — absent,
-/// unreadable, different — each get a sentence a developer can act on. An
-/// unreadable launcher is drift like any other: `apply()` rewrites it.
+/// unreadable, different — each get a sentence a developer can act on, and they
+/// are three rather than two on purpose: "is missing" printed for a launcher
+/// sitting right there at mode 000 sends the developer looking for the wrong
+/// problem. Either way it is drift, and `apply()` rewrites it.
 async fn launcher_drift(ctx: &Ctx) -> Option<String> {
     let path = ctx.paths.bin_dir().join("codex");
-    let Ok(found) = tokio::fs::read_to_string(&path).await else {
-        return Some(format!("{} is missing", path.display()));
+    let found = match tokio::fs::read_to_string(&path).await {
+        Ok(found) => found,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(format!("{} is missing", path.display()));
+        }
+        Err(error) => {
+            return Some(format!("{} could not be read: {error}", path.display()));
+        }
     };
     let wanted =
         shims::codex::launcher_script(&ctx.paths.codex_dir(), &ctx.codex(), &ctx.paths.bin_dir());
@@ -368,6 +376,40 @@ mod tests {
 
         let status = CodexCli.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("missing"), "{status:?}");
+    }
+
+    /// A launcher riabuild cannot read is drift too, and says so in its own
+    /// words. Reporting "is missing" for a file sitting right there would send
+    /// the developer looking for the wrong problem.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_launcher_is_drift_and_does_not_claim_to_be_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ctx, _home) = ready().await;
+        let path = ctx.paths.bin_dir().join("codex");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+
+        // Root reads a 000 file regardless, and this suite runs in containers
+        // that sometimes are root. Asserting on a permission the kernel did not
+        // actually enforce would be a test that passes for the wrong reason, so
+        // ask whether the mode took effect rather than assuming it did.
+        let enforced = tokio::fs::read_to_string(&path).await.is_err();
+        let status = CodexCli.check(&ctx).await.unwrap();
+        // Restored before any assertion can leave the tempdir unremovable.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        if !enforced {
+            return;
+        }
+        assert_ne!(status, Status::Satisfied, "{status:?}");
+        assert!(
+            !format!("{status:?}").contains("is missing"),
+            "a file that is present must not be reported as missing: {status:?}"
+        );
     }
 
     #[tokio::test]
