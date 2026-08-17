@@ -21,6 +21,8 @@
 use super::{Ctx, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
+use riabuild_paths::contract_tilde;
+use riabuild_ui::Failure;
 
 /// The script itself, compiled in. A `brew upgrade` is the only thing that can
 /// change what runs on a developer's machine.
@@ -100,8 +102,28 @@ impl Task for ClaudeStatusline {
         // live script, so anyone debugging a status line finds it, reads it,
         // and concludes the installed script is correct. Removing it is the
         // second half of moving the file, not tidying.
-        if let Some(stale) = superseded_copy(ctx) {
-            let _ = tokio::fs::remove_file(&stale).await;
+        //
+        // The failure is reported rather than swallowed, and that is the whole
+        // reason this is not a bare `let _ =`. `check()` looks for this file, so
+        // a removal that quietly did nothing comes back as "an older riabuild
+        // left a script in your namespace" on every run from here on, with
+        // nothing naming the reason. Saying `remove` failed, and on what, is the
+        // difference between one actionable error and a permanent unexplained
+        // one.
+        if let Some(stale) = superseded_copy(ctx)
+            && tokio::fs::try_exists(&stale).await.unwrap_or(false)
+        {
+            tokio::fs::remove_file(&stale).await.map_err(|error| {
+                Failure::new(
+                    format!(
+                        "removing the status line script an older riabuild left at {}",
+                        contract_tilde(&stale, &ctx.paths.home())
+                    ),
+                    "delete that file and run `riabuild` again — the status line itself is \
+                     already installed",
+                )
+                .detail(error.to_string())
+            })?;
         }
         Ok(())
     }
