@@ -228,6 +228,18 @@ mod tests {
                 "github.com\n  ✓ Logged in to github.com account ada\n  - Token scopes: 'gist', 'read:org', 'repo'",
             )
             .with(MEMBERSHIP, 0, r#"{"state":"active","role":"member"}"#, "")
+            // Every interactive `gh auth` command riabuild runs is preceded by
+            // this one — see `sign_in::own_git_credentials`. A machine where it
+            // works is part of what `healthy` means.
+            .with("gh auth setup-git", 0, "", "")
+    }
+
+    /// Where `fragment` appears in the recorded calls, for asserting order.
+    fn position(calls: &[String], fragment: &str) -> usize {
+        calls
+            .iter()
+            .position(|call| call.contains(fragment))
+            .unwrap_or_else(|| panic!("`{fragment}` was never run: {calls:?}"))
     }
 
     async fn reason(runner: FakeRunner) -> String {
@@ -365,6 +377,94 @@ mod tests {
         let subdued = calls.subdued_calls();
         assert_eq!(subdued.len(), 1, "{subdued:?}");
         assert!(subdued[0].contains("auth refresh"), "{subdued:?}");
+
+        // `gh auth refresh` asks the same unanswerable question the sign-in
+        // does — `refresh.go` carries `login_flow.go`'s `Interactive &&
+        // gitProtocol == "https"` pair — so it is settled before this hand-over
+        // too, and not in `sign_in` alone.
+        let ran = calls.calls();
+        assert!(
+            position(&ran, "auth setup-git") < position(&ran, "auth refresh"),
+            "the credential question must be settled before the refresh: {ran:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gh_owns_gits_credentials_before_it_is_handed_the_terminal() {
+        // The bug this covers stopped `riabuild remote` dead, with no device
+        // code and no way forward. `gh auth login` opens by asking
+        //
+        //     ? Authenticate Git with your GitHub credentials? (Y/n)
+        //
+        // *before* it authenticates anything, and under a subdued child that
+        // `survey` prompt cannot be answered at all: it sizes the terminal by
+        // parking the cursor at `ESC[999;999f` and reading the reply to
+        // `ESC[6n`, `subdue` drops both, riabuild answers no terminal query,
+        // and every keystroke after it is swallowed by a parser waiting for a
+        // cursor report. Answering it in advance is what keeps this flow to
+        // text and a wait for a person.
+        let runner = healthy()
+            .with("gh auth status", 1, "", "You are not logged into any hosts")
+            .with("gh auth login", 0, "", "");
+        let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
+        install_owned_tools(&ctx).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(true);
+
+        GithubCli.apply(&mut ctx).await.unwrap();
+
+        let ran = calls.calls();
+        assert!(
+            position(&ran, "auth setup-git") < position(&ran, "auth login"),
+            "the credential question must be settled before the sign-in: {ran:?}"
+        );
+        // Both flags, because neither is optional. Without `--hostname
+        // github.com` `--force` is rejected outright, and without `--force`
+        // `setup-git` refuses a host that is not authenticated yet — which is
+        // every host, at this point in the flow, since the sign-in has not
+        // happened. Losing either one puts the prompt straight back.
+        let setup = &ran[position(&ran, "auth setup-git")];
+        assert!(setup.contains("--hostname github.com"), "{setup}");
+        assert!(setup.contains("--force"), "{setup}");
+        // Captured, not subdued: it asks nothing and prints nothing, so it has
+        // no business holding a pty. The sign-in is the only call that does.
+        let subdued = calls.subdued_calls();
+        assert_eq!(subdued.len(), 1, "{subdued:?}");
+        assert!(subdued[0].contains("auth login"), "{subdued:?}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_helper_that_cannot_be_taken_over_stops_before_the_hand_over() {
+        // Loud, not skipped. Carrying on would hand `gh` the terminal with the
+        // prompt still to come, which is the hang this whole path exists to
+        // avoid — and this repository would rather present a hang as a red job
+        // than as a slow one.
+        let runner = healthy()
+            .with("gh auth status", 1, "", "You are not logged into any hosts")
+            .with("gh auth login", 0, "", "")
+            .with("gh auth setup-git", 1, "", "fatal: not in a git directory");
+        let (mut ctx, _home, calls) = ctx_and_runner(runner).await;
+        install_owned_tools(&ctx).await;
+        ctx.ui = Ui::new(true).assume_prompts_work(true);
+
+        let failed = GithubCli.apply(&mut ctx).await.unwrap_err();
+        let message = failed.to_string();
+        assert!(message.contains("credentials"), "{message}");
+        // `gh`'s own reason has to reach the developer, and `Display` carries
+        // only the attempt and the next action — the cause travels in the
+        // detail. A failure here is one nobody can act on without it.
+        let failure = failed
+            .downcast_ref::<Failure>()
+            .unwrap_or_else(|| panic!("not a Failure: {message}"));
+        assert!(
+            failure.detail.contains("not in a git directory"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            !calls.calls().iter().any(|call| call.contains("auth login")),
+            "gh must never be handed the terminal: reaching it is the hang. {:?}",
+            calls.calls()
+        );
     }
 
     #[tokio::test]
@@ -399,6 +499,17 @@ mod tests {
         assert!(
             !calls.calls().iter().any(|call| call.contains("auth login")),
             "gh must never be started at all: reaching it is the hang. {:?}",
+            calls.calls()
+        );
+        // The no-terminal guard comes first, so an unattended run does not
+        // rewrite the developer's global git config on its way to refusing.
+        // Nothing here needed a credential helper.
+        assert!(
+            !calls
+                .calls()
+                .iter()
+                .any(|call| call.contains("auth setup-git")),
+            "{:?}",
             calls.calls()
         );
     }

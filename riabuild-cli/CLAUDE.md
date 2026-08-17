@@ -170,6 +170,18 @@ as long as the developer takes to type a password, and a blocking read would hol
 reactor with it. The handoff remains the default and the rule everywhere `subdued` is
 `None`, which is every site except apt, dnf, and `gh auth login`.
 
+**A subdued child may never ask the terminal a question.** Dropping every escape sequence
+drops the ones that are *questions*, and under a pty riabuild owns riabuild is the only
+thing that could answer them — it answers none. A child that asks waits for ever, and it
+waits while eating the developer's keystrokes, because the read it is blocked in is looking
+for a reply rather than for input. `gh auth login` used to open with a `survey` confirm
+(*"Authenticate Git with your GitHub credentials? (Y/n)"*, asked **before** it
+authenticates), and `survey` sizes the terminal with `ESC[999;999f` then `ESC[6n`;
+`riabuild remote` sat on that line ignoring every `y`, with no device code above it to hint
+why. `github_cli`'s `own_git_credentials` removes the question rather than answering it.
+So the test for a new subdued site is not "is its output untidy" but "does it ask" — plain
+text and a wait for a person is fine, a full-screen prompt library is not.
+
 Three things are synchronous because they are not IO, and are not exceptions to anything:
 `paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
 candidates, and tarball extraction is CPU work over an in-memory buffer — `extract_tarball`
