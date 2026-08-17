@@ -607,9 +607,12 @@ in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settin
 # a status line whose command fails renders as no status line at all. Nothing
 # errored, nothing was logged, and the task reported satisfied on both runs.
 #
-# Only a look at the filesystem could have caught that, and only from out here:
-# every unit test until now built a laptop, where the shared root and the
-# namespace are the same directory and both spellings pass.
+# Written here, and — like every assertion in this block — NOT RUNNING YET, for
+# reason (2) in the header. It is recorded rather than claimed: the live gate on
+# that bug is `claude_statusline`'s own unit tests, which now build a server
+# shape via `testing::ctx_on_a_server` instead of the laptop every test here had
+# been built on. This line is what starts covering it from outside the binary the
+# moment the run gets past the install step.
 in_container "test -s ~/.riabuild/claude-statusline.js"
 # and nowhere else — a copy in a namespace is byte-identical to the live script,
 # so it answers "is the script installed?" with a yes that means nothing.

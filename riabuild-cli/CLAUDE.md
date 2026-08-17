@@ -676,8 +676,16 @@ only reconcilable where they coincide, which is exactly the machine every test w
 written on. And a test that pins such a path must assert the **whole** path: the one
 guarding this asserted the filename and the prefix separately, so both halves stayed true
 when `root()` moved out from under the command and the test that existed to connect the
-two repositories went on passing while they disagreed. `e2e/remote/run.sh` now looks for
-the script on the server, which is the only gate that could have seen it.
+two repositories went on passing while they disagreed.
+
+The live gate is `tasks::testing::ctx_on_a_server` — a `Ctx` whose `root()` and
+`tools_root()` are different directories, which is the machine every unit test in that
+crate had been missing. Reach for it for anything that has to be right on a server: the
+laptop shape collapses the two roots into one directory, so a path built on either passes.
+`e2e/remote/run.sh` looks for the script on the box as well, but that assertion is in the
+block that **does not run yet** — see reason (2) in its header — so it is a recorded
+intention rather than coverage, and reading it as coverage is the mistake that file's own
+comments exist to prevent.
 
 `claude_agents_view` is also the one task that **offers** rather than imposes. It writes
 the key only where the account has no answer, because `/config` persists a developer's
