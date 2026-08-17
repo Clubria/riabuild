@@ -119,6 +119,17 @@ pub trait Paths: Send + Sync {
     fn claude_config_file(&self, profile: &str) -> PathBuf {
         self.claude_profile_dir(profile).join(".claude.json")
     }
+    /// What `CODEX_HOME` points at — Codex CLI's `config.toml`, its sessions,
+    /// and its logs, under riabuild's tree rather than in `~/.codex`.
+    ///
+    /// A directory rather than a file, and it has to *exist*: Codex refuses to
+    /// start against a `CODEX_HOME` that is not there ("Error finding codex
+    /// home"), so naming it is only half of pointing at it. `codex_cli` creates
+    /// it and the generated launcher recreates it, because a developer who
+    /// deletes it should get a fresh Codex rather than a broken one.
+    fn codex_dir(&self) -> PathBuf {
+        self.root().join("codex")
+    }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)
     }

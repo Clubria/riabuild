@@ -553,9 +553,22 @@ step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
 for task in login github_cli infisical_cli toolchain project repo_status \
-            org_settings env_local claude_statusline; do
+            codex_cli org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
+
+# `codex_cli` is asserted on *both* paths, unlike the four below, and that is
+# the point of it being here: it waits on the toolchain and on nothing else, so
+# a developer who walked away from the Claude sign-in still has a working Codex.
+# It is declared ahead of `claude_accounts` in `registry()` precisely so that
+# stays true — an aborted apply ends the run, so a task behind the one browser
+# round trip would never run on the machine that most needs it to.
+check "the codex launcher is there" test -x "$RIA_HOME/bin/codex"
+check "the codex config directory is there" test -d "$RIA_HOME/codex"
+check_contains "the codex launcher pins riabuild's CODEX_HOME" \
+  "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "CODEX_HOME=\"$RIA_HOME/codex\""
+check_contains "the codex launcher adds --yolo" \
+  "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "--yolo"
 
 # The four tasks the sign-in gates. `claude_accounts` is only recorded once
 # account 1 is actually signed in; `claude_trust`, `claude_onboarding` and

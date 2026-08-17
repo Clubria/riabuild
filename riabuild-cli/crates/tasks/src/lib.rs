@@ -15,6 +15,7 @@ pub mod claude_onboarding;
 pub mod claude_plugins;
 pub mod claude_statusline;
 pub mod claude_trust;
+pub mod codex_cli;
 pub mod engine;
 pub mod env_local;
 pub mod github_cli;
@@ -353,6 +354,25 @@ impl Ctx {
         }
     }
 
+    /// The Codex CLI riabuild installed, by absolute path.
+    ///
+    /// Same reasoning as `claude()`, and the same fallback: Codex is installed
+    /// by riabuild's own npm, so its home is the pinned Node's `bin`, and
+    /// before a Node is pinned the bare name is the only thing a machine could
+    /// use.
+    pub fn codex(&self) -> String {
+        match &self.config.node_version {
+            Some(version) => self
+                .paths
+                .node_dir(version)
+                .join("bin")
+                .join("codex")
+                .to_string_lossy()
+                .into_owned(),
+            None => "codex".to_string(),
+        }
+    }
+
     fn owned_tool(&self, tool: &str, version: &str, member: &str) -> String {
         self.paths
             .tool_dir(tool, version)
@@ -372,6 +392,14 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(toolchain::Toolchain),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
+        // Ahead of `claude_accounts`, and that placement is load-bearing rather
+        // than cosmetic. Within a dependency wave tasks run in this order, and
+        // an `apply()` that fails aborts the whole run — so a Codex install
+        // declared after the one task that waits on a browser would never run
+        // on a machine whose developer walked away from the Claude sign-in.
+        // Nothing about Codex depends on that sign-in, so nothing about it
+        // should wait behind it.
+        Box::new(codex_cli::CodexCli),
         Box::new(claude_accounts::ClaudeAccounts),
         Box::new(org_settings::OrgSettings),
         Box::new(claude_trust::ClaudeTrust),

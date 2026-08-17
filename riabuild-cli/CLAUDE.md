@@ -382,8 +382,8 @@ one *moves* the untested branch into the wrapper rather than removing it, and a 
 hardcoding `false` would send every Mac to `secret-tool` while the suite stayed green on
 both hosts.
 
-**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, `gh`, and
-`infisical` are downloaded, verified against a published digest, and kept under
+**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
+and `infisical` are downloaded, verified against a published digest, and kept under
 `~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a
 package manager to install a dependency. Run them through `ctx.gh()` and `ctx.infisical()`
 rather than by name: during provisioning `~/.riabuild/bin` is not on `PATH`, so the bare
@@ -675,6 +675,41 @@ one — not because there is another prompt to suppress. Do not go looking for a
 plugin-trust key; there isn't one.
 
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
+
+## The Codex CLI
+
+`codex_cli` installs `@openai/codex` with the Node riabuild owns and writes one launcher,
+`~/.riabuild/bin/codex`, which pins `CODEX_HOME` to `~/.riabuild/codex` and adds `--yolo`.
+It does **not** sign anyone in: a Codex sign-in is the developer's own OpenAI account,
+nothing riabuild brokers, and nothing the onboarding path is blocked on.
+
+**One launcher, not nine.** Claude Code's numbering exists to keep several *sign-ins*
+apart. With nobody signed in, a second Codex directory would hold nothing that
+distinguishes it from the first, and `riabuild claude delete 3` would grow a counterpart
+with no account to delete.
+
+**`CODEX_HOME` has to exist, not merely be named.** Codex refuses to start against a
+directory that is not there — `Error finding codex home` — rather than creating one. So it
+is part of what `check()` asserts, and the launcher recreates it too: the gap between two
+riabuild runs is where a `rm -rf` lands, and the task would otherwise go on reporting a
+satisfied machine while every `codex` refused to start.
+
+**`--yolo` is a default, not an imposition, and it has to be.** Codex rejects the flag
+twice (`cannot be used multiple times`) and rejects it beside `--ask-for-approval`
+(`cannot be used with`), so a launcher that always appended it would make `codex --yolo`
+and `codex -a on-request` — the two things a developer who knows this tool is most likely
+to type — fail in the parser, naming a flag they never typed. The launcher scans its own
+arguments and stands aside where the developer expressed an approval policy.
+
+All three of those are undocumented, read out of Codex 0.147.0, which is why `MIN_VERSION`
+names that version and why `the_generated_launcher_runs_a_real_codex` is an `#[ignore]`d
+smoke test that runs the launcher itself. Run `cargo test -- --ignored` when the floor
+moves.
+
+The Claude launcher's `unset SSH_CONNECTION SSH_CLIENT SSH_TTY` and its `WAYLAND_DISPLAY`
+claim are deliberately **not** copied into it. Both are workarounds for behaviour read out
+of the Claude Code binary; neither is a fact about Codex, and asserting them here would be
+inventing an upstream behaviour rather than accommodating one.
 
 ## Colour
 
