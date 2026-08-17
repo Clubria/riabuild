@@ -214,6 +214,36 @@ Two behaviours are preserved, and one improves:
   which is what they meant by it — today it reaches riabuild, which is not running apt.
 - **EOF.** `0x04` forwards the same way.
 
+## riabuild becomes the terminal, and it answers no question
+
+Dropping what a child draws with has a consequence this design did not state, and the
+omission cost a hang. Some escape sequences are **questions**, and under a pty riabuild
+owns, riabuild is the only thing that could answer them. It answers none: the filter drops
+`ESC[6n` along with every other CSI, and nothing writes a reply back to the master.
+
+A child that asks one therefore waits for ever — and worse than silently, because the read
+it is blocked in consumes the developer's keystrokes while it looks for a reply that is not
+coming. The prompt on screen is not slow to answer; it cannot be answered.
+
+This is not hypothetical. `gh auth login` opens with a `survey` confirm — *"Authenticate
+Git with your GitHub credentials? (Y/n)"* — **before** it authenticates anything, and
+`survey` measures the terminal by parking the cursor at `ESC[999;999f` and reading the
+reply to `ESC[6n`. `riabuild remote` sat on that line ignoring every `y`, with no device
+code above it to suggest what had gone wrong. The fix was to stop the question being asked
+(`tasks/github_cli/sign_in.rs`'s `own_git_credentials` settles it in advance), not to
+answer it.
+
+So the rule for adding a subdued site is narrower than "its output is untidy":
+
+> A child may be subdued only if it never asks the terminal anything. A child whose
+> prompts are drawn by a full-screen prompt library asks; plain text and a wait for a
+> person does not.
+
+apt, dnf and the device-code flow all satisfy that. If a future child does not, the
+choices are to remove the question at the source, or to stop subduing it — and if neither
+is possible, to teach `pty.rs` to reply, which means riabuild owning a cursor position it
+currently and deliberately throws away.
+
 ## Amendment to the stdio invariant
 
 `riabuild-cli/CLAUDE.md` currently exempts stdio from the async-IO rule on the grounds
