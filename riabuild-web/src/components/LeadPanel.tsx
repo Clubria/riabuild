@@ -266,7 +266,7 @@ export function OrgSettings() {
           spellCheck={false}
           onChange={setNgrokToken}
         />
-        <p className="mt-1 max-w-prose text-xs text-fg-faint">
+        <p className="mt-1 text-xs text-fg-faint wrap-value">
           Every developer&rsquo;s CLI fetches this when they run{" "}
           <span className="text-fg-dim">ngrok</span>, and stores it nowhere. One
           account carries the whole team, so who opened which tunnel is answered
