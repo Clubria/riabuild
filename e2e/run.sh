@@ -606,9 +606,50 @@ step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
 for task in login github_cli infisical_cli toolchain project repo_status \
-            org_settings env_local claude_statusline; do
+            codex_cli org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
+
+# `codex_cli` is asserted on *both* paths, unlike the four below, and that is
+# the point of it being here: it waits on the toolchain and on nothing else, so
+# a developer who walked away from the Claude sign-in still has a working Codex.
+# It is declared ahead of `claude_accounts` in `registry()` precisely so that
+# stays true — an aborted apply ends the run, so a task behind the one browser
+# round trip would never run on the machine that most needs it to.
+check "the codex launcher is there" test -x "$RIA_HOME/bin/codex"
+check_contains "the codex launcher adds --yolo" \
+  "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "--yolo"
+
+# All nine, each with its own directory and its own CODEX_HOME. Codex keeps
+# sign-ins apart per CODEX_HOME and by nothing else, so nine launchers sharing
+# one would be nine names for a single account — and every other assertion here
+# would still pass. `CODEX_HOMES` collects them so the distinctness of the set
+# can be asserted rather than just the presence of each.
+CODEX_HOMES=""
+for n in 1 2 3 4 5 6 7 8 9; do
+  check "codex profile $n has a config directory" test -d "$RIA_HOME/codex/$n"
+  check "the codex-$n launcher is there" test -x "$RIA_HOME/bin/codex-$n"
+  check_contains "codex-$n pins its own CODEX_HOME" \
+    "$(cat "$RIA_HOME/bin/codex-$n" 2>/dev/null || echo '')" \
+    "CODEX_HOME=\"$RIA_HOME/codex/$n\""
+  CODEX_HOMES="$CODEX_HOMES$(sed -n 's/^CODEX_HOME="\(.*\)"$/\1/p' \
+    "$RIA_HOME/bin/codex-$n" 2>/dev/null | head -1)
+"
+done
+CODEX_DISTINCT="$(printf '%s' "$CODEX_HOMES" | sort -u | grep -c . || true)"
+if [ "$CODEX_DISTINCT" = "9" ]; then
+  pass "the nine codex launchers open nine different accounts"
+else
+  fail "the codex launchers share a CODEX_HOME — $CODEX_DISTINCT distinct, expected 9"
+fi
+
+# `codex` and `codex-1` are one account under two names, the shape `claude` and
+# `claude-1` already have.
+if cmp -s "$RIA_HOME/bin/codex" "$RIA_HOME/bin/codex-1"; then
+  pass "the bare codex launcher is the first profile"
+else
+  fail "the bare codex launcher is not codex-1"
+fi
 
 # The four tasks the sign-in gates. `claude_accounts` is only recorded once
 # account 1 is actually signed in; `claude_trust`, `claude_onboarding` and

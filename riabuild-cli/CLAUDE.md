@@ -394,8 +394,8 @@ one *moves* the untested branch into the wrapper rather than removing it, and a 
 hardcoding `false` would send every Mac to `secret-tool` while the suite stayed green on
 both hosts.
 
-**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, `gh`, and
-`infisical` are downloaded, verified against a published digest, and kept under
+**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
+and `infisical` are downloaded, verified against a published digest, and kept under
 `~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a
 package manager to install a dependency. Run them through `ctx.gh()` and `ctx.infisical()`
 rather than by name: during provisioning `~/.riabuild/bin` is not on `PATH`, so the bare
@@ -715,6 +715,61 @@ one — not because there is another prompt to suppress. Do not go looking for a
 plugin-trust key; there isn't one.
 
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
+
+## The Codex CLI
+
+`codex_cli` installs `@openai/codex` with the Node riabuild owns and writes ten launchers:
+`codex-1` … `codex-9`, each pinning `CODEX_HOME` to its own `~/.riabuild/codex/<n>`, and
+`codex` for the first. Every one adds `--yolo`. riabuild does **not** sign anyone in: a
+Codex sign-in is the developer's own OpenAI account, nothing riabuild brokers, and nothing
+the onboarding path is blocked on.
+
+**Nine profiles, because Codex really does keep sign-ins apart.** It stores credentials in
+`$CODEX_HOME/auth.json` and nowhere else — no OS keychain, so nothing collides the way it
+would for a tool that keyed one. Verified against 0.147.0: two homes hold two different API
+keys at the same time, and `codex logout` in one leaves the other logged in.
+`two_launchers_hold_two_independent_logins` pins that through the generated launchers
+themselves, because nine scripts that each export a different directory and still shared an
+account would pass every other test in the file.
+
+**The nine exist from the first run** rather than being created on demand. Claude's
+accounts are made by riabuild's own sign-in flow, which is what gives it something to
+count; riabuild signs nobody in to Codex, so there is no moment at which it would learn a
+developer wants a second one. Nine empty directories cost nothing, and `codex-3 login`
+works the first time it is typed instead of failing on a `CODEX_HOME` that is not there.
+That is also why there is no `riabuild codex new|delete|primary`: with a fixed set nothing
+is ever created or renumbered, so `codex-3` and `~/.riabuild/codex/3` stay the same thing.
+
+**The profile directories are numbered, not uuids.** Claude's are uuids because its
+accounts can be deleted and renumbered, so *position* is the account number and the
+directory name has to survive that. Codex's set is fixed, so the name can simply be the
+number.
+
+**`CODEX_HOME` has to exist, not merely be named.** Codex refuses to start against a
+directory that is not there — `Error finding codex home` — rather than creating one. So all
+nine are part of what `check()` asserts, and each launcher recreates its own: the gap
+between two riabuild runs is where a `rm -rf` lands, and the task would otherwise go on
+reporting a satisfied machine while that `codex-<n>` refused to start. `check()` also
+compares all ten launchers against what riabuild would write now, not just `codex` — a
+developer who lives in `codex-4` would otherwise be the one person it cannot help.
+
+**`--yolo` is a default, not an imposition, and it has to be.** Codex rejects the flag
+twice (`cannot be used multiple times`) and rejects it beside `--ask-for-approval`
+(`cannot be used with`), so a launcher that always appended it would make `codex --yolo`
+and `codex -a on-request` — the two things a developer who knows this tool is most likely
+to type — fail in the parser, naming a flag they never typed. The launcher scans its own
+arguments and stands aside where the developer expressed an approval policy.
+
+All of those are undocumented, read out of Codex 0.147.0, which is why `MIN_VERSION` names
+that version and why the two `#[ignore]`d smoke tests run the generated launcher itself
+rather than asserting on the text of a shell script. Run `cargo test -- --ignored` when the
+floor moves. One trap they encode: `codex login status` reports on **stderr**, so a test
+that reads stdout gets an empty string and fails for the wrong reason.
+
+The Claude launcher's `unset SSH_CONNECTION SSH_CLIENT SSH_TTY` and its `WAYLAND_DISPLAY`
+claim are deliberately **not** copied into it. Both are workarounds for behaviour read out
+of the Claude Code binary; neither is a fact about Codex, and asserting them here would be
+inventing an upstream behaviour rather than accommodating one.
 
 ## Colour
 

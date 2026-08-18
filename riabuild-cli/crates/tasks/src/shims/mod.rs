@@ -46,6 +46,7 @@
 
 pub mod browser;
 pub mod clipboard;
+pub mod codex;
 
 use crate::Ctx;
 use anyhow::{Context, Result};

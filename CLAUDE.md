@@ -72,8 +72,8 @@ Editing that string in the dashboard cannot change what runs on a laptop — onl
 upgrade can. A settings key whose value the server chose the *contents* of would
 be the manifest again under another name.
 
-**riabuild owns every tool it installs.** Node, pnpm, Claude Code, `gh`, and `infisical`
-are downloaded by riabuild and verified against a published digest. No task shells out to
+**riabuild owns every tool it installs.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
+and `infisical` are downloaded by riabuild and verified against a published digest. No task shells out to
 Homebrew, apt, or dnf to install a dependency — those exist to distribute riabuild itself,
 nothing else. A provisioner that needs a package manager already set up cannot be the
 first thing a developer runs.
