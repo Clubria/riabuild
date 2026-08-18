@@ -324,6 +324,10 @@ pub(super) async fn connect_and_setup(
     if request.quiet {
         args.push("--quiet".to_string());
     }
+    if let Some(repo) = &request.repo {
+        args.push("--repo".to_string());
+        args.push(repo.clone());
+    }
     if let Some(project) = &request.project {
         args.push("--project".to_string());
         args.push(project.clone());

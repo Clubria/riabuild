@@ -151,6 +151,49 @@ export const forApi = internalQuery({
   handler: async (ctx) => await loadConfig(ctx),
 });
 
+/**
+ * Each half of `owner/repo`, as GitHub itself allows it.
+ *
+ * `repoSlug` was the one field this mutation stored without checking, and it is
+ * the field the CLI hands to `gh repo clone` and uses to *name a directory*. So
+ * `-upload-pack=…/x` was an argv option rather than a repository, and
+ * `Clubria/..` was the parent of the directory riabuild meant to clone into —
+ * with the brokered `.env` files landing there.
+ *
+ * `api::Repo::parse` refuses the same values on the CLI side, because a value a
+ * developer now types at the picker never reaches this mutation at all. Neither
+ * check makes the other redundant: this one keeps a lead's typo out of every
+ * developer's machine, and that one is what makes a developer's answer safe.
+ */
+const REPO_HALF = /^[A-Za-z0-9._-]+$/;
+
+/** GitHub's own ceiling is 39 for a login and 100 for a repository name. */
+const REPO_HALF_MAX = 100;
+
+function checkRepoSlug(raw: string): void {
+  const halves = raw.trim().split("/");
+  if (halves.length !== 2) {
+    throw new Error(
+      'The repository must be written "owner/repo", e.g. Clubria/ai-builders-hub.',
+    );
+  }
+  for (const half of halves) {
+    if (
+      half.length === 0 ||
+      half.length > REPO_HALF_MAX ||
+      half === "." ||
+      half === ".." ||
+      half.startsWith("-") ||
+      !REPO_HALF.test(half)
+    ) {
+      throw new Error(
+        `"${half}" cannot be half of a repository name — letters, digits, dot, ` +
+          "dash and underscore only, and not starting with a dash.",
+      );
+    }
+  }
+}
+
 export const update = mutation({
   args: {
     claudeSettings: v.optional(v.string()),
@@ -166,6 +209,10 @@ export const update = mutation({
     if (member === null) throw new Error("Not signed in.");
     if (member.role !== "lead" || member.status !== "active") {
       throw new Error("Only team leads can change org config.");
+    }
+
+    if (args.repoSlug !== undefined) {
+      checkRepoSlug(args.repoSlug);
     }
 
     if (args.claudeSettings !== undefined) {
@@ -202,7 +249,10 @@ export const update = mutation({
         args.claudeSettings !== current.claudeSettings
           ? now
           : current.claudeSettingsUpdatedAt,
-      repoSlug: args.repoSlug ?? current.repoSlug,
+      // Trimmed, because what is stored is what the CLI is served and what
+      // reaches `gh repo clone` — storing the untrimmed string while validating
+      // the trimmed one is how a value nobody checked gets shipped.
+      repoSlug: args.repoSlug?.trim() ?? current.repoSlug,
       minCliVersion: args.minCliVersion ?? current.minCliVersion,
       latestCliVersion: args.latestCliVersion ?? current.latestCliVersion,
       secretsUpdatedAt: args.markSecretsRotated

@@ -15,9 +15,12 @@
 //!
 //! `org::version_only` states the reasoning for the field beside this one: the
 //! client-side check exists so the CLI survives a server that forgets its own.
-//! Here it is one step stronger. `org.update` validates both version fields
-//! against a regex and accepts `repoSlug` as a bare string, so for this value
-//! there has never been a server-side check to forget.
+//! Here it was stronger still, because until this existed there was no
+//! server-side check at all — `org.update` validated both version fields against
+//! a regex and stored `repoSlug` as a bare string. It checks that too now, and
+//! the two do not make each other redundant: the server's keeps a lead's typo
+//! off every developer's machine, and this one is what makes a value a developer
+//! types at a prompt — which never passes through the server — safe.
 
 use anyhow::{Result, anyhow};
 use std::fmt;
@@ -108,8 +111,7 @@ impl Repo {
             format!("git@github.com:{slug}"),
             format!("ssh://git@github.com/{slug}"),
         ]
-        .iter()
-        .any(|candidate| remote == *candidate)
+        .contains(&remote)
     }
 }
 

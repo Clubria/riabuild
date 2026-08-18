@@ -4,10 +4,17 @@ Provisioning tool that gets a Clubria developer from "accepted a GitHub org invi
 "running Claude Code against our codebase with working secrets" without them making a
 single environment decision.
 
-The one exception is where their own source code lives, which riabuild offers rather than
-imposes: first setup shows the path it would use and takes Enter for yes, and
-`riabuild move-project` changes it later. Everything else stays riabuild's decision — a
+Two things are the exception, and riabuild *offers* both rather than imposing them.
+**Which repository** they are working on: every run opens with the list they are authorized
+to see and takes Enter for `ai-builders-hub`. And **where its source code lives**: first
+setup for a repository shows the path it would use and takes Enter for yes, with
+`riabuild move-project` changing it later. Everything else stays riabuild's decision — a
 developer who presses Enter has still decided nothing.
+
+Neither is a platform feature creeping in. A developer whose work is in a second Clubria
+repository had no path through riabuild at all: they cloned by hand, and the toolchain, the
+brokered `.env` files and the trusted Claude directory all stopped at the edge of the first
+one. See `docs/superpowers/specs/2026-08-18-repository-picker-design.md`.
 
 Design: `docs/superpowers/specs/2026-08-04-riabuild-design.md`. Read it before changing
 anything structural.
@@ -60,7 +67,10 @@ carry a config value in a commit, which is why this is written down rather than 
 
 **The server ships data, never logic.** Setup tasks are compiled into the Rust binary —
 versioned, auditable, distributed through signed Homebrew releases. riabuild-web provides
-the org Claude settings JSON, the repo slug, version floors, and brokered tokens. A
+the org Claude settings JSON, the *default* repo slug, version floors, and brokered
+tokens. It does not provide the list of repositories a developer may pick from: the CLI
+asks GitHub for that through the developer's own `gh`, so GitHub does the authorizing and
+riabuild holds no permission logic that could be wrong about it. A
 server-driven task manifest would be a remote code execution channel onto every
 developer's laptop. Do not cross this boundary for convenience.
 

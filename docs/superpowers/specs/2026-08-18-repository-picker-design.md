@@ -63,6 +63,11 @@ Two repositories therefore mean two checkouts, side by side, each keeping its ow
 branches, its own uncommitted work and its own `.env` files. Switching back to one is
 silent: the path is remembered, so nothing is re-cloned and nothing is asked.
 
+`active_repo` is written by whatever decided — the picker, or `--repo`. The `project` task
+fills it only when it is *blank*, and never overrules it: that is the first run above,
+where nothing put the question, and a machine that recorded a checkout while saying it
+works on no repository would be a file that contradicts itself.
+
 ### The old single path
 
 `project_path` stays, and stays serialised, until it is migrated. It cannot be folded in
@@ -76,9 +81,16 @@ run that rewrites `config.json` for an unrelated reason — `riabuild claude add
 drops a checkout nothing has folded yet, and the next run clones a second copy of the
 repository the developer already has.
 
-`Ctx::project_dir` reads the map, and falls back to `project_path` while the map is empty,
-so `riabuild status`, `riabuild env`, `riabuild shell` and `riabuild --check` all find the
-existing checkout on a machine whose migration has not run. Read both, write one.
+`Ctx::project_dir` reads the map, keyed by the repository *this run* is about rather than
+by `active_repo` — which repository a run is about is the run's to know, and `active_repo`
+is only how that is remembered for the next run's default.
+
+It falls back to `project_path` under two conditions together: the repository asked about
+is the org default, and nothing has chosen yet. Both are about never handing back a path
+that is a checkout of something else — the old path can only be a checkout of the default,
+and a machine that has chosen has a map. That is what lets `riabuild status`, `riabuild
+env`, `riabuild shell` and `riabuild --check` find an existing checkout on a machine whose
+migration has not run, none of which may write. Read both, write one.
 
 ### No per-repository task state
 
@@ -99,20 +111,39 @@ repository instead.
 A validated newtype replaces the bare string:
 
 ```rust
-pub struct Repo(String);              // always exactly "owner/name"
+pub struct Repo { slug: String, slash: usize }   // always exactly "owner/name"
 
 impl Repo {
-    pub fn parse(raw: &str, default_owner: &str) -> Result<Repo>;
-    pub fn name(&self) -> &str;       // was OrgConfig::repo_name
+    /// As `/api/v1/org/config` serves it: the owner is not optional.
+    pub fn parse(raw: &str) -> Result<Repo>;
+    /// As a developer types it: a bare name means "in our org".
+    pub fn parse_with_owner(raw: &str, default_owner: &str) -> Result<Repo>;
+    pub fn slug(&self) -> &str;
     pub fn owner(&self) -> &str;
+    pub fn name(&self) -> &str;                          // was OrgConfig::repo_name
     pub fn matches_remote(&self, remote: &str) -> bool;  // was OrgConfig::matches_remote
 }
 ```
 
+Two constructors rather than one with an `Option`, because the two callers differ in what
+a missing owner *means*. A developer typing `payments` is being helped; a dashboard slug
+naming no owner is a value that would clone whichever `payments` the signed-in account
+happens to own, and the old `repo_name()` let exactly that through.
+
 `parse` is the security-shaped part of this design, and the reason the newtype exists at
-all rather than another `String`. Today `repoSlug` is validated **on the server**:
-`org.update` tests it before storing, and the CLI trusts what it is served. A picker makes
-that value *developer input*, and it reaches two places that cannot take arbitrary text:
+all rather than another `String`.
+
+The first draft of this spec said `repoSlug` was validated on the server and that the
+picker was making a checked value into developer input. That was wrong, and the truth is
+worse: `org.update` validates `minCliVersion` and `latestCliVersion` against a regex and
+stores `repoSlug` as a bare `v.string()`. So a lead could already type anything into the
+dashboard and have it arrive on every developer's machine, and this feature is what
+noticed. Both ends are checked now — the server refuses the write, the CLI refuses the
+value — and neither makes the other redundant: one keeps a lead's typo off every machine,
+the other is what makes an answer typed at a prompt, which never passes through the
+server, safe.
+
+What the value reaches, on both paths:
 
 - `gh repo clone <slug> <dir>` argv, where a leading `-` is a flag rather than a
   repository, and
@@ -154,7 +185,7 @@ have no repositories" — the distinction `github.ts` already draws with `unavai
 
 | Situation | What the prompt does |
 |---|---|
-| `gh` not installed yet (first run) | offers the default, says the list needs GitHub sign-in and will be there next run |
+| `gh` not installed yet | offers the default, says the list needs GitHub sign-in and will be there next run |
 | `gh` present, the listing failed or timed out | offers the default, names the failure |
 | the listing worked and was empty | says so, rather than drawing an empty box |
 
@@ -168,6 +199,14 @@ In `provision`, between `ctx.connect()` — which is what makes the org default 
 
 `--check`, `status`, `env` and `shell` never ask. A dry run must change nothing, and
 `config.json` is part of nothing; the other three do less than provision by definition.
+
+**A machine with no session yet is not asked either**, which is every machine's first run.
+The question needs two things that arrive with a session — a default to offer, and a
+GitHub sign-in to list through — and neither exists before the `login` task has run, which
+happens inside the task engine the question is put in front of. So the first run
+provisions the org default and records it, and the run after it, which has both, puts the
+question. The alternative was splitting the engine in two around one prompt: a structural
+change, to buy a list on the one run that cannot have one anyway.
 
 **No terminal takes the default, silently.** `Ui::ask` answers `None` there and taking the
 default is the crate rule. `remote::pick` is the deliberate exception to that rule
@@ -187,15 +226,23 @@ The answer is settled by a pure function, so every rule is testable without a te
 ever reading real stdin — the split `remote::pick` documents:
 
 ```rust
-pub enum Choice {
-    /// Zero-based index into the repositories shown.
+pub enum Answer {
+    /// Enter: the repository the question offered.
+    Default,
+    /// A number, as a zero-based index into the rows shown.
     Listed(usize),
-    /// A name typed at the prompt.
+    /// A name, which may be any repository this developer can see.
     Named(Repo),
 }
 
-pub fn settle(answer: &str, listed: &[Entry], default_owner: &str) -> Option<Choice>
+/// `Err` carries the objection to put before asking again.
+pub fn settle(answer: &str, shown: usize, default_owner: &str) -> Result<Answer, String>
 ```
+
+`Err(String)` rather than `None`, because `Repo::parse` already knows *why* a name is
+unusable and the prompt should say that rather than "try again". Ordering and the ten-row
+cut are pure too, in `rows_for`, for the same reason: what the box shows is a rule, and a
+rule that can only be checked by drawing a box on a terminal is a rule nothing checks.
 
 ## Moving a checkout
 
@@ -211,6 +258,10 @@ choose and the question is not put at all, which keeps `riabuild move-project <p
 behaving precisely as it does today on the machine every developer has.
 
 Moving does not change which repository is active. It is a question about a directory.
+
+A typed name has to be one of the checkouts, and `riabuild has no checkout of X` is the
+answer when it is not — better said at the question than by a `rename` failing on a path
+nobody recorded.
 
 ## What this costs, said out loud
 
@@ -240,7 +291,8 @@ Moving does not change which repository is active. It is a question about a dire
 | `tasks/src/project.rs` | clones the active repository; the mismatch message names it |
 | `cli/` | `--repo`; `provision` puts the question; `status` reports the active repository and the known checkouts; `move-project` asks which |
 | `remote/` | `Request.repo`, forwarded as `--repo` |
-| `riabuild-web` | no endpoint change. One label: `repo <slug>` becomes `default repo <slug>`, so a lead is not told it is the only one |
+| `riabuild-web` | no endpoint change. `org.update` validates `repoSlug` and stores it trimmed — see above. One label: `repo <slug>` becomes `default repo <slug>`, so a lead is not told it is the only one |
+| `e2e/run.sh` | reads the checkout map rather than `project_path`, and one new step for `--repo` |
 | docs | this spec; the root `CLAUDE.md` exception becomes two — where source lives, and which repository |
 
 `/api/v1` is untouched. The server still ships one string and never a list it computed

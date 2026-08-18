@@ -297,14 +297,35 @@ impl Ctx {
     /// on a machine whose migration has not run: none of them puts the picker's
     /// question, and none of them may write. Read both, write one.
     pub fn project_dir(&self) -> Option<std::path::PathBuf> {
-        let repo = self.repo().ok()?;
-        let recorded = self.config.checkout_of(repo.slug()).or_else(|| {
-            let default = self.org.as_ref()?.default_repo().ok()?;
-            (repo == default)
-                .then(|| self.config.legacy_checkout())
-                .flatten()
-        });
+        let recorded = match self.repo().ok() {
+            Some(repo) => self
+                .config
+                .checkout_of(repo.slug())
+                .or_else(|| self.legacy_checkout_for(&repo)),
+            // Not signed in, and nothing has said which repository this is
+            // about. The one checkout an older riabuild recorded is still the
+            // answer — `riabuild move-project` on a laptop with no session is
+            // the case that reaches this.
+            None => self.config.legacy_checkout(),
+        };
         recorded.map(|path| riabuild_paths::expand_tilde(path, &self.paths.home()))
+    }
+
+    /// The pre-picker checkout, where it is an answer about `repo`.
+    ///
+    /// Two conditions, and both are about not handing back a path that is a
+    /// checkout of something else. It answers only for the org default, because
+    /// that is the only repository riabuild could have cloned before it asked;
+    /// and only while nothing has chosen, because a machine that has chosen has
+    /// a map, and a path outside it is one the map does not claim.
+    fn legacy_checkout_for(&self, repo: &Repo) -> Option<&str> {
+        if self.config.active_repo.is_some() {
+            return None;
+        }
+        match self.org.as_ref().and_then(|org| org.default_repo().ok()) {
+            Some(default) if *repo != default => None,
+            _ => self.config.legacy_checkout(),
+        }
     }
 
     /// Where a checkout goes when the developer has not chosen a place.

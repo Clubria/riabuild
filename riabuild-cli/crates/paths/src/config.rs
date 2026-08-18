@@ -215,17 +215,19 @@ impl UserConfig {
     /// repository — the only repository riabuild could have cloned before it
     /// asked.
     ///
-    /// A no-op once `active_repo` is set: from then on the map is the truth.
-    /// Clearing `project_path` in the same write is what stops a later run from
-    /// folding a stale path a second time.
+    /// Taken unconditionally, and never over an entry the map already has: the
+    /// field is cleared in the same write, so the only way it can reappear is an
+    /// older riabuild writing it again, and folding that under the default is
+    /// still the right reading of it.
+    ///
+    /// Says nothing about which repository is *active*. Both callers decide that
+    /// for themselves, and a fold that also claimed it would have to refuse to
+    /// run once they had — which is how a path gets orphaned in a file nothing
+    /// reads any more.
     pub fn adopt_legacy_checkout(&mut self, slug: &str) {
-        if self.active_repo.is_some() {
-            return;
-        }
         if let Some(path) = self.project_path.take() {
             self.repos.entry(slug.to_string()).or_insert(path);
         }
-        self.active_repo = Some(slug.to_string());
     }
 
     fn fold_legacy_profile(&mut self) {
@@ -615,25 +617,28 @@ mod tests {
         // question, so they read this file with the migration still pending —
         // and a path that is a checkout of the org default must not be handed
         // back as a checkout of anything else.
-        let mut config = UserConfig::default();
-        config.project_path = Some("/Users/ada/code/hub".into());
+        let config = UserConfig {
+            project_path: Some("/Users/ada/code/hub".into()),
+            ..UserConfig::default()
+        };
         assert_eq!(config.legacy_checkout(), Some("/Users/ada/code/hub"));
         assert_eq!(config.checkout_of("Clubria/ai-builders-hub"), None);
     }
 
     #[test]
     fn the_legacy_checkout_is_adopted_by_the_org_default_and_then_forgotten() {
-        let mut config = UserConfig::default();
-        config.project_path = Some("/Users/ada/code/hub".into());
+        let mut config = UserConfig {
+            project_path: Some("/Users/ada/code/hub".into()),
+            ..UserConfig::default()
+        };
 
         config.adopt_legacy_checkout("Clubria/ai-builders-hub");
 
         assert_eq!(
-            config.repos.get("Clubria/ai-builders-hub").map(String::as_str),
+            config.checkout_of("Clubria/ai-builders-hub"),
             Some("/Users/ada/code/hub"),
             "the developer's existing tree must not be re-cloned"
         );
-        assert_eq!(config.active_repo.as_deref(), Some("Clubria/ai-builders-hub"));
         assert_eq!(
             config.project_path, None,
             "the migrated field must be cleared in the same write"
@@ -641,25 +646,27 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_that_has_already_migrated_is_left_alone() {
-        // A `project_path` appearing after the map exists is the only way this
-        // is reachable, and the map is the truth from the first migration on.
+    fn a_fold_never_writes_over_a_checkout_the_map_already_has() {
+        // Reachable by an older riabuild writing the field again after a
+        // migration. The map is the truth, and the path in it is the one the
+        // last run actually cloned or moved.
         let mut config = UserConfig::default();
-        config.set_checkout("Clubria/payments", "/Users/ada/code/payments");
-        config.active_repo = Some("Clubria/payments".into());
+        config.set_checkout("Clubria/ai-builders-hub", "/Users/ada/code/hub");
         config.project_path = Some("/somewhere/stale".into());
 
         config.adopt_legacy_checkout("Clubria/ai-builders-hub");
 
-        assert_eq!(config.active_repo.as_deref(), Some("Clubria/payments"));
-        assert!(!config.repos.contains_key("Clubria/ai-builders-hub"));
+        assert_eq!(
+            config.checkout_of("Clubria/ai-builders-hub"),
+            Some("/Users/ada/code/hub")
+        );
+        assert_eq!(config.project_path, None, "and the stale field is gone");
     }
 
     #[test]
-    fn a_fresh_machine_adopts_nothing_and_still_becomes_active() {
+    fn a_fresh_machine_adopts_nothing() {
         let mut config = UserConfig::default();
         config.adopt_legacy_checkout("Clubria/ai-builders-hub");
-        assert_eq!(config.active_repo.as_deref(), Some("Clubria/ai-builders-hub"));
         assert!(config.repos.is_empty(), "there was no checkout to adopt");
     }
 

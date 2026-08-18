@@ -115,8 +115,8 @@ pub fn rows_for(
     rows.sort_by(|left, right| {
         let key = |row: &Row| {
             (
-                row.repo != *default,  // what Enter takes, first
-                !row.cloned,           // then the trees already here
+                row.repo != *default, // what Enter takes, first
+                !row.cloned,          // then the trees already here
                 std::cmp::Reverse(row.pushed_at),
                 row.repo.slug().to_string(),
             )
@@ -180,7 +180,7 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
     }
     ctx.ui.info("");
     ctx.ui.info(&render::repos_box(
-        org_default.owner(),
+        &format!("{} repositories", org_default.owner()),
         &rows,
         hidden,
         now(),
@@ -238,6 +238,125 @@ pub async fn adopt(ctx: &mut Ctx, chosen: Repo, org_default: &Repo) -> Result<Re
     }
     ctx.repo = Some(chosen.clone());
     Ok(chosen)
+}
+
+/// Which of this machine's checkouts a command that acts on one is about.
+///
+/// `None` is "there is nothing to choose": no checkout recorded at all, which on
+/// a machine whose migration has not run still means the one path `project_dir`
+/// finds. The caller keeps its own behaviour for that case rather than being
+/// handed a repository riabuild invented.
+///
+/// Restricted to repositories this machine has actually cloned, because a
+/// repository with no checkout has nothing to move. With exactly one there is no
+/// question to put, which is every machine that has only ever worked on one
+/// repository — so `riabuild move-project ~/elsewhere` there is unchanged.
+pub async fn choose_cloned(ctx: &mut Ctx) -> Result<Option<Repo>> {
+    let mut cloned: Vec<Repo> = ctx
+        .config
+        .repos
+        .keys()
+        .filter_map(|slug| Repo::parse(slug).ok())
+        .collect();
+    if cloned.is_empty() {
+        return Ok(None);
+    }
+
+    // What Enter takes: the repository this machine is working on, if it is one
+    // of the cloned ones.
+    let active = ctx
+        .config
+        .active_repo
+        .as_deref()
+        .and_then(|slug| Repo::parse(slug).ok())
+        .filter(|repo| cloned.contains(repo));
+    let default = active.clone().unwrap_or_else(|| cloned[0].clone());
+    cloned.sort_by_key(|repo| (*repo != default, repo.slug().to_string()));
+
+    if cloned.len() == 1 {
+        let only = cloned.remove(0);
+        ctx.repo = Some(only.clone());
+        return Ok(Some(only));
+    }
+
+    let chosen = if ctx.ui.interactive() {
+        let org_default = ctx.org.as_ref().and_then(|org| org.default_repo().ok());
+        let rows: Vec<Row> = cloned
+            .iter()
+            .map(|repo| Row {
+                default: org_default.as_ref() == Some(repo),
+                repo: repo.clone(),
+                pushed_at: 0,
+                cloned: true,
+            })
+            .collect();
+        ctx.ui.info("");
+        ctx.ui.info(&render::repos_box(
+            "Repositories checked out on this machine",
+            &rows,
+            0,
+            now(),
+            ctx.ui.theme(),
+        ));
+        ask_cloned(&ctx.ui, &cloned, &default)
+    } else {
+        // The crate rule: a prompt offers a choice, so nobody there takes the
+        // default. `move-project` with no path then fails at its own question,
+        // which is the failure that was always there.
+        default
+    };
+
+    ctx.repo = Some(chosen.clone());
+    Ok(Some(chosen))
+}
+
+/// The question, for a box whose rows are all checkouts.
+///
+/// A typed name has to be one of them: a repository this machine has not cloned
+/// has no directory to move, and "which repository" is a better place to say so
+/// than a failed `rename`.
+fn ask_cloned(ui: &Ui, cloned: &[Repo], default: &Repo) -> Repo {
+    let question = format!("Which repository's checkout? (press enter for {default})");
+    for _ in 0..ATTEMPTS {
+        let Some(answer) = ui.ask(&question) else {
+            break;
+        };
+        match settle(&answer, cloned.len(), default.owner()) {
+            Ok(Answer::Default) => break,
+            Ok(Answer::Listed(index)) => return cloned[index].clone(),
+            Ok(Answer::Named(named)) => match cloned.contains(&named) {
+                true => return named,
+                false => ui.warn(&format!(
+                    "riabuild has no checkout of {named} on this machine — \
+                     run `riabuild` and pick it to clone one"
+                )),
+            },
+            Err(objection) => ui.warn(&objection),
+        }
+    }
+    default.clone()
+}
+
+/// Records a repository named on the command line by `--repo`.
+///
+/// Separate from [`adopt`] only in where the org default comes from: `--repo` is
+/// honoured on a machine with no session, where there is no default to migrate a
+/// pre-picker checkout under, so there the choice is recorded on its own.
+pub async fn adopt_named(ctx: &mut Ctx, repo: Repo) -> Result<()> {
+    match ctx.org.as_ref().and_then(|org| org.default_repo().ok()) {
+        Some(default) => {
+            adopt(ctx, repo, &default).await?;
+        }
+        None => {
+            if !ctx.dry_run {
+                let slug = repo.slug().to_string();
+                ctx.update_config(|config: &mut UserConfig| config.active_repo = Some(slug))
+                    .await?;
+            }
+            ctx.repo = Some(repo);
+        }
+    }
+    Ok(())
 }
 
 fn now() -> u64 {
@@ -425,7 +544,10 @@ mod tests {
             Some("Clubria/ai-builders-hub"),
             "the answer has to be recorded before the tasks read it"
         );
-        assert_eq!(ctx.repo.as_ref().map(Repo::slug), Some("Clubria/ai-builders-hub"));
+        assert_eq!(
+            ctx.repo.as_ref().map(Repo::slug),
+            Some("Clubria/ai-builders-hub")
+        );
     }
 
     #[tokio::test]
@@ -445,7 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn three_unusable_answers_and_riabuild_takes_the_default() {
-        let (mut ctx, _home, _fake) = asked(&["nope/../x", "-x", "99", "2"], listing_runner()).await;
+        let (mut ctx, _home, _fake) =
+            asked(&["nope/../x", "-x", "99", "2"], listing_runner()).await;
 
         let chosen = choose(&mut ctx).await.expect("chooses");
 
@@ -488,7 +611,10 @@ mod tests {
         choose(&mut ctx).await.expect("chooses");
 
         assert_eq!(
-            ctx.config.repos.get("Clubria/ai-builders-hub").map(String::as_str),
+            ctx.config
+                .repos
+                .get("Clubria/ai-builders-hub")
+                .map(String::as_str),
             Some("/code/hub"),
             "the tree the developer already has must not be re-cloned"
         );
@@ -506,7 +632,10 @@ mod tests {
 
         assert_eq!(ctx.config.active_repo.as_deref(), Some("Clubria/payments"));
         assert_eq!(
-            ctx.config.repos.get("Clubria/ai-builders-hub").map(String::as_str),
+            ctx.config
+                .repos
+                .get("Clubria/ai-builders-hub")
+                .map(String::as_str),
             Some("/code/hub"),
             "switching away must not forget where the other tree is"
         );
@@ -536,7 +665,9 @@ mod tests {
         );
         let (mut ctx, _home, _fake) = asked(&[""], runner).await;
 
-        let chosen = choose(&mut ctx).await.expect("a failed listing is not fatal");
+        let chosen = choose(&mut ctx)
+            .await
+            .expect("a failed listing is not fatal");
 
         assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
     }

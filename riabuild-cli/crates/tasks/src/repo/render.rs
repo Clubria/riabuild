@@ -30,9 +30,13 @@ pub struct Row {
     pub default: bool,
 }
 
-pub fn repos_box(owner: &str, rows: &[Row], hidden: usize, now: u64, theme: Theme) -> String {
+/// `heading` rather than the org name, because the same box answers two
+/// different questions: which repository to work on, and which checkout to move.
+/// Naming the org above a list of this machine's own checkouts would be the wrong
+/// label on the right list.
+pub fn repos_box(heading: &str, rows: &[Row], hidden: usize, now: u64, theme: Theme) -> String {
     let mut lines = vec![
-        theme.paint(Role::Strong, &format!("{owner} repositories:")),
+        theme.paint(Role::Strong, &format!("{heading}:")),
         String::new(),
     ];
 
@@ -133,7 +137,7 @@ mod tests {
             row("ai-builders-hub", true, true, NOW - 2 * HOUR),
             row("payments", false, false, NOW - 50 * HOUR),
         ];
-        let drawn = repos_box("Clubria", &rows, 0, NOW, Theme::plain());
+        let drawn = repos_box("Clubria repositories", &rows, 0, NOW, Theme::plain());
 
         assert!(drawn.contains("Clubria repositories:"), "{drawn}");
         assert!(
@@ -151,7 +155,7 @@ mod tests {
         // Silent truncation would read as "this is all of them", which is the
         // one thing the box must not imply about an org list capped at ten.
         let rows = [row("payments", false, false, NOW)];
-        let drawn = repos_box("Clubria", &rows, 6, NOW, Theme::plain());
+        let drawn = repos_box("Clubria repositories", &rows, 6, NOW, Theme::plain());
         assert!(drawn.contains("… 6 more — type a name"), "{drawn}");
     }
 
@@ -161,7 +165,7 @@ mod tests {
         // past the first page. It is still pickable, and inventing an age for it
         // would be a lie in a column.
         let rows = [row("payments", true, false, 0)];
-        let drawn = repos_box("Clubria", &rows, 0, NOW, Theme::plain());
+        let drawn = repos_box("Clubria repositories", &rows, 0, NOW, Theme::plain());
         assert!(drawn.contains("cloned"), "{drawn}");
         assert!(!drawn.contains("pushed"), "{drawn}");
     }

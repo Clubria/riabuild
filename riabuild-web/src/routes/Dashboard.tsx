@@ -147,8 +147,8 @@ export function Dashboard({ member }: { member: Member }) {
         </p>
         {config !== null && (
           <p className="mt-3 text-xs text-fg-faint wrap-value">
-            repo {config.repoSlug} · needs riabuild v{config.minCliVersion} or
-            newer
+            default repo {config.repoSlug} · needs riabuild v
+            {config.minCliVersion} or newer
           </p>
         )}
       </Panel>
