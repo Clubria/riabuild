@@ -860,18 +860,22 @@ if [ "$SIGN_IN" = done ]; then
   NAMED="$(last_run_log)"
   check_contains "and still applies nothing, because it is the same repository" \
     "$NAMED" "applied=[]"
-
-  # A repository nobody could clone is refused before anything is provisioned,
-  # by the CLI's own check — `..` would otherwise be a directory name and
-  # `-upload-pack` an option to `gh`.
-  if riabuild --repo "Clubria/.." --no-shell >/dev/null 2>&1; then
-    fail "a repository name that escapes its directory was accepted"
-  else
-    pass "a repository name that escapes its directory is refused"
-  fi
 else
-  info "--repo not exercised: the run stopped before the sign-in finished"
+  info "a named repository was not provisioned: the run stopped before the sign-in finished"
 fi
+
+# Outside that gate on purpose. A repository nobody could clone is refused by
+# `main::remember_repo`, which runs before anything is provisioned and needs no
+# session — so this is the one assertion here that a run with an unfinished
+# sign-in can still make, and the whole block was reporting "not exercised" in CI
+# while it sat inside.
+#
+# The message is asserted, not merely the exit code: without a session every
+# invocation exits non-zero, so a status check alone would pass for the wrong
+# reason on exactly the run this is here to cover.
+REFUSED="$(riabuild --repo "Clubria/.." --no-shell 2>&1 || true)"
+check_contains "a repository name that escapes its directory is refused, by name" \
+  "$REFUSED" "--repo"
 
 step "Drift is detected and repaired"
 
