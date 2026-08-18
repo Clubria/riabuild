@@ -19,6 +19,14 @@
 #
 # Design: docs/superpowers/specs/2026-08-18-ngrok-design.md
 
+# The tag is `ngrok-v<version>`, which is not the `v<date>` shape riabuild's own
+# releases use — checked, because `release.yml` builds the apt and dnf
+# repositories from `gh release list --limit 50` filtered by
+# `^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}...$`. A mirror tag cannot match that filter,
+# and `--latest=false` below keeps it from taking the badge Homebrew's users
+# read. It does occupy one of those 50 rows, so mirror tags stay rare: one per
+# ngrok bump, which is a code change anyway.
+
 set -euo pipefail
 
 CHANNEL="https://bin.equinox.io/c/bNyj1mQVY4c"
@@ -79,13 +87,40 @@ echo "  pub const NGROK_VERSION: &str = \"$version\";"
 echo "  const NGROK_MIRROR: &str = \"https://github.com/Clubria/riabuild/releases/download/$tag\";"
 echo
 
+# Collected once and printed twice: to the terminal for the person pasting them
+# into `tools.rs`, and into the release notes so anyone auditing the mirror can
+# check it against Equinox without cloning anything.
+notes="$work/notes.md"
+{
+  echo "ngrok $version, republished **unmodified** from <$CHANNEL> so riabuild can pin it"
+  echo "and verify it against a digest committed to its own repository. **This is not a"
+  echo "riabuild release** — see the \`v<date>\` tags for those."
+  echo
+  echo "Why this exists: Equinox serves one floating build per platform, and the version in"
+  echo "that URL is decorative — a URL naming a version nobody published returns the current"
+  echo "bytes all the same. There is no immutable URL to pin and no published checksum file,"
+  echo "so riabuild takes a copy of the bytes it verified rather than downloading something"
+  echo "unverified, or letting a server tell a laptop which bytes to trust."
+  echo
+  echo "| asset | sha256 |"
+  echo "|---|---|"
+} > "$notes"
+
 for entry in "${PLATFORMS[@]}"; do
   read -r platform extension <<<"$entry"
   asset="ngrok-$version-$platform.$extension"
   mv "$work/$platform.$extension" "$work/$asset"
   digest="$(shasum -a 256 "$work/$asset" | awk '{print $1}')"
   printf '  %-34s %s\n' "$platform" "$digest"
+  printf '| `%s` | `%s` |\n' "$asset" "$digest" >> "$notes"
 done
+
+{
+  echo
+  echo "The same digests are constants in \`riabuild-cli/crates/fetch/src/tools.rs\`, and"
+  echo "\`tools::install\` refuses anything that does not match. Regenerate all of this with"
+  echo "\`./packaging/ngrok/mirror.sh\`."
+} >> "$notes"
 echo
 
 if $dry_run; then
@@ -96,8 +131,11 @@ fi
 if ! gh release view "$tag" >/dev/null 2>&1; then
   gh release create "$tag" \
     --title "ngrok $version (mirrored)" \
-    --notes "ngrok $version, republished unmodified from $CHANNEL so riabuild can pin it and verify it against a digest committed to this repository. Not a riabuild release." \
+    --notes-file "$notes" \
     --latest=false
+else
+  # A re-run after a partial upload should not leave last run's digests standing.
+  gh release edit "$tag" --notes-file "$notes"
 fi
 gh release upload "$tag" "$work"/ngrok-"$version"-*.{zip,tgz} --clobber
 
