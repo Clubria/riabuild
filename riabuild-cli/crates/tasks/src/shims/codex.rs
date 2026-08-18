@@ -9,11 +9,19 @@
 //! CODEX_HOME=~/.riabuild/codex codex --yolo
 //! ```
 //!
-//! There is one launcher rather than nine. Claude Code's numbering exists to
-//! keep several *sign-ins* apart, and riabuild does not sign anyone in to Codex
-//! — so a second directory would hold nothing that distinguishes it from the
-//! first, and `riabuild claude delete 3` would grow a counterpart with no
-//! account to delete.
+//! Nine of them, `codex-1` … `codex-9`, plus `codex` for the first — because
+//! Codex keeps several sign-ins apart exactly the way Claude Code does. Its
+//! credentials live in `$CODEX_HOME/auth.json` and nowhere else, so pointing it
+//! at nine directories really is nine independent accounts. Verified against
+//! 0.147.0: two homes hold two different API keys at the same time, and
+//! `codex logout` in one leaves the other logged in.
+//!
+//! The nine exist from the first run rather than being created on demand.
+//! Claude's are made by riabuild's own sign-in flow, which is what gives it
+//! something to count; riabuild signs nobody in to Codex, so there is no moment
+//! at which it would learn that a developer wants a second one. Nine empty
+//! directories cost nothing, and `codex-3 login` then works the first time it
+//! is typed instead of failing on a `CODEX_HOME` that is not there.
 //!
 //! Three things the Claude launcher does are deliberately **not** copied here.
 //! `unset SSH_CONNECTION SSH_CLIENT SSH_TTY` and the `WAYLAND_DISPLAY` claim
@@ -33,6 +41,16 @@ use std::path::Path;
 /// launcher that always appended it would turn a developer typing the obvious
 /// `codex --yolo` into a parser error naming a flag they did not type.
 const YOLO_LONG: &str = "--dangerously-bypass-approvals-and-sandbox";
+
+/// How many Codex profiles riabuild makes.
+///
+/// Nine, for the reason `accounts::MAX` is nine: it keeps every launcher name
+/// single digit, so `codex-9` is the last one and `codex-12` is an obvious typo
+/// rather than something to interpret. Deliberately its own constant rather
+/// than a reference to `accounts::MAX` — the two happen to agree, but a Codex
+/// profile and a Claude account are not the same thing, and coupling them would
+/// make changing one silently change the other.
+pub const PROFILES: usize = 9;
 
 /// The launcher, which is the only thing that names `CODEX_HOME`.
 ///
@@ -96,19 +114,50 @@ exec "$codex_binary" --yolo "$@"
     )
 }
 
-/// Writes `~/.riabuild/bin/codex`.
+/// Writes `codex` and `codex-1` … `codex-9`.
 ///
-/// Landed by rename and then made executable, like every other generated
-/// script: the hazard is an interrupt mid-write leaving a truncated launcher
-/// that fails with a shell syntax error.
+/// `codex` and `codex-1` are the same script, which is what makes the bare name
+/// mean profile 1 — the shape `shims::write_all` already uses for `claude` and
+/// `claude-1`.
+///
+/// Each is landed by rename and then made executable, like every other
+/// generated script: the hazard is an interrupt mid-write leaving a truncated
+/// launcher that fails with a shell syntax error.
 pub async fn write(ctx: &crate::Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin).await?;
+    let codex = ctx.codex();
 
-    let script = launcher_script(&ctx.paths.codex_dir(), &ctx.codex(), &bin);
-    let path = bin.join("codex");
-    riabuild_paths::config::write_atomic(&path, script.as_bytes()).await?;
-    make_executable(&path).await?;
+    for profile in 1..=PROFILES {
+        let script = launcher_script(&ctx.paths.codex_profile_dir(profile), &codex, &bin);
+        write_launcher(&bin.join(format!("codex-{profile}")), &script).await?;
+        if profile == 1 {
+            write_launcher(&bin.join("codex"), &script).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Every launcher this module owns, in the order `check()` reports them.
+///
+/// One list, so a `check()` that verifies the set and an `apply()` that writes
+/// it cannot come to disagree about what the set is.
+pub fn launcher_names() -> Vec<String> {
+    let mut names = vec!["codex".to_string()];
+    names.extend((1..=PROFILES).map(|profile| format!("codex-{profile}")));
+    names
+}
+
+/// Which profile a launcher opens: `codex` and `codex-1` both open profile 1.
+pub fn profile_of(name: &str) -> usize {
+    name.strip_prefix("codex-")
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(1)
+}
+
+async fn write_launcher(path: &Path, script: &str) -> Result<()> {
+    riabuild_paths::config::write_atomic(path, script.as_bytes()).await?;
+    make_executable(path).await?;
     Ok(())
 }
 
@@ -205,6 +254,33 @@ mod tests {
         assert!(script.contains(r#"*) codex_binary="" ;;"#), "{script}");
     }
 
+    #[test]
+    fn the_launcher_set_is_the_bare_name_and_nine_numbers() {
+        let names = launcher_names();
+        assert_eq!(names.len(), PROFILES + 1);
+        assert_eq!(names[0], "codex");
+        assert_eq!(names[1], "codex-1");
+        assert_eq!(names[PROFILES], "codex-9");
+    }
+
+    #[test]
+    fn the_bare_name_and_the_first_number_are_one_profile() {
+        assert_eq!(profile_of("codex"), 1);
+        assert_eq!(profile_of("codex-1"), 1);
+        assert_eq!(profile_of("codex-9"), 9);
+    }
+
+    #[tokio::test]
+    async fn writing_lays_down_every_launcher() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write(&ctx).await.expect("the launchers are written");
+
+        for name in launcher_names() {
+            let path = ctx.paths.bin_dir().join(&name);
+            assert!(is_executable(&path).await, "{name} is not executable");
+        }
+    }
+
     #[tokio::test]
     async fn the_launcher_is_written_executable() {
         let (ctx, _home) = ctx_with(FakeRunner::new()).await;
@@ -279,6 +355,105 @@ mod tests {
                 .expect("the launcher runs");
             assert!(output.ok(), "{args:?} was rejected: {output:?}");
         }
+    }
+
+    /// Two launchers, two accounts, against a real Codex.
+    ///
+    /// This is the claim the other eight launchers exist for, and the one that
+    /// cannot be made by reading a generated script: that pointing Codex at two
+    /// `CODEX_HOME`s really does keep two sign-ins apart, rather than both
+    /// landing in one store the way a keychain-backed tool would. Nine scripts
+    /// that each export a different directory and yet share an account would
+    /// pass every other test in this file.
+    ///
+    /// Uses `login --with-api-key`, which reads the key from stdin, so it needs
+    /// no browser and no real credential — Codex records whatever it is given
+    /// and reports it back, which is all this asserts.
+    ///
+    /// `#[ignore]`d because it needs a real install: run
+    /// `cargo test -- --ignored` when `MIN_VERSION` moves.
+    #[tokio::test]
+    #[ignore = "needs a real Codex CLI install; pins that CODEX_HOME really does separate sign-ins"]
+    async fn two_launchers_hold_two_independent_logins() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(codex) = runner.which("codex") else {
+            panic!("codex is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin");
+        tokio::fs::create_dir_all(&bin).await.unwrap();
+
+        let mut launchers = Vec::new();
+        for profile in [1usize, 2] {
+            let codex_home = home.path().join("codex").join(profile.to_string());
+            let script = launcher_script(&codex_home, &codex.to_string_lossy(), &bin);
+            let path = bin.join(format!("codex-{profile}"));
+            tokio::fs::write(&path, script.as_bytes()).await.unwrap();
+            make_executable(&path).await.unwrap();
+            launchers.push(path.to_string_lossy().into_owned());
+        }
+
+        let sign_in = |launcher: String, key: &'static str| {
+            let runner = RealRunner;
+            async move {
+                runner
+                    .run(
+                        &launcher,
+                        &["login", "--with-api-key"],
+                        &RunOptions {
+                            stdin: Some(format!("{key}\n").into_bytes()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("the launcher runs")
+            }
+        };
+        // `codex login status` reports on **stderr**, not stdout — verified
+        // against 0.147.0. Reading `.stdout` here gets an empty string and an
+        // assertion that fails for the wrong reason, so both streams are joined
+        // rather than one being guessed at.
+        let status = |launcher: String| {
+            let runner = RealRunner;
+            async move {
+                let out = runner
+                    .run(&launcher, &["login", "status"], &RunOptions::default())
+                    .await
+                    .expect("the launcher runs");
+                format!("{}{}", out.stdout, out.stderr)
+            }
+        };
+
+        let first = sign_in(launchers[0].clone(), "sk-test-AAAA1111").await;
+        assert!(first.ok(), "signing in to codex-1: {first:?}");
+        let second = sign_in(launchers[1].clone(), "sk-test-BBBB2222").await;
+        assert!(second.ok(), "signing in to codex-2: {second:?}");
+
+        // Both at once. If the two shared a store, whichever signed in last
+        // would be the only account either launcher could see.
+        let one = status(launchers[0].clone()).await;
+        let two = status(launchers[1].clone()).await;
+        assert!(one.contains("A1111"), "codex-1 lost its own account: {one}");
+        assert!(two.contains("B2222"), "codex-2 lost its own account: {two}");
+
+        // And leaving one does not leave the other.
+        let out = RealRunner
+            .run(&launchers[1], &["logout"], &RunOptions::default())
+            .await
+            .expect("the launcher runs");
+        assert!(out.ok(), "{out:?}");
+        let one = status(launchers[0].clone()).await;
+        let two = status(launchers[1].clone()).await;
+        assert!(
+            one.contains("A1111"),
+            "codex-2's logout took codex-1: {one}"
+        );
+        assert!(
+            !two.contains("B2222"),
+            "codex-2 is still signed in after logout: {two}"
+        );
     }
 
     #[cfg(unix)]

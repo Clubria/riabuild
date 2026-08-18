@@ -119,16 +119,34 @@ pub trait Paths: Send + Sync {
     fn claude_config_file(&self, profile: &str) -> PathBuf {
         self.claude_profile_dir(profile).join(".claude.json")
     }
-    /// What `CODEX_HOME` points at — Codex CLI's `config.toml`, its sessions,
-    /// and its logs, under riabuild's tree rather than in `~/.codex`.
+    /// The nine Codex profiles, one directory each.
     ///
-    /// A directory rather than a file, and it has to *exist*: Codex refuses to
-    /// start against a `CODEX_HOME` that is not there ("Error finding codex
-    /// home"), so naming it is only half of pointing at it. `codex_cli` creates
-    /// it and the generated launcher recreates it, because a developer who
-    /// deletes it should get a fresh Codex rather than a broken one.
+    /// A parent rather than a `CODEX_HOME` itself. Codex keeps its credentials
+    /// in `$CODEX_HOME/auth.json` and nowhere else — no OS keychain is
+    /// involved — so two homes really are two independent sign-ins, in the way
+    /// `claude_profile_dir` is for Claude Code. Verified against Codex 0.147.0:
+    /// two homes hold two different API keys at once, and `codex logout` in one
+    /// leaves the other logged in.
     fn codex_dir(&self) -> PathBuf {
         self.root().join("codex")
+    }
+    /// One Codex profile — what `CODEX_HOME` points at.
+    ///
+    /// Numbered `1`..=`9` rather than named by a uuid the way Claude Code's
+    /// are. Claude's accounts are created by riabuild's own sign-in flow and
+    /// can be deleted and renumbered, so their *position* in a list is their
+    /// number and the directory name has to survive that. Codex profiles are a
+    /// fixed set riabuild creates once and never reorders, so the directory
+    /// name can simply be the number — which makes `codex-3` and
+    /// `~/.riabuild/codex/3` obviously the same thing to anyone reading their
+    /// own disk.
+    ///
+    /// It has to *exist*: Codex refuses to start against a `CODEX_HOME` that is
+    /// not there ("Error finding codex home"), so naming one is only half of
+    /// pointing at it. `codex_cli` creates all nine, and each generated
+    /// launcher recreates its own.
+    fn codex_profile_dir(&self, profile: usize) -> PathBuf {
+        self.codex_dir().join(profile.to_string())
     }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)

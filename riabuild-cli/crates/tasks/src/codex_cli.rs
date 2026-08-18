@@ -1,15 +1,17 @@
 //! The Codex CLI, and the launcher that runs it.
 //!
-//! riabuild installs Codex with the Node it owns and points it at a config
-//! directory under `~/.riabuild/`, the same way it does Claude Code. It does
+//! riabuild installs Codex with the Node it owns and points it at config
+//! directories under `~/.riabuild/`, the same way it does Claude Code. It does
 //! **not** sign anyone in: a Codex sign-in is a developer's own OpenAI account,
 //! nothing riabuild brokers, and nothing the onboarding path is blocked on.
-//! `codex login` is one command away when they want it, and it lands in
-//! riabuild's `CODEX_HOME` because the launcher is what put them there.
+//! `codex-3 login` is one command away when they want it, and it lands in that
+//! profile's `CODEX_HOME` because the launcher is what put them there.
 //!
-//! The generated launcher is `shims::codex` — see that module for why there is
-//! one of it rather than nine, and why `--yolo` is a default rather than an
-//! imposition.
+//! The generated launchers are `shims::codex`: `codex-1` … `codex-9`, each with
+//! its own `CODEX_HOME`, and `codex` for the first. Codex keeps sign-ins apart
+//! per `CODEX_HOME` exactly as Claude Code does per `CLAUDE_CONFIG_DIR`, so the
+//! nine are nine real accounts — see that module for the evidence, and for why
+//! `--yolo` is a default rather than an imposition.
 
 use super::{Ctx, Status, Task, TaskId};
 use crate::shims;
@@ -67,11 +69,19 @@ async fn install_needed(ctx: &Ctx) -> Result<bool> {
 /// check has no business reading it and less business creating it. This is the
 /// same rule `CLAUDE.md` states for `cwd`: the inputs riabuild did not choose
 /// are the ones a check must not leave to chance.
+///
+/// Profile 1, not `codex_dir()`. That is the *parent* of the nine now, and
+/// Codex writes its sqlite state and logs into whatever it is handed — so
+/// naming the parent would strew a tenth profile's worth of files in among the
+/// nine, on every run, for a probe that only wants a version string.
 fn probe_options(ctx: &Ctx) -> RunOptions {
     RunOptions {
         env: vec![(
             "CODEX_HOME".to_string(),
-            ctx.paths.codex_dir().to_string_lossy().into_owned(),
+            ctx.paths
+                .codex_profile_dir(1)
+                .to_string_lossy()
+                .into_owned(),
         )],
         ..Default::default()
     }
@@ -124,49 +134,62 @@ impl Task for CodexCli {
         }
 
         // Codex refuses to start against a `CODEX_HOME` that is not there, so
-        // the directory is part of "this machine is correct", not a detail of
-        // having installed something once.
-        if !tokio::fs::try_exists(ctx.paths.codex_dir())
-            .await
-            .unwrap_or(false)
-        {
-            return Ok(Status::needs("the Codex config directory is missing"));
+        // every profile directory is part of "this machine is correct", not a
+        // detail of having installed something once. Each is named, because
+        // "a Codex config directory is missing" does not say which of nine to
+        // deal with.
+        for profile in 1..=shims::codex::PROFILES {
+            if !tokio::fs::try_exists(ctx.paths.codex_profile_dir(profile))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(Status::needs(format!(
+                    "Codex profile {profile}'s config directory is missing"
+                )));
+            }
         }
 
-        // The launcher is compared against what riabuild would generate *now*,
+        // Each launcher is compared against what riabuild would generate *now*,
         // not merely tested for existence. That is what makes this check see
-        // the three ways it goes stale on a machine that ran this task six
+        // the three ways one goes stale on a machine that ran this task six
         // weeks ago: a Node upgrade moves the binary it records, a riabuild
         // upgrade changes the flags it passes, and a developer can edit it. An
         // existence test would report every one of those machines as correct.
-        match launcher_drift(ctx).await {
-            None => Ok(Status::Satisfied),
-            Some(detail) => Ok(Status::needs(detail)),
+        //
+        // All ten, not just `codex`. A developer who lives in `codex-4` would
+        // otherwise be the one person this check cannot help.
+        for name in shims::codex::launcher_names() {
+            if let Some(detail) = launcher_drift(ctx, &name).await {
+                return Ok(Status::needs(detail));
+            }
         }
+        Ok(Status::Satisfied)
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         if install_needed(ctx).await? {
             install_codex(ctx).await?;
         }
-        // Before the launcher, because the launcher is what a developer runs
-        // next and Codex will not start without it.
-        tokio::fs::create_dir_all(ctx.paths.codex_dir()).await?;
+        // Before the launchers, because a launcher is what a developer runs
+        // next and Codex will not start without its directory.
+        for profile in 1..=shims::codex::PROFILES {
+            tokio::fs::create_dir_all(ctx.paths.codex_profile_dir(profile)).await?;
+        }
         shims::codex::write(ctx).await?;
         Ok(())
     }
 }
 
-/// Why the launcher on disk is not the one riabuild would write, or `None` when
-/// it is.
+/// Why the launcher named `name` is not the one riabuild would write, or `None`
+/// when it is.
 ///
 /// Named rather than folded into `check()` so the three states — absent,
 /// unreadable, different — each get a sentence a developer can act on, and they
 /// are three rather than two on purpose: "is missing" printed for a launcher
 /// sitting right there at mode 000 sends the developer looking for the wrong
 /// problem. Either way it is drift, and `apply()` rewrites it.
-async fn launcher_drift(ctx: &Ctx) -> Option<String> {
-    let path = ctx.paths.bin_dir().join("codex");
+async fn launcher_drift(ctx: &Ctx, name: &str) -> Option<String> {
+    let path = ctx.paths.bin_dir().join(name);
     let found = match tokio::fs::read_to_string(&path).await {
         Ok(found) => found,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -176,8 +199,11 @@ async fn launcher_drift(ctx: &Ctx) -> Option<String> {
             return Some(format!("{} could not be read: {error}", path.display()));
         }
     };
-    let wanted =
-        shims::codex::launcher_script(&ctx.paths.codex_dir(), &ctx.codex(), &ctx.paths.bin_dir());
+    let wanted = shims::codex::launcher_script(
+        &ctx.paths.codex_profile_dir(shims::codex::profile_of(name)),
+        &ctx.codex(),
+        &ctx.paths.bin_dir(),
+    );
     (found != wanted).then(|| format!("{} is not the launcher riabuild writes", path.display()))
 }
 
@@ -326,12 +352,126 @@ mod tests {
     #[tokio::test]
     async fn the_version_probe_never_reads_the_developers_own_codex_home() {
         // Unset, CODEX_HOME is `~/.codex` — a directory riabuild does not own
-        // and a check has no business touching.
+        // and a check has no business touching. Profile 1 rather than the
+        // parent of the nine: Codex writes sqlite state into whatever it is
+        // handed, and the parent is not a profile.
         let (ctx, _home) = ctx_with_codex(installed()).await;
         let options = probe_options(&ctx);
         let (key, value) = options.env.first().expect("the probe names a CODEX_HOME");
         assert_eq!(key, "CODEX_HOME");
-        assert_eq!(value, &ctx.paths.codex_dir().to_string_lossy().into_owned());
+        assert_eq!(
+            value,
+            &ctx.paths
+                .codex_profile_dir(1)
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_profile_gets_a_directory_and_a_launcher() {
+        let (ctx, _home) = ready().await;
+        for profile in 1..=shims::codex::PROFILES {
+            assert!(
+                tokio::fs::try_exists(ctx.paths.codex_profile_dir(profile))
+                    .await
+                    .unwrap(),
+                "profile {profile} has no directory"
+            );
+            assert!(
+                tokio::fs::try_exists(ctx.paths.bin_dir().join(format!("codex-{profile}")))
+                    .await
+                    .unwrap(),
+                "codex-{profile} was not written"
+            );
+        }
+        assert!(
+            tokio::fs::try_exists(ctx.paths.bin_dir().join("codex"))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The regression that would make nine launchers worthless.
+    ///
+    /// Nine scripts that all export the same `CODEX_HOME` look right in every
+    /// other test — they are present, executable, carry `--yolo`, and run — and
+    /// yet every one of them opens the same account. Codex keeps sign-ins apart
+    /// per `CODEX_HOME` and by nothing else, so *distinct* is the whole feature.
+    #[tokio::test]
+    async fn the_nine_launchers_open_nine_different_accounts() {
+        let (ctx, _home) = ready().await;
+        let mut homes = std::collections::BTreeSet::new();
+        for profile in 1..=shims::codex::PROFILES {
+            let script =
+                tokio::fs::read_to_string(ctx.paths.bin_dir().join(format!("codex-{profile}")))
+                    .await
+                    .unwrap();
+            let home = ctx.paths.codex_profile_dir(profile);
+            let line = format!("CODEX_HOME=\"{}\"", home.display());
+            assert!(
+                script.contains(&line),
+                "codex-{profile} does not pin {line}"
+            );
+            homes.insert(home);
+        }
+        assert_eq!(
+            homes.len(),
+            shims::codex::PROFILES,
+            "the launchers share a CODEX_HOME, so they share an account"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bare_name_is_the_first_profile() {
+        // `codex` and `codex-1` are one account reached by two names, the shape
+        // `claude` and `claude-1` already have.
+        let (ctx, _home) = ready().await;
+        let bare = tokio::fs::read_to_string(ctx.paths.bin_dir().join("codex"))
+            .await
+            .unwrap();
+        let first = tokio::fs::read_to_string(ctx.paths.bin_dir().join("codex-1"))
+            .await
+            .unwrap();
+        assert_eq!(bare, first);
+        assert!(
+            bare.contains(
+                &ctx.paths
+                    .codex_profile_dir(1)
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "{bare}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_profile_directory_names_the_profile() {
+        // "a Codex config directory is missing" does not say which of nine to
+        // deal with, and the developer has to act on it by hand.
+        let (ctx, _home) = ready().await;
+        tokio::fs::remove_dir_all(ctx.paths.codex_profile_dir(4))
+            .await
+            .unwrap();
+
+        let status = CodexCli.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("profile 4"),
+            "the profile is not named: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_numbered_launcher_is_drift() {
+        // Not just `codex`: a developer who lives in codex-7 would otherwise be
+        // the one person this check cannot help.
+        let (ctx, _home) = ready().await;
+        tokio::fs::remove_file(ctx.paths.bin_dir().join("codex-7"))
+            .await
+            .unwrap();
+
+        let status = CodexCli.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("codex-7"), "{status:?}");
     }
 
     #[tokio::test]
