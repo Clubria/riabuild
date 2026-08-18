@@ -471,6 +471,11 @@ http.route({
         // exist on every run, and brokering a token to find out would hit
         // Infisical and write an audit row for a question nobody asked.
         secretEnvironments: environmentsForRole(member.role),
+        // When a lead last set the team's ngrok authtoken, or 0 if none is set.
+        // Metadata, never the token: it rides here so the CLI can say "your
+        // lead has not set one" without calling /org/ngrok-token, which hands
+        // out a live credential and writes an audit row.
+        ngrokAuthTokenUpdatedAt: config.ngrokAuthTokenUpdatedAt,
       });
     }),
   ),
@@ -504,6 +509,60 @@ http.route({
       return jsonResponse({
         settings,
         updatedAt: config.claudeSettingsUpdatedAt,
+      });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
+/* GET /api/v1/org/ngrok-token — the team's ngrok authtoken                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The second response that carries a durable credential, after `/issued-keys`.
+ *
+ * It is its own route rather than a field on `/org/config` because of what that
+ * difference buys: `/org/config` is fetched on every `riabuild` run, and this
+ * is fetched when somebody actually runs `ngrok`. The audit row therefore says
+ * a developer used the team's tunnel credential, which — since ngrok sees one
+ * account for the whole org — is the only attribution that exists.
+ *
+ * The token does not expire on its own, so the org check is doing the whole job
+ * here, exactly as it is for an issued key.
+ */
+http.route({
+  path: "/api/v1/org/ngrok-token",
+  method: "GET",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const config = await loadConfig(ctx);
+      enforceMinVersion(req, config);
+      const { member } = await authenticate(ctx, req);
+      // `members.role` is never the sole gate: a developer who left the org
+      // yesterday must lose the team's tunnel today, without anyone
+      // remembering to edit a Convex row.
+      await requireOrgMembership(member.githubLogin);
+
+      if (config.ngrokAuthToken === "") {
+        // Nothing is broken and the CLI says so in the developer's terms — the
+        // person who can fix this is not the person reading the message.
+        fail(
+          404,
+          "not_configured",
+          "Your team has not set an ngrok authtoken yet.",
+          "Ask your team lead to add one in the riabuild dashboard, under org settings.",
+        );
+      }
+
+      await ctx.runMutation(internal.audit.record, {
+        memberId: member._id,
+        action: "org.ngrok_token_fetched",
+        meta: { role: member.role },
+      });
+
+      return jsonResponse({
+        token: config.ngrokAuthToken,
+        updatedAt: config.ngrokAuthTokenUpdatedAt,
       });
     }),
   ),

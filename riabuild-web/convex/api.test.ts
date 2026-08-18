@@ -2316,3 +2316,154 @@ describe("the SSH keys the org issues", () => {
     expect(await response.json()).toEqual({ keys: [] });
   });
 });
+
+describe("the team's ngrok authtoken", () => {
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.stubEnv("GITHUB_ORG_TOKEN", "ghp_test");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    globalThis.fetch = realFetch;
+  });
+
+  /** Stands in for the org-membership check every brokering route re-runs. */
+  function stubGithub(membership: number) {
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.includes("api.github.com")) {
+        return new Response(null, { status: membership });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    };
+  }
+
+  async function setToken(t: ReturnType<typeof setup>, token: string) {
+    const { rowId, userId } = await seedMember(t, {
+      login: "lead",
+      role: "lead",
+    });
+    await t
+      .withIdentity({ subject: userId })
+      .mutation(api.org.update, { ngrokAuthToken: token });
+    return rowId;
+  }
+
+  test("a member's CLI is served the token, and the fetch is audited", async () => {
+    const t = setup();
+    await setToken(t, "2abcDEF_the_org_token");
+    const { rowId } = await seedMember(t, { login: "ada" });
+    const session = await issueSession(t, rowId);
+    stubGithub(204);
+
+    const response = await t.fetch("/api/v1/org/ngrok-token", {
+      headers: bearer(session),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).token).toBe("2abcDEF_the_org_token");
+
+    // ngrok sees one account for the whole team, so this row is the only
+    // record of who opened a tunnel.
+    const actions = await t.run(async (ctx) => {
+      const rows = await ctx.db.query("auditLog").collect();
+      return rows.map((row) => row.action);
+    });
+    expect(actions).toContain("org.ngrok_token_fetched");
+  });
+
+  test("a team whose lead has not set one gets a 404 the CLI can explain", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t);
+    const session = await issueSession(t, rowId);
+    stubGithub(204);
+
+    const response = await t.fetch("/api/v1/org/ngrok-token", {
+      headers: bearer(session),
+    });
+    expect(response.status).toBe(404);
+    // The code, not just the status: a route that does not exist is also a 404,
+    // and the CLI rewords this one for the developer.
+    expect((await response.json()).error.code).toBe("not_configured");
+  });
+
+  test("a developer removed from the GitHub org loses the tunnel today", async () => {
+    const t = setup();
+    await setToken(t, "2abcDEF_the_org_token");
+    const { rowId } = await seedMember(t, { login: "ada" });
+    const session = await issueSession(t, rowId);
+    // Their Convex row still says active; GitHub is the identity.
+    stubGithub(404);
+
+    const response = await t.fetch("/api/v1/org/ngrok-token", {
+      headers: bearer(session),
+    });
+    expect(response.status).toBe(403);
+  });
+
+  test("a machine with no session is refused", async () => {
+    const t = setup();
+    await setToken(t, "2abcDEF_the_org_token");
+
+    const response = await t.fetch("/api/v1/org/ngrok-token", {});
+    expect(response.status).toBe(401);
+  });
+
+  test("only a lead can set it", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t, { role: "developer" });
+    await expect(
+      t
+        .withIdentity({ subject: userId })
+        .mutation(api.org.update, { ngrokAuthToken: "2abcDEF_someone_elses" }),
+    ).rejects.toThrow();
+  });
+
+  test("the dashboard is shown a hint, never the token", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t, { role: "lead" });
+    await t
+      .withIdentity({ subject: userId })
+      .mutation(api.org.update, { ngrokAuthToken: "2abcDEF_the_org_token" });
+
+    const config = await t
+      .withIdentity({ subject: userId })
+      .query(api.org.get, {});
+    expect(JSON.stringify(config)).not.toContain("2abcDEF_the_org_token");
+    expect(config.ngrokAuthTokenHint).toBe("…oken");
+    expect(config.ngrokAuthTokenUpdatedAt).toBeGreaterThan(0);
+  });
+
+  test("config says when the token was set, and never what it is", async () => {
+    const t = setup();
+    await setToken(t, "2abcDEF_the_org_token");
+    const { rowId } = await seedMember(t, { login: "ada" });
+    const session = await issueSession(t, rowId);
+
+    const response = await t.fetch("/api/v1/org/config", {
+      headers: bearer(session),
+    });
+    const body = await response.json();
+    // The CLI reads this on every run to tell a developer their lead has not
+    // set one — without brokering a live credential to find out.
+    expect(body.ngrokAuthTokenUpdatedAt).toBeGreaterThan(0);
+    expect(JSON.stringify(body)).not.toContain("2abcDEF_the_org_token");
+  });
+
+  test("clearing it puts the team back to unconfigured", async () => {
+    const t = setup();
+    const { userId } = await seedMember(t, { role: "lead" });
+    const identity = t.withIdentity({ subject: userId });
+    await identity.mutation(api.org.update, { ngrokAuthToken: "2abcDEF_x" });
+    await identity.mutation(api.org.update, { ngrokAuthToken: "" });
+
+    const { rowId } = await seedMember(t, { login: "ada" });
+    const session = await issueSession(t, rowId);
+    stubGithub(204);
+    const response = await t.fetch("/api/v1/org/ngrok-token", {
+      headers: bearer(session),
+    });
+    expect(response.status).toBe(404);
+  });
+});

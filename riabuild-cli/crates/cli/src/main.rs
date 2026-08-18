@@ -302,6 +302,9 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::SeedGithub,
         }) => return internal::seed_github(ctx).await,
+        Some(Command::Internal {
+            action: cli::InternalAction::NgrokToken,
+        }) => return internal::ngrok_token(ctx).await,
         Some(Command::MoveProject { path }) => {
             return move_project::run(ctx, path.as_deref()).await;
         }

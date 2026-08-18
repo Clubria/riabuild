@@ -90,6 +90,15 @@ export type OrgConfig = {
   minCliVersion: string;
   latestCliVersion: string;
   secretsUpdatedAt: number;
+  /**
+   * The last four characters of the team's ngrok authtoken, or `""` when none
+   * is set. Never the token: a lead has to recognise the one they pasted, and
+   * has no reason to read it back. The value leaves riabuild-web only through
+   * `GET /api/v1/org/ngrok-token`, to a signed-in CLI.
+   */
+  ngrokAuthTokenHint: string;
+  /** When a lead last set it. Zero means no token is set. */
+  ngrokAuthTokenUpdatedAt: number;
 };
 
 /**
@@ -153,6 +162,12 @@ export type OrgUpdate = {
   minCliVersion?: string;
   latestCliVersion?: string;
   markSecretsRotated?: boolean;
+  /**
+   * Absent leaves the team's token alone, which is what an ordinary settings
+   * save must do — the field on screen is blank because it is write-only, not
+   * because anybody cleared it. An empty string is the deliberate removal.
+   */
+  ngrokAuthToken?: string;
 };
 
 export type Data = {

@@ -21,6 +21,7 @@ pub mod env_local;
 pub mod github_cli;
 pub mod infisical_cli;
 pub mod login;
+pub mod ngrok;
 pub mod org_settings;
 pub mod project;
 pub mod repo_status;
@@ -330,6 +331,18 @@ impl Ctx {
         )
     }
 
+    /// The `ngrok` riabuild owns. Same reasoning as `gh`, with one addition:
+    /// what `PATH` finds inside the environment shell is the *shim*, which is
+    /// this binary plus the team's authtoken. riabuild's own `check()` wants
+    /// the binary itself, unauthenticated and unwrapped.
+    pub fn ngrok(&self) -> String {
+        self.owned_tool(
+            "ngrok",
+            riabuild_fetch::tools::NGROK_VERSION,
+            riabuild_fetch::tools::NGROK_MEMBER,
+        )
+    }
+
     /// The Claude Code riabuild installed, by absolute path.
     ///
     /// Same reasoning as `gh()`, with one addition: `which("claude")` reads the
@@ -389,6 +402,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(login::Login),
         Box::new(github_cli::GithubCli),
         Box::new(infisical_cli::InfisicalCli),
+        Box::new(ngrok::Ngrok),
         Box::new(toolchain::Toolchain),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
