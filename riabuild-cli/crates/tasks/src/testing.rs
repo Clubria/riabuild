@@ -124,6 +124,7 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         config: UserConfig::default(),
         state: State::default(),
         org: Some(org_config()),
+        repo: None,
         member: None,
         server: None,
         cli_version: "0.1.0".into(),

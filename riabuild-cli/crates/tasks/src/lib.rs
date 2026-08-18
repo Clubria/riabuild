@@ -23,6 +23,7 @@ pub mod infisical_cli;
 pub mod login;
 pub mod org_settings;
 pub mod project;
+pub mod repo;
 pub mod repo_status;
 pub mod scope;
 pub mod shell;
@@ -35,7 +36,7 @@ use crate::scope::Scope;
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_api::org::OrgConfig;
-use riabuild_api::{ApiClient, ApiError, Member};
+use riabuild_api::{ApiClient, ApiError, Member, Repo};
 use riabuild_keychain::Keychain;
 use riabuild_paths::Paths;
 use riabuild_paths::config::{State, UserConfig};
@@ -114,6 +115,14 @@ pub struct Ctx {
     pub config: UserConfig,
     pub state: State,
     pub org: Option<OrgConfig>,
+    /// The repository this run is about, once something has decided which.
+    ///
+    /// Set from `config.active_repo`, from `--repo`, or by the picker — never by
+    /// a task. Tasks read it through `Ctx::repo`, which is the only thing they
+    /// may name a repository by: `org.repo_slug` is the *default* the picker
+    /// offers, and reading it in a task is how a run ends up cloning one
+    /// repository and provisioning another.
+    pub repo: Option<Repo>,
     pub member: Option<Member>,
     /// The server this riabuild is managed from, when it is on one.
     ///
@@ -163,6 +172,7 @@ impl Ctx {
             config,
             state,
             org: None,
+            repo: None,
             member: None,
             server: scope.server.clone(),
             cli_version: riabuild_version::VERSION.to_string(),
@@ -205,6 +215,7 @@ impl Ctx {
             Ok(member) => {
                 self.member = Some(member);
                 self.org = Some(riabuild_api::org::fetch_config(&self.api).await?);
+                self.adopt_recorded_repo();
                 Ok(())
             }
             Err(error) => match error.downcast_ref::<ApiError>() {
@@ -245,12 +256,55 @@ impl Ctx {
         Ok(())
     }
 
-    /// The project directory the developer chose, if one has been chosen.
-    pub fn project_dir(&self) -> Option<std::path::PathBuf> {
-        self.config
-            .project_path
+    /// The repository this run is about: what the picker settled on, else what
+    /// this machine last used, else the org default.
+    ///
+    /// Fallible only in the last case, and only for a dashboard slug nobody
+    /// could clone — see `OrgConfig::default_repo`.
+    pub fn repo(&self) -> Result<Repo> {
+        match &self.repo {
+            Some(repo) => Ok(repo.clone()),
+            None => self.org()?.default_repo(),
+        }
+    }
+
+    /// Takes the repository this machine recorded, so a command that never puts
+    /// the picker's question — `status`, `env`, `shell`, anything under
+    /// `--check` — still reads the checkout of the repository the developer was
+    /// last working on rather than the org default's.
+    ///
+    /// A recorded slug that will not parse is dropped rather than fatal: it can
+    /// only have come from a riabuild that wrote one, and falling back to the
+    /// default repository is a working machine where `?` here would be a broken
+    /// one.
+    fn adopt_recorded_repo(&mut self) {
+        if self.repo.is_some() {
+            return;
+        }
+        self.repo = self
+            .config
+            .active_repo
             .as_deref()
-            .map(|path| riabuild_paths::expand_tilde(path, &self.paths.home()))
+            .and_then(|slug| Repo::parse(slug).ok());
+    }
+
+    /// The checkout of the repository this run is about, if it has one.
+    ///
+    /// Falls back to the single path an older riabuild recorded, and only when
+    /// the repository asked about is the org default — the only repository that
+    /// path can be a checkout of. That is what lets `riabuild status`, `riabuild
+    /// env`, `riabuild shell` and `riabuild --check` find an existing checkout
+    /// on a machine whose migration has not run: none of them puts the picker's
+    /// question, and none of them may write. Read both, write one.
+    pub fn project_dir(&self) -> Option<std::path::PathBuf> {
+        let repo = self.repo().ok()?;
+        let recorded = self.config.checkout_of(repo.slug()).or_else(|| {
+            let default = self.org.as_ref()?.default_repo().ok()?;
+            (repo == default)
+                .then(|| self.config.legacy_checkout())
+                .flatten()
+        });
+        recorded.map(|path| riabuild_paths::expand_tilde(path, &self.paths.home()))
     }
 
     /// Where a checkout goes when the developer has not chosen a place.
@@ -261,11 +315,8 @@ impl Ctx {
     /// developer's branches, uncommitted work, and `.env.local` never land in
     /// another's session. See `paths::remote_project_dir`.
     pub async fn default_checkout(&self) -> std::path::PathBuf {
-        let repo = self
-            .org
-            .as_ref()
-            .map(|org| org.repo_name())
-            .unwrap_or("repo");
+        let named = self.repo().ok();
+        let repo = named.as_ref().map(Repo::name).unwrap_or("repo");
         let home = self.paths.home();
         let Some(login) = self
             .server

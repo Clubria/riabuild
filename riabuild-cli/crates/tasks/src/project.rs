@@ -192,25 +192,29 @@ impl Task for Project {
 
         // Before sign-in there is nothing to compare against; `login` runs
         // first and this task re-runs once it has.
-        let Some(org) = ctx.org.as_ref() else {
+        if ctx.org.is_none() {
             return Ok(Status::needs("waiting for sign-in"));
-        };
+        }
+        let repo = ctx.repo()?;
         match origin_url(ctx, &dir).await {
             None => Ok(Status::needs("that checkout has no `origin` remote")),
-            Some(remote) if org.matches_remote(&remote) => Ok(Status::Satisfied),
+            Some(remote) if repo.matches_remote(&remote) => Ok(Status::Satisfied),
+            // Reached by picking a repository whose checkout is not where this
+            // one is, as well as by a developer moving a directory aside. Naming
+            // the repository that was *asked for* is what makes the first case
+            // read as an answer rather than a fault.
             Some(remote) => Ok(Status::needs(format!(
-                "that checkout points at {remote}, not {}",
-                org.repo_slug
+                "that checkout points at {remote}, not {repo}"
             ))),
         }
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let org = ctx.org()?.clone();
+        let repo = ctx.repo()?;
         let home = ctx.paths.home();
 
-        let dir = match ctx.config.project_path.clone() {
-            Some(path) => expand_tilde(&path, &home),
+        let dir = match ctx.project_dir() {
+            Some(path) => path,
             None => {
                 // Where this lands is riabuild's decision, and it differs per
                 // platform, and per machine when several developers share one
@@ -230,10 +234,10 @@ impl Task for Project {
             // an existing directory would fail, and deleting it could destroy
             // uncommitted work.
             if let Some(remote) = origin_url(ctx, &dir).await
-                && !org.matches_remote(&remote)
+                && !repo.matches_remote(&remote)
             {
                 return Err(Failure::new(
-                    format!("using {} for the Clubria repo", dir.display()),
+                    format!("using {} for {repo}", dir.display()),
                     "Move that directory aside, or set another path with `riabuild --project <path>`, then run `riabuild` again.",
                 )
                 .detail(format!("it is a checkout of {remote}"))
@@ -246,24 +250,24 @@ impl Task for Project {
             // No space before the ellipsis — every other progress line in
             // riabuild is written "Downloading Node 22…", and this one sat
             // among them looking misaligned.
-            ctx.ui.note(&format!("Cloning {}…", org.repo_slug));
+            ctx.ui.note(&format!("Cloning {repo}…"));
             // Through `gh` so the developer's existing GitHub auth is reused and
             // nobody has to set up SSH keys to get started.
             let output = ctx
                 .runner
                 .run(
                     &ctx.gh(),
-                    &["repo", "clone", &org.repo_slug, &dir.to_string_lossy()],
+                    &["repo", "clone", repo.slug(), &dir.to_string_lossy()],
                     &RunOptions::default(),
                 )
                 .await?;
             if !output.ok() {
                 return Err(Failure::new(
-                    format!("cloning {}", org.repo_slug),
+                    format!("cloning {repo}"),
                     "Check you can open the repository on github.com, then run `riabuild` again."
                         .to_string(),
                 )
-                .command(format!("gh repo clone {}", org.repo_slug))
+                .command(format!("gh repo clone {repo}"))
                 .detail(output.stderr)
                 .into());
             }
@@ -282,7 +286,8 @@ impl Task for Project {
         }
 
         let chosen = dir.to_string_lossy().into_owned();
-        ctx.update_config(|config| config.project_path = Some(chosen))
+        let slug = repo.slug().to_string();
+        ctx.update_config(|config| config.set_checkout(&slug, chosen))
             .await?;
         Ok(())
     }
@@ -401,7 +406,7 @@ mod tests {
 
         let expected = riabuild_paths::default_project_dir(home.path(), "ai-builders-hub");
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(expected.to_string_lossy().as_ref()),
             "the checkout must land where this platform puts it"
         );
@@ -426,7 +431,7 @@ mod tests {
             .join("ada")
             .join("ai-builders-hub");
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(expected.to_string_lossy().as_ref()),
             "a server checkout must be grouped under the developer, not the platform default"
         );
@@ -474,7 +479,7 @@ mod tests {
             "the shared platform default {shared} must never be offered on a server: {asked:?}"
         );
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(expected.to_string_lossy().as_ref())
         );
     }
@@ -495,7 +500,7 @@ mod tests {
         Project.apply(&mut ctx).await.unwrap();
 
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(
                 home.path()
                     .join("Clubria")
@@ -522,7 +527,7 @@ mod tests {
         Project.apply(&mut ctx).await.unwrap();
 
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(mine.to_string_lossy().as_ref())
         );
     }
@@ -536,7 +541,7 @@ mod tests {
         Project.apply(&mut ctx).await.unwrap();
 
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(chosen.to_string_lossy().as_ref())
         );
     }
@@ -552,7 +557,7 @@ mod tests {
 
         let default = riabuild_paths::default_project_dir(home.path(), "ai-builders-hub");
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(default.to_string_lossy().as_ref()),
             "a refused answer must fall back to the default"
         );
@@ -571,7 +576,7 @@ mod tests {
 
         let default = riabuild_paths::default_project_dir(home.path(), "ai-builders-hub");
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(default.to_string_lossy().as_ref())
         );
     }
@@ -594,7 +599,7 @@ mod tests {
         Project.apply(&mut ctx).await.unwrap();
 
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(existing.to_string_lossy().as_ref())
         );
     }
@@ -607,7 +612,7 @@ mod tests {
         Project.apply(&mut ctx).await.unwrap();
 
         assert_eq!(
-            ctx.config.project_path.as_deref(),
+            ctx.project_dir().as_deref().map(Path::to_string_lossy).as_deref(),
             Some(chosen.to_string_lossy().as_ref()),
             "`riabuild --project` must not be overridden by the default"
         );

@@ -5,7 +5,8 @@
 //! developer's laptop.
 
 use crate::ApiClient;
-use anyhow::Result;
+use crate::repo::Repo;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Note the absence of a checkout path. The server used to send one, but a
@@ -91,30 +92,28 @@ where
 }
 
 impl OrgConfig {
-    /// The repository half of `owner/repo`, which is what the checkout
-    /// directory is named after.
-    pub fn repo_name(&self) -> &str {
-        self.repo_slug
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&self.repo_slug)
-    }
-
-    /// Accepts every spelling of a GitHub remote for the same repository, so a
-    /// developer who cloned over SSH is not told their checkout is wrong.
-    pub fn matches_remote(&self, remote: &str) -> bool {
-        let remote = remote.trim().trim_end_matches(".git");
-        let slug = self.repo_slug.to_lowercase();
-        let candidates = [
-            format!("https://github.com/{slug}"),
-            format!("http://github.com/{slug}"),
-            format!("git@github.com:{slug}"),
-            format!("ssh://git@github.com/{slug}"),
-        ];
-        candidates
-            .iter()
-            .any(|candidate| remote.to_lowercase() == *candidate)
+    /// The repository Enter takes at the picker, and the owner a bare name
+    /// typed there is completed with.
+    ///
+    /// The *default*, not the only one — which is the whole of what changed when
+    /// `riabuild` began asking. Everything that clones, names a directory, or
+    /// checks a remote reads the repository this run is about, from
+    /// `Ctx::repo`, and reaches this only to find out what Enter means.
+    ///
+    /// Fallible, and deliberately not checked at deserialize time the way
+    /// `version_only` checks the fields beside it. `fetch_config` is reached
+    /// through `main::connect` with `?`, so refusing there would stop `status`,
+    /// `logout`, `remote forget` and every other command on a value only the
+    /// provisioning flow needs. A lead who types a malformed slug into the
+    /// dashboard should break the run that has to clone something and nothing
+    /// else.
+    pub fn default_repo(&self) -> Result<Repo> {
+        Repo::parse(&self.repo_slug).with_context(|| {
+            format!(
+                "the default repository in the riabuild dashboard, {:?}, is not usable",
+                self.repo_slug
+            )
+        })
     }
 }
 
@@ -170,17 +169,28 @@ mod tests {
     }
 
     #[test]
-    fn the_checkout_is_named_after_the_repository_not_the_owner() {
-        assert_eq!(config().repo_name(), "ai-builders-hub");
+    fn the_default_repository_is_the_slug_the_dashboard_holds() {
+        let repo = config().default_repo().expect("parses");
+        assert_eq!(repo.slug(), "Clubria/ai-builders-hub");
+        // What a bare name typed at the picker is completed with.
+        assert_eq!(repo.owner(), "Clubria");
+        // What the checkout directory is named after.
+        assert_eq!(repo.name(), "ai-builders-hub");
     }
 
     #[test]
-    fn a_slug_without_an_owner_is_still_usable() {
+    fn a_default_repository_nobody_could_clone_says_where_it_came_from() {
+        // `repoSlug` is the one field `org.update` stores without checking, so
+        // this is reachable by a lead's typo — and the message has to send them
+        // to the dashboard rather than read as a bug in their machine.
         let mut config = config();
         config.repo_slug = "ai-builders-hub".into();
-        assert_eq!(config.repo_name(), "ai-builders-hub");
-        config.repo_slug = "Clubria/".into();
-        assert_eq!(config.repo_name(), "Clubria/");
+        let error = config.default_repo().expect_err("names no owner");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("riabuild dashboard") && message.contains("names no owner"),
+            "unhelpful message: {message}"
+        );
     }
 
     #[test]
@@ -192,7 +202,7 @@ mod tests {
                 "minCliVersion":"0.1.0","latestCliVersion":"0.1.0","secretsUpdatedAt":0}"#,
         )
         .expect("an unknown field must not break the config");
-        assert_eq!(config.repo_name(), "ai-builders-hub");
+        assert_eq!(config.repo_slug, "Clubria/ai-builders-hub");
     }
 
     /// A payload with `latestCliVersion`/`minCliVersion` set to `value`.
@@ -303,24 +313,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recognises_every_way_of_writing_the_same_remote() {
-        let config = config();
-        for remote in [
-            "https://github.com/Clubria/ai-builders-hub.git",
-            "https://github.com/clubria/ai-builders-hub",
-            "git@github.com:Clubria/ai-builders-hub.git",
-            "ssh://git@github.com/Clubria/ai-builders-hub.git",
-        ] {
-            assert!(config.matches_remote(remote), "should accept {remote}");
-        }
-    }
-
-    #[test]
-    fn rejects_a_different_repository() {
-        let config = config();
-        assert!(!config.matches_remote("git@github.com:Clubria/other-repo.git"));
-        assert!(!config.matches_remote("git@gitlab.com:Clubria/ai-builders-hub.git"));
-        assert!(!config.matches_remote(""));
-    }
+    // Remote spellings moved with `matches_remote` onto `Repo`, and are
+    // covered by `repo::tests::every_spelling_of_the_same_remote_matches`.
 }

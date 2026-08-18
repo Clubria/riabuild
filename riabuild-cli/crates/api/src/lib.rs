@@ -14,7 +14,10 @@ pub mod issued;
 pub mod openssh;
 pub mod org;
 pub mod remotes;
+pub mod repo;
 pub mod secrets;
+
+pub use repo::Repo;
 
 use anyhow::{Context, Result};
 use riabuild_ui::Failure;
