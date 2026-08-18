@@ -1,6 +1,18 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const PORT = 5199;
+/**
+ * `RIABUILD_UI_PORT` because `reuseExistingServer` is on off CI, and the port was
+ * fixed: a second worktree running this suite found the first one's Vite already
+ * listening, reused it, and screenshotted **another checkout's code**. Every
+ * assertion still ran, most still passed, and the images were of a page nobody
+ * was testing — which is worse than a failure, because a green run is evidence
+ * of nothing at all.
+ *
+ * Overriding the port is how a worktree gets its own server without stopping
+ * anybody else's. CI is unaffected: it sets neither, and `reuseExistingServer`
+ * is false there.
+ */
+const PORT = Number(process.env.RIABUILD_UI_PORT ?? 5199);
 
 /**
  * Three viewports, because the failures live at the edges: 380 is a small phone
