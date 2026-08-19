@@ -91,6 +91,7 @@ a task never records a success it has not verified.
 | 9 | `claude_trust` | every account trusts the checkout, so no modal on first launch |
 | 10 | `env_local` | one `.env.<environment>` per environment you may see — `.env.dev`, plus `.env.staging` for developers and leads — freshly brokered, parseable, and git-ignored |
 | 11 | `claude_statusline` | the status line script the org settings name |
+| 12 | `git_credentials` | your own `git push` uses your GitHub sign-in, with no password to type |
 
 Then it drops you into your own shell with the environment applied, opening with a box
 listing your Claude Code accounts and who is signed into each.
