@@ -149,6 +149,14 @@ fi
 if [ -f "{settings}" ]; then
   exec "$claude_binary" --settings "{settings}" {flag} "$@"
 fi
+# The team's settings are the only way org policy — the permission mode, the
+# deny rules, the status line — reaches Claude Code, and this is the branch
+# where they are not on this machine. Claude Code still starts, because a
+# developer on a plane should not be locked out of their editor by a settings
+# file they cannot fetch. It says so first: a session that quietly runs without
+# the team's permission mode looks exactly like one that has it, right up until
+# it asks a question it was configured never to ask.
+echo "riabuild: the team's Claude Code settings are not on this machine, so this session has no team policy — no permission mode, no deny rules, no status line. Run \`riabuild\` to fetch them." >&2
 exec "$claude_binary" {flag} "$@"
 "#,
         config_dir = config_dir.display(),
@@ -591,6 +599,26 @@ mod tests {
             )),
             "{script}"
         );
+    }
+
+    #[test]
+    fn a_launch_without_the_team_settings_says_so() {
+        // The branch above this one is the whole reason org policy exists, and
+        // the branch below it is indistinguishable from a working machine: same
+        // Claude Code, same prompt, no permission mode. "claude keeps
+        // forgetting its permission mode" is what that looks like from a
+        // terminal, and it is unanswerable without this line.
+        let script = script();
+        let (_, fallback) = script
+            .split_once(r#"exec "$claude_binary" --settings"#)
+            .expect("the launcher execs with the settings it has");
+        assert!(
+            fallback.contains("riabuild: the team's Claude Code settings are not on this machine"),
+            "the settings-less exec must announce itself: {script}"
+        );
+        // On stderr, so it cannot land in the middle of `claude -p` output that
+        // something else is parsing.
+        assert!(fallback.contains(r#"to fetch them." >&2"#), "{script}");
     }
 
     #[test]
