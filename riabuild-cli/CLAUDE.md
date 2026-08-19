@@ -193,6 +193,18 @@ exists. "Current-thread" describes the reactor, not the process, and the binary 
 threads. Closures cannot be async, so `and_then`/`unwrap_or_else` chains around IO have to
 be unrolled into `match` or `let else` rather than kept for tidiness.
 
+**A repository is a `Repo`, never a `String`, and a task never reads `org.repo_slug`.**
+`api::Repo` is the only thing that may name one, because the value reaches `gh repo clone`
+argv *and* a directory name: a leading `-` is an option rather than a repository, and `..`
+puts a checkout — with the brokered `.env` files `env_local` writes into it — outside the
+directory riabuild chose. It arrives from a developer at a prompt as well as from the
+dashboard, and `org.update` stored that field with no check at all until the picker existed.
+
+`org.repo_slug` is the **default** the picker offers and nothing else. What a run is about
+is `Ctx::repo`, set by the picker or by `--repo`; a task that reaches for the org's slug
+instead will clone one repository and provision another, on a machine where every test
+still passes because the two are the same value until somebody picks.
+
 **Every prompt has a default.** `Ui::ask` returns `None` when there is no terminal — in
 CI, over a pipe, under `cargo test` — so a question is how riabuild offers a choice, never
 how it obtains a value it cannot otherwise get. A prompt that is the only route to an
@@ -494,7 +506,7 @@ crates form a straight line, each depending only on those above it:
 | `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
-| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
+| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run | all of the above |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 

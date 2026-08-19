@@ -275,6 +275,7 @@ fn holds_gh_session_marker(cli: &Cli) -> bool {
 /// match below.
 async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
     keep_current(cli, ctx).await?;
+    remember_repo(cli, ctx).await?;
     remember_project(cli, ctx).await?;
 
     match &cli.command {
@@ -384,8 +385,65 @@ async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
     }
     let expanded = expand_tilde(project, &ctx.paths.home());
     let chosen = expanded.to_string_lossy().into_owned();
-    ctx.update_config(|config| config.project_path = Some(chosen))
-        .await
+    // Recorded against the repository this run is about — `--repo`'s answer
+    // when there is one, otherwise whatever this machine last worked on, and
+    // the org default on a machine that has never chosen. A path is a fact
+    // about one checkout, and there can now be several.
+    match ctx.repo().ok() {
+        Some(repo) => {
+            let slug = repo.slug().to_string();
+            ctx.update_config(|config| config.set_checkout(&slug, chosen))
+                .await
+        }
+        // Not signed in, so there is no repository to key it by yet. The single
+        // path is what an older riabuild wrote and what `project_dir` still
+        // reads, and the picker migrates it as soon as there is a session.
+        None => {
+            ctx.update_config(|config| config.project_path = Some(chosen))
+                .await
+        }
+    }
+}
+
+/// Remembers `--repo`, unless the repository names one on a *server*.
+///
+/// The same reasoning as `remember_project`: `riabuild remote --repo payments
+/// build-01` is asking for `payments` on `build-01`, and `remote::flow` forwards
+/// the flag over SSH for the server's own riabuild to act on. Writing it here as
+/// well would switch *this* laptop to a repository the developer was talking
+/// about somewhere else.
+///
+/// A value this laptop cannot parse fails the run rather than being dropped: it
+/// was typed on this command line, and silently provisioning a different
+/// repository than the one asked for is the one outcome nobody could debug.
+async fn remember_repo(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
+    let Some(named) = &cli.repo else {
+        return Ok(());
+    };
+    if matches!(cli.command, Some(Command::Remote { .. })) {
+        return Ok(());
+    }
+    // The org default supplies the owner for a bare name. With no session there
+    // is nothing to supply it, so `owner/repo` is required — which is the form a
+    // script would use anyway.
+    let owner = ctx
+        .org
+        .as_ref()
+        .and_then(|org| org.default_repo().ok())
+        .map(|default| default.owner().to_string());
+    let repo = match owner {
+        Some(owner) => riabuild_api::Repo::parse_with_owner(named, &owner),
+        None => riabuild_api::Repo::parse(named),
+    }
+    .map_err(|error| {
+        riabuild_ui::Failure::new(
+            format!("reading --repo {named}"),
+            "Give it as `owner/repo`, or a bare repository name once this machine is signed in.",
+        )
+        .detail(format!("{error}"))
+    })?;
+
+    tasks::repo::pick::adopt_named(ctx, repo).await
 }
 
 async fn logout(ctx: &mut Ctx) -> Result<i32> {
@@ -508,6 +566,79 @@ mod tests {
         assert!(ctx.paths.config_file().exists());
     }
 
+    #[tokio::test]
+    async fn a_named_repository_is_remembered_for_the_next_run_too() {
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from(["riabuild", "--repo", "Clubria/payments"]);
+
+        remember_repo(&cli, &mut ctx).await.expect("remembers");
+
+        assert_eq!(
+            ctx.repo.as_ref().map(|repo| repo.slug()),
+            Some("Clubria/payments"),
+            "every repository-scoped task reads this, not the flag"
+        );
+        assert_eq!(
+            ctx.config.active_repo.as_deref(),
+            Some("Clubria/payments"),
+            "and the next run's default is what this run worked on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_repository_on_a_remote_run_is_not_recorded_here() {
+        // `riabuild remote --repo payments build-01` is about `build-01`:
+        // `flow/connect.rs` forwards the flag, and the server's own riabuild
+        // acts on it. Recording it here would switch this laptop to a
+        // repository the developer was talking about somewhere else — the same
+        // bug `remember_project`'s guard exists for.
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from([
+            "riabuild",
+            "--repo",
+            "Clubria/payments",
+            "remote",
+            "build-01",
+        ]);
+
+        remember_repo(&cli, &mut ctx)
+            .await
+            .expect("nothing to remember here is not an error");
+
+        assert_eq!(ctx.config.active_repo, None);
+        assert!(ctx.repo.is_none());
+        assert!(
+            !ctx.paths.config_file().exists(),
+            "and config.json must not have been written at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_riabuild_cannot_use_fails_the_run_rather_than_being_dropped() {
+        // Silently provisioning a different repository than the one named on the
+        // command line is the outcome nobody could debug.
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from(["riabuild", "--repo", "Clubria/.."]);
+
+        let error = remember_repo(&cli, &mut ctx)
+            .await
+            .expect_err("must not be accepted");
+        assert!(format!("{error:#}").contains("--repo"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_bare_name_with_no_session_says_what_form_to_use() {
+        // The org default supplies the owner for a bare name, and there is no
+        // org default until this machine has signed in.
+        let (mut ctx, _home) = ctx_for(&scope::Scope::read(None));
+        let cli = Cli::parse_from(["riabuild", "--repo", "payments"]);
+
+        let error = remember_repo(&cli, &mut ctx)
+            .await
+            .expect_err("no owner to complete it with");
+        assert!(format!("{error:#}").contains("owner/repo"), "{error:#}");
+    }
+
     /// A `Cli` with every field but `command`/`no_shell`/`check` at its
     /// ordinary default, for the marker-predicate tests below — those three
     /// are the only fields `opens_shell` reads.
@@ -515,6 +646,7 @@ mod tests {
         Cli {
             command,
             project: None,
+            repo: None,
             check,
             quiet: false,
             no_shell,

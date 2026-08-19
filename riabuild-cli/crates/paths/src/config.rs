@@ -92,7 +92,36 @@ impl State {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserConfig {
-    /// Where the repo lives. Absolute once chosen.
+    /// The checkout of each repository this machine has cloned, keyed by
+    /// `owner/repo`, absolute once chosen.
+    ///
+    /// A map rather than a path because `riabuild` asks which repository to work
+    /// on, and a developer who answers with one they have used before must not
+    /// be re-cloned or re-asked: the tree, its branches, its uncommitted work
+    /// and its `.env` files are all still there. Keys are slugs an `api::Repo`
+    /// produced — this crate stores them and never parses them, which is why it
+    /// holds strings and not the newtype.
+    #[serde(default)]
+    pub repos: BTreeMap<String, String>,
+    /// Which of `repos` this machine is working on, as `owner/repo`.
+    ///
+    /// `None` means the picker has not run here yet, which is what
+    /// `adopt_legacy_checkout` tests before it migrates anything.
+    #[serde(default)]
+    pub active_repo: Option<String>,
+    /// The single checkout riabuild recorded before it asked which repository.
+    ///
+    /// Migrated into `repos` by `adopt_legacy_checkout`, which the picker calls —
+    /// the first place both this path and the org's default repository are known.
+    /// It cannot be folded in `load` the way `claude_profile` is, because folding
+    /// it means knowing *which* repository the path is a checkout of, and that
+    /// arrives from `/api/v1/org/config` long after this file is read.
+    ///
+    /// Still serialised until then, deliberately. `skip_serializing` would mean
+    /// any run that rewrites `config.json` for an unrelated reason — `riabuild
+    /// claude add` is one — drops a checkout nothing has folded yet, and the next
+    /// provisioning run clones a second copy of the repository the developer
+    /// already has.
     #[serde(default)]
     pub project_path: Option<String>,
     /// Pinned by `toolchain` so every later run agrees on which Node is ours.
@@ -157,6 +186,50 @@ impl UserConfig {
     ///
     /// Takes the field rather than copying it, so no caller can read a value
     /// that will not be saved.
+    /// The checkout of one repository, if this machine has one.
+    ///
+    /// Keyed by the repository asked about rather than by `active_repo`: which
+    /// repository a *run* is about is the run's to know — `--repo` and the picker
+    /// both set it before any task looks at a checkout — and `active_repo` is
+    /// only how that is remembered for the next run's default.
+    pub fn checkout_of(&self, slug: &str) -> Option<&str> {
+        self.repos.get(slug).map(String::as_str)
+    }
+
+    /// The one checkout riabuild recorded before it asked which repository.
+    ///
+    /// Only `Ctx::project_dir` reads it, and only for the org default, because
+    /// that is the only repository this path can be a checkout of. Kept
+    /// separate from `checkout_of` so no caller can answer a question about
+    /// `Clubria/payments` with a path that is a checkout of something else.
+    pub fn legacy_checkout(&self) -> Option<&str> {
+        self.project_path.as_deref()
+    }
+
+    /// Records where a repository's checkout is.
+    pub fn set_checkout(&mut self, slug: &str, path: impl Into<String>) {
+        self.repos.insert(slug.to_string(), path.into());
+    }
+
+    /// Folds the pre-picker checkout into `repos` under `slug`, the org's default
+    /// repository — the only repository riabuild could have cloned before it
+    /// asked.
+    ///
+    /// Taken unconditionally, and never over an entry the map already has: the
+    /// field is cleared in the same write, so the only way it can reappear is an
+    /// older riabuild writing it again, and folding that under the default is
+    /// still the right reading of it.
+    ///
+    /// Says nothing about which repository is *active*. Both callers decide that
+    /// for themselves, and a fold that also claimed it would have to refuse to
+    /// run once they had — which is how a path gets orphaned in a file nothing
+    /// reads any more.
+    pub fn adopt_legacy_checkout(&mut self, slug: &str) {
+        if let Some(path) = self.project_path.take() {
+            self.repos.entry(slug.to_string()).or_insert(path);
+        }
+    }
+
     fn fold_legacy_profile(&mut self) {
         // Taken unconditionally: a value that will not be saved must not be
         // readable either. `extend` over the Option keeps this one statement
@@ -509,6 +582,129 @@ mod tests {
         assert_eq!(loaded.project_path.as_deref(), Some("/Users/ada/code/hub"));
         assert_eq!(loaded.node_version.as_deref(), Some("22.23.1"));
         assert_eq!(loaded.claude_profile, None);
+    }
+
+    #[test]
+    fn each_repository_keeps_its_own_checkout() {
+        let mut config = UserConfig::default();
+        config.set_checkout("Clubria/ai-builders-hub", "/Users/ada/code/ai-builders-hub");
+        config.set_checkout("Clubria/payments", "/Users/ada/code/payments");
+
+        // Switching is a pointer move: both trees, their branches and their
+        // .env files stay recorded.
+        assert_eq!(
+            config.checkout_of("Clubria/payments"),
+            Some("/Users/ada/code/payments")
+        );
+        assert_eq!(
+            config.checkout_of("Clubria/ai-builders-hub"),
+            Some("/Users/ada/code/ai-builders-hub")
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_checkout_yet_has_none() {
+        // What the `project` task reads as "no project directory chosen yet",
+        // which is exactly right for a repository picked but never cloned.
+        let mut config = UserConfig::default();
+        config.set_checkout("Clubria/ai-builders-hub", "/Users/ada/code/hub");
+        assert_eq!(config.checkout_of("Clubria/payments"), None);
+    }
+
+    #[test]
+    fn the_checkout_an_older_riabuild_recorded_is_kept_apart_from_the_map() {
+        // `riabuild status` and `riabuild --check` never put the picker's
+        // question, so they read this file with the migration still pending —
+        // and a path that is a checkout of the org default must not be handed
+        // back as a checkout of anything else.
+        let config = UserConfig {
+            project_path: Some("/Users/ada/code/hub".into()),
+            ..UserConfig::default()
+        };
+        assert_eq!(config.legacy_checkout(), Some("/Users/ada/code/hub"));
+        assert_eq!(config.checkout_of("Clubria/ai-builders-hub"), None);
+    }
+
+    #[test]
+    fn the_legacy_checkout_is_adopted_by_the_org_default_and_then_forgotten() {
+        let mut config = UserConfig {
+            project_path: Some("/Users/ada/code/hub".into()),
+            ..UserConfig::default()
+        };
+
+        config.adopt_legacy_checkout("Clubria/ai-builders-hub");
+
+        assert_eq!(
+            config.checkout_of("Clubria/ai-builders-hub"),
+            Some("/Users/ada/code/hub"),
+            "the developer's existing tree must not be re-cloned"
+        );
+        assert_eq!(
+            config.project_path, None,
+            "the migrated field must be cleared in the same write"
+        );
+    }
+
+    #[test]
+    fn a_fold_never_writes_over_a_checkout_the_map_already_has() {
+        // Reachable by an older riabuild writing the field again after a
+        // migration. The map is the truth, and the path in it is the one the
+        // last run actually cloned or moved.
+        let mut config = UserConfig::default();
+        config.set_checkout("Clubria/ai-builders-hub", "/Users/ada/code/hub");
+        config.project_path = Some("/somewhere/stale".into());
+
+        config.adopt_legacy_checkout("Clubria/ai-builders-hub");
+
+        assert_eq!(
+            config.checkout_of("Clubria/ai-builders-hub"),
+            Some("/Users/ada/code/hub")
+        );
+        assert_eq!(config.project_path, None, "and the stale field is gone");
+    }
+
+    #[test]
+    fn a_fresh_machine_adopts_nothing() {
+        let mut config = UserConfig::default();
+        config.adopt_legacy_checkout("Clubria/ai-builders-hub");
+        assert!(config.repos.is_empty(), "there was no checkout to adopt");
+    }
+
+    #[tokio::test]
+    async fn the_repository_map_round_trips() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+
+        UserConfig::update(&paths, |config| {
+            config.set_checkout("Clubria/payments", "/Users/ada/code/payments");
+            config.active_repo = Some("Clubria/payments".into());
+        })
+        .await
+        .unwrap();
+
+        let loaded = UserConfig::load(&paths).await;
+        assert_eq!(
+            loaded.checkout_of("Clubria/payments"),
+            Some("/Users/ada/code/payments")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_written_before_the_picker_existed_still_loads() {
+        let home = TempDir::new().unwrap();
+        let paths = RealPaths::rooted_at(home.path());
+        tokio::fs::create_dir_all(paths.root()).await.unwrap();
+        tokio::fs::write(
+            paths.config_file(),
+            br#"{"project_path":"/Users/ada/code/hub","node_version":"22.23.1"}"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = UserConfig::load(&paths).await;
+        assert_eq!(loaded.legacy_checkout(), Some("/Users/ada/code/hub"));
+        assert!(loaded.repos.is_empty());
+        assert_eq!(loaded.active_repo, None);
     }
 
     #[tokio::test]

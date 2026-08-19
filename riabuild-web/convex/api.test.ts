@@ -1300,6 +1300,47 @@ describe("member administration", () => {
     ).rejects.toThrow(/dotted-numeric/i);
   });
 
+  test("org config refuses a repository the CLI would hand to a shell or a path", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "lead", role: "lead" });
+    const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
+
+    // This value reaches `gh repo clone <slug>` argv and names a *directory* on
+    // every developer's machine. Until the repository picker existed it was
+    // stored with no check at all.
+    for (const bad of [
+      "ai-builders-hub",
+      "Clubria/..",
+      "Clubria/../../etc",
+      "Clubria/sub/dir",
+      "-upload-pack=x/y",
+      "Clubria/-x",
+      "Clubria/pay ments",
+      "Clubria/",
+      "",
+    ]) {
+      await expect(
+        asLead.mutation(api.org.update, { repoSlug: bad }),
+        `"${bad}" must be refused`,
+      ).rejects.toThrow(/repository/i);
+    }
+  });
+
+  test("org config stores the repository trimmed, so the CLI is served what was checked", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "lead", role: "lead" });
+    const asLead = t.withIdentity({ subject: `${lead.userId}|session` });
+
+    await asLead.mutation(api.org.update, {
+      repoSlug: "  Clubria/payments\n",
+    });
+
+    const row = await t.run(
+      async (ctx) => await ctx.db.query("orgConfig").first(),
+    );
+    expect(row?.repoSlug).toBe("Clubria/payments");
+  });
+
   test("org config refuses a floor nobody could satisfy", async () => {
     const t = setup();
     const lead = await seedMember(t, { login: "lead", role: "lead" });

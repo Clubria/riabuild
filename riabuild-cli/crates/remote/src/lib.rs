@@ -64,6 +64,9 @@ pub struct Request {
     pub no_shell: bool,
     /// Where the checkout should live *on the server*, not on this laptop.
     pub project: Option<String>,
+    /// `--repo`, forwarded for the server's own riabuild to act on — it is the
+    /// one that puts the picker's question, and the one that clones.
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

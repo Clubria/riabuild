@@ -206,6 +206,7 @@ pub fn remote_request(
         quiet: cli.quiet,
         no_shell: cli.no_shell,
         project: cli.project.clone(),
+        repo: cli.repo.clone(),
     }
 }
 
@@ -268,9 +269,9 @@ mod tests {
 
     #[test]
     fn the_global_flags_a_remote_run_honours_reach_the_request() {
-        // `--check`, `--quiet`, `--no-shell` and `--project` are global, and
-        // `flow/connect.rs` reads all four. Handing them over by name is what
-        // stops it reading any other flag it likes.
+        // `--check`, `--quiet`, `--no-shell`, `--project` and `--repo` are
+        // global, and `flow/connect.rs` reads all five. Handing them over by
+        // name is what stops it reading any other flag it likes.
         let request = request_from(&[
             "riabuild",
             "--check",
@@ -278,9 +279,12 @@ mod tests {
             "--no-shell",
             "--project",
             "/srv/checkout",
+            "--repo",
+            "Clubria/payments",
             "remote",
             "build-01",
         ]);
+        assert_eq!(request.repo.as_deref(), Some("Clubria/payments"));
         assert!(request.check);
         assert!(request.quiet);
         assert!(request.no_shell);

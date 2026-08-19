@@ -688,13 +688,40 @@ read_config() { printf '%s' "$CONFIG" | python3 -c "import json,sys; print(json.
 read_config_list_first() {
   printf '%s' "$CONFIG" | python3 -c "import json,sys; v=json.load(sys.stdin).get('$1') or []; print(v[0] if v else '')"
 }
+# The checkout of the repository this machine is working on.
+#
+# `config.json` holds a *map* of checkouts since riabuild began asking which
+# repository to work on, keyed by `owner/repo`, with `active_repo` naming the one
+# in use. `project_path` is what riabuild wrote before that and is read here as a
+# fallback for exactly one reason: this suite must keep passing against a
+# `config.json` an older riabuild left behind.
+read_active_checkout() {
+  printf '%s' "$CONFIG" | python3 -c "
+import json, sys
+
+config = json.load(sys.stdin)
+repos = config.get('repos') or {}
+active = config.get('active_repo')
+print(repos.get(active) or config.get('project_path') or '')
+"
+}
+read_active_repo() {
+  printf '%s' "$CONFIG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('active_repo') or '')"
+}
 
 NODE_VERSION="$(read_config node_version)"
 PNPM_VERSION="$(read_config pnpm_version)"
-PROJECT_DIR="$(read_config project_path)"
+PROJECT_DIR="$(read_active_checkout)"
+ACTIVE_REPO="$(read_active_repo)"
 CLAUDE_ACCOUNT="$(read_config_list_first claude_accounts)"
 info "node=$NODE_VERSION pnpm=$PNPM_VERSION account=$CLAUDE_ACCOUNT"
-info "checkout=$PROJECT_DIR"
+info "checkout=$PROJECT_DIR repo=$ACTIVE_REPO"
+
+# The repository picker's own record. A first run has no session when the
+# question would be put, so it provisions the org default and records that —
+# which is the repository this suite's checkout has to be of.
+check_contains "the repository riabuild recorded is the one the server named" \
+  "$ACTIVE_REPO" "$E2E_REPO_SLUG"
 
 check_contains "riabuild's Node is the version it pinned" \
   "$("$RIA_HOME/node/$NODE_VERSION/bin/node" -v 2>&1)" "v$NODE_VERSION"
@@ -821,6 +848,45 @@ else
     fail "expected only claude_accounts,claude_trust,claude_onboarding,claude_agents_view outstanding — got [$OUTSTANDING]"
   fi
 fi
+
+step "Naming a repository on the command line"
+
+# `--repo` is how an unattended run, a script, or this suite says which
+# repository to work on without a prompt. Asserted against the repository already
+# checked out, so it proves the flag's path — parse, record, and provision *that*
+# repository — without paying for a second clone on a hosted runner.
+#
+# The prompt itself is not reachable from here and is not meant to be: `Ui::ask`
+# answers `None` with no terminal, which is the documented behaviour this run
+# relies on everywhere else. Its rules are unit-tested in `repo::pick`.
+if [ "$SIGN_IN" = done ]; then
+  if REPO_RUN="$(riabuild --repo "$E2E_REPO_SLUG" --no-shell 2>&1)"; then
+    pass "a run naming its repository exits 0"
+  else
+    fail "a run naming its repository did not exit 0"
+    printf '%s\n' "$REPO_RUN" | sed 's/^/         | /' >&2
+  fi
+  check_contains "and says which repository it is working on" \
+    "$REPO_RUN" "$E2E_REPO_SLUG"
+  NAMED="$(last_run_log)"
+  check_contains "and still applies nothing, because it is the same repository" \
+    "$NAMED" "applied=[]"
+else
+  info "a named repository was not provisioned: the run stopped before the sign-in finished"
+fi
+
+# Outside that gate on purpose. A repository nobody could clone is refused by
+# `main::remember_repo`, which runs before anything is provisioned and needs no
+# session — so this is the one assertion here that a run with an unfinished
+# sign-in can still make, and the whole block was reporting "not exercised" in CI
+# while it sat inside.
+#
+# The message is asserted, not merely the exit code: without a session every
+# invocation exits non-zero, so a status check alone would pass for the wrong
+# reason on exactly the run this is here to cover.
+REFUSED="$(riabuild --repo "Clubria/.." --no-shell 2>&1 || true)"
+check_contains "a repository name that escapes its directory is refused, by name" \
+  "$REFUSED" "--repo"
 
 step "Drift is detected and repaired"
 

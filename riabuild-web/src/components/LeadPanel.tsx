@@ -222,7 +222,12 @@ export function OrgSettings() {
 
   return (
     <div className="max-w-2xl">
-      <Field label="repository" value={slug} onChange={setRepoSlug} />
+      <Field
+        label="default repository"
+        hint="What Enter picks when riabuild asks. Developers can work on any repository they can see."
+        value={slug}
+        onChange={setRepoSlug}
+      />
 
       <div className="mt-4">
         <TextArea

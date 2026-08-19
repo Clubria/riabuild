@@ -53,6 +53,8 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     ctx.ui.banner("Clubria");
     ctx.connect().await?;
     describe_session(ctx);
+    ask_which_repository(ctx, cli).await?;
+    describe_repo(ctx);
 
     // The update check that used to stand here now runs for *every* command,
     // from `main::keep_current`, before this function is reached. It has not
@@ -115,6 +117,27 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
         return Ok(0);
     }
     open_shell(ctx).await
+}
+
+/// Which repository this run is about, asked before any task looks at a checkout.
+///
+/// Three runs go straight past it:
+///
+/// - `--repo` was given, so the answer is already on the command line and
+///   `main::remember_repo` has recorded it.
+/// - `--check` and `riabuild status`, which report and change nothing —
+///   `config.json` is part of "nothing", and a question is a poor thing to put to
+///   somebody who asked for a report.
+/// - a machine with no session yet, where there is no team configuration to name
+///   a default with and no GitHub sign-in to list anything through. That is the
+///   first run on every machine: it provisions the org default, and the run after
+///   it — which has both — puts the question.
+async fn ask_which_repository(ctx: &mut Ctx, cli: &Cli) -> Result<()> {
+    if cli.repo.is_some() || ctx.dry_run || ctx.org.is_none() {
+        return Ok(());
+    }
+    riabuild_tasks::repo::choose(ctx).await?;
+    Ok(())
 }
 
 /// The Claude Code launchers, written unless this run promised to change nothing.
@@ -190,6 +213,23 @@ fn describe_session(ctx: &Ctx) {
         member.role,
         ctx.keychain.describe(),
     ));
+}
+
+/// Which repository this run is about, and where its checkout is.
+///
+/// Printed for the same reason `describe_session` is: with more than one
+/// repository in play, "riabuild is working on the wrong one" is otherwise
+/// invisible until a task says something that reads as a fault.
+fn describe_repo(ctx: &Ctx) {
+    let Ok(repo) = ctx.repo() else {
+        return;
+    };
+    let home = ctx.paths.home();
+    let checkout = match ctx.project_dir() {
+        Some(dir) => riabuild_paths::contract_tilde(&dir, &home),
+        None => "not cloned yet".to_string(),
+    };
+    ctx.ui.note(&format!("working on {repo} · {checkout}"));
 }
 
 /// One line per run in `~/.riabuild/logs/riabuild.log`.
@@ -269,6 +309,64 @@ mod tests {
     use riabuild_runner::FakeRunner;
     use riabuild_tasks::accounts;
     use riabuild_tasks::testing::ctx_with;
+
+    /// A `Cli` for the picker tests: only `check` and `repo` are read by
+    /// `ask_which_repository`.
+    fn cli_with(check: bool, repo: Option<&str>) -> Cli {
+        Cli {
+            command: None,
+            project: None,
+            repo: repo.map(str::to_string),
+            check,
+            quiet: false,
+            no_shell: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_never_asks_which_repository() {
+        // `--check` and `riabuild status` report and change nothing, and a
+        // question is a poor thing to put to somebody who asked for a report.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.ui = ui::Ui::scripted(["payments"]);
+        ctx.dry_run = true;
+
+        ask_which_repository(&mut ctx, &cli_with(true, None))
+            .await
+            .expect("asks nothing");
+
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+        assert_eq!(ctx.config.active_repo, None);
+    }
+
+    #[tokio::test]
+    async fn a_named_repository_is_not_asked_about_again() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.ui = ui::Ui::scripted(["payments"]);
+
+        ask_which_repository(&mut ctx, &cli_with(false, Some("Clubria/payments")))
+            .await
+            .expect("asks nothing");
+
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_session_yet_is_not_asked() {
+        // Every machine's first run: there is no team configuration to name a
+        // default with, and no GitHub sign-in to list anything through. It
+        // provisions the org default, and the run after it puts the question.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.org = None;
+        ctx.ui = ui::Ui::scripted(["payments"]);
+
+        ask_which_repository(&mut ctx, &cli_with(false, None))
+            .await
+            .expect("asks nothing");
+
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+        assert_eq!(ctx.config.active_repo, None);
+    }
 
     /// The far side of a handoff prints no spacing of its own.
     ///

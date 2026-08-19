@@ -18,9 +18,18 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Where the Clubria repository should live.
+    /// Where the repository you are working on should live.
     #[arg(long, global = true, value_name = "PATH")]
     pub project: Option<String>,
+
+    /// Which repository to work on, as `owner/repo` or a bare name in the org.
+    ///
+    /// Skips the question `riabuild` otherwise asks, which is what an
+    /// unattended run or a script wants. Global rather than scoped to the
+    /// default flow because `riabuild remote --repo payments build-01` has to
+    /// reach the server's own riabuild, the same way `--project` does.
+    #[arg(long, global = true, value_name = "OWNER/REPO")]
+    pub repo: Option<String>,
 
     /// Check everything and report, changing nothing.
     #[arg(long, global = true)]

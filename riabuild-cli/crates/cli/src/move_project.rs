@@ -1,13 +1,19 @@
-//! `riabuild move-project` — the checkout, somewhere else.
+//! `riabuild move-project` — a checkout, somewhere else.
 //!
 //! Moving a checkout by hand leaves riabuild pointing at a directory that is no
 //! longer there, and the next run quietly clones a second copy to the old
 //! place. This is the supported way to change the answer given at first setup.
+//!
+//! Two questions now, because a machine can have a checkout of more than one
+//! repository: which one, and then where it should go. The first is only put
+//! when there is something to choose — one checkout is not a choice — so on the
+//! machine every developer has, this command is exactly what it was.
 
 use crate::fs_move::move_tree;
 use anyhow::Result;
 use riabuild_paths::{contract_tilde, expand_tilde};
 use riabuild_tasks::Ctx;
+use riabuild_tasks::repo;
 use riabuild_tasks::shell;
 use riabuild_ui::Failure;
 use std::path::{Path, PathBuf};
@@ -16,15 +22,21 @@ use std::path::{Path, PathBuf};
 /// says when there is no argument.
 pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
     let home = ctx.paths.home();
+    // Asked first, because everything below is about one checkout: which
+    // directory is being moved, which path is refused for being inside it, and
+    // which repository's entry is rewritten at the end. `None` is a machine with
+    // nothing recorded but the single pre-picker path, which the rest of this
+    // still handles exactly as it did.
+    let moving = repo::pick::choose_cloned(ctx).await?;
     let from = recorded_checkout(ctx, &home).await?;
 
     let answer = match requested {
         Some(path) => path.to_string(),
         None => {
-            ctx.ui.info(&format!(
-                "The repository is at {}.",
-                contract_tilde(&from, &home)
-            ));
+            ctx.ui.info(&match &moving {
+                Some(repo) => format!("{repo} is at {}.", contract_tilde(&from, &home)),
+                None => format!("The repository is at {}.", contract_tilde(&from, &home)),
+            });
             ctx.ui.ask("Move it to:").ok_or_else(|| {
                 Failure::new(
                     "moving your Clubria checkout",
@@ -90,8 +102,20 @@ pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
     })?;
 
     let destination = to.to_string_lossy().into_owned();
-    ctx.update_config(|config| config.project_path = Some(destination))
-        .await?;
+    match &moving {
+        // The moved repository's own entry, and nothing else: the other
+        // checkouts on this machine have not gone anywhere. Which repository is
+        // *active* is untouched too — this is a question about a directory.
+        Some(repo) => {
+            let slug = repo.slug().to_string();
+            ctx.update_config(|config| config.set_checkout(&slug, destination))
+                .await?;
+        }
+        None => {
+            ctx.update_config(|config| config.project_path = Some(destination))
+                .await?;
+        }
+    }
 
     ctx.ui.info(&format!(
         "moved {} → {}",
@@ -228,6 +252,143 @@ mod tests {
             .unwrap();
 
         assert!(to.join("README.md").exists());
+    }
+
+    /// A checkout of one particular repository, recorded the way the picker and
+    /// the `project` task record one.
+    ///
+    /// Written through `update_config` rather than onto `ctx.config`, because the
+    /// first real write reloads the file and would discard a seed that only ever
+    /// existed in memory — the trap `riabuild-cli/CLAUDE.md` names under "State
+    /// is read under a lock".
+    async fn recorded_for(ctx: &mut Ctx, slug: &str, dir: &Path) {
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        write_file(&dir.join("README.md"), "hello\n").await;
+        let path = dir.to_string_lossy().into_owned();
+        let slug = slug.to_string();
+        ctx.update_config(|config| config.set_checkout(&slug, path))
+            .await
+            .expect("record the checkout");
+    }
+
+    /// Which repository this machine is working on, recorded durably.
+    async fn working_on(ctx: &mut Ctx, slug: &str) {
+        let slug = slug.to_string();
+        ctx.update_config(|config| config.active_repo = Some(slug))
+            .await
+            .expect("record the active repository");
+    }
+
+    #[tokio::test]
+    async fn with_two_checkouts_it_asks_which_one_and_moves_that_one() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let hub = home.path().join("code/ai-builders-hub");
+        let payments = home.path().join("code/payments");
+        let to = home.path().join("work/payments");
+        recorded_for(&mut ctx, "Clubria/ai-builders-hub", &hub).await;
+        recorded_for(&mut ctx, "Clubria/payments", &payments).await;
+        working_on(&mut ctx, "Clubria/ai-builders-hub").await;
+        // "2" is `payments`: the box puts what Enter would take first, and the
+        // rest in name order.
+        ctx.ui = Ui::scripted(["2", to.to_string_lossy().as_ref()]);
+
+        run(&mut ctx, None).await.unwrap();
+
+        assert!(to.join(".git/HEAD").exists(), "payments should have moved");
+        assert!(
+            hub.join(".git/HEAD").exists(),
+            "the other tree must not move"
+        );
+        assert_eq!(
+            ctx.config.checkout_of("Clubria/payments"),
+            Some(to.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            ctx.config.checkout_of("Clubria/ai-builders-hub"),
+            Some(hub.to_string_lossy().as_ref()),
+            "the repository that did not move keeps its path"
+        );
+        assert_eq!(
+            ctx.config.active_repo.as_deref(),
+            Some("Clubria/ai-builders-hub"),
+            "moving a directory must not change which repository is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_typed_repository_name_picks_the_checkout_to_move() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let hub = home.path().join("code/ai-builders-hub");
+        let payments = home.path().join("code/payments");
+        let to = home.path().join("work/payments");
+        recorded_for(&mut ctx, "Clubria/ai-builders-hub", &hub).await;
+        recorded_for(&mut ctx, "Clubria/payments", &payments).await;
+        ctx.ui = Ui::scripted(["payments", to.to_string_lossy().as_ref()]);
+
+        run(&mut ctx, None).await.unwrap();
+
+        assert!(to.join(".git/HEAD").exists());
+        assert!(hub.join(".git/HEAD").exists());
+    }
+
+    #[tokio::test]
+    async fn a_repository_this_machine_has_not_cloned_is_refused_at_the_question() {
+        // There is no directory to move, and saying so here is better than a
+        // `rename` that fails on a path nobody recorded.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let hub = home.path().join("code/ai-builders-hub");
+        let payments = home.path().join("code/payments");
+        let to = home.path().join("work/payments");
+        recorded_for(&mut ctx, "Clubria/ai-builders-hub", &hub).await;
+        recorded_for(&mut ctx, "Clubria/payments", &payments).await;
+        working_on(&mut ctx, "Clubria/payments").await;
+        ctx.ui = Ui::scripted(["design-system", "", to.to_string_lossy().as_ref()]);
+
+        run(&mut ctx, None).await.unwrap();
+
+        // The second answer was Enter, which takes `payments`.
+        assert!(to.join(".git/HEAD").exists());
+        assert!(hub.join(".git/HEAD").exists());
+    }
+
+    #[tokio::test]
+    async fn with_one_checkout_there_is_no_repository_question() {
+        // The machine every developer has. One checkout is not a choice, and a
+        // picker with one row is a worse way to say "this one".
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let from = home.path().join("code/hub");
+        let to = home.path().join("work/hub");
+        recorded_for(&mut ctx, "Clubria/ai-builders-hub", &from).await;
+        ctx.ui = Ui::scripted([to.to_string_lossy().as_ref()]);
+
+        run(&mut ctx, None).await.unwrap();
+
+        assert!(to.join(".git/HEAD").exists());
+        let asked = ctx.ui.asked();
+        assert_eq!(asked.len(), 1, "only the destination was asked: {asked:?}");
+        assert!(asked[0].contains("Move it to"), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn a_machine_that_has_not_migrated_yet_moves_its_one_checkout() {
+        // `config.json` from before the picker existed: one path, no map. The
+        // command has to keep working there, because a developer reaches for it
+        // on exactly the machine they have been using for months.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let from = home.path().join("code/hub");
+        let to = home.path().join("work/hub");
+        recorded(&mut ctx, &from).await;
+
+        run(&mut ctx, Some(to.to_string_lossy().as_ref()))
+            .await
+            .unwrap();
+
+        assert!(to.join(".git/HEAD").exists());
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(to.to_string_lossy().as_ref()),
+            "the field the next run still reads has to be the one updated"
+        );
     }
 
     #[tokio::test]
