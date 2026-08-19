@@ -108,6 +108,13 @@ pub enum InternalAction {
     SeedGithub,
     /// Remove what a session that died without cleaning up left behind.
     GhSweep,
+    /// Print the team's ngrok authtoken on stdout.
+    ///
+    /// Hidden: run by the generated `~/.riabuild/bin/ngrok` on every
+    /// invocation, never by a person. Its stdout is the token itself, which is
+    /// why — like `askpass` — it is one of the commands riabuild does not
+    /// print anything else during.
+    NgrokToken,
     /// Answer an `ssh` password prompt. Run by `ssh` itself, via SSH_ASKPASS.
     ///
     /// `trailing_var_arg` because the one argument is `ssh`'s own prompt text
@@ -500,6 +507,14 @@ mod tests {
             sweep.command,
             Some(Command::Internal {
                 action: InternalAction::GhSweep
+            })
+        ));
+
+        let token = Cli::parse_from(["riabuild", "internal", "ngrok-token"]);
+        assert!(matches!(
+            token.command,
+            Some(Command::Internal {
+                action: InternalAction::NgrokToken
             })
         ));
 

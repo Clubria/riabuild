@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod issued;
+pub mod ngrok;
 pub mod openssh;
 pub mod org;
 pub mod remotes;

@@ -87,6 +87,56 @@ async fn accept_github_token(ctx: &mut Ctx, token: &str) -> Result<i32> {
     Ok(if output.ok() { 0 } else { 1 })
 }
 
+/// Prints the team's ngrok authtoken, and nothing else.
+///
+/// Run by `~/.riabuild/bin/ngrok` on every invocation, inside a command
+/// substitution. **The token is the only thing on stdout**, for the same reason
+/// it is in `askpass` below: the caller reads this process's stdout as the
+/// value. Anything riabuild has to say goes to stderr, where the developer sees
+/// it and the shim does not capture it.
+///
+/// A failure here is deliberately not fatal to `ngrok`. The shim leaves the
+/// variable unset and runs it anyway, so `ngrok --version` and `ngrok help`
+/// work on a machine with no network, and the developer meets the explanation
+/// rather than an empty `NGROK_AUTHTOKEN` that reads as "not authenticated".
+pub(crate) async fn ngrok_token(ctx: &mut Ctx) -> Result<i32> {
+    ctx.connect().await?;
+    if ctx.org.is_none() {
+        return Err(not_signed_in().into());
+    }
+    let fetched = riabuild_api::ngrok::fetch_authtoken(&ctx.api)
+        .await
+        .map_err(explain)?;
+    println!("{}", fetched.token);
+    Ok(0)
+}
+
+fn not_signed_in() -> riabuild_ui::Failure {
+    riabuild_ui::Failure::new(
+        "fetching the team's ngrok authtoken",
+        "Run `riabuild` to sign this machine in, then try again.",
+    )
+}
+
+/// Turns what the server said into what the developer should do about it.
+///
+/// Only the cases the server cannot phrase for itself are reworded. A
+/// `not_configured` is the one worth naming here: nothing is broken, and the
+/// person who can fix it is not the person reading the message.
+fn explain(error: anyhow::Error) -> anyhow::Error {
+    let Some(api_error) = error.downcast_ref::<riabuild_api::ApiError>() else {
+        return error;
+    };
+    if api_error.code == "not_configured" {
+        return riabuild_ui::Failure::new(
+            "fetching the team's ngrok authtoken",
+            "Ask your team lead to set one in the riabuild dashboard, under org settings.              ngrok will run unauthenticated until they do.",
+        )
+        .into();
+    }
+    error
+}
+
 /// Answers the password prompt `ssh` is holding open, and remembers the
 /// answer.
 ///
@@ -121,6 +171,41 @@ pub(crate) async fn askpass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_error(code: &str, message: &str) -> anyhow::Error {
+        riabuild_api::ApiError {
+            status: 404,
+            code: code.into(),
+            message: message.into(),
+            action: "Do the thing.".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_team_with_no_ngrok_token_is_told_who_can_set_one() {
+        // The server's own 404 is accurate and useless to the person reading
+        // it: nothing on this machine is broken, and the fix belongs to
+        // somebody else.
+        let explained = explain(api_error("not_configured", "No ngrok authtoken is set."));
+        let rendered = format!("{explained}");
+        assert!(rendered.contains("team lead"), "{rendered}");
+        assert!(rendered.contains("dashboard"), "{rendered}");
+    }
+
+    #[test]
+    fn an_error_the_server_already_phrased_is_passed_through_untouched() {
+        // The server knows why it refused; the CLI does not. Rewording a 403
+        // here would replace an accurate sentence with a guess.
+        let explained = explain(api_error(
+            "not_org_member",
+            "You are no longer in the Clubria GitHub organisation.",
+        ));
+        assert!(
+            format!("{explained}").contains("no longer in the Clubria GitHub organisation"),
+            "{explained}"
+        );
+    }
     use riabuild_keychain::{self as keychain, MemoryKeychain};
     use riabuild_paths::config::{State, UserConfig};
     use riabuild_paths::{Paths, RealPaths};

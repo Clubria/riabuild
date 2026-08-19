@@ -1,4 +1,4 @@
-//! The third-party CLIs riabuild owns: `gh` and `infisical`.
+//! The third-party CLIs riabuild owns: `gh`, `infisical` and `ngrok`.
 //!
 //! riabuild already owns Node, pnpm, and Claude Code — it downloads them,
 //! verifies them against a published digest, and keeps them under
@@ -32,12 +32,45 @@ use std::path::{Path, PathBuf};
 /// it so every existing install converges.
 pub const GH_VERSION: &str = "2.97.0";
 pub const INFISICAL_VERSION: &str = "0.43.120";
+pub const NGROK_VERSION: &str = "3.39.11";
+
+/// Where riabuild republishes the ngrok builds it verified.
+///
+/// ngrok is the one tool here whose project pins nothing. Equinox serves a
+/// single floating build per platform, and the version in the path is
+/// decorative — on 2026-08-18 `ngrok-v9.99.9-stable-linux-amd64.tgz` returned
+/// the same 12,104,579 bytes as `ngrok-v3-stable-linux-amd64.tgz`. There is no
+/// immutable URL to pin and no checksum file to verify against.
+///
+/// So a maintainer mirrors: `packaging/ngrok/mirror.sh` downloads the four
+/// builds, prints the version each reports and its digest, and uploads them
+/// under this tag. The digests below are what it printed. See
+/// `docs/superpowers/specs/2026-08-18-ngrok-design.md`.
+const NGROK_MIRROR: &str = "https://github.com/Clubria/riabuild/releases/download/ngrok-v3.39.11";
 
 /// Where each binary sits inside its archive — and, once installed, inside
 /// `~/.riabuild/<tool>/<version>/`. One constant for both, so the path a task
 /// runs and the path `install` writes cannot drift apart.
 pub const GH_MEMBER: &str = "bin/gh";
 pub const INFISICAL_MEMBER: &str = "infisical";
+pub const NGROK_MEMBER: &str = "ngrok";
+
+/// How riabuild learns what the download is supposed to hash to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checksum {
+    /// Fetched from the files the project publishes beside the artifact. Tried
+    /// in order — more than one because Infisical splits them, see
+    /// `download::digest_from_any`.
+    Published(Vec<String>),
+    /// Recorded in this repository, because upstream publishes none.
+    ///
+    /// Only for a tool riabuild mirrors itself. A digest that arrived over the
+    /// network alongside the artifact proves less than one committed here, and
+    /// a digest the *server* chose would pick which bytes execute on a laptop —
+    /// which is the task manifest under another name. `Formula/riabuild.rb`
+    /// pins riabuild's own releases exactly this way.
+    Pinned(&'static str),
+}
 
 /// Everything needed to fetch one tool and find its binary afterwards.
 #[derive(Debug, Clone)]
@@ -47,9 +80,7 @@ pub struct Release {
     pub version: &'static str,
     pub asset: String,
     pub url: String,
-    /// Tried in order. More than one because Infisical splits them — see
-    /// `download::digest_from_any`.
-    pub checksum_urls: Vec<String>,
+    pub checksum: Checksum,
     /// The binary's path inside the archive, and equally its path inside the
     /// tool's directory once installed.
     pub member: &'static str,
@@ -96,9 +127,9 @@ pub fn gh() -> Result<Release> {
         version: GH_VERSION,
         url: format!("https://github.com/cli/cli/releases/download/v{GH_VERSION}/{asset}"),
         // One file, covering every platform.
-        checksum_urls: vec![format!(
+        checksum: Checksum::Published(vec![format!(
             "https://github.com/cli/cli/releases/download/v{GH_VERSION}/gh_{GH_VERSION}_checksums.txt"
-        )],
+        )]),
         asset,
         // Both containers wrap the tree in a directory named after the asset,
         // so the version is in the prefix and the member is matched by suffix.
@@ -131,13 +162,70 @@ pub fn infisical() -> Result<Release> {
         // Two files, and the third — `cli_<version>_checksums.txt`, the one
         // named after the release — is a decoy holding a single line for
         // `windows_amd64`. darwin is built separately and lands in its own file.
-        checksum_urls: vec![
+        checksum: Checksum::Published(vec![
             format!("{base}/checksums.txt"),
             format!("{base}/checksums-darwin.txt"),
-        ],
+        ]),
         asset,
         member: INFISICAL_MEMBER,
     })
+}
+
+/// ngrok, from riabuild's own mirror.
+///
+/// The asset keeps the container upstream published it in — darwin a zip,
+/// linux a tgz — so `Kind::of` reads it without a special case and nothing has
+/// to trust a repacking step. Each archive holds one file, `ngrok`, at its
+/// root.
+///
+/// The digest is per platform and pinned here. See [`NGROK_MIRROR`] for why
+/// there is nothing to fetch it from.
+pub fn ngrok() -> Result<Release> {
+    let arch = go_arch()?;
+    let (os, extension, digest) = match (std::env::consts::OS, arch) {
+        ("macos", "arm64") => (
+            "darwin",
+            "zip",
+            "9324a6552d74e25d5bdfdbedc4b32422c96f044fda37877498ad8ef10bddf7f7",
+        ),
+        ("macos", "amd64") => (
+            "darwin",
+            "zip",
+            "c6b9b3d9184fc08c33fb8b181d9f241d8f5d61162a0be0521b6dfc1f11813a96",
+        ),
+        ("linux", "arm64") => (
+            "linux",
+            "tgz",
+            "3b6ba05a9d9585c34157fa0819fa95cdb13839f5b506b9e63204705cf7f79e29",
+        ),
+        ("linux", "amd64") => (
+            "linux",
+            "tgz",
+            "cec0b4997fcc5f529dfc74bac89050354d11a915f968720600039738fdf330cf",
+        ),
+        (os, arch) => return Err(anyhow!("riabuild does not support {os}/{arch} yet")),
+    };
+    let asset = format!("ngrok-{NGROK_VERSION}-{os}-{arch}.{extension}");
+    Ok(Release {
+        tool: "ngrok",
+        version: NGROK_VERSION,
+        url: format!("{NGROK_MIRROR}/{asset}"),
+        checksum: Checksum::Pinned(digest),
+        asset,
+        member: NGROK_MEMBER,
+    })
+}
+
+/// What the download has to hash to, fetched or recalled.
+///
+/// Split out of `install` so the pinned arm is assertable without a network:
+/// reaching for a checksum file on the mirror would 404, because it publishes
+/// none.
+async fn expected_digest(release: &Release) -> Result<String> {
+    match &release.checksum {
+        Checksum::Published(urls) => download::digest_from_any(urls, &release.asset).await,
+        Checksum::Pinned(digest) => Ok((*digest).to_string()),
+    }
 }
 
 /// Downloads, verifies, and unpacks one tool into `~/.riabuild/<tool>/<version>`.
@@ -147,7 +235,7 @@ pub fn infisical() -> Result<Release> {
 /// directories mean a bump installs beside the old copy rather than writing
 /// over a binary that may be running.
 pub async fn install(release: &Release, tool_dir: &Path) -> Result<PathBuf> {
-    let expected = download::digest_from_any(&release.checksum_urls, &release.asset).await?;
+    let expected = expected_digest(release).await?;
 
     let bytes = download::fetch_bytes(&release.url).await?;
     let actual = download::sha256_hex(&bytes);
@@ -246,12 +334,14 @@ mod tests {
         // darwin digests are only ever in checksums-darwin.txt, and the file
         // named after the release covers windows_amd64 alone.
         let release = infisical().unwrap();
-        assert_eq!(release.checksum_urls.len(), 2);
-        assert!(release.checksum_urls[0].ends_with("/checksums.txt"));
-        assert!(release.checksum_urls[1].ends_with("/checksums-darwin.txt"));
+        let Checksum::Published(urls) = release.checksum else {
+            panic!("infisical publishes checksum files");
+        };
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].ends_with("/checksums.txt"));
+        assert!(urls[1].ends_with("/checksums-darwin.txt"));
         assert!(
-            !release
-                .checksum_urls
+            !urls
                 .iter()
                 .any(|url| url.contains("cli_0.43.120_checksums.txt")),
             "the file named after the release holds one line, for windows"
@@ -287,5 +377,95 @@ mod tests {
     fn architectures_are_gos_words_not_rusts() {
         let arch = go_arch().unwrap();
         assert!(["amd64", "arm64"].contains(&arch), "{arch}");
+    }
+
+    #[test]
+    fn ngrok_comes_from_riabuilds_own_mirror() {
+        // Equinox serves one floating build per platform: on 2026-08-18
+        // `ngrok-v9.99.9-stable-linux-amd64.tgz` returned the same bytes as
+        // `ngrok-v3-stable-linux-amd64.tgz`. Pointing a laptop at that URL pins
+        // nothing, so riabuild republishes the artifact it verified.
+        let release = ngrok().unwrap();
+        assert!(
+            release.url.starts_with(
+                "https://github.com/Clubria/riabuild/releases/download/ngrok-v3.39.11/"
+            ),
+            "{}",
+            release.url
+        );
+        assert!(!release.url.contains("equinox.io"), "{}", release.url);
+    }
+
+    #[test]
+    fn ngrok_asset_names_match_the_mirror() {
+        // The mirrored assets keep the container each upstream build arrives
+        // in — darwin is a zip, linux a tgz — so `Kind::of` reads them without
+        // a special case, and repacking never has to be trusted.
+        let release = ngrok().unwrap();
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "ngrok-3.39.11-darwin-arm64.zip",
+            ("macos", "x86_64") => "ngrok-3.39.11-darwin-amd64.zip",
+            ("linux", "aarch64") => "ngrok-3.39.11-linux-arm64.tgz",
+            ("linux", "x86_64") => "ngrok-3.39.11-linux-amd64.tgz",
+            (os, arch) => panic!("no expectation recorded for {os}/{arch}"),
+        };
+        assert_eq!(release.asset, expected);
+        assert!(release.url.ends_with(expected), "{}", release.url);
+    }
+
+    #[test]
+    fn ngrok_is_verified_against_a_digest_recorded_in_this_repository() {
+        // The whole reason for the mirror. There is no checksum file to fetch,
+        // and a digest riabuild-web could choose would select which bytes
+        // execute on a laptop.
+        let release = ngrok().unwrap();
+        match release.checksum {
+            Checksum::Pinned(digest) => {
+                assert_eq!(digest.len(), 64, "{digest}");
+                assert!(
+                    digest
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "{digest}"
+                );
+            }
+            Checksum::Published(urls) => panic!("ngrok publishes no checksums, got {urls:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_digest_is_answered_without_fetching_anything() {
+        // `Pinned` exists to skip the network entirely: the expected digest is
+        // already in the binary. Reaching for a checksum file here would 404 on
+        // the mirror, which publishes none.
+        let release = ngrok().unwrap();
+        let Checksum::Pinned(digest) = release.checksum else {
+            panic!("ngrok should be pinned");
+        };
+        assert_eq!(expected_digest(&release).await.unwrap(), digest);
+    }
+
+    #[test]
+    fn the_tools_that_publish_checksums_still_fetch_them() {
+        // The enum must not quietly turn gh and infisical into pinned digests:
+        // theirs move with every upstream release and are verified from the
+        // files those projects publish.
+        for release in [gh().unwrap(), infisical().unwrap()] {
+            assert!(
+                matches!(release.checksum, Checksum::Published(_)),
+                "{} should still fetch its checksums",
+                release.tool
+            );
+        }
+    }
+
+    #[test]
+    fn the_ngrok_binary_lands_where_the_check_will_look_for_it() {
+        assert_eq!(
+            ngrok()
+                .unwrap()
+                .binary_in(Path::new("/Users/ada/.riabuild/ngrok/3.39.11")),
+            PathBuf::from("/Users/ada/.riabuild/ngrok/3.39.11/ngrok")
+        );
     }
 }

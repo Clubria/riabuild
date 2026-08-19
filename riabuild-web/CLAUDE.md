@@ -72,6 +72,16 @@ against Infisical with a per-role machine identity and returns a short-lived acc
 token. The CLI fetches the actual secrets. Path scoping is enforced by Infisical's RBAC,
 not by our code.
 
+**Two responses carry a durable credential, and both are write-only from a browser.**
+`GET /api/v1/issued-keys` hands out a private SSH key; `GET /api/v1/org/ngrok-token` hands
+out the team's ngrok authtoken. Neither expires on its own, so the GitHub org re-check is
+doing the whole job on both, and both audit the fetch rather than the change — for ngrok
+that row is the *only* attribution there is, since one account carries the whole team. In
+the dashboard a lead sets the ngrok token and gets back its last four characters and a
+date: `org.get` returns `publicConfigView`, `org.forApi` returns the value, and they are
+two validators on purpose. One validator serving a browser and the CLI is how a secret
+reaches a browser by omission instead of by decision.
+
 **Anything that changes access writes an `auditLog` entry.** Role promotion, suspension,
 session revocation, delegation.
 

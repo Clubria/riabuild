@@ -73,10 +73,21 @@ upgrade can. A settings key whose value the server chose the *contents* of would
 be the manifest again under another name.
 
 **riabuild owns every tool it installs.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
-and `infisical` are downloaded by riabuild and verified against a published digest. No task shells out to
-Homebrew, apt, or dnf to install a dependency — those exist to distribute riabuild itself,
-nothing else. A provisioner that needs a package manager already set up cannot be the
+`infisical` and `ngrok` are downloaded by riabuild and verified against a digest. No task
+shells out to Homebrew, apt, or dnf to install a dependency — those exist to distribute
+riabuild itself, nothing else. A provisioner that needs a package manager already set up cannot be the
 first thing a developer runs.
+
+**Where a project publishes no digest, riabuild republishes the artifact rather than
+lowering the bar.** ngrok is the one that forces this: Equinox serves a single floating
+build per platform, the version in the URL is decorative — `ngrok-v9.99.9-…` returns the
+same bytes as `ngrok-v3-stable-…` — and there is no checksum file anywhere. So
+`packaging/ngrok/mirror.sh` uploads the exact bytes we verified to a `Clubria/riabuild`
+release and `tools.rs` pins the URL beside a `Checksum::Pinned` digest, which is what
+`Formula/riabuild.rb` already does to riabuild itself. The two things this must never
+become are a floating download nobody verifies, and a digest the *server* supplies —
+which would let riabuild-web choose which bytes execute on a laptop, and is the task
+manifest under another name.
 
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
@@ -127,6 +138,20 @@ lost on the servers that were never going to provide it. See
 `docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md`. Nothing here loosens the
 two sentences above it either: the Infisical credential is still minted per use, and a
 developer's own account password is still their own.
+
+**The team's ngrok authtoken is a third server-held secret, and it lands on no
+filesystem.** A lead sets one token in the dashboard and every developer tunnels with it.
+Like an issued SSH key it is long-lived and stored in Convex in plaintext, so the same
+sentence has to be said out loud: **a dump of that database hands out the team's ngrok
+account.** What bounds it is that it never comes to rest anywhere else — no `ngrok.yml`,
+no rcfile, no keychain entry. `~/.riabuild/bin/ngrok` is a shim that fetches the token
+from `GET /api/v1/org/ngrok-token` on every invocation, puts it in that one process's
+environment, and execs ngrok; no route returns it to a browser, the dashboard shows only
+its last four characters, and every fetch is audited. Exporting it into the environment
+shell instead would be cheaper and is deliberately not done: every process in that shell
+inherits it, and one of them is Claude Code. The cost is attribution — ngrok sees one
+account for the whole team, so `auditLog` is the only record of who opened what. See
+`docs/superpowers/specs/2026-08-18-ngrok-design.md`.
 
 **Identity is GitHub, authorization is Convex.** Membership in the Clubria GitHub org
 gates access at all; `members.role` decides how much. Every secret-brokering request

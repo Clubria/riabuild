@@ -160,6 +160,23 @@ export default defineSchema({
     latestCliVersion: v.string(),
     /** Bumped when secrets rotate; the CLI treats an older .env.<environment> as stale. */
     secretsUpdatedAt: v.number(),
+    /**
+     * The one ngrok authtoken the whole team tunnels with, set by a lead.
+     *
+     * Stored in plaintext, like an issued SSH key and for the same reason: the
+     * CLI needs the value itself, so encryption with a key held in this same
+     * deployment would move the problem rather than solve it. It is bounded the
+     * same way instead — no route returns it to a browser, every fetch is
+     * audited, and it never lands on a developer's filesystem. See
+     * `docs/superpowers/specs/2026-08-18-ngrok-design.md`.
+     *
+     * Optional because the row written before this field existed must still
+     * validate, and because a team that has not set one is an ordinary state
+     * rather than a broken deployment.
+     */
+    ngrokAuthToken: v.optional(v.string()),
+    /** When a lead last set it. Zero, or absent, means no token is set. */
+    ngrokAuthTokenUpdatedAt: v.optional(v.number()),
   }),
 
   /**

@@ -26,6 +26,7 @@ pub fn org_config() -> OrgConfig {
         // A developer who may see staging, which is the case with two files to
         // get right. Tests for the narrower case set this to `["dev"]`.
         secret_environments: vec!["dev".into(), "staging".into()],
+        ngrok_authtoken_updated_at: 0,
     }
 }
 
@@ -56,7 +57,7 @@ pub async fn ctx_with_tools(runner: FakeRunner) -> (Ctx, TempDir) {
 }
 
 pub async fn install_owned_tools(ctx: &Ctx) {
-    for binary in [ctx.gh(), ctx.infisical()] {
+    for binary in [ctx.gh(), ctx.infisical(), ctx.ngrok()] {
         write_file(std::path::Path::new(&binary), "#!/bin/sh\n").await;
     }
 }

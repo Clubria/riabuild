@@ -99,6 +99,13 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
  */
 export const RETIRED_DEFAULT_PROJECT_PATH = "~/code/ai-builders-hub";
 
+/**
+ * What `forApi` hands the HTTP layer: everything, including the secret.
+ *
+ * Kept apart from `publicConfigView` below on purpose. The two used to be one
+ * validator, and one validator serving both a browser and the CLI is how a
+ * secret ends up in a browser by omission rather than by decision.
+ */
 const configView = v.object({
   claudeSettings: v.string(),
   claudeSettingsUpdatedAt: v.number(),
@@ -106,6 +113,20 @@ const configView = v.object({
   minCliVersion: v.string(),
   latestCliVersion: v.string(),
   secretsUpdatedAt: v.number(),
+  ngrokAuthToken: v.string(),
+  ngrokAuthTokenUpdatedAt: v.number(),
+});
+
+/** What a signed-in browser may see: the ngrok token as a hint, not a value. */
+const publicConfigView = v.object({
+  claudeSettings: v.string(),
+  claudeSettingsUpdatedAt: v.number(),
+  repoSlug: v.string(),
+  minCliVersion: v.string(),
+  latestCliVersion: v.string(),
+  secretsUpdatedAt: v.number(),
+  ngrokAuthTokenHint: v.string(),
+  ngrokAuthTokenUpdatedAt: v.number(),
 });
 
 export type OrgConfig = {
@@ -115,7 +136,21 @@ export type OrgConfig = {
   minCliVersion: string;
   latestCliVersion: string;
   secretsUpdatedAt: number;
+  ngrokAuthToken: string;
+  ngrokAuthTokenUpdatedAt: number;
 };
+
+/**
+ * Enough of the token for a lead to recognise the one they pasted, and not
+ * enough to use.
+ *
+ * A lead never needs the secret back — the same rule an issued SSH key follows,
+ * where the row is readable as a fingerprint. Empty means none is set, which is
+ * what the settings screen says in words.
+ */
+export function ngrokAuthTokenHint(token: string): string {
+  return token === "" ? "" : `…${token.slice(-4)}`;
+}
 
 export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
   const row = await ctx.db.query("orgConfig").first();
@@ -127,6 +162,8 @@ export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
       minCliVersion: row.minCliVersion,
       latestCliVersion: row.latestCliVersion,
       secretsUpdatedAt: row.secretsUpdatedAt,
+      ngrokAuthToken: row.ngrokAuthToken ?? "",
+      ngrokAuthTokenUpdatedAt: row.ngrokAuthTokenUpdatedAt ?? 0,
     };
   }
   return {
@@ -136,13 +173,18 @@ export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
     minCliVersion: "0.1.0",
     latestCliVersion: "0.1.0",
     secretsUpdatedAt: 0,
+    ngrokAuthToken: "",
+    ngrokAuthTokenUpdatedAt: 0,
   };
 }
 
 export const get = query({
   args: {},
-  returns: configView,
-  handler: async (ctx) => await loadConfig(ctx),
+  returns: publicConfigView,
+  handler: async (ctx) => {
+    const { ngrokAuthToken, ...config } = await loadConfig(ctx);
+    return { ...config, ngrokAuthTokenHint: ngrokAuthTokenHint(ngrokAuthToken) };
+  },
 });
 
 export const forApi = internalQuery({
@@ -159,6 +201,12 @@ export const update = mutation({
     latestCliVersion: v.optional(v.string()),
     /** Set when secrets rotate; forces every developer's .env.<environment> to refresh. */
     markSecretsRotated: v.optional(v.boolean()),
+    /**
+     * The team's ngrok authtoken. An empty string clears it, which puts the
+     * team back to unconfigured rather than serving a token that authenticates
+     * nothing.
+     */
+    ngrokAuthToken: v.optional(v.string()),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -195,6 +243,13 @@ export const update = mutation({
 
     const now = Date.now();
     const current = await loadConfig(ctx);
+    // Trimmed rather than refused: a token is pasted, and a pasted line carries
+    // whitespace. It reaches a shell's `$(...)` on a laptop, where a stray
+    // newline is the difference between authenticated and not.
+    const nextNgrokToken =
+      args.ngrokAuthToken === undefined
+        ? current.ngrokAuthToken
+        : args.ngrokAuthToken.trim();
     const next = {
       claudeSettings: args.claudeSettings ?? current.claudeSettings,
       claudeSettingsUpdatedAt:
@@ -208,6 +263,16 @@ export const update = mutation({
       secretsUpdatedAt: args.markSecretsRotated
         ? now
         : current.secretsUpdatedAt,
+      ngrokAuthToken: nextNgrokToken,
+      // Zero when there is no token, because that is the value the CLI reads as
+      // "nobody has set one" — a cleared token that kept its timestamp would
+      // have every developer's riabuild reporting a token that is not there.
+      ngrokAuthTokenUpdatedAt:
+        nextNgrokToken === ""
+          ? 0
+          : nextNgrokToken === current.ngrokAuthToken
+            ? current.ngrokAuthTokenUpdatedAt
+            : now,
     };
 
     // A floor above the newest published build locks out every developer at
