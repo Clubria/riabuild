@@ -94,7 +94,15 @@ pub async fn channel(action: &ChannelAction, quiet: bool) -> Result<i32> {
         ChannelAction::Status => {
             let ui = Ui::new(quiet);
             let socket = channel::socket_path();
-            match channel::client::request(&socket, &channel::protocol::Request::ChannelPing).await
+            // On the ping's own deadline rather than a transfer's: this command
+            // answers one question and must answer it quickly. See
+            // `client::PING_TIMEOUT`.
+            match channel::client::request_within(
+                &socket,
+                &channel::protocol::Request::ChannelPing,
+                channel::client::PING_TIMEOUT,
+            )
+            .await
             {
                 Ok(_) => {
                     ui.info(&format!(

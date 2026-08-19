@@ -32,11 +32,21 @@ pub const VERBATIM_INDENT: &str = "      ";
 /// `COLUMNS` would take a number the developer's *shell* set for its own
 /// window and apply it to a file.
 pub fn terminal_columns() -> Option<usize> {
+    columns_of(libc::STDOUT_FILENO)
+}
+
+/// The same measurement, of whichever terminal a caller is actually writing to.
+///
+/// `status_bar` draws on `/dev/tty` rather than on stdout, and in a remote
+/// session those are not always the same file: the supervisor prints beside a
+/// shell whose own streams may be piped. Asking stdout how wide it is would
+/// then measure something nobody is looking at.
+pub fn columns_of(fd: std::os::unix::io::RawFd) -> Option<usize> {
     // SAFETY: `winsize` is plain data with no invalid bit patterns, and the
     // ioctl either fills it or leaves it as the zeroes it was created with —
     // which the `> 0` below rejects.
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
         return None;
     }
     (size.ws_col > 0).then_some(size.ws_col as usize)

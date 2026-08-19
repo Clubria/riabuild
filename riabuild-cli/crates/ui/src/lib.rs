@@ -30,6 +30,14 @@ mod prompt;
 /// from, so a prompt written there would *be* the answer.
 pub mod secret;
 
+/// One line pinned to a fixed row of a terminal a full-screen program owns —
+/// the shape the clipboard channel's supervisor needs, and the one thing `Ui`
+/// cannot be: it prints, and printing into a raw-mode terminal somebody else
+/// is drawing on is what produced the staircase of ruined newlines this
+/// module exists to end.
+mod status_bar;
+pub use status_bar::StatusBar;
+
 /// Folding riabuild's prose to the terminal's width, and the indents every
 /// multi-line message shares. Its own file because the layout rules are pure
 /// and worth asserting on their own, and `Ui` is not.

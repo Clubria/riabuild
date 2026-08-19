@@ -22,7 +22,7 @@
 //! `protocol::decode_request`, which is the entire security argument for the
 //! channel and is unchanged by moving the transport.
 
-use crate::mux::{Frame, read_frame, write_frame};
+use crate::mux::{Frame, KEEPALIVE_ID, read_frame, write_frame};
 use crate::protocol::MAX_PAYLOAD;
 use anyhow::{Context, Result};
 use riabuild_ui::Failure;
@@ -34,6 +34,13 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
+// `tokio`'s instant, not `std`'s, and the difference is not cosmetic: this is
+// the clock the keepalive's own sleeps are measured against, and the two only
+// agree outside a test. Under a paused clock `std::time::Instant` goes on
+// reporting wall-clock, so the deadline below would be measured against a
+// clock nothing else in the loop is using — which is a test that cannot fail
+// rather than a test that passes.
+use tokio::time::Instant;
 
 /// How long a shim waits for the laptop before the pump gives up on its behalf.
 ///
@@ -49,6 +56,34 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 /// co-tenant on a shared account could connect to, so its input is bounded here
 /// rather than trusted.
 const MAX_REQUEST: u64 = MAX_PAYLOAD as u64 + 4096;
+
+/// How often the pump asks the laptop whether it is still on the other end.
+///
+/// The same interval as the `ServerAliveInterval` the laptop's own `ssh` is
+/// started with, because this is the same measurement taken from the other
+/// side. Cheap in a way the health probe this design deleted was not: one empty
+/// frame down a pipe that is already open, never a second SSH connection.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long the pump goes unanswered before it gives the socket back.
+///
+/// Three missed keepalives, matching `ServerAliveCountMax=3` on the laptop, so
+/// the two ends give up on each other at about the same moment.
+///
+/// **This is the bound on how long a pump can outlive its laptop, and until it
+/// existed there was none.** The laptop notices a dropped connection because
+/// `ssh` is measuring it; the server does not, because `sshd` ships with
+/// `ClientAliveInterval 0` and a TCP connection whose peer stopped
+/// acknowledging is indistinguishable from an idle one for as long as the
+/// kernel keeps retransmitting — a quarter of an hour, and longer if the peer
+/// is merely wedged rather than gone. For all of it the pump stayed bound to
+/// the socket, which cost the developer three things at once: every paste and
+/// every `riabuild channel status` blocked for the full reply timeout and then
+/// failed, every pump the reconnecting supervisor started found the socket
+/// live and refused it, and the supervisor — recognising none of that — said
+/// the channel could not reach the server, which was the one thing that was
+/// not true.
+const KEEPALIVE_DEADLINE: Duration = Duration::from_secs(45);
 
 /// How long [`answers`] gives a socket to say whether anything is serving on it.
 ///
@@ -98,17 +133,32 @@ where
     // being unavailable, which is the truth and is what `client` reports.
     let (gone, watching) = watch::channel(false);
 
+    // When the laptop was last heard from, as milliseconds since `since`.
+    // An instant is not atomic and this is read by one task and written by
+    // another on every frame, which is the whole of why it is stored this way.
+    let since = Instant::now();
+    let heard = Arc::new(AtomicU64::new(0));
+
     let router = tokio::spawn({
         let pending = Arc::clone(&pending);
+        let heard = Arc::clone(&heard);
         async move {
             let mut input = BufReader::new(input);
             // Ends on a clean close, a closed lid, or a frame this end cannot
             // read — all three mean the same thing here, which is that no
             // further reply is coming.
             while let Ok(Some(frame)) = read_frame(&mut input).await {
+                // Any frame at all is proof the laptop is there, which is why
+                // the keepalive below needs nothing of its own to read: a reply
+                // to a paste counts exactly as much as a reply to a keepalive,
+                // and a busy channel never pays for one.
+                heard.store(since.elapsed().as_millis() as u64, Ordering::Relaxed);
                 // A reply for a connection that has given up is dropped, not an
                 // error: the shim timed out and closed, and the laptop had no
-                // way to know before answering.
+                // way to know before answering. The keepalive's own reply lands
+                // here too, and being dropped is the right answer for it: it
+                // was never asking a question, only proving there is somebody
+                // to answer one.
                 if let Some(waiting) = pending.lock().await.remove(&frame.id) {
                     let _ = waiting.send(frame.payload);
                 }
@@ -145,6 +195,11 @@ where
         // failure: `riabuild remote` finished, or the lid closed.
         _ = router => Ok(()),
         _ = writer => Ok(()),
+        // A laptop that stopped answering without closing anything. Also not a
+        // failure, and it must not be reported as one: the supervisor on the
+        // other end reads this pump's exit as an ordinary disconnect and
+        // rebuilds, which is exactly what should happen.
+        () = keepalive(since, Arc::clone(&heard), outbound.clone()) => Ok(()),
     };
 
     // Ours, and nothing answers on it now. Leaving it behind is precisely the
@@ -218,6 +273,47 @@ async fn relay(
     stream.write_all(&response).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Returns when the laptop has gone [`KEEPALIVE_DEADLINE`] without a word.
+///
+/// The point of it is the *return*. Ending the pump unbinds the socket, which
+/// is what lets the reconnecting supervisor's own pump take the path, and what
+/// turns a paste into an immediate "the channel is not running" instead of a
+/// twenty-second wait for a laptop that is not there.
+///
+/// Sent rather than merely waited for, because silence on this pipe is not
+/// evidence of anything on its own: a developer who is not pasting produces
+/// exactly as little traffic as a laptop that has gone. The frame obliges an
+/// answer — see [`KEEPALIVE_ID`] for why an empty one is enough — and it is the
+/// answer that is the measurement.
+async fn keepalive(since: Instant, heard: Arc<AtomicU64>, outbound: mpsc::Sender<Frame>) {
+    loop {
+        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+
+        let last = Duration::from_millis(heard.load(Ordering::Relaxed));
+        if since.elapsed().saturating_sub(last) >= KEEPALIVE_DEADLINE {
+            return;
+        }
+
+        // `try_send`, never `send`. The queue drains into a pipe that is
+        // precisely what may have stopped moving, and a keepalive that blocked
+        // on the wedged connection it exists to detect would be the one thing
+        // this function must not do. A full queue is not treated as a failure
+        // on its own — the deadline above is the only thing that decides — but
+        // a closed one means the writer has already ended, and there is nothing
+        // left to keep alive.
+        if outbound
+            .try_send(Frame {
+                id: KEEPALIVE_ID,
+                payload: Vec::new(),
+            })
+            .is_err()
+            && outbound.is_closed()
+        {
+            return;
+        }
+    }
 }
 
 /// Binds the channel socket, clearing a dead one and refusing a live one.
@@ -542,6 +638,100 @@ mod tests {
         assert!(
             error.to_string().contains("already serving"),
             "{error} should name the other session"
+        );
+        serving.abort();
+    }
+
+    /// The failure this keepalive exists for, and the one that cost a developer
+    /// two bug reports at once.
+    ///
+    /// A laptop that *closes* the pipe is easy — every test above covers it.
+    /// This is a laptop that says nothing and closes nothing, which is what a
+    /// dropped wifi link leaves behind: the laptop's own `ssh` gives up on its
+    /// `ServerAliveInterval` and reconnects, while on the server `sshd` — whose
+    /// `ClientAliveInterval` is off by default — sits on a TCP connection the
+    /// kernel will go on retransmitting into for a quarter of an hour. For all
+    /// of it the pump used to hold the socket, and holding the socket is what
+    /// made both symptoms: every paste and every `riabuild channel status`
+    /// waited out the full reply timeout, and every pump the reconnecting
+    /// laptop started was refused with `already serving`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_whose_laptop_goes_silent_gives_the_socket_back() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("channel.sock");
+        // Held, never read from and never written to: a pipe that is open and
+        // dead, which is the whole point. Dropping it would be the easy case.
+        let (_laptop, serving) = pump(&socket).await;
+
+        let ended = tokio::time::timeout(Duration::from_secs(600), serving)
+            .await
+            .expect("the pump never gave up on a laptop that stopped answering");
+
+        assert!(ended.expect("join").is_ok(), "this is not a failure");
+        // The half that matters to the next session: the path is free, so the
+        // reconnecting laptop's own pump binds it instead of being refused.
+        assert!(
+            !socket.exists(),
+            "the socket must be given back, not left for the next pump to be refused by"
+        );
+    }
+
+    /// …and a laptop that is answering keeps its pump, however little the
+    /// developer is pasting.
+    ///
+    /// The mirror of the test above, and the one that stops the fix from being
+    /// worse than the bug: an idle channel produces no shim traffic at all, so
+    /// a pump that took silence for absence would end a working session's paste
+    /// every forty-five seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_laptop_that_answers_keepalives_keeps_its_pump() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("channel.sock");
+        let (mut laptop, serving) = pump(&socket).await;
+
+        // Four rounds is past the deadline twice over, with no shim connecting
+        // at any point.
+        for round in 0..4 {
+            let frame = laptop.frame("the pump stopped sending keepalives").await;
+            assert_eq!(frame.id, KEEPALIVE_ID, "round {round}");
+            assert!(
+                frame.payload.is_empty(),
+                "a keepalive asks for nothing: {:?}",
+                frame.payload
+            );
+            write_frame(
+                &mut laptop.writer,
+                &Frame {
+                    id: frame.id,
+                    payload: Vec::new(),
+                },
+            )
+            .await
+            .expect("write");
+        }
+
+        assert!(!serving.is_finished(), "an answered pump must stay up");
+        // And it is still a pump, not merely a live process.
+        let asking = tokio::spawn({
+            let socket = socket.clone();
+            async move { shim(&socket, b"after\n").await }
+        });
+        let frame = laptop.frame("the pump stopped relaying").await;
+        assert_eq!(frame.payload, b"after\n");
+        write_frame(
+            &mut laptop.writer,
+            &Frame {
+                id: frame.id,
+                payload: b"ok".to_vec(),
+            },
+        )
+        .await
+        .expect("write");
+        assert_eq!(
+            within("the shim was never answered", asking)
+                .await
+                .expect("shim"),
+            b"ok"
         );
         serving.abort();
     }

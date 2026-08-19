@@ -18,7 +18,7 @@ pub use sockets::remote_socket;
 
 use super::{Remote, askpass, identity, shell};
 use anyhow::Result;
-use riabuild_channel::supervisor::{Stop, Tunnel, supervise};
+use riabuild_channel::supervisor::{StatusLine, Stop, Tunnel, supervise};
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
 use riabuild_ui::{Failure, Ui};
@@ -123,6 +123,18 @@ struct Channel {
 struct Started {
     stop: Stop,
     tunnel: tokio::task::JoinHandle<Option<Failure>>,
+    /// The one line the channel is allowed to say anything on while the
+    /// developer's shell owns the screen.
+    ///
+    /// Started here rather than inside the supervisor because the reason it
+    /// exists is remote mode's own: the next thing this function's caller does
+    /// is hand the terminal to mosh, and a background task printing into a
+    /// screen mosh is drawing — in the raw mode any interactive shell puts it
+    /// in, where a newline drops a row and does not return to column one —
+    /// produces the staircase of half-lines developers reported. Held here for
+    /// the same reason: the session's end is when the line comes off, and that
+    /// is [`Channel::stop`], not anything the supervisor can see.
+    line: StatusLine,
 }
 
 impl Channel {
@@ -196,6 +208,10 @@ impl Channel {
 
     async fn stop(self) {
         if let Some(started) = self.started {
+            // Before the supervisor is even asked to stop: the shell has
+            // already exited, so riabuild is about to print its own output to
+            // a terminal that must not have a stale warning pinned to row two.
+            started.line.stop();
             started.stop.stop();
             // Awaited, not detached: the supervisor kills its `ssh` on the way
             // out, which ends the pump, which frees the server's socket before
@@ -221,6 +237,10 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
     let agent = riabuild_channel::laptop_agent(plan.runner.clone(), &plan.paths.bin_dir())?;
 
     let stop = Stop::new();
+    // After everything that can fail, and before the one thing that outlives
+    // this call: an early return past this point would leave a task repainting
+    // a line for a channel that never started.
+    let line = StatusLine::start(plan.quiet);
     let tunnel = tokio::spawn(supervise(
         plan.runner.clone(),
         Tunnel {
@@ -242,9 +262,10 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
         agent,
         Ui::new(plan.quiet),
         stop.clone(),
+        line.bar(),
     ));
 
-    Ok(Started { stop, tunnel })
+    Ok(Started { stop, tunnel, line })
 }
 
 /// The channel's own failure voice.

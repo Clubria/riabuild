@@ -35,6 +35,21 @@ struct Header {
     len: usize,
 }
 
+/// The id no shim connection is ever given.
+///
+/// `pump::serve` hands out ids from one, so zero is free — and the pump uses it
+/// for the one frame that belongs to no connection: the keepalive it sends to
+/// find out whether the laptop is still on the other end of the pipe. Reserved
+/// here, beside the ids it has to stay clear of, rather than in either end that
+/// depends on it.
+///
+/// It carries no payload and asks for nothing. The pump has no business naming
+/// an operation — it is a relay, and the laptop's compiled-in `decode_request`
+/// is the only thing that decides what an operation *is* — so all this frame
+/// does is oblige the far end to send a frame back. Any answer will do,
+/// including the error an older laptop returns for a request it cannot parse.
+pub const KEEPALIVE_ID: u64 = 0;
+
 /// One request or one reply, tagged with the connection it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
