@@ -74,15 +74,42 @@ async fn install_needed(ctx: &Ctx) -> Result<bool> {
 /// Codex writes its sqlite state and logs into whatever it is handed — so
 /// naming the parent would strew a tenth profile's worth of files in among the
 /// nine, on every run, for a probe that only wants a version string.
+///
+/// `PATH` is named for the same reason, and it is what makes this probe answer
+/// at all on a machine that is not a laptop. npm installs `bin/codex` as a
+/// symlink to a `codex.js` whose shebang is `#!/usr/bin/env node`, so asking
+/// Codex its version asks `PATH` for a Node first. riabuild's own Node is the
+/// one that has to answer: on a **managed server** riabuild runs under a
+/// non-interactive SSH exec whose `PATH` is `/usr/local/bin:/usr/bin:/bin` and
+/// carries no Node at all, so `codex --version` exits 127 with `env: 'node':
+/// No such file or directory`. `check()` reads that as "the Codex CLI is not
+/// installed", `apply()` then installs it perfectly well — `install_codex` is
+/// the one call here that already puts riabuild's Node on `PATH` — and the
+/// re-check after it says the same thing again, which is the hard error a
+/// developer cannot get past by running riabuild again.
+///
+/// A laptop hides this: the developer's own nvm or Homebrew Node answers, and
+/// the probe passes for a reason riabuild did not arrange and cannot rely on.
+/// Claude Code hides it further by not having it — `@anthropic-ai/claude-code`
+/// ships a native `bin/claude.exe`, so `claude_accounts` probing with a bare
+/// `RunOptions::default()` is correct there. That is a fact about that package
+/// rather than a pattern to copy.
 fn probe_options(ctx: &Ctx) -> RunOptions {
+    let mut env = vec![(
+        "CODEX_HOME".to_string(),
+        ctx.paths
+            .codex_profile_dir(1)
+            .to_string_lossy()
+            .into_owned(),
+    )];
+    // Only where a Node is pinned. Without one `ctx.codex()` is the bare name,
+    // there is no riabuild Node to put in front, and both callers have already
+    // refused to run anything by the time that could matter.
+    if let Some(version) = &ctx.config.node_version {
+        env.push(path_led_by(&ctx.paths.node_dir(version).join("bin")));
+    }
     RunOptions {
-        env: vec![(
-            "CODEX_HOME".to_string(),
-            ctx.paths
-                .codex_profile_dir(1)
-                .to_string_lossy()
-                .into_owned(),
-        )],
+        env,
         ..Default::default()
     }
 }
@@ -268,11 +295,23 @@ async fn install_codex(ctx: &mut Ctx) -> Result<()> {
 /// is on `PATH` — and npm derives its global prefix from `process.execPath`,
 /// which would then be a Node riabuild does not own.
 fn npm_env(node_bin: &Path) -> Vec<(String, String)> {
+    vec![path_led_by(node_bin)]
+}
+
+/// `PATH` with `dir` in front of whatever riabuild itself was started with.
+///
+/// Prepended rather than replacing: the ambient `PATH` is how `npm` finds the
+/// `sh`, `git` and `tar` it shells out to, and a probe that cleared it would
+/// trade one missing-program failure for several.
+///
+/// Every Node-script tool in this task needs it — npm to install under the
+/// right Node, `codex --version` to start at all — which is why it is one
+/// function rather than the two copies of the same `format!` this file used to
+/// carry. It stays local to `codex_cli` all the same, for the reason `npm_env`
+/// gives: a shared helper would need a module that exists only to hold it.
+fn path_led_by(dir: &Path) -> (String, String) {
     let ambient = std::env::var("PATH").unwrap_or_default();
-    vec![(
-        "PATH".to_string(),
-        format!("{}:{ambient}", node_bin.display()),
-    )]
+    ("PATH".to_string(), format!("{}:{ambient}", dir.display()))
 }
 
 #[cfg(test)]
@@ -365,6 +404,53 @@ mod tests {
                 .codex_profile_dir(1)
                 .to_string_lossy()
                 .into_owned()
+        );
+    }
+
+    /// The bug that stopped remote mode dead: `check()` reporting "not
+    /// installed" for a Codex it had just installed.
+    ///
+    /// Asserted on the call the runner actually recorded rather than on
+    /// `probe_options`, because the two ways this regresses are a probe built
+    /// correctly and not used — `install_needed` reaching for
+    /// `RunOptions::default()` the way `claude_accounts` legitimately does — and
+    /// a `PATH` that names riabuild's Node somewhere other than the front.
+    #[tokio::test]
+    async fn the_version_probe_runs_codex_under_riabuilds_own_node() {
+        let (mut ctx, _home) = ctx_with_codex(installed()).await;
+        let runner = Arc::new(installed());
+        ctx.runner = runner.clone();
+
+        CodexCli.check(&ctx).await.unwrap();
+
+        let env = runner.env_of(&format!("{} --version", ctx.codex()));
+        let (_, path) = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .expect("the probe names a PATH");
+        let node_bin = ctx.paths.node_dir(NODE).join("bin");
+        assert!(
+            path.starts_with(&node_bin.to_string_lossy().into_owned()),
+            "riabuild's own Node does not lead the probe's PATH: {path}"
+        );
+        // Prepended, not replacing: npm and Codex both shell out, and a probe
+        // that cleared PATH would trade one missing program for several.
+        assert!(path.contains(':'), "the ambient PATH was discarded: {path}");
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_node_of_its_own_still_answers_the_probe() {
+        // The server case in one line: riabuild under a non-interactive SSH
+        // exec, whose PATH carries no Node at all. Nothing here can make the
+        // fake runner honour a PATH, so what is asserted is that riabuild
+        // supplies one rather than borrowing whatever the machine had — which
+        // on a laptop is the developer's nvm, and on a server is nothing.
+        let (ctx, _home) = ctx_with_codex(installed()).await;
+        let options = probe_options(&ctx);
+        assert!(
+            options.env.iter().any(|(key, _)| key == "PATH"),
+            "the probe leaves Node to whatever the machine happens to have: {:?}",
+            options.env
         );
     }
 

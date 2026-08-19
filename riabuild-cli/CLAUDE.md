@@ -745,6 +745,32 @@ accounts can be deleted and renumbered, so *position* is the account number and 
 directory name has to survive that. Codex's set is fixed, so the name can simply be the
 number.
 
+**Codex is a Node script, so everything that starts it has to carry riabuild's own Node.**
+npm installs `bin/codex` as a symlink to a `codex.js` whose shebang is `#!/usr/bin/env
+node`, which means starting Codex asks `PATH` for a Node before Codex gets a say. Both the
+`check()` probe and the generated launcher name riabuild's Node explicitly; neither may go
+back to `RunOptions::default()` or to a bare `exec`. Claude Code is the tempting precedent
+and is not one — `@anthropic-ai/claude-code` ships a native `bin/claude.exe`, so
+`claude_accounts` probing with a bare `RunOptions::default()` is correct *there*. That is a
+fact about that package, not a pattern to copy, and copying it is how this bug was
+written.
+
+The cost of getting it wrong is paid entirely on machines that are not laptops. A
+developer's own nvm or Homebrew Node answers the probe, so the whole thing passes locally
+for a reason riabuild did not arrange; on a **managed server** riabuild runs under a
+non-interactive SSH exec whose `PATH` is `/usr/local/bin:/usr/bin:/bin` and carries no Node
+at all. `codex --version` exits 127 with `env: 'node': No such file or directory`,
+`check()` reads that as "the Codex CLI is not installed", `apply()` installs it perfectly
+well — `install_codex` was the one call that already set `PATH` — and the re-check says the
+same thing again. That is the `apply()`-did-not-take-effect hard error, on every run,
+forever, on a machine where Codex is installed and working. Shipped in #91 and fixed after
+the first server ran it.
+
+`the_launcher_starts_codex_where_the_machine_has_no_node` is the gate, and it runs the
+generated script under a Node-less `PATH` rather than asserting on its text: a
+`PATH="$codex_node_bin:$PATH"` exported on the wrong branch, too late, or with a variable
+that expanded to nothing all read identically in the source.
+
 **`CODEX_HOME` has to exist, not merely be named.** Codex refuses to start against a
 directory that is not there — `Error finding codex home` — rather than creating one. So all
 nine are part of what `check()` asserts, and each launcher recreates its own: the gap
