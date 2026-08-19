@@ -34,6 +34,15 @@ pub struct OrgConfig {
     /// the field, which the task reports rather than guesses around.
     #[serde(rename = "secretEnvironments", default)]
     pub secret_environments: Vec<String>,
+    /// When a lead last set the team's ngrok authtoken, or `0` if none is set.
+    ///
+    /// Metadata, never the token itself. It is here so the CLI can tell a
+    /// developer their lead has not set one without calling
+    /// `/api/v1/org/ngrok-token`, which brokers a live credential and writes an
+    /// audit row — the same reasoning that puts `secretEnvironments` here
+    /// rather than behind `/secrets/token`.
+    #[serde(rename = "ngrokAuthTokenUpdatedAt", default)]
+    pub ngrok_authtoken_updated_at: u64,
 }
 
 /// Refuses anything that is not digits and dots — `^\d+(\.\d+)*$`, the same
@@ -115,6 +124,15 @@ impl OrgConfig {
             )
         })
     }
+
+    /// Whether a lead has set the team's ngrok authtoken.
+    ///
+    /// A deployment released before the field sends nothing, which reads as
+    /// `0` — the same answer as "nobody has set one". Both are true in the way
+    /// that matters: asking for the token would come back empty-handed.
+    pub fn has_ngrok_authtoken(&self) -> bool {
+        self.ngrok_authtoken_updated_at > 0
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +161,7 @@ mod tests {
             latest_cli_version: "0.1.0".into(),
             secrets_updated_at: 0,
             secret_environments: vec!["dev".into()],
+            ngrok_authtoken_updated_at: 0,
         }
     }
 
@@ -176,6 +195,35 @@ mod tests {
         assert_eq!(repo.owner(), "Clubria");
         // What the checkout directory is named after.
         assert_eq!(repo.name(), "ai-builders-hub");
+    }
+
+    #[test]
+    fn a_deployment_that_names_no_ngrok_token_reads_as_never_set() {
+        // Zero is what the endpoint sends when no lead has set one, and it is
+        // also what a deployment released before the field sends — nothing.
+        // Both mean the same thing to the CLI, so both decode the same way.
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"repoSlug":"Clubria/ai-builders-hub","minCliVersion":"1.0.0",
+                "latestCliVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.ngrok_authtoken_updated_at, 0);
+        assert!(!config.has_ngrok_authtoken());
+    }
+
+    #[test]
+    fn a_configured_ngrok_token_is_visible_without_brokering_one() {
+        // The timestamp rides on a response every run already fetches, so the
+        // CLI can say the token is missing without asking for its value —
+        // which would reach the server and write an audit row for a question
+        // nobody asked.
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"repoSlug":"Clubria/ai-builders-hub","minCliVersion":"1.0.0",
+                "latestCliVersion":"1.0.0","ngrokAuthTokenUpdatedAt":1755000000}"#,
+        )
+        .unwrap();
+        assert_eq!(config.ngrok_authtoken_updated_at, 1_755_000_000);
+        assert!(config.has_ngrok_authtoken());
     }
 
     #[test]

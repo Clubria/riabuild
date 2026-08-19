@@ -407,11 +407,20 @@ hardcoding `false` would send every Mac to `secret-tool` while the suite stayed 
 both hosts.
 
 **riabuild owns every tool it depends on.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
-and `infisical` are downloaded, verified against a published digest, and kept under
+`infisical` and `ngrok` are downloaded, verified against a digest, and kept under
 `~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a
-package manager to install a dependency. Run them through `ctx.gh()` and `ctx.infisical()`
-rather than by name: during provisioning `~/.riabuild/bin` is not on `PATH`, so the bare
-name finds a binary no `check()` verified, or nothing at all.
+package manager to install a dependency. Run them through `ctx.gh()`, `ctx.infisical()`
+and `ctx.ngrok()` rather than by name: during provisioning `~/.riabuild/bin` is not on
+`PATH`, so the bare name finds a binary no `check()` verified, or nothing at all.
+
+ngrok is the one whose digest is **not** published by its own project, and
+`tools::Checksum` is where that shows up. `Published(urls)` is the normal case — gh and
+infisical fetch the checksum files their releases carry. `Pinned(digest)` is ngrok alone:
+Equinox serves one floating build per platform with no checksum anywhere, so
+`packaging/ngrok/mirror.sh` republishes the bytes we verified as a `Clubria/riabuild`
+release and the digest is a constant in this repository. Reaching for `Pinned` for a tool
+that *does* publish digests would freeze a value that moves with every upstream release;
+reaching for a server-supplied digest would hand riabuild-web the choice of what executes.
 
 Pinned versions live in `riabuild-fetch`'s `tools` as constants, never a `releases/latest` lookup —
 what riabuild puts on a laptop should be versioned, auditable, and shipped in a signed
@@ -756,6 +765,32 @@ is ever created or renumbered, so `codex-3` and `~/.riabuild/codex/3` stay the s
 accounts can be deleted and renumbered, so *position* is the account number and the
 directory name has to survive that. Codex's set is fixed, so the name can simply be the
 number.
+
+**Codex is a Node script, so everything that starts it has to carry riabuild's own Node.**
+npm installs `bin/codex` as a symlink to a `codex.js` whose shebang is `#!/usr/bin/env
+node`, which means starting Codex asks `PATH` for a Node before Codex gets a say. Both the
+`check()` probe and the generated launcher name riabuild's Node explicitly; neither may go
+back to `RunOptions::default()` or to a bare `exec`. Claude Code is the tempting precedent
+and is not one — `@anthropic-ai/claude-code` ships a native `bin/claude.exe`, so
+`claude_accounts` probing with a bare `RunOptions::default()` is correct *there*. That is a
+fact about that package, not a pattern to copy, and copying it is how this bug was
+written.
+
+The cost of getting it wrong is paid entirely on machines that are not laptops. A
+developer's own nvm or Homebrew Node answers the probe, so the whole thing passes locally
+for a reason riabuild did not arrange; on a **managed server** riabuild runs under a
+non-interactive SSH exec whose `PATH` is `/usr/local/bin:/usr/bin:/bin` and carries no Node
+at all. `codex --version` exits 127 with `env: 'node': No such file or directory`,
+`check()` reads that as "the Codex CLI is not installed", `apply()` installs it perfectly
+well — `install_codex` was the one call that already set `PATH` — and the re-check says the
+same thing again. That is the `apply()`-did-not-take-effect hard error, on every run,
+forever, on a machine where Codex is installed and working. Shipped in #91 and fixed after
+the first server ran it.
+
+`the_launcher_starts_codex_where_the_machine_has_no_node` is the gate, and it runs the
+generated script under a Node-less `PATH` rather than asserting on its text: a
+`PATH="$codex_node_bin:$PATH"` exported on the wrong branch, too late, or with a variable
+that expanded to nothing all read identically in the source.
 
 **`CODEX_HOME` has to exist, not merely be named.** Codex refuses to start against a
 directory that is not there — `Error finding codex home` — rather than creating one. So all

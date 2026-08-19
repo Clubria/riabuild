@@ -91,6 +91,24 @@ if [ ! -x "$codex_binary" ]; then
   PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "{bin_dir}" | paste -sd: -)
   export PATH
   codex_binary=codex
+else
+  # Codex is a Node script, not a native binary: npm installs bin/codex as a
+  # symlink to a codex.js whose shebang is `#!/usr/bin/env node`, so starting
+  # it asks PATH for a Node before Codex gets a say. riabuild's own Node sits
+  # in the same directory as the binary just tested, and naming it here is what
+  # makes this launcher work in a shell that never sourced riabuild's
+  # environment — `ssh box bin/codex-3`, a cron entry, an editor that sanitised
+  # its environment. Without it those all fail with "env: 'node': No such file
+  # or directory", on a machine where Codex is installed perfectly well.
+  #
+  # Only on this branch. The fallback above has no recorded binary, so there is
+  # no directory to derive a Node from, and whatever PATH offers is all it ever
+  # had.
+  codex_node_bin="${{codex_binary%/*}}"
+  if [ -n "$codex_node_bin" ]; then
+    PATH="$codex_node_bin:$PATH"
+    export PATH
+  fi
 fi
 # --yolo is a default, not an imposition, and it has to be: Codex refuses the
 # flag twice ("cannot be used multiple times") and refuses it beside
@@ -252,6 +270,91 @@ mod tests {
             Path::new("/home/ada/.riabuild/bin"),
         );
         assert!(script.contains(r#"*) codex_binary="" ;;"#), "{script}");
+    }
+
+    #[test]
+    fn the_launcher_carries_riabuilds_own_node() {
+        // Codex is a Node script — npm installs bin/codex as a symlink to a
+        // codex.js whose shebang is `#!/usr/bin/env node` — so a launcher that
+        // named only the binary works exactly on the machines that happen to
+        // have a Node of their own.
+        let script = script();
+        assert!(
+            script.contains(r#"PATH="$codex_node_bin:$PATH""#),
+            "{script}"
+        );
+        assert!(
+            script.contains(r#"codex_node_bin="${codex_binary%/*}""#),
+            "the launcher does not derive the Node directory from the binary: {script}"
+        );
+    }
+
+    /// The launcher starting Codex on a machine whose `PATH` carries no Node.
+    ///
+    /// The text assertions above cannot see this: `PATH="$codex_node_bin:$PATH"`
+    /// is present in a script that exports it too late, on the wrong branch, or
+    /// with a `codex_node_bin` that expanded to nothing, and every one of those
+    /// reads the same. So this runs the generated script and asks what `PATH`
+    /// it actually handed the binary.
+    ///
+    /// A stand-in `codex` that prints its `PATH` rather than a real one, which
+    /// is what keeps this out of the `#[ignore]`d pair above: the question here
+    /// is what the *launcher* exports, and a real Codex would answer it no
+    /// better while making the test need an install.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_launcher_starts_codex_where_the_machine_has_no_node() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+
+        let home = tempfile::TempDir::new().unwrap();
+        let node_bin = home.path().join("node").join("24.19.0").join("bin");
+        let bin = home.path().join("bin");
+        tokio::fs::create_dir_all(&node_bin).await.unwrap();
+        tokio::fs::create_dir_all(&bin).await.unwrap();
+
+        // Where npm puts it: beside the Node that interprets it.
+        let codex = node_bin.join("codex");
+        tokio::fs::write(&codex, "#!/bin/sh\nprintf '%s' \"$PATH\"\n")
+            .await
+            .unwrap();
+        make_executable(&codex).await.unwrap();
+
+        let launcher = bin.join("codex");
+        let script = launcher_script(
+            &home.path().join("codex-home"),
+            &codex.to_string_lossy(),
+            &bin,
+        );
+        tokio::fs::write(&launcher, script.as_bytes())
+            .await
+            .unwrap();
+        make_executable(&launcher).await.unwrap();
+
+        // The server shape: riabuild under a non-interactive SSH exec, whose
+        // PATH is this and which carries no Node anywhere.
+        let output = RealRunner
+            .run(
+                &launcher.to_string_lossy(),
+                &[],
+                &RunOptions {
+                    env: vec![(
+                        "PATH".to_string(),
+                        "/usr/local/bin:/usr/bin:/bin".to_string(),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the launcher runs");
+
+        assert!(output.ok(), "{output:?}");
+        assert!(
+            output
+                .stdout
+                .starts_with(&node_bin.to_string_lossy().into_owned()),
+            "the launcher did not lead PATH with riabuild's own Node: {:?}",
+            output.stdout
+        );
     }
 
     #[test]

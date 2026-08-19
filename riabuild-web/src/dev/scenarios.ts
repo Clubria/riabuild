@@ -283,6 +283,8 @@ const ORG: OrgConfig = {
   minCliVersion: "2026.08.04",
   latestCliVersion: "2026.08.04",
   secretsUpdatedAt: NOW - 9 * DAY,
+  ngrokAuthTokenHint: "…tok3",
+  ngrokAuthTokenUpdatedAt: NOW - 3 * DAY,
 };
 
 /**
@@ -431,6 +433,19 @@ export const SCENARIOS: Record<string, () => Data> = {
   lead: () => base(LEAD),
 
   suspended: () => base({ ...DEVELOPER, status: "suspended" }),
+
+  /**
+   * A team whose lead has not set an ngrok authtoken. Ordinary, not broken —
+   * riabuild still installs ngrok, and it runs unauthenticated until somebody
+   * fills this in, which is what the settings screen has to say out loud.
+   */
+  "ngrok-unset": () => ({
+    ...base(LEAD),
+    orgConfig: {
+      state: "ready" as const,
+      value: { ...ORG, ngrokAuthTokenHint: "", ngrokAuthTokenUpdatedAt: 0 },
+    },
+  }),
 
   "not-member": () => ({
     ...base(DEVELOPER),

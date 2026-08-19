@@ -605,7 +605,7 @@ fi
 step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
-for task in login github_cli infisical_cli toolchain project repo_status \
+for task in login github_cli infisical_cli ngrok toolchain project repo_status \
             codex_cli org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
@@ -619,6 +619,17 @@ done
 check "the codex launcher is there" test -x "$RIA_HOME/bin/codex"
 check_contains "the codex launcher adds --yolo" \
   "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "--yolo"
+
+# ngrok is installed but never authenticated on disk: the launcher fetches the
+# team's authtoken on every invocation and puts it in that one process's
+# environment. A token written into ngrok.yml, an rcfile, or this script would
+# be the thing the whole design exists to avoid, so the assertion is about what
+# is *absent* as much as what is there.
+check "the ngrok launcher is there" test -x "$RIA_HOME/bin/ngrok"
+check_contains "the ngrok launcher fetches the token per invocation" \
+  "$(cat "$RIA_HOME/bin/ngrok" 2>/dev/null || echo '')" "internal ngrok-token"
+check "riabuild wrote no ngrok config" \
+  test ! -f "$HOME/Library/Application Support/ngrok/ngrok.yml"
 
 # All nine, each with its own directory and its own CODEX_HOME. Codex keeps
 # sign-ins apart per CODEX_HOME and by nothing else, so nine launchers sharing

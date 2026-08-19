@@ -193,6 +193,11 @@ export function OrgSettings() {
   const [repoSlug, setRepoSlug] = useState<string | null>(null);
   const [latestCli, setLatestCli] = useState<string | null>(null);
   const [minCli, setMinCli] = useState<string | null>(null);
+  // `null` is untouched, and is not the same as "". The field is blank on every
+  // load because the token is write-only, so sending that blank with an
+  // ordinary settings save would wipe the team's token every time a lead
+  // changed the repo slug.
+  const [ngrokToken, setNgrokToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -253,6 +258,27 @@ export function OrgSettings() {
         />
       </div>
 
+      <div className="mt-4">
+        <Field
+          label="ngrok authtoken"
+          hint={
+            config.ngrokAuthTokenUpdatedAt > 0
+              ? `Set ${formatTime(config.ngrokAuthTokenUpdatedAt)}, ending ${config.ngrokAuthTokenHint}. Type a new one to replace it — this box is blank because the token is never shown back.`
+              : "Not set, so every developer's ngrok runs unauthenticated. Paste the token from the team's ngrok account."
+          }
+          value={ngrokToken ?? ""}
+          placeholder="2abc…"
+          spellCheck={false}
+          onChange={setNgrokToken}
+        />
+        <p className="mt-1 text-xs text-fg-faint wrap-value">
+          Every developer&rsquo;s CLI fetches this when they run{" "}
+          <span className="text-fg-dim">ngrok</span>, and stores it nowhere. One
+          account carries the whole team, so who opened which tunnel is answered
+          by the audit log below and not by ngrok.
+        </p>
+      </div>
+
       {floorIsChanging && (
         <div className="mt-4">
           <Alert tone="danger" title="This blocks people mid-workday">
@@ -280,8 +306,12 @@ export function OrgSettings() {
                 repoSlug: slug,
                 latestCliVersion: latest.trim(),
                 minCliVersion: floor.trim(),
+                ...(ngrokToken === null
+                  ? {}
+                  : { ngrokAuthToken: ngrokToken.trim() }),
               })
               .then(() => {
+                setNgrokToken(null);
                 setSaved(true);
                 setTimeout(() => setSaved(false), 2000);
               })
@@ -302,6 +332,20 @@ export function OrgSettings() {
         >
           mark secrets rotated
         </Button>
+        {config.ngrokAuthTokenUpdatedAt > 0 && (
+          <Button
+            variant="quiet"
+            onClick={() => {
+              setError(null);
+              void data
+                .updateOrg({ ngrokAuthToken: "" })
+                .then(() => setNgrokToken(null))
+                .catch((cause: unknown) => setError(readError(cause)));
+            }}
+          >
+            remove ngrok authtoken
+          </Button>
+        )}
         {saved && (
           <span className="text-xs tracking-wider text-ok uppercase">saved</span>
         )}
