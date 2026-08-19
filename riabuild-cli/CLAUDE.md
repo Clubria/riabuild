@@ -178,7 +178,8 @@ for a reply rather than for input. `gh auth login` used to open with a `survey` 
 (*"Authenticate Git with your GitHub credentials? (Y/n)"*, asked **before** it
 authenticates), and `survey` sizes the terminal with `ESC[999;999f` then `ESC[6n`;
 `riabuild remote` sat on that line ignoring every `y`, with no device code above it to hint
-why. `github_cli`'s `own_git_credentials` removes the question rather than answering it.
+why. `git_credentials::own_git_credentials`, called by `github_cli`'s `run_gh_auth` before
+it hands over the terminal, removes the question rather than answering it.
 So the test for a new subdued site is not "is its output untidy" but "does it ask" — plain
 text and a wait for a person is fine, a full-screen prompt library is not.
 

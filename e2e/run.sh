@@ -605,10 +605,22 @@ fi
 step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
-for task in login github_cli infisical_cli ngrok toolchain project repo_status \
-            codex_cli org_settings env_local claude_statusline; do
+for task in login github_cli git_credentials infisical_cli ngrok toolchain project \
+            repo_status codex_cli org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
+
+# `git_credentials` is asserted against the machine as well as against
+# `state.json`, and this suite is the exact case it exists for: gh is signed in
+# from `GH_TOKEN`, so `github_cli` is satisfied on its first check and the
+# `setup-git` inside its own sign-in path never runs. A recorded task proves
+# only that riabuild believed itself done, so the config is read back — with
+# `HOME` set the way riabuild had it, since the helper goes in that home's
+# global gitconfig and nowhere else.
+check_contains "git asks riabuild's own gh for github.com credentials" \
+  "$(env HOME="$E2E_HOME" git config --get-all \
+      'credential.https://github.com.helper' 2>/dev/null || echo '')" \
+  "$RIA_HOME/gh/"
 
 # `codex_cli` is asserted on *both* paths, unlike the four below, and that is
 # the point of it being here: it waits on the toolchain and on nothing else, so

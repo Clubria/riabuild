@@ -18,6 +18,7 @@ pub mod claude_trust;
 pub mod codex_cli;
 pub mod engine;
 pub mod env_local;
+pub mod git_credentials;
 pub mod github_cli;
 pub mod infisical_cli;
 pub mod login;
@@ -473,6 +474,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
     vec![
         Box::new(login::Login),
         Box::new(github_cli::GithubCli),
+        Box::new(git_credentials::GitCredentials),
         Box::new(infisical_cli::InfisicalCli),
         Box::new(ngrok::Ngrok),
         Box::new(toolchain::Toolchain),

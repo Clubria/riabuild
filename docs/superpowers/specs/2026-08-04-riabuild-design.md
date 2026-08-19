@@ -300,6 +300,7 @@ names a registered task.
 | 10 | `claude_trust` | 5, 7 | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
 | 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
 | 12 | `claude_onboarding` | 7 | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Depends on 7 alone: unlike trust, nothing here needs a checkout. |
+| 13 | `git_credentials` | 2 | git's effective credential helper for `https://github.com` delegates to the `gh` riabuild owns, by absolute path. The sign-in path already runs `gh auth setup-git`, but only when riabuild performs the sign-in — a `gh` already signed in (by the developer, by an older riabuild, or by `internal seed-github` on every managed server) satisfies task 2 on its first check, so nothing writes the helper and the developer can clone but not push. Matching the *path* rather than "a helper exists" is what rejects a signed-out system `gh` answering for git. |
 
 > **Superseded for Claude Code.** This document's single-profile model — one
 > `~/.riabuild/claude/<uuid>/` reached by a `c` launcher — was replaced by an ordered list

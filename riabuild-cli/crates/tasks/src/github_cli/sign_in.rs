@@ -9,6 +9,7 @@
 
 use super::ORG_SCOPE;
 use crate::Ctx;
+use crate::git_credentials::own_git_credentials;
 use anyhow::Result;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
@@ -78,6 +79,44 @@ pub(super) async fn run_gh_auth(
     // Before the terminal is handed over, not after: the question this settles
     // is asked *before* `gh` authenticates anything, and it cannot be answered
     // once it has been put.
+    //
+    // `gh` opens both of these commands with
+    //
+    // ```text
+    // ? Authenticate Git with your GitHub credentials? (Y/n)
+    // ```
+    //
+    // whenever the git protocol is https and the helper configured for the host
+    // is not `gh` itself — `login_flow.go`'s `Interactive && gitProtocol ==
+    // "https"`, then `GitCredentialFlow.Prompt`, which returns early when
+    // `helper.IsOurs()`. `refresh.go` carries the same pair, which is why this
+    // belongs here rather than in `sign_in` alone.
+    //
+    // riabuild cannot allow it to be asked, because under a subdued child it
+    // cannot be answered. It is a `survey` prompt, and `survey` measures the
+    // terminal by parking the cursor at `ESC[999;999f` and reading the reply to
+    // `ESC[6n`. `subdue` drops both — a child does not get to move riabuild's
+    // cursor — and riabuild answers no terminal query, so that read never
+    // returns and every keystroke after it is swallowed by a parser waiting for
+    // a cursor report that is not coming. The prompt is not slow to answer; it
+    // is unanswerable. `riabuild remote` sat on that line, ignoring `y`, until
+    // something outside killed it.
+    //
+    // So riabuild answers it in advance, which is where the answer belonged.
+    // This is a decision riabuild owns: it clones with `gh repo clone` over
+    // https and the developer pushes back over it, `gh`'s own default here is
+    // yes, and a developer pressing Y has decided nothing riabuild was not
+    // going to decide for them. Settling it first also earns the `workflow`
+    // scope, which `gh` requests only once this question is — the scope a
+    // `git push` touching `.github/workflows/` needs.
+    //
+    // A failure is loud rather than skipped. Carrying on would hand `gh` the
+    // terminal with the prompt still to come, and this codebase would rather
+    // present a hang as a red job than as a slow one.
+    //
+    // The command itself lives in `git_credentials`, the task that owns this
+    // end state on every machine — including the ones that never reach a
+    // sign-in at all, which is the case this call cannot cover.
     own_git_credentials(ctx).await?;
 
     // The `gh` riabuild owns, by absolute path. `~/.riabuild/bin` is not on
@@ -96,10 +135,10 @@ pub(super) async fn run_gh_auth(
                 // why this is set here rather than on every `gh` invocation.
                 //
                 // "Text and a wait for a person" is true of this flow only
-                // because `own_git_credentials` above has removed the one
-                // `survey` prompt it used to open with. It was not true when
-                // this comment was first written, and the cost was a hang: see
-                // that function for why a `survey` prompt under a pty riabuild
+                // because the `own_git_credentials` call above has removed the
+                // one `survey` prompt it used to open with. It was not true
+                // when this comment was first written, and the cost was a hang:
+                // see that call for why a `survey` prompt under a pty riabuild
                 // owns cannot be answered at all.
                 subdued: Some(ctx.ui.theme()),
                 ..Default::default()
@@ -116,73 +155,4 @@ pub(super) async fn run_gh_auth(
         .into());
     }
     Ok(())
-}
-
-/// Makes `gh` git's credential helper for github.com, so that `gh` never asks
-/// whether it may.
-///
-/// Both commands that reach `run_gh_auth` open with this, *before* they
-/// authenticate anything and so before the device code is ever printed:
-///
-/// ```text
-/// ? Authenticate Git with your GitHub credentials? (Y/n)
-/// ```
-///
-/// It is put whenever the git protocol is https and the credential helper
-/// configured for the host is not `gh` itself — `login_flow.go`'s
-/// `Interactive && gitProtocol == "https"`, then `GitCredentialFlow.Prompt`,
-/// which returns early when `helper.IsOurs()`. `refresh.go` carries the same
-/// pair, which is why this belongs here rather than in `sign_in` alone.
-///
-/// riabuild cannot allow that question to be asked, because under a subdued
-/// child it cannot be answered. It is a `survey` prompt, and `survey` measures
-/// the terminal by parking the cursor at `ESC[999;999f` and reading the reply to
-/// `ESC[6n`. `subdue` drops both — a child does not get to move riabuild's
-/// cursor — and riabuild answers no terminal query, so that read never returns
-/// and every keystroke after it is swallowed by a parser waiting for a cursor
-/// report that is not coming. The prompt is not slow to answer; it is
-/// unanswerable. `riabuild remote` sat on that line, ignoring `y`, until
-/// something outside killed it.
-///
-/// So riabuild answers it in advance, which is where the answer belonged. This
-/// is a decision riabuild owns: it clones with `gh repo clone` over https and
-/// the developer pushes back over it, `gh`'s own default here is yes, and a
-/// developer pressing Y has decided nothing riabuild was not going to decide for
-/// them. Settling it first also earns the `workflow` scope, which `gh` requests
-/// only once this question is — the scope a `git push` touching
-/// `.github/workflows/` needs.
-///
-/// `--force` is what lets this run *before* the sign-in rather than after:
-/// github.com is not an authenticated host yet, and `setup-git` refuses an
-/// unknown one without it. The path `gh` writes into the global git config is
-/// its own executable's, so it names `~/.riabuild/gh/<version>/bin/gh` — which
-/// stays valid across a pin bump, because tool directories are per-version and
-/// none is ever removed, and is rewritten by the next run that reaches here.
-///
-/// A failure is loud rather than skipped. Carrying on would hand `gh` the
-/// terminal with the prompt still to come, and this codebase would rather
-/// present a hang as a red job than as a slow one.
-async fn own_git_credentials(ctx: &mut Ctx) -> Result<()> {
-    let done = ctx
-        .runner
-        .run(
-            &ctx.gh(),
-            &["auth", "setup-git", "--hostname", "github.com", "--force"],
-            &RunOptions::default(),
-        )
-        .await?;
-    if done.ok() {
-        return Ok(());
-    }
-    Err(Failure::new(
-        "letting gh manage git's GitHub credentials",
-        "Check that `git` is installed and that your global git config is writable, \
-         then run `riabuild` again.",
-    )
-    .command("gh auth setup-git --hostname github.com --force")
-    .detail(match done.stderr.trim() {
-        "" => "that command failed and said nothing".to_string(),
-        stderr => stderr.to_string(),
-    })
-    .into())
 }
