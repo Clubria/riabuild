@@ -7,6 +7,11 @@
 mod pipe;
 mod server;
 
+/// What one pipe connection carried, which is the supervisor's evidence about
+/// the connection it has just lost. Re-exported because `pipe` is private and
+/// the supervisor is the caller it was written for.
+pub use pipe::Served;
+
 use crate::clipboard::Clipboard;
 use crate::opener::Opener;
 use crate::protocol::{ErrorCode, MAX_PAYLOAD, Request, Response};

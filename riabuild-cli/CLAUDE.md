@@ -624,11 +624,27 @@ compile.
 above for the whole life of the exec transport: `Host key verification failed` matched none
 of `diagnose`'s patterns, so the loop backed off to the ceiling and retried in silence for
 the length of every session, under a banner that said `connected`. `should_say_it_cannot_connect`
-is the whole decision — never carried anything, not yet said, past `QUIET_FAILURES` — and
+is the whole decision — never once connected, not yet said, past `QUIET_FAILURES` — and
 it is a predicate rather than three inline conditions because `supervise` takes an owned
 `Ui` and a test cannot read back what it printed. Unlike a named wall it keeps retrying
 afterwards: an unrecognised failure cannot be told apart from a server that is slow to come
 back.
+
+**"Never connected" is not "never carried a request", and conflating them is a message that
+lies.** Those were one flag. A connection carries a request only when somebody pastes, so on
+a link that drops and rebuilds — which is the whole reason the developer is on mosh — an
+idle channel that came up perfectly every time reported that it could not reach the server,
+four rebuilds in. `serve_pipe` returns `Served { requests, keepalives }` and `connected()`
+is either; `requests` alone still means "somebody's paste worked" and is not what a message
+about reachability may be built on. The keepalive is what gives an idle connection anything
+to say for itself, which is why this and the pump's own liveness are one change.
+
+**`cannot_connect` picks the sentence, because one of the two unrecognised walls is not a
+network fault at all.** `another riabuild is already serving the clipboard channel` comes
+back from a server the `ssh` reached perfectly — see the pump's keepalive below — and
+reporting it as "cannot reach this server" sends a developer to look at the one thing that
+is definitely working. It stays a retry rather than becoming a `diagnose` branch, because it
+resolves itself: the pump holding the socket gives it up within the minute.
 
 **`RIABUILD_CHANNEL_SOCKET` outlives the channel, and the shim reports that as a state
 rather than as an `errno`.** The variable is written once into the shell's environment when
@@ -655,7 +671,38 @@ a forward is a channel riding on the ssh session and can wedge while ssh believe
 connected — keepalives run below it and cannot see that. With the exec transport the
 requests travel over the ssh session's own stdio, so "carrying traffic" and "alive" are one
 question, and `ServerAliveInterval` answers it on the same connection. What the probe fed —
-the backoff reset — is now the request count `serve_pipe` returns.
+the backoff reset — is now what `serve_pipe` returns about the connection it just lost.
+
+**`ServerAliveInterval` only measures the end that started the connection, and the pump has
+a keepalive because of it.** `sshd` ships with `ClientAliveInterval 0`, and a TCP connection
+whose peer stopped acknowledging looks exactly like an idle one for as long as the kernel
+retransmits — a quarter of an hour, unbounded if the peer is wedged rather than gone. So a
+laptop on a flaky link left a pump *alive on the server*, still bound to `channel.sock`,
+relaying into a pipe nothing would ever read. One cause, three unrelated-looking symptoms:
+every paste and every `riabuild channel status` waited out the reply timeout and failed;
+every pump the reconnecting laptop started was refused with `already serving`; and the
+supervisor said it could not reach a server it was reaching every time.
+
+The pump now sends one frame every `KEEPALIVE_INTERVAL` (15 s) and returns after
+`KEEPALIVE_DEADLINE` (45 s) of silence — the laptop's own `ServerAliveInterval` and
+`ServerAliveCountMax`, measured from the other end — unbinding the socket as it goes. This
+is **not** the deleted health probe: it costs no second SSH connection and asks the server
+nothing. It is `mux::KEEPALIVE_ID`, a reserved id carrying **no payload**, which is what
+keeps "the pump is a relay and never a parser" true of it — it names no operation and reads
+no answer, it only obliges a frame back, and `serve_pipe` answers every frame including one
+it cannot parse. Measure it against `tokio::time::Instant`, never `std`'s: the sleeps beside
+it are tokio's, and a deadline on the other clock is a test that cannot fail.
+
+**The supervisor is the one thing that prints beside a shell rather than in front of one, so
+it speaks on a status bar.** In a remote session the terminal is in raw mode — `\n` drops a
+row without returning to column one — and mosh and Claude Code are painting it, so a folded
+warning printed there arrives as a staircase and stays in the middle of somebody else's
+screen. `riabuild_ui::StatusBar` puts one line on row two (mosh owns row one) over
+`/dev/tty`, with the cursor saved and restored; `supervisor::StatusLine` redraws it on a
+tick because nothing announces a repaint underneath, and `remote::channel` owns its
+lifetime because the session's end is when the line comes off. A bar carries one line, so
+the detail and the remedy stay in `riabuild channel status`. With no bar — every non-remote
+run, `--quiet`, every test — `report` prints exactly as it always did.
 
 Inside `archive`, `staging.rs` owns *how* a tree lands: unpack into a sibling
 directory and `rename` it into place, never `remove_dir_all` the target first.

@@ -32,12 +32,18 @@
 //! plumbing that drives them — the held child, the agent on its pipe, and the
 //! rebuild.
 
+mod bar;
 mod run;
 
 // `supervisor::supervise`, not `supervisor::run::supervise`: which file the
 // loop lives in is this module's business, and a caller that had to know would
 // have to be edited the next time it moves.
 pub use run::{Stop, supervise};
+
+/// The one line the channel speaks on while a full-screen shell owns the
+/// screen — see `bar`. Remote mode starts it, because remote mode is what
+/// knows a shell is about to take the terminal over.
+pub use bar::StatusLine;
 
 use riabuild_ui::Failure;
 use std::time::Duration;

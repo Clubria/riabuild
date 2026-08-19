@@ -148,6 +148,22 @@ async fn write(
         return 1;
     };
 
+    // Before stdin is touched, not after. A piped write reads to **end of
+    // input**, so with no channel to send it to this drained a pipe it was
+    // going to discard — and where nothing ever closes that pipe, it did not
+    // return at all. That is the whole of `a_write_with_no_channel_fails_rather
+    // _than_pretending` hanging for as long as its runner would allow: the test
+    // gives the shim the ambient stdin of whoever typed `cargo test`, so it
+    // passed against a terminal or a closed pipe and hung against an open one,
+    // which is a property of the machine and not of this code. Failing first is
+    // also what the real tools do — a `xclip -i` that cannot copy anywhere has
+    // no reason to read what it cannot copy — and the writer on the other end
+    // gets the same `EPIPE` any failed pipeline gives it.
+    let Some(socket) = socket else {
+        log("no clipboard channel is configured for this session");
+        return 1;
+    };
+
     let bytes = match literal {
         Some(text) => text.as_bytes().to_vec(),
         None => {
@@ -159,11 +175,6 @@ async fn write(
             }
             buffer
         }
-    };
-
-    let Some(socket) = socket else {
-        log("no clipboard channel is configured for this session");
-        return 1;
     };
 
     let request = Request::ClipboardWrite {

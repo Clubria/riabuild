@@ -21,6 +21,17 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 15 MB screenshot over a hotel connection is a legitimate slow case.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What a request carrying nothing waits, which is every `channel.ping`.
+///
+/// The generous deadline above is for a transfer, and a ping has nothing to
+/// transfer: it is one short line each way, so anything past a few seconds is a
+/// laptop that is not going to answer rather than one that is still sending.
+/// Twenty seconds of silence is what `riabuild channel status` — a command
+/// whose entire job is to answer "is this thing working?" — used to spend
+/// before saying anything at all, which reads as riabuild hanging and is how a
+/// dead channel got reported as a stuck command.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct Reply {
     pub response: Response,
@@ -31,11 +42,28 @@ pub async fn request(socket: &Path, request: &Request) -> Result<Reply> {
     request_with_body(socket, request, &[]).await
 }
 
+/// A request with a deadline of the caller's choosing.
+///
+/// One knob, because there is one thing a caller knows that this file does not:
+/// how much it is asking for. See [`PING_TIMEOUT`].
+pub async fn request_within(socket: &Path, request: &Request, waiting: Duration) -> Result<Reply> {
+    exchange_within(socket, request, &[], waiting).await
+}
+
 /// A request that carries a payload — today only `clipboard.write`.
 ///
 /// The body goes out on the same connection, straight after the header line,
 /// framed by the length the header announced.
 pub async fn request_with_body(socket: &Path, request: &Request, body: &[u8]) -> Result<Reply> {
+    exchange_within(socket, request, body, REQUEST_TIMEOUT).await
+}
+
+async fn exchange_within(
+    socket: &Path,
+    request: &Request,
+    body: &[u8],
+    waiting: Duration,
+) -> Result<Reply> {
     let connect = UnixStream::connect(socket);
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
@@ -47,9 +75,40 @@ pub async fn request_with_body(socket: &Path, request: &Request, body: &[u8]) ->
         })?
         .map_err(|error| unavailable(socket, &error))?;
 
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange(stream, request, body))
+    tokio::time::timeout(waiting, exchange(stream, request, body))
         .await
-        .context("the laptop channel did not answer in time")?
+        .map_err(|_| unanswered(socket, waiting))?
+}
+
+/// What a shim says when the socket is there, something is serving it, and the
+/// laptop behind it never replies.
+///
+/// A `Failure` rather than a bare context line, which is what it was, and the
+/// difference is the whole of what a developer gets: `channel status` renders
+/// `action` as the one thing to do, and a plain `anyhow` context has no such
+/// field — so the command that exists to explain a dead channel timed out and
+/// then explained nothing.
+///
+/// The remedy says to wait, because this is the state that resolves itself. A
+/// pump whose connection to the laptop dropped without the server noticing goes
+/// on holding the socket and swallowing every request into a pipe nobody reads;
+/// its own keepalive is what ends that, and it ends within the minute.
+fn unanswered(socket: &Path, waited: Duration) -> anyhow::Error {
+    Failure::new(
+        format!(
+            "the clipboard channel did not answer within {} seconds",
+            waited.as_secs()
+        ),
+        "Wait a minute and try again — a session whose connection to the laptop dropped keeps \
+         the channel until it notices, and gives it up on its own. If it is still silent after \
+         that, run `riabuild remote` again from your laptop.",
+    )
+    .detail(format!(
+        "Something is serving {}, so the channel is bound here; it is the laptop on the other \
+         end that is not replying.",
+        socket.display()
+    ))
+    .into()
 }
 
 /// What a shim says when there is no channel to talk to.
@@ -288,6 +347,46 @@ mod tests {
         assert!(!error.contains("channel status"), "{error}");
         // The kernel's wording must not be what leads.
         assert!(!error.starts_with("No such file"), "{error}");
+    }
+
+    /// A laptop that never answers must produce something a developer can act
+    /// on, and this is the case that produced the worst of both.
+    ///
+    /// It was an `anyhow` context line, which has no `action` field — so
+    /// `riabuild channel status`, the one command whose whole job is to explain
+    /// a dead channel, sat silent for twenty seconds and then printed a
+    /// diagnosis with no remedy under it. The silence read as riabuild hanging,
+    /// which is how one dead channel was reported as a stuck command.
+    #[tokio::test(start_paused = true)]
+    async fn a_laptop_that_never_answers_says_what_to_do_about_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("silent.sock");
+        // Accepts and then says nothing: a pump whose own connection to the
+        // laptop has dropped without the server noticing.
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let held = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+
+        let error = request_within(&socket, &Request::ChannelPing, PING_TIMEOUT)
+            .await
+            .expect_err("should time out");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("a timeout must carry a remedy, not only a sentence");
+
+        assert!(failure.attempting.contains("did not answer"), "{failure}");
+        assert!(failure.action.contains("riabuild remote"), "{failure}");
+        // The distinction the developer needs: the channel is bound *here*, so
+        // this is not the "nothing is running" case and the remedy is not the
+        // same one.
+        assert!(
+            !failure.to_string().contains("not running"),
+            "{failure} confuses a silent laptop with an absent one"
+        );
+        held.abort();
     }
 
     /// A socket file with nobody accepting is a different sentence: "nothing is

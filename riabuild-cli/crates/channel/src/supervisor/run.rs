@@ -16,8 +16,8 @@
 
 use super::{Tunnel, backoff, diagnose, ssh_args};
 
-/// How many consecutive failures, with nothing ever carried, before the
-/// supervisor says out loud that it cannot reach the server.
+/// How many consecutive failures, with the channel never once having come up,
+/// before the supervisor says out loud that it cannot reach the server.
 ///
 /// Four puts it around half a minute into the backoff schedule — long enough
 /// that an ordinary reconnect after a closed lid stays silent, short enough
@@ -31,19 +31,27 @@ const QUIET_FAILURES: u32 = 4;
 /// the decision and the loop around it cannot be unit-tested without an `ssh`:
 /// `supervise` takes an owned `Ui`, so a test cannot hold on to the printer it
 /// moved in and read back what was said. Extracted, every branch is reachable.
-fn should_say_it_cannot_connect(ever_carried: bool, said_so: bool, attempt: u32) -> bool {
+///
+/// `ever_connected`, not "ever carried a request", and the difference is the
+/// bug this sentence exists to keep fixed. Those were one flag, and on a link
+/// that drops and rebuilds — which is the whole reason the developer is on mosh
+/// — a channel nobody happened to paste through carried nothing on any attempt.
+/// Four rebuilds later riabuild told them it could not reach a server it had
+/// reached every single time. What proves a connection came up is the pump's
+/// keepalive, which is why the pump has one.
+fn should_say_it_cannot_connect(ever_connected: bool, said_so: bool, attempt: u32) -> bool {
     // A channel that has worked and then dropped is a laptop that slept, and
     // there is nothing for anyone to do about it.
-    !ever_carried
+    !ever_connected
         // Once per supervisor. At the backoff ceiling, "every time" is a line
         // every thirty seconds printed over whatever the developer is doing.
         && !said_so
         // Late enough that an ordinary slow reconnect stays quiet.
         && attempt >= QUIET_FAILURES
 }
-use crate::agent::Agent;
+use crate::agent::{Agent, Served};
 use riabuild_runner::{CommandRunner, RunOptions};
-use riabuild_ui::{Failure, Ui};
+use riabuild_ui::{Failure, StatusBar, Ui};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -117,23 +125,30 @@ async fn stopped(signal: &mut watch::Receiver<bool>) {
 /// ago. `agent` is shared rather than owned for the mirror reason — one agent
 /// answers every connection this loop builds, and rebuilding it per attempt
 /// would re-detect the laptop's clipboard tooling on every network blip.
+/// `bar` is the line the channel speaks on while a full-screen shell owns the
+/// terminal, from `remote::channel`. A disabled one — which is what every run
+/// without a remote session and every test has — sends each message back to
+/// `Ui`, printed the ordinary way.
 pub async fn supervise(
     runner: Arc<dyn CommandRunner>,
     tunnel: Tunnel,
     agent: Arc<Agent>,
     ui: Ui,
     stop: Stop,
+    bar: Arc<StatusBar>,
 ) -> Option<Failure> {
     let mut signal = stop.signal();
     // Consecutive failures, and therefore the position in the backoff schedule.
-    // Reset by a connection that actually carried a request, so a laptop that
+    // Reset by a connection that reached the pump at all, so a laptop that
     // suspends every afternoon reconnects in a second rather than inheriting
-    // the ceiling from a bad week.
+    // the ceiling from a bad week — and so does one on a link that keeps
+    // dropping, which is the case that most needs paste back quickly and the
+    // one a rule counting only requests left at the thirty-second ceiling.
     let mut attempt = 0u32;
-    // Whether this channel has ever worked. A connection that dropped is a
-    // laptop that slept; one that has never carried a byte is a channel that
-    // cannot come up, and only the second is worth a message.
-    let mut ever_carried = false;
+    // Whether this channel has ever come up. A connection that dropped is a
+    // laptop that slept; one that has never reached the pump at all is a
+    // channel that cannot come up, and only the second is worth a message.
+    let mut ever_connected = false;
     // The unrecognised-wall message is said once per supervisor, never once per
     // attempt: at the backoff ceiling that would be a line every thirty seconds
     // for the length of a session, printed over whatever the developer is doing.
@@ -160,6 +175,7 @@ pub async fn supervise(
                 // loop off: retrying it is an infinite loop, not resilience.
                 return Some(report(
                     &ui,
+                    &bar,
                     Failure::new(
                         "riabuild could not start the clipboard channel",
                         "Check that `ssh` is installed and runnable, then open a new riabuild shell. Everything except paste works without it.",
@@ -178,6 +194,7 @@ pub async fn supervise(
             let _ = child.kill().await;
             return Some(report(
                 &ui,
+                &bar,
                 Failure::new(
                     "riabuild could not open the clipboard channel's pipe",
                     "Open a new riabuild shell. Everything except paste works without it.",
@@ -209,16 +226,19 @@ pub async fn supervise(
         // rather than wait out its own read.
         let _ = child.kill().await;
         // The pipes close with the child, so this resolves rather than hanging.
-        let carried = matches!(serving.await, Ok(Ok(count)) if count > 0);
+        let served = match serving.await {
+            Ok(Ok(served)) => served,
+            _ => Served::default(),
+        };
 
         match ended {
             Ended::Stopped => return None,
             Ended::Exited(stderr) => {
                 if let Some(failure) = diagnose(&stderr) {
-                    return Some(report(&ui, failure));
+                    return Some(report(&ui, &bar, failure));
                 }
-                // A failure `diagnose` does not recognise, repeated, with not
-                // one request ever carried. That is a wall too — it is simply
+                // A failure `diagnose` does not recognise, repeated, with the
+                // channel never once having come up. That is a wall too — simply
                 // one nobody has written a sentence for yet — and the loop used
                 // to retry it in silence for the length of the session while
                 // the banner overhead said "connected".
@@ -230,26 +250,25 @@ pub async fn supervise(
                 // worse mistake. What it buys is that the next cause of a dead
                 // channel costs one message instead of three rounds of
                 // guesswork.
-                if should_say_it_cannot_connect(ever_carried, said_so, attempt) {
+                if should_say_it_cannot_connect(ever_connected, said_so, attempt) {
                     said_so = true;
                     report(
                         &ui,
-                        Failure::new(
-                            "the clipboard channel cannot reach this server",
-                            "Run `riabuild channel status` on the server to check, and \
-                             `riabuild remote` again from here to rebuild it. Everything \
-                             except paste works without it.",
-                        )
-                        .command(format!("ssh {}", args.join(" ")))
-                        .detail(stderr.trim().to_string()),
+                        &bar,
+                        cannot_connect(&stderr).command(format!("ssh {}", args.join(" "))),
                     );
                 }
             }
         }
 
-        if carried {
+        if served.connected() {
             attempt = 0;
-            ever_carried = true;
+            ever_connected = true;
+            // The connection came up, so whatever the bar was saying about one
+            // that would not is over. Cleared here rather than left for the
+            // developer to disbelieve: a warning that outlives its cause is how
+            // the next true one stops being read.
+            bar.clear();
         }
 
         let delay = backoff(attempt);
@@ -271,13 +290,63 @@ enum Ended {
     Exited(String),
 }
 
+/// The sentence for a connection that keeps failing in a way `diagnose` has no
+/// pattern for.
+///
+/// Two of them, because one of the two is not a network fault at all and saying
+/// it was sent developers looking at their wifi. A pump that outlived its
+/// laptop — the connection dropped, the server never noticed, and the process
+/// stayed bound to the socket — refuses every replacement with `already
+/// serving`, so the `ssh` reaches the server perfectly and comes back with a
+/// message about a *colleague's* session. "Cannot reach this server" is the one
+/// thing that is definitely not happening.
+///
+/// It resolves itself now, which is why the wording says to wait rather than to
+/// do something: the pump gives the socket up once its own keepalive goes
+/// unanswered, and the next attempt binds it.
+fn cannot_connect(stderr: &str) -> Failure {
+    if stderr.to_ascii_lowercase().contains("already serving") {
+        return Failure::new(
+            "another session on this server is still holding the channel",
+            "Nothing to do — it is usually a session whose connection dropped without the \
+             server noticing, and it gives the channel up within a minute. If paste is still \
+             dead after that, run `riabuild channel status` on the server.",
+        )
+        .detail(stderr.trim().to_string());
+    }
+
+    Failure::new(
+        "the clipboard channel cannot reach this server",
+        "Run `riabuild channel status` on the server to check, and `riabuild remote` again \
+         from here to rebuild it. Everything except paste works without it.",
+    )
+    .detail(stderr.trim().to_string())
+}
+
 /// Shows a failure without claiming riabuild stopped.
 ///
 /// `Ui::failure` prints "riabuild stopped:", which would be a lie here. The
 /// setup run, the secrets and the mosh session are all untouched — only paste
 /// stops — and sending a developer to look for a broken environment they do not
 /// have is worse than saying nothing.
-fn report(ui: &Ui, failure: Failure) -> Failure {
+///
+/// **On the bar where there is one, and printed only where there is not.** This
+/// runs beside the developer's remote shell, which means printing it lands
+/// multi-line prose in the middle of a screen mosh and Claude Code are drawing,
+/// through a terminal an interactive shell has put in raw mode — where `\n`
+/// drops a row without returning to column one, so the folded sentence arrives
+/// as a staircase and stays there. One line at a fixed row, with the cursor put
+/// back, is the whole of the repair; the detail and the remedy are what the bar
+/// cannot carry, and `riabuild channel status` is where a developer gets them.
+fn report(ui: &Ui, bar: &StatusBar, failure: Failure) -> Failure {
+    if bar.enabled() {
+        bar.show(&format!(
+            "▲ Clipboard channel — {} · paste is off",
+            failure.attempting
+        ));
+        return failure;
+    }
+
     ui.warn(&format!("Clipboard channel — {failure}"));
     for line in failure
         .detail
@@ -331,6 +400,7 @@ mod tests {
             agent(),
             Ui::new(true),
             stop.clone(),
+            Arc::new(StatusBar::disabled()),
         ));
 
         until_spawns(&fake, 1).await;
@@ -354,6 +424,7 @@ mod tests {
             agent(),
             Ui::new(true),
             stop.clone(),
+            Arc::new(StatusBar::disabled()),
         ));
 
         until_spawns(&fake, 1).await;
@@ -384,6 +455,7 @@ mod tests {
             agent(),
             Ui::new(true),
             stop.clone(),
+            Arc::new(StatusBar::disabled()),
         ));
 
         until_spawns(&fake, 2).await;
@@ -418,6 +490,34 @@ mod tests {
         assert!(!should_say_it_cannot_connect(true, false, 99));
     }
 
+    /// The wall that is not a network fault, told apart from the one that is.
+    ///
+    /// `already serving` comes back from a server the `ssh` reached perfectly:
+    /// a pump that outlived its laptop is still bound to the socket and refuses
+    /// the replacement. Reported as "cannot reach this server" — which is what
+    /// every unrecognised failure used to become — it sends a developer to look
+    /// at their network, which is the one thing that is definitely working.
+    #[test]
+    fn a_socket_another_pump_still_holds_is_not_reported_as_an_unreachable_server() {
+        let held = cannot_connect(
+            "riabuild stopped: another riabuild is already serving the clipboard channel at /x",
+        );
+        assert!(
+            !held.to_string().contains("cannot reach"),
+            "{held} blames the network for a server that answered"
+        );
+        assert!(held.attempting.contains("another session"), "{held}");
+        // And it says to wait rather than to do something, because the other
+        // pump's own keepalive is what ends this.
+        assert!(held.action.contains("within a minute"), "{held}");
+
+        let unreachable = cannot_connect("ssh: connect to host build-01 port 22: No route to host");
+        assert!(
+            unreachable.attempting.contains("cannot reach"),
+            "{unreachable}"
+        );
+    }
+
     /// A server with no pump is a wall: every attempt fails identically, so the
     /// supervisor stops and says so instead of backing off to the ceiling and
     /// retrying there for the rest of the session.
@@ -431,6 +531,7 @@ mod tests {
             agent(),
             Ui::new(true),
             Stop::new(),
+            Arc::new(StatusBar::disabled()),
         ));
 
         let failure = supervising.await.expect("join").expect("a failure");
@@ -498,6 +599,7 @@ mod tests {
             agent(),
             Ui::new(true),
             Stop::new(),
+            Arc::new(StatusBar::disabled()),
         )
         .await
         .expect("a failure");

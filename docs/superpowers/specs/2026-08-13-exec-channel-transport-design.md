@@ -98,9 +98,56 @@ connection. A pump that dies ends the remote command, which ends `ssh`, which th
 supervisor sees; a pipe that closes is reported by `serve_pipe` as an end.
 
 So the probe is not an optimisation that was removed — it is a question that stopped being
-askable. What it fed, the backoff reset, is now a count `serve_pipe` already has: how many
-requests that connection answered. "It carried something" stays the bar, rather than the
-weaker "it stayed up".
+askable. What it fed, the backoff reset, is now something `serve_pipe` already has: what
+that connection carried.
+
+#### The half this got wrong, and the keepalive that fixes it
+
+Everything above is written from the laptop, and the laptop is only one end. `ssh` measures
+the connection for the side that *started* it; the server measures nothing. `sshd` ships
+with `ClientAliveInterval 0`, and a TCP connection whose peer has stopped acknowledging is
+indistinguishable from an idle one for as long as the kernel goes on retransmitting into it
+— a quarter of an hour, and unbounded if the peer is wedged rather than gone.
+
+So a laptop on a flaky link produced this, every time: the laptop's `ssh` gave up after
+45 s and reconnected, while on the server the pump from the *previous* connection stayed
+alive, bound to `channel.sock`, relaying into a pipe nobody would ever read again. Three
+symptoms, one cause, and no two of them looked related:
+
+- every paste and every `riabuild channel status` reached that pump, waited out the full
+  reply timeout and failed;
+- every pump the reconnecting laptop started found the socket answering and exited with
+  `another riabuild is already serving the clipboard channel`;
+- the supervisor, whose `diagnose` has no pattern for that, retried it silently and then
+  reported **"the clipboard channel cannot reach this server"** — about a server it had
+  reached on every single attempt.
+
+**The pump now measures the laptop, the way `ssh` measures the server.** Every
+`KEEPALIVE_INTERVAL` (15 s, the laptop's `ServerAliveInterval`) it sends one frame up the
+pipe; after `KEEPALIVE_DEADLINE` (45 s, three of them, the laptop's `ServerAliveCountMax`)
+with nothing coming back, it returns — unbinding the socket on the way out. The corpse is
+gone before the reconnecting supervisor's second attempt, paste fails immediately instead
+of after twenty seconds, and the socket is free for the pump that should have it.
+
+The frame is `id: 0` — reserved in `mux`, since connection ids start at one — and carries
+**no payload**, which is what keeps `the pump is a relay and never a parser` true of it. It
+names no operation and reads no answer; it needs a frame back and nothing else, and
+`serve_pipe` already guarantees one for every frame including a frame it cannot parse. A
+laptop too old to recognise the id answers with a parse error, which counts.
+
+#### "It carried something" was the wrong bar for the *message*
+
+The keepalive also settles what the supervisor had been getting wrong on its own side.
+"Did this connection do any work" and "did this connection come up" had been one flag, and
+the message about an unreachable server was gated on the first. On a link that drops and
+rebuilds — the whole reason the developer is on mosh — a developer who simply was not
+pasting carried nothing on any attempt, and the fourth rebuild of a perfectly healthy
+channel told them it could not reach their server.
+
+`serve_pipe` now returns `Served { requests, keepalives }`. `connected()` is either of
+them, and it is what gates both the message and the backoff reset: a connection that
+exchanged a keepalive demonstrably worked, and making paste wait out the thirty-second
+ceiling on a link that is fine is the worse error.
 
 ### What is removed
 
@@ -117,6 +164,31 @@ longer applies to a laptop socket that no longer exists.
 | `channel` | new `mux` (framing) and `pump` (the server side). `agent::pipe` serves an `Agent` over a frame pipe. `supervisor` spawns the exec session instead of the forward. |
 | `remote` | `Plan` loses `probe`, gains the pump command. `sockets::local_socket` goes. |
 | `cli` | `riabuild channel pump`, dispatched like `channel status`, and excluded from self-update along with the other `channel …` subcommands — its stdout is a payload. |
+| `ui` | `StatusBar`: one line at a fixed row of a terminal something else is drawing on. See below. |
+
+### The supervisor speaks on a status bar, not in the scrollback
+
+The supervisor is the one thing riabuild runs *beside* the developer's shell rather than in
+front of it, and it had been printing the same way every other part of riabuild does. Both
+halves of that are wrong in a remote session, and the first is what gets reported:
+
+- an interactive shell puts the terminal in **raw mode**, where `\n` drops a row and does
+  not return to column one, so a folded warning arrives as a staircase down the screen —
+  "ruined newlines", in the words of the person who hit it;
+- it lands in the middle of a screen mosh and Claude Code are painting, and neither of them
+  knows a line appeared.
+
+`riabuild_ui::StatusBar` draws one line on **row two** — mosh's own bar owns row one, and
+two programs writing the same cells is a race — with the cursor saved and put back, over
+`/dev/tty` rather than a stdout that may be a pipe. `supervisor::StatusLine` redraws it
+every two seconds, because the program underneath repaints and there is no notification
+when it does; `remote::channel` owns it, since the session's end is when the line comes
+off, and the supervisor clears it the moment a connection comes up. A bar holds one line
+and truncates it, so the detail and the remedy stay where a developer can read them:
+`riabuild channel status`.
+
+Where there is no bar — every run that is not a remote session, `--quiet`, every test — the
+supervisor prints exactly as it did.
 
 ## Security
 

@@ -12,7 +12,7 @@
 //! design, and the reason the security argument did not have to be re-made.
 
 use super::Agent;
-use crate::mux::{Frame, read_frame, write_frame};
+use crate::mux::{Frame, KEEPALIVE_ID, read_frame, write_frame};
 use crate::protocol::{ErrorCode, Request, Response, decode_request, encode_response};
 use anyhow::Result;
 use std::sync::Arc;
@@ -20,17 +20,48 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 
-impl Agent {
-    /// Serves until the pipe closes, answering with how many requests it
-    /// carried.
+/// What one connection turned out to be, once it had ended.
+///
+/// Two numbers rather than one, because the supervisor asks two different
+/// questions of a connection that has closed and they had been sharing an
+/// answer:
+///
+/// - *Did it do any work?* — which is what a fast retry is earned by. A channel
+///   that came up, carried nothing and sat there for an hour has not earned
+///   one.
+/// - *Did it come up at all?* — which is what decides whether the developer is
+///   told the channel cannot reach the server.
+///
+/// Answering the second with the first is why a developer whose channel was
+/// working perfectly was told it could not reach their server: on a connection
+/// that drops and rebuilds — a flaky link, a laptop that sleeps — nobody who
+/// simply is not pasting ever carries a request, and four rebuilds of a healthy
+/// idle channel produced a message about a server it had reached every time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Served {
+    /// Requests from shims on the server: a paste, an image, an `xdg-open`.
+    pub requests: u64,
+    /// Keepalives from the pump. Proof the connection came up and stayed up,
+    /// and the only such proof an idle channel produces.
+    pub keepalives: u64,
+}
+
+impl Served {
+    /// Whether this connection ever reached the pump at the other end.
     ///
-    /// The count is what the supervisor's backoff schedule is reset by. "The
-    /// connection stayed up" is not the same claim: a channel that came up,
-    /// carried nothing and sat there for an hour has not earned a fast retry,
-    /// and under the old transport that distinction needed a health probe over
-    /// a second SSH connection to make. Here it is a number this loop already
-    /// has.
-    pub async fn serve_pipe<R, W>(self: Arc<Self>, input: R, output: W) -> Result<u64>
+    /// A pump too old to send keepalives leaves this false on an idle
+    /// connection, exactly as it was before this existed. That is the one
+    /// direction it can be wrong in, it costs a message that is no worse than
+    /// the one being replaced, and `riabuild remote` upgrades the server's
+    /// riabuild on the run that fixes it.
+    pub fn connected(self) -> bool {
+        self.requests > 0 || self.keepalives > 0
+    }
+}
+
+impl Agent {
+    /// Serves until the pipe closes, answering with what it carried.
+    pub async fn serve_pipe<R, W>(self: Arc<Self>, input: R, output: W) -> Result<Served>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -49,7 +80,7 @@ impl Agent {
             }
         });
 
-        let mut carried = 0u64;
+        let mut served = Served::default();
         let mut input = BufReader::new(input);
         loop {
             let frame = match read_frame(&mut input).await {
@@ -62,7 +93,24 @@ impl Agent {
                 Err(_) => break,
             };
 
-            carried = carried.saturating_add(1);
+            // The pump's keepalive, which belongs to no shim and asks for
+            // nothing. Answered rather than ignored — an unanswered keepalive
+            // is a pump that concludes this laptop is gone and gives up the
+            // socket — and answered here rather than through `answer`, which
+            // would manufacture a parse error for a frame that deliberately
+            // carries nothing to parse.
+            if frame.id == KEEPALIVE_ID {
+                served.keepalives = served.keepalives.saturating_add(1);
+                let _ = replies
+                    .send(Frame {
+                        id: KEEPALIVE_ID,
+                        payload: Vec::new(),
+                    })
+                    .await;
+                continue;
+            }
+
+            served.requests = served.requests.saturating_add(1);
             let agent = Arc::clone(&self);
             let replies = replies.clone();
             tokio::spawn(async move {
@@ -78,7 +126,7 @@ impl Agent {
 
         drop(replies);
         let _ = writing.await;
-        Ok(carried)
+        Ok(served)
     }
 }
 
@@ -153,7 +201,7 @@ mod tests {
         writer: tokio::io::DuplexStream,
     }
 
-    fn served(agent: Arc<Agent>) -> (Server, tokio::task::JoinHandle<Result<u64>>) {
+    fn served(agent: Arc<Agent>) -> (Server, tokio::task::JoinHandle<Result<Served>>) {
         let (ours_out, theirs_out) = duplex(64 * 1024);
         let (ours_in, theirs_in) = duplex(64 * 1024);
         let serving = tokio::spawn(agent.serve_pipe(theirs_out, theirs_in));
@@ -176,6 +224,76 @@ mod tests {
             .expect("a reply");
         assert_eq!(frame.id, id, "a reply must carry its request's id");
         frame.payload
+    }
+
+    /// The pump's keepalive, from the end that has to answer it.
+    ///
+    /// Two claims in one, and the channel breaks in a different way for each.
+    /// Unanswered, the pump on the server concludes this laptop is gone and
+    /// gives up the socket — every forty-five seconds, on a session that is
+    /// working perfectly. Counted as a request, it would tell the supervisor
+    /// that a paste had been carried when none had, which is the fast-retry
+    /// signal and not this one's to give.
+    #[tokio::test]
+    async fn a_keepalive_is_answered_and_is_not_counted_as_a_request() {
+        let (server, serving) = served(Arc::new(agent_holding(&[TEXT], b"hello")));
+        let Server {
+            mut reader,
+            mut writer,
+        } = server;
+
+        write_frame(
+            &mut writer,
+            &Frame {
+                id: KEEPALIVE_ID,
+                payload: Vec::new(),
+            },
+        )
+        .await
+        .expect("write");
+        let reply = read_frame(&mut reader)
+            .await
+            .expect("read")
+            .expect("a keepalive must be answered");
+        assert_eq!(reply.id, KEEPALIVE_ID);
+        assert!(
+            reply.payload.is_empty(),
+            "a keepalive answers nothing: {:?}",
+            reply.payload
+        );
+
+        // The pipe ends, which is how `serve_pipe` reports what it carried.
+        drop(writer);
+        let served = serving.await.expect("join").expect("served");
+        assert_eq!(
+            served,
+            Served {
+                requests: 0,
+                keepalives: 1
+            }
+        );
+        // It came up — which is the question the supervisor asks, and the only
+        // evidence an idle channel produces.
+        assert!(served.connected());
+    }
+
+    /// …and a real request is still a request. The two counts are only useful
+    /// if they can disagree.
+    #[tokio::test]
+    async fn a_request_is_counted_apart_from_a_keepalive() {
+        let (mut server, serving) = served(Arc::new(agent_holding(&[TEXT], b"hello")));
+        ask(
+            &mut server,
+            7,
+            encode_request(&Request::ClipboardTargets).into_bytes(),
+        )
+        .await;
+
+        drop(server.writer);
+        let served = serving.await.expect("join").expect("served");
+        assert_eq!(served.requests, 1);
+        assert_eq!(served.keepalives, 0);
+        assert!(served.connected());
     }
 
     #[tokio::test]
