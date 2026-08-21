@@ -1,7 +1,7 @@
 # riabuild-cli — async migration
 
 **Date:** 2026-08-05
-**Status:** Approved
+**Status:** Implemented
 **Scope:** `riabuild-cli` only. `riabuild-web` is untouched.
 **Supersedes:** nothing. Extends [2026-08-04-riabuild-design.md](2026-08-04-riabuild-design.md).
 

@@ -1,6 +1,7 @@
 # Concurrent runs on one machine
 
-**Status:** accepted, 2026-08-12
+**Date:** 2026-08-12
+**Status:** Implemented
 **Amends:** nothing — this closes a hole the invariants never covered
 
 ## Problem

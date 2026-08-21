@@ -1,14 +1,26 @@
 # The laptop channel, and the clipboard — Design
 
 **Date:** 2026-08-07
-**Status:** Draft
+**Status:** Implemented, amended by
+[`2026-08-13-exec-channel-transport-design.md`](2026-08-13-exec-channel-transport-design.md)
 **Extends:** [`2026-08-04-riabuild-design.md`](2026-08-04-riabuild-design.md),
 [`2026-08-06-remote-mode-design.md`](2026-08-06-remote-mode-design.md)
 
-**Depends on remote mode**, which is unmerged at the time of writing. This is PR D: it
-needs `src/remote/` to exist, the SSH identity to be established, and the shell to be
-running before there is anything for a channel to attach to. Nothing here changes remote
-mode's three PRs.
+> **The transport in this document is not the one that ships.** On 2026-08-13 the channel
+> moved off `ssh -N -R` and onto a plain command execution, `ssh -T <host> riabuild
+> channel pump`, with the pump binding the socket itself in a process riabuild started.
+> The protocol, the operation allowlist, the agent and the shims are unchanged, which is
+> why the rest of this document still describes shipped code — but every mention below of
+> a reverse forward, of `ExitOnForwardFailure`, of `StreamLocalBindUnlink`, and of the
+> thirty-second health probe describes a mechanism that has been removed. Each of those
+> passages is marked where it appears. Read
+> [`2026-08-13-exec-channel-transport-design.md`](2026-08-13-exec-channel-transport-design.md)
+> for what replaced them and why.
+
+**Depended on remote mode**, which was unmerged when this was written and has shipped
+since. This was PR D: it needs remote mode to exist, the SSH identity to be established,
+and the shell to be running before there is anything for a channel to attach to. Nothing
+here changed remote mode's three PRs.
 
 ## Purpose
 
@@ -66,6 +78,14 @@ change:
 > It carries no credentials, it is owned by the laptop's session, and every property the
 > server depends on — setup, secrets, the shell — continues to work when it is gone.
 
+**Amended 2026-08-13, in the direction that needs no amendment.** Nothing is forwarded
+any more, so "no SSH forwarding" is once again true as written: the socket is bound by
+`riabuild channel pump`, a process riabuild started over the command execution remote mode
+already depends on. The sentence above is kept because the *permission* it grants is still
+the right one to have granted — one unix socket, carrying no credentials, owned by the
+laptop's session — and because a reader arriving from the remote-mode spec needs to find
+the question answered rather than absent.
+
 What that sentence existed to protect is unmoved. No credential crosses the channel. The
 Infisical credential is still brokered per use; the session token is still minted by the
 laptop and revocable; the mosh shell is still self-sufficient. The channel is an ergonomic
@@ -100,6 +120,14 @@ working, and nothing else does.
 
 Four components, two of which are the same binary invoked differently.
 
+> **Amended 2026-08-13.** The `ssh -N -R` arrow in this diagram is now `ssh -T <host>
+> riabuild channel pump`, and `channel.sock` is bound by the pump rather than by `sshd`.
+> Every other box is unchanged — the shim still connects to a unix socket in the
+> namespace's `0700` runtime directory and still knows nothing about how the bytes leave
+> the machine, which is what made the transport swappable at all. On the laptop side the
+> agent is held in-process by the supervisor for remote sessions; `riabuild channel agent`
+> keeps its own socket only for a developer running it by hand.
+
 ```
 LAPTOP                                          SERVER
 ──────                                          ──────
@@ -110,6 +138,7 @@ riabuild channel agent                          Claude Code (or any program)
   ▲                                               │ connects to
   │                                               ▼
   └──── ssh -N -R (supervised) ◄────────── <runtime>/channel.sock   (0700 dir)
+        ↑ now: ssh -T … riabuild channel pump
                                                   │
                                                   │ ← {"ok":true,"targets":["image/png", …]}
                                                   ▼
@@ -120,7 +149,9 @@ The paste path, end to end:
 
 1. Claude Code runs `xclip -selection clipboard -t TARGETS -o`.
 2. The shim opens `channel.sock` and sends `{"v":1,"op":"clipboard.targets"}`.
-3. `ssh -R` carries it to the laptop agent, which reads the **laptop's** clipboard.
+3. The pipe carries it to the laptop agent, which reads the **laptop's** clipboard. This
+   step said `ssh -R` until 2026-08-13; it is a framed request down the exec session's
+   stdio now, and nothing above or below this line noticed.
 4. The reply comes back; the shim prints the target list in xclip's format.
 5. Claude Code greps it, matches, and runs `xclip … -t image/png -o`. Same round trip,
    raw bytes on stdout.
@@ -148,11 +179,18 @@ port on the server**, which every other user on that box can connect to. The rem
 spec already has a trust boundary about developers sharing a machine; a TCP port would put
 "read this developer's laptop clipboard on demand" inside it.
 
-A forwarded unix socket lives in the namespace's existing runtime directory, which is
-already `0700` and already ownership- and symlink-checked. Filesystem permissions do the
-gating, and the check is one riabuild already performs. OpenSSH has supported unix-socket
-remote forwarding since 6.7; servers older than that are a hard stop rather than a TCP
-fallback, because the fallback is the thing being avoided.
+A unix socket lives in the namespace's existing runtime directory, which is already
+`0700` and already ownership- and symlink-checked. Filesystem permissions do the gating,
+and the check is one riabuild already performs.
+
+> **Amended 2026-08-13.** The conclusion holds and the reasoning that produced it was
+> half wrong. This section originally ended by requiring OpenSSH 6.7 for unix-socket
+> *remote forwarding*, and treating older or non-OpenSSH servers as a hard stop rather
+> than falling back to TCP. riabuild no longer asks for that extension: the pump binds
+> the socket itself, in a process riabuild started, so the socket is the same socket with
+> the same permissions and the SSH server has no opinion about it. The hard stop is gone
+> with the requirement, and the TCP fallback is still refused — it was never the version
+> floor that ruled it out, it was the co-tenant.
 
 ## The protocol
 
@@ -417,6 +455,33 @@ which is the whole point.
 The requirement is mosh-grade: recover whenever the channel drops *or goes quiet for too
 long*. Three mechanisms, because each catches what the others miss.
 
+> **Amended 2026-08-13 — this whole section is two mechanisms now, not three, and neither
+> ssh option below is passed any more.** The supervised child is `ssh -T <host> riabuild
+> channel pump`; `ServerAliveInterval`/`ServerAliveCountMax` survive unchanged. What went
+> is the row beneath them.
+>
+> The probe existed because `ssh -N -R` had two channels — the ssh session, and the
+> forwarded socket riding under it — so ssh could believe itself perfectly connected while
+> the forward was wedged, and keepalives running below a forward could not see it.
+> Catching that cost a second short-lived SSH connection every thirty seconds for the
+> whole of a developer's session. Under the exec transport the data path *is* the ssh
+> session's stdio: there is no second channel to wedge independently, so silence is
+> exactly what `ServerAliveInterval` already measures, on the same connection the bytes
+> travel over. The probe is not an optimisation that was removed; it is a question that
+> stopped being askable. The `channel.ping` operation itself still exists, because
+> `riabuild channel status` asks it on demand — what is gone is anything asking it on a
+> timer.
+>
+> `ExitOnForwardFailure` and `StreamLocalBindUnlink` went with the forward. The second is
+> worth recording rather than deleting, because the paragraph below states its effect
+> backwards: for `-R` it is **sshd** that calls `bind()`, so the server's own
+> `sshd_config` decides, and its default is `no`. The `-o StreamLocalBindUnlink=yes`
+> riabuild passed is a *client* option that applies only to sockets `ssh` itself creates
+> — `-L`, not `-R`. It did nothing. A `channel.sock` left by a killed session therefore
+> blocked every later session permanently and no riabuild flag could clear it, which is
+> one of the two failures that moved the channel off the forward. Removing a stale socket
+> is now an ordinary `unlink` by the process that owns it.
+
 | Mechanism | Catches |
 |---|---|
 | Supervisor: `ssh -N -R` as a supervised child, rebuilt with jittered backoff (1 s → 30 s) | clean exits — the connection died and said so |
@@ -521,6 +586,13 @@ restricts by content — reaches the same clipboard today. Refusing writes here 
 
 Each has its own remedy, so each is detected separately.
 
+> **Amended 2026-08-13.** The first three rows are about a forward that no longer exists.
+> The first two are not failures any more at all — riabuild asks for no socket forwarding
+> and no OpenSSH version, only the command execution remote mode already needs — and the
+> third finally works: a stale socket is now unlinked by the process that owns it rather
+> than left for an `sshd_config` default to refuse. What replaces them is a server that
+> will not run a command, which is a hard stop everything else in remote mode shares.
+
 | What went wrong | What riabuild says |
 |---|---|
 | Server refuses socket forwarding (`AllowStreamLocalForwarding no`) | hard stop naming the `sshd_config` directive — the failure nobody can diagnose from the symptom |
@@ -595,6 +667,14 @@ between a channel that comes back on its own and one they have to notice.
 The channel is not remote-flow-specific — the shim runs on the server, the agent on the
 laptop — so it gets its own module rather than growing `src/remote/`.
 
+> **Superseded twice.** `src/channel/` became the `riabuild-channel` crate on 2026-08-12
+> — see [`2026-08-12-cargo-workspace-design.md`](2026-08-12-cargo-workspace-design.md) —
+> and the exec transport then added `mux`, `pump`, `agent::pipe` and `socket` to it while
+> `supervisor` became a directory. The current module list is in `riabuild-cli/CLAUDE.md`
+> under *Layout*. The tree below is what this design proposed, not what the repository
+> holds, and the line about `supervisor.rs` keeping `ssh -N -R` alive with a ping is the
+> transport this document no longer describes.
+
 ```
 src/channel/
   protocol.rs   request/response types, framing, the op allowlist
@@ -653,6 +733,12 @@ a PNG at all, so an image write through it would not be lossy but unconstructibl
 | Leasing | two shells share one channel; the second starts no connection of its own, and **takes the lease over when the one serving it ends** — the case a refcount could not express |
 | **Degradation** | container test: the tunnel is killed mid-session; setup re-runs, secrets re-pull, the shell works, and only clipboard fails |
 | End to end | the `e2e/remote` sshd container plus a laptop-side agent: a PNG and a UTF-8 string paste through a real shim |
+
+> **Amended 2026-08-13.** Two of these rows tested the forward and went with it: *Ping
+> timeout*, because nothing pings on a timer any more, and *Forward refused*, because
+> riabuild asks for no forward to refuse. Everything else in this table still holds, which
+> is the clearest evidence that the change was a transport change — the protocol, the
+> shims and the degradation guarantee were all tested the same way before and after.
 
 The degradation row earns its cost for the same reason remote mode's namespace test does:
 it is the executable form of the amended invariant. Without it, "the channel is strictly

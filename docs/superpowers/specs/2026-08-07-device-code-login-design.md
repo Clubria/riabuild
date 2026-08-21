@@ -1,6 +1,7 @@
 # Device-code login
 
-**Status:** accepted, 2026-08-07
+**Date:** 2026-08-07
+**Status:** Implemented
 **Supersedes:** the loopback section of `2026-08-04-riabuild-design.md`
 
 ## Problem

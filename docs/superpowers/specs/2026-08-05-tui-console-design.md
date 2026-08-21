@@ -1,5 +1,10 @@
 # riabuild console — a fake-TUI dashboard
 
+**Date:** 2026-08-05
+**Status:** Implemented
+**Supersedes:** the visual section of
+[`2026-08-04-riabuild-design.md`](2026-08-04-riabuild-design.md)
+
 Replaces the "manifest sheet" print aesthetic of `riabuild-web` with a single framed
 terminal. Adds the component library, dev-access harness, Playwright loop, 404 page and
 error boundary that the reskin needs in order to be verifiable.
@@ -215,7 +220,9 @@ by Claude reading the image files; that inspection is the point of the suite.
 
 Not done until this has converged:
 
-1. `pnpm ui:check` — runs the visual suite, writes screenshots
+1. `pnpm ui:check` — runs the whole Playwright suite, writes screenshots. Every spec,
+   not only the visual one: each scenario at 380, 768 and 1440, plus the smoke run. A
+   test tagged `@viewport-agnostic` runs once, at 768
 2. Open the screenshots and look at them, every scenario, every viewport
 3. Fix what is wrong — clipping, overlap, wrapping, unreadable contrast, broken frame
 4. Repeat from 1

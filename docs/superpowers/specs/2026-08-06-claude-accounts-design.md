@@ -1,8 +1,12 @@
 # Claude Code account management
 
-Status: approved, not yet implemented.
+**Date:** 2026-08-06
+**Status:** Implemented — shipped in #28 on 2026-08-07; the "not yet implemented" this
+line used to carry was true only for the day between
+**Supersedes:** task 7 (`claude_profiles`) in
+[`2026-08-04-riabuild-design.md`](2026-08-04-riabuild-design.md)
+
 Written against `main` at `70f52c2`.
-Supersedes task 7 (`claude_profiles`) in `2026-08-04-riabuild-design.md`.
 
 A Clubria developer runs more than one Claude Code account — a personal subscription and
 one or more work accounts, or two subscriptions to spread usage limits. Today riabuild

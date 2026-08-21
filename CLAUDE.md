@@ -25,9 +25,14 @@ anything structural.
 |---|---|
 | `riabuild-cli/` | Rust CLI — a cargo workspace of thirteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
-| `e2e/` | the CLI and the backend tested together on macOS — `e2e/README.md` |
-| `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies |
+| `e2e/` | the CLI and the backend tested together — `run.sh` on macOS, and `remote/` driving `riabuild remote` against a real Debian container. `e2e/README.md` |
+| `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies; `ngrok/` and `grok/` hold the mirror scripts for the two tools nobody publishes a digest for |
+| `Formula/riabuild.rb` | the rendered formula `brew tap` reads — written by the release workflow, never by hand |
 | `docs/superpowers/specs/` | design specs |
+| `docs/superpowers/plans/` | the implementation plans those specs were built from. History: read one to find out why something is the way it is, never as instructions for what to do now |
+| `docs/releasing.md` | cutting a CLI release |
+| `docs/deploying.md` | putting riabuild-web on the domain |
+| `shared-build/` | the one cargo build directory every checkout and worktree compiles into. Untracked, created by a `SessionStart` hook — `riabuild-cli/CLAUDE.md` is the authority |
 | `.claude/skills/` | repo skills — read the relevant one before the work it covers |
 
 `riabuild-web/e2e/` is a different thing: the dashboard's Playwright suite. The

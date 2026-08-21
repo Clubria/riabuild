@@ -1,6 +1,10 @@
 # Concurrent Run Safety Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Completed — historical record, do not execute.** Shipped in #53, 2026-08-12. The
+> unchecked `- [ ]` boxes below are how the plan was written and not work outstanding, and
+> the instruction to an agentic worker to implement it task-by-task that stood here has
+> been removed: acting on it would rebuild something that already ships. See
+> [`README.md`](README.md) for the index, and the design spec for what the code does now.
 
 **Goal:** Make `riabuild` safe to run in two terminal windows at once, so no run can lose another's writes to `config.json`, `state.json` or `remotes.json`, and no interrupt can leave a half-written file behind.
 

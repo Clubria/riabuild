@@ -302,10 +302,16 @@ been told about reaches nobody — silently, with nothing anywhere reporting a
 problem. The `announce` job calls `release:publishCliVersion`, which re-checks
 with GitHub that the release really exists before writing, and
 `org.setLatestCliVersion` refuses to move the version backwards. Between them
-the only value that can land there is the newest genuinely published build,
-which is why the entry point needs no shared secret — a Convex deploy key
-cannot write environment variables, so a secret could only have been installed
-by hand.
+the only value that can land there is the newest genuinely published build.
+
+It is an `internalAction`, reached with `CONVEX_DEPLOY_KEY` the same way
+`npx convex run org:backfillClaudeDefaults --prod` is, and by no browser
+client. That needs no shared secret of its own — which matters, because a
+Convex deploy key cannot write environment variables, so a secret could only
+have been installed by hand. It was public until it was noticed that every
+call spends a request from `GITHUB_ORG_TOKEN`: the same token every
+org-membership re-check uses, whose exhaustion 503s secret brokering for the
+whole org.
 
 Without `CONVEX_DEPLOY_KEY` the release still publishes and the job warns that
 nobody was offered it.

@@ -1,7 +1,7 @@
 # Linux support — Design
 
 **Date:** 2026-08-06
-**Status:** Approved
+**Status:** Implemented
 **Extends:** [`2026-08-04-riabuild-design.md`](2026-08-04-riabuild-design.md)
 
 ## Purpose

@@ -1,6 +1,14 @@
 # Laptop Channel and Clipboard Bridge — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Completed — historical record, do not execute.** Written for #27 on 2026-08-07 and
+> shipped in #35 on 2026-08-09; the transport it describes was then replaced on
+> 2026-08-13, so this plan is two changes behind the code rather than one. The unchecked
+> `- [ ]` boxes below are how the plan was written and not work outstanding, and the
+> instruction to an agentic worker to implement it task-by-task that stood here has been
+> removed: acting on it would rebuild something that already ships, in the shape it no
+> longer has. See [`README.md`](README.md) for the index, and
+> [`../specs/2026-08-13-exec-channel-transport-design.md`](../specs/2026-08-13-exec-channel-transport-design.md)
+> for the transport that did land.
 
 **Goal:** Build a general-purpose request channel from a remote server back to the developer's laptop, with the clipboard as its first consumer, so Ctrl+V in Claude Code over `riabuild remote` attaches the laptop's clipboard content.
 
