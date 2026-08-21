@@ -444,12 +444,25 @@ jobs:
           # A 401 from our own route proves the backend is listening *and* that
           # convex/http.ts is deployed. Waiting on the URL alone races the
           # function push and fails later, further from the cause.
+          #
+          # The version header is not decoration. `guard` runs the version
+          # floor *before* authentication, and an absent
+          # `x-riabuild-cli-version` counts as version `0` rather than as an
+          # exemption — so a bare curl against a deployment with no `orgConfig`
+          # row is answered 409 `cli_too_old` against the default floor of
+          # 0.1.0, and never 401. Sending a version that clears any floor is
+          # what keeps this poll an assertion about the *auth* path, which is
+          # the one smoke.spec.ts is about to walk.
           SITE="$(sed -n 's/^VITE_CONVEX_SITE_URL=//p' .env.local | tr -d '\r')"
+          probe() {
+            curl -s -o /dev/null -w '%{http_code}' \
+              -H 'x-riabuild-cli-version: 9999.0.0' "$SITE/api/v1/me"
+          }
           for _ in $(seq 1 120); do
-            [ "$(curl -s -o /dev/null -w '%{http_code}' "$SITE/api/v1/me")" = "401" ] && break
+            [ "$(probe)" = "401" ] && break
             sleep 1
           done
-          [ "$(curl -s -o /dev/null -w '%{http_code}' "$SITE/api/v1/me")" = "401" ]
+          [ "$(probe)" = "401" ]
 
       # Structural assertions only — horizontal overflow, clipping, focus
       # visibility, axe, console errors. Deliberately no committed pixel

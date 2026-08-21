@@ -57,22 +57,21 @@ impl Strategy {
 /// A tarball or `cargo` riabuild there ran `brew upgrade clubria/tap/riabuild`,
 /// which installs a second copy under the brew prefix and leaves this one
 /// running, for ever, reporting success every time.
-pub async fn strategy(runner: &dyn CommandRunner, executable: &str) -> Strategy {
-    strategy_on(cfg!(target_os = "macos"), runner, executable).await
-}
-
-/// [`strategy`] with the platform question as a parameter.
+///
+/// The platform arrives as `is_macos` rather than being read from `cfg!`
+/// here, and there is exactly one `cfg!(target_os = "macos")` above this — in
+/// [`super::apply`], pinned by
+/// `the_upgrade_asks_the_platform_it_is_actually_running_on`.
 ///
 /// `cfg!` compiles the other branch out of the test binary, so with it inline
-/// the four tests below could assert nothing about `dpkg`/`rpm` on the macOS
-/// job and nothing about Homebrew on Linux — each of them was an `if
-/// cfg!(macos) { … } else { … }` asserting only whichever half the host
-/// happened to be. That is the half-applied pattern
-/// `riabuild-cli/CLAUDE.md` records under `keychain::select`, which shipped
-/// two binary-less releases. The parameter is what makes both branches
-/// assertable on every host, and
-/// `the_wrapper_asks_the_platform_it_is_actually_running_on` pins the wrapper
-/// itself so the untested branch cannot simply move up into it.
+/// the tests below could assert nothing about `dpkg`/`rpm` on the macOS job
+/// and nothing about Homebrew on Linux — each of them was an `if cfg!(macos)
+/// { … } else { … }` asserting only whichever half the host happened to be.
+/// That is the half-applied pattern `riabuild-cli/CLAUDE.md` records under
+/// `keychain::select`, which shipped two binary-less releases. The parameter
+/// is what makes both branches assertable on every host; keeping only one
+/// `cfg!` in the whole path is what stops the untested branch from moving up
+/// a level instead of going away.
 pub async fn strategy_on(is_macos: bool, runner: &dyn CommandRunner, executable: &str) -> Strategy {
     if is_macos {
         return match homebrew_owns(runner, executable).await {
@@ -248,22 +247,6 @@ mod tests {
             strategy_on(true, &runner, "/opt/homebrew/bin/riabuild").await,
             Strategy::Unmanaged
         );
-    }
-
-    #[tokio::test]
-    async fn the_wrapper_asks_the_platform_it_is_actually_running_on() {
-        // Not optional, and the reason is in `riabuild-cli/CLAUDE.md`: a
-        // parameter without this test *moves* the untested branch into the
-        // wrapper rather than removing it. This runner answers differently on
-        // each side — dpkg owns the binary, and there is no brew — so a
-        // wrapper hardcoding either value fails on one of the two CI hosts.
-        let runner = FakeRunner::new().with("dpkg -S", 0, "riabuild: /usr/bin/riabuild", "");
-        let expected = if cfg!(target_os = "macos") {
-            Strategy::Unmanaged
-        } else {
-            Strategy::Apt
-        };
-        assert_eq!(strategy(&runner, "/usr/bin/riabuild").await, expected);
     }
 
     #[test]

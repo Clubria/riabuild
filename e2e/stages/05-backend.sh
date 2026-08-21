@@ -64,9 +64,17 @@ info "api: $API_URL"
 # A 401 from our own endpoint proves two things at once: the backend is
 # listening, and convex/http.ts is deployed. Waiting on the port alone races
 # with the function push and fails later, further from the cause.
+#
+# `api_curl`, never a bare `curl`: without `x-riabuild-cli-version` this route
+# answers 409 rather than 401, because a missing header is version `0` and no
+# `orgConfig` row has been seeded yet — so the floor is the `0.1.0` default.
+# See "Talking to /api/v1 directly" in e2e/run.sh. Still asserting 401 rather
+# than accepting the 409: 401 is the answer that says the *authentication* path
+# this run is about to walk is deployed, and it is the answer that keeps saying
+# so once stage 07 has seeded a floor.
 READY=""
 for _ in $(seq 1 120); do
-  if [ "$(curl -s -o /dev/null -w '%{http_code}' "$API_URL/api/v1/me")" = "401" ]; then
+  if [ "$(api_curl -o /dev/null -w '%{http_code}' "$API_URL/api/v1/me")" = "401" ]; then
     READY=1
     break
   fi

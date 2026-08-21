@@ -75,6 +75,37 @@ E2E_LATEST_CLI_VERSION="2026.01.01"
 E2E_CLAUDE_SETTINGS='{"env":{"CLUBRIA_E2E":"1"},"permissions":{"deny":["Read(./.env.dev)","Read(./.env.staging)"]}}'
 
 # ---------------------------------------------------------------------------
+# Talking to /api/v1 directly
+# ---------------------------------------------------------------------------
+#
+# Two stages call the API with `curl` rather than through riabuild — stage 05
+# waits for `/api/v1/me` to answer at all, and stage 07 checks that the session
+# it seeded authenticates. Both have to send the version header, and the reason
+# is a decision `guard()` makes before it looks at anything else.
+#
+# `x-riabuild-cli-version` is **not** optional from the server's side. An absent
+# header used to return early out of `enforceMinVersion`, which made the version
+# floor opt-in from the client: anything that simply did not send one sailed past
+# `minCliVersion` on every route. `convex/lib/guard.ts` now reads a missing
+# header as version `0`, so a bare `curl` is refused `409 cli_too_old` *before*
+# authentication is reached — and a probe waiting for `401` waits out its whole
+# timeout and then reports the backend as never having answered.
+#
+# `9999.0.0` is above every floor this run can meet: the `0.1.0` a fresh
+# anonymous deployment falls back to with no `orgConfig` row (stages 05 and 06,
+# before anything is seeded) and the E2E_MIN_CLI_VERSION stage 07 seeds. It is
+# also what a local build reports and what `convex/testing.fixtures.ts` uses, so
+# the harness is not inventing a version of its own.
+E2E_CLI_VERSION="9999.0.0"
+
+# One caller for every direct `/api/v1` request, so the header cannot be sent by
+# the poll and forgotten by the assertion after it. Anything curl takes goes
+# through here.
+api_curl() {
+  curl -s -H "x-riabuild-cli-version: $E2E_CLI_VERSION" "$@"
+}
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 

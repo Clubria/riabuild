@@ -118,6 +118,21 @@
 #      the missing piece is *named* in the banner instead of guessed at.
 #      Adding those routes, and an Infisical stand-in the container can reach,
 #      is the work that finally makes the block at the bottom run.
+#   f. CLOSED, and it is the one that was hiding directly behind (b). The
+#      first run to get past the sign-in stopped three tasks in, on
+#      `git_credentials`: `gh auth setup-git` reported "unable to find git
+#      executable in PATH", because `Dockerfile` installed `openssh-server`
+#      and `ca-certificates` and nothing else. That is riabuild correctly
+#      refusing a machine it cannot provision, so `known_gap` did not forgive
+#      it and must not be taught to — the fix belongs in the container, and
+#      `git` is now installed there with the reasoning beside it.
+#
+#      Worth stating once so the next missing-tool failure is read correctly:
+#      `git` is the *only* thing riabuild expects a server to already have.
+#      Everything else it needs it downloads and verifies itself, and it
+#      unpacks what it downloads in-process, so a future "command not found"
+#      on this container means riabuild grew a dependency on the host — not
+#      that the image is one `apt-get install` short.
 #
 # WHERE IT STOPS IS NO LONGER SOMETHING THIS HEADER PREDICTS. It said "the
 # binary-install step" for two releases after the install started working, and

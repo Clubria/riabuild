@@ -5,7 +5,7 @@ use riabuild_runner::{CommandRunner, RunOptions};
 use riabuild_theme::Theme;
 use riabuild_ui::{Failure, Ui};
 
-use super::strategy::{Strategy, strategy};
+use super::strategy::{Strategy, strategy_on};
 
 /// Upgrades riabuild and re-execs it with the original arguments.
 ///
@@ -41,9 +41,32 @@ async fn replace_binary(
     to: &str,
     mandatory: bool,
 ) -> Result<bool> {
+    replace_binary_on(cfg!(target_os = "macos"), runner, ui, to, mandatory).await
+}
+
+/// [`replace_binary`] with the platform question as a parameter, for the same
+/// reason [`strategy_on`] takes one.
+///
+/// With `cfg!` inline this decided *two different things* depending on which
+/// CI host ran it, and a test could only ever see one of them: the apt case
+/// below scripted `dpkg -S` and got `Apt` on Linux, while the macOS job asked
+/// the same fake for `brew`, found none, and got `Unmanaged` — a mandatory
+/// upgrade that stops the run. That is not a test failing on one platform, it
+/// is a test asserting nothing on it. The parameter is what lets both branches
+/// of the decision — including a Mac's, from Linux — be driven through the
+/// fake runner, and
+/// `the_upgrade_asks_the_platform_it_is_actually_running_on` pins the wrapper
+/// so the untested branch cannot move up into it.
+async fn replace_binary_on(
+    is_macos: bool,
+    runner: &dyn CommandRunner,
+    ui: &Ui,
+    to: &str,
+    mandatory: bool,
+) -> Result<bool> {
     let executable = std::env::current_exe()?;
     let executable = executable.to_string_lossy().into_owned();
-    let strategy = strategy(runner, &executable).await;
+    let strategy = strategy_on(is_macos, runner, &executable).await;
 
     if strategy == Strategy::Unmanaged {
         decline(
@@ -220,6 +243,23 @@ mod tests {
     use super::*;
     use riabuild_runner::FakeRunner;
 
+    /// A Mac whose Homebrew prefix contains *this test binary*, because that
+    /// is the path `replace_binary_on` probes: it asks `current_exe()` who
+    /// owns it, so a fixed `/opt/homebrew` would answer "not this one" and
+    /// send every macOS assertion below down the `Unmanaged` branch instead.
+    fn a_mac_that_poured_this_binary() -> FakeRunner {
+        let executable = std::env::current_exe().expect("a test binary has a path");
+        let prefix = executable
+            .parent()
+            .expect("and a directory it lives in")
+            .to_string_lossy()
+            .into_owned();
+        FakeRunner::new()
+            .with("brew --prefix", 0, &format!("{prefix}\n"), "")
+            .with("brew list --formula riabuild", 0, "riabuild\n", "")
+            .with("brew upgrade", 0, "", "")
+    }
+
     #[tokio::test]
     async fn a_package_manager_upgrade_prints_through_riabuild() {
         // apt is the loudest thing in a run and none of it is riabuild's.
@@ -265,11 +305,16 @@ mod tests {
         // this binary, the question before the sudo, the command itself, and
         // the answer that says the process should now be replaced. Every one
         // of those was previously reachable only by a developer's laptop.
+        //
+        // `false` rather than the host's own answer: this scripts a Linux
+        // machine, and asked with `cfg!` it scripted one only on Linux — the
+        // macOS job ran the same fake through the Homebrew probe, found no
+        // brew, and got the `Unmanaged` refusal instead of any of this.
         let runner = FakeRunner::new()
             .with("dpkg -S", 0, "riabuild: /usr/bin/riabuild", "")
             .with("sudo apt-get", 0, "", "");
 
-        let replaced = replace_binary(&runner, &Ui::scripted(["y"]), "2026.08.12", true)
+        let replaced = replace_binary_on(false, &runner, &Ui::scripted(["y"]), "2026.08.12", true)
             .await
             .expect("the upgrade runs");
 
@@ -284,27 +329,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mandatory_upgrade_on_a_mac_pours_the_tap_without_asking() {
+        // The same path on the other platform, asserted on every host rather
+        // than only on the one CI job with a Mac. The `Ui` has no answer to
+        // give, which is the assertion that nothing here asks: a question put
+        // to it reads as "could not ask", and a mandatory upgrade that cannot
+        // ask stops the run rather than reaching `brew`.
+        let runner = a_mac_that_poured_this_binary();
+
+        let replaced = replace_binary_on(
+            true,
+            &runner,
+            &Ui::scripted([] as [&str; 0]),
+            "2026.08.12",
+            true,
+        )
+        .await
+        .expect("the upgrade runs");
+
+        assert!(replaced, "a successful upgrade has to be re-exec'd into");
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call == "brew upgrade clubria/tap/riabuild"),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(runner.calls().iter().all(|call| !call.contains("sudo")));
+        assert_eq!(runner.subdued_calls(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_asks_the_platform_it_is_actually_running_on() {
+        // The one `cfg!(target_os = "macos")` left in this path, and this is
+        // what pins it: a parameter without a test on the wrapper *moves* the
+        // untested branch up a level rather than removing it. dpkg owns this
+        // binary and there is no brew, so the two platforms disagree and a
+        // wrapper hardcoding either one fails on one of the two CI hosts —
+        // which is the whole point. Optional rather than
+        // mandatory so neither answer ends the run: Linux upgrades, a Mac
+        // finds nothing that owns this and prints how to do it by hand.
+        let runner = FakeRunner::new()
+            .with("dpkg -S", 0, "riabuild: /usr/bin/riabuild", "")
+            .with("sudo apt-get", 0, "", "");
+
+        let replaced = replace_binary(&runner, &Ui::scripted(["y"]), "2026.08.12", false)
+            .await
+            .expect("an optional upgrade is never a failure");
+
+        assert_eq!(replaced, !cfg!(target_os = "macos"));
+    }
+
+    #[tokio::test]
     async fn a_binary_nothing_owns_is_never_replaced_and_never_re_execd() {
         // `Unmanaged` plus `mandatory` is the one combination that must stop
         // the run with an instruction rather than pretend: there is nothing
         // riabuild can do here, and a re-exec would loop on the same binary.
-        let runner = FakeRunner::new();
+        // Both platforms, because a bare machine reaches this on both — the
+        // Mac through "no brew", Linux through "no dpkg and no rpm".
+        for is_macos in [false, true] {
+            let runner = FakeRunner::new();
 
-        let error = replace_binary(&runner, &Ui::new(true), "2026.08.12", true)
-            .await
-            .expect_err("a floor this machine cannot climb past stops the run");
+            let error = replace_binary_on(is_macos, &runner, &Ui::new(true), "2026.08.12", true)
+                .await
+                .expect_err("a floor this machine cannot climb past stops the run");
 
-        assert!(format!("{error}").contains("riabuild"), "{error}");
-        assert!(runner.calls().iter().all(|call| !call.contains("sudo")));
+            assert!(format!("{error}").contains("riabuild"), "{error}");
+            assert!(runner.calls().iter().all(|call| !call.contains("sudo")));
+        }
     }
 
     #[tokio::test]
     async fn an_optional_upgrade_nothing_owns_carries_on() {
-        assert!(
-            !replace_binary(&FakeRunner::new(), &Ui::new(true), "2026.08.12", false)
+        for is_macos in [false, true] {
+            assert!(
+                !replace_binary_on(
+                    is_macos,
+                    &FakeRunner::new(),
+                    &Ui::new(true),
+                    "2026.08.12",
+                    false
+                )
                 .await
-                .expect("an optional upgrade that cannot happen is not a failure")
-        );
+                .expect("an optional upgrade that cannot happen is not a failure"),
+                "is_macos: {is_macos}"
+            );
+        }
     }
 
     #[tokio::test]

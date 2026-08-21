@@ -36,6 +36,11 @@ pass "seeded @$E2E_LOGIN as a developer, org pointed at $E2E_REPO_SLUG"
 
 # The seeded session has to survive the real authentication path before the CLI
 # is asked to depend on it, or a bad seed reads as a broken CLI.
-ME="$(curl -s -H "authorization: Bearer $SESSION_TOKEN" "$API_URL/api/v1/me")"
+#
+# `api_curl` carries the version header. The floor is E2E_MIN_CLI_VERSION as of
+# the seed two lines up, and `guard()` enforces it ahead of the session, so a
+# bare `curl` here would be turned away 409 without the token ever being looked
+# at — and this assertion would blame the seed for it.
+ME="$(api_curl -H "authorization: Bearer $SESSION_TOKEN" "$API_URL/api/v1/me")"
 check_contains "the seeded session authenticates against /api/v1/me" "$ME" "\"githubLogin\":\"$E2E_LOGIN\""
 

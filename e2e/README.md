@@ -167,6 +167,16 @@ now implements `do_POST`, minting a delegated session and reproducing the real
 endpoint's gates — an authenticated caller, one hop only, a reply shaped exactly
 as `ServerSessionReply` deserialises.
 
+Closing that immediately uncovered the next thing, which is the shape this keeps
+taking. With the sign-in working, the run reached the task DAG and stopped three
+tasks in: the container had no `git`, so `gh auth setup-git` could not run. That
+is riabuild refusing a machine it genuinely cannot provision, not a gap in the
+harness, and the gate correctly declined to forgive it — so the fix is in
+`Dockerfile`, where `git` is now installed. It is the only tool riabuild expects
+a server to already have; everything else it downloads, verifies and unpacks
+itself, so the next "command not found" in there would mean riabuild had grown a
+dependency on the host.
+
 What stops the run now is the size of the stand-in rather than a missing handler.
 Past the sign-in the server runs the whole task DAG, and there is no Infisical
 stand-in reachable from the container and no toolchain. Making the bottom
