@@ -1,0 +1,28 @@
+# Every `uses:` in this repository is pinned to a 40-character commit SHA, which
+# is what stops a tag or a branch being moved under us — and also what stops it
+# ever moving at all. A pin nobody bumps is an action frozen at whatever it was
+# the day it was pinned, security fixes included. Dependabot is the half that
+# makes pinning survivable: when the release a pin was taken from moves, it opens
+# a pull request that rewrites the SHA and the `# v4.4.0` comment beside it, and
+# the bump lands as an ordinary reviewable change like any other.
+#
+# `github-actions` is the only ecosystem here, and the omissions are deliberate.
+# The versions and digests of the tools riabuild installs are pinned by hand in
+# `riabuild-cli/crates/fetch/src/tools.rs` against artifacts we mirror ourselves;
+# a bot editing those would be a bot choosing which bytes execute on a
+# developer's laptop, which is the thing the mirror exists to prevent.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      # `/` means this repository's workflows — it is how Dependabot spells
+      # `.github/workflows`, and it stops there.
+      - /
+      # The composite actions need naming separately, because `/` does not reach
+      # them. A glob rather than two literal paths: the point of the composites
+      # is that a pin lives in exactly one place, and a new one appearing here
+      # unwatched would undo that quietly.
+      - /.github/actions/*
+    schedule:
+      interval: weekly
