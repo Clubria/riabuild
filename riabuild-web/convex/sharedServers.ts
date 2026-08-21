@@ -140,7 +140,9 @@ export const add = mutation({
       .withIndex("by_name", (q) => q.eq("name", address.name))
       .unique();
     if (existing !== null) {
-      throw new Error(`There is already a shared server called ${address.name}.`);
+      throw new Error(
+        `There is already a shared server called ${address.name}.`,
+      );
     }
 
     const now = Date.now();
@@ -183,7 +185,9 @@ export const update = mutation({
       .withIndex("by_name", (q) => q.eq("name", address.name))
       .unique();
     if (clash !== null && clash._id !== server._id) {
-      throw new Error(`There is already a shared server called ${address.name}.`);
+      throw new Error(
+        `There is already a shared server called ${address.name}.`,
+      );
     }
 
     await ctx.db.patch("sharedServers", server._id, {

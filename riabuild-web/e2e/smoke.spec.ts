@@ -8,23 +8,86 @@ import { checkPage, expect, test } from "./helpers";
  * same `Data` contract the fixtures implement. Fixtures cannot catch a renamed
  * field; this can.
  *
+ * It runs as part of `pnpm ui:check`, which is what CI runs — for a long time
+ * it did not, because that script named `visual.spec.ts` and nothing named this
+ * one, so the suite documented as the one that catches a renamed field was
+ * executed by nobody.
+ *
  * It skips itself when no backend is reachable, so a missing local deployment
- * never blocks the visual suite. It needs, on that deployment:
+ * never blocks the visual suite, and `RIABUILD_E2E_BACKEND=1` turns that skip
+ * into a failure for a run that arranged one. It needs, on that deployment:
  *
  *   RIABUILD_DEV_AUTH=1     registers the dev sign-in provider
  *   RIABUILD_DEV_SEED=1     allows devSeed:seedOrgForDev
  *   RIABUILD_BOOTSTRAP_LEADS=devlead
  */
-test.describe("against a real backend", () => {
+const SIGN_IN = /sign in as devlead/i;
+
+/**
+ * Long enough for a cold Vite dev server to transform the entry modules and for
+ * `@convex-dev/auth` to settle. Only ever spent when there is no backend: with
+ * one, the button is there as soon as the app renders.
+ */
+const BACKEND_TIMEOUT = 15_000;
+
+/**
+ * Turns "no backend" from a skip into a failure.
+ *
+ * A run that went to the trouble of standing a deployment up wants to hear
+ * about it when the deployment is not answering — a silent skip there is the
+ * suite reporting green for tests that never ran. Off by default, because on a
+ * laptop with no `pnpm dev` running the skip is the right answer and blocking
+ * the visual suite behind backend availability is not.
+ */
+const BACKEND_REQUIRED = process.env.RIABUILD_E2E_BACKEND === "1";
+
+/**
+ * Asked once per worker. The answer cannot change mid-run, and the probe is the
+ * only slow thing here when there is nothing to talk to.
+ */
+let backendUp: boolean | null = null;
+
+/**
+ * Tagged so this suite runs under one viewport instead of three.
+ *
+ * Not because these pages are width-independent — they are the same pages the
+ * fixture suite shoots at 380, 768 and 1440 — but because what this proves is
+ * the wiring, and the wiring is the same at every width. Three runs of it cost
+ * three sign-ins against a real deployment to assert one thing.
+ */
+test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
-    const hasBackend = await page
-      .getByRole("button", { name: /sign in as devlead/i })
-      .isVisible()
-      .catch(() => false);
+    const signIn = page.getByRole("button", { name: SIGN_IN });
+
+    if (backendUp === null) {
+      // `isVisible()` asks with no waiting at all, so a first render that had
+      // not landed yet answered "no backend" and the whole suite skipped
+      // itself — quietly, and most likely on the slow machine where running it
+      // mattered. A real wait cannot be raced by a slow render.
+      backendUp = await signIn
+        .waitFor({
+          state: "visible",
+          timeout: BACKEND_TIMEOUT,
+        })
+        .then(
+          () => true,
+          () => false,
+        );
+    }
+
+    if (BACKEND_REQUIRED) {
+      // Fails with the locator's own message, naming what was looked for.
+      await expect(
+        signIn,
+        "RIABUILD_E2E_BACKEND=1 asked for a deployment with RIABUILD_DEV_AUTH=1, and none answered",
+      ).toBeVisible({ timeout: BACKEND_TIMEOUT });
+    }
+
     test.skip(
-      !hasBackend,
-      "no local Convex deployment with RIABUILD_DEV_AUTH=1 — run `pnpm dev` first",
+      !backendUp,
+      "no local Convex deployment with RIABUILD_DEV_AUTH=1 — run `pnpm dev` first, " +
+        "or set RIABUILD_E2E_BACKEND=1 to make its absence a failure",
     );
   });
 
@@ -32,9 +95,11 @@ test.describe("against a real backend", () => {
     page,
     consoleErrors,
   }, info) => {
-    await page.getByRole("button", { name: /sign in as devlead/i }).click();
+    await page.getByRole("button", { name: SIGN_IN }).click();
 
-    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+    await expect(
+      page.getByText("One command builds the machine."),
+    ).toBeVisible();
     await expect(page.getByText("confirm your profile")).toBeVisible();
     await expect(page.getByText("your machines")).toBeVisible();
     await expect(page.getByText("members and roles")).toBeVisible();
@@ -48,8 +113,10 @@ test.describe("against a real backend", () => {
     page,
     consoleErrors,
   }, info) => {
-    await page.getByRole("button", { name: /sign in as devlead/i }).click();
-    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+    await page.getByRole("button", { name: SIGN_IN }).click();
+    await expect(
+      page.getByText("One command builds the machine."),
+    ).toBeVisible();
 
     await page.goto("/nope");
     await expect(page.getByText("command not found")).toBeVisible();
@@ -70,8 +137,10 @@ test.describe("against a real backend", () => {
    * library, and the assertion worth making is that storage came out clean.
    */
   test("stale sign-in state clears itself", async ({ page }) => {
-    await page.getByRole("button", { name: /sign in as devlead/i }).click();
-    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+    await page.getByRole("button", { name: SIGN_IN }).click();
+    await expect(
+      page.getByText("One command builds the machine."),
+    ).toBeVisible();
 
     const refreshTokens = () =>
       page.evaluate(() =>
@@ -93,30 +162,34 @@ test.describe("against a real backend", () => {
     await page.reload();
 
     // The door is open again...
-    await expect(
-      page.getByRole("button", { name: /sign in as devlead/i }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: SIGN_IN })).toBeVisible();
 
     // ...and the dead half went with it, rather than waiting to break the next
     // attempt the way it did in production.
     await expect.poll(refreshTokens, { timeout: 10_000 }).toEqual([]);
 
     // The point of all of it: signing in works without clearing site data.
-    await page.getByRole("button", { name: /sign in as devlead/i }).click();
-    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+    await page.getByRole("button", { name: SIGN_IN }).click();
+    await expect(
+      page.getByText("One command builds the machine."),
+    ).toBeVisible();
   });
 
   test("the authorize page renders for a signed-in machine", async ({
     page,
     consoleErrors,
   }, info) => {
-    await page.getByRole("button", { name: /sign in as devlead/i }).click();
-    await expect(page.getByText("One command builds the machine.")).toBeVisible();
+    await page.getByRole("button", { name: SIGN_IN }).click();
+    await expect(
+      page.getByText("One command builds the machine."),
+    ).toBeVisible();
 
     // No code: against a real backend there is no pending request to find, so
     // the code box is what this proves renders and accepts input.
     await page.goto("/cli");
     await expect(page.getByLabel(/code from your terminal/i)).toBeVisible();
-    await checkPage(page, info, consoleErrors, { screenshot: "smoke-authorize" });
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "smoke-authorize",
+    });
   });
 });

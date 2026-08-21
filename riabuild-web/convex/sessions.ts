@@ -232,7 +232,13 @@ export const delegate = internalMutation({
       sessionId: v.id("cliSessions"),
       expiresAt: v.number(),
     }),
-    v.object({ status: v.literal("not_permitted") }),
+    v.object({
+      status: v.union(
+        v.literal("not_permitted"),
+        v.literal("revoked"),
+        v.literal("expired"),
+      ),
+    }),
   ),
   handler: async (ctx, args) => {
     const parent = await ctx.db.get("cliSessions", args.parentSessionId);
@@ -242,6 +248,16 @@ export const delegate = internalMutation({
     if (parent.origin === "delegated") {
       return { status: "not_permitted" as const };
     }
+
+    // Re-read, not inherited. `authenticate` checked `revokedAt` and
+    // `expiresAt` in an earlier transaction, and `POST /api/v1/cli/sessions`
+    // spends a GitHub round trip between the two — so a session revoked in
+    // that window would otherwise mint a fresh ninety-day credential on its
+    // way out, which is precisely the window `riabuild remote forget` exists
+    // to close. Every gate is re-read next to the row it is a fact about.
+    if (parent.revokedAt !== undefined) return { status: "revoked" as const };
+    const now = Date.now();
+    if (parent.expiresAt <= now) return { status: "expired" as const };
 
     const sessionId = await createSession(ctx, {
       memberId: parent.memberId,
@@ -263,7 +279,56 @@ export const delegate = internalMutation({
     return {
       status: "ok" as const,
       sessionId,
-      expiresAt: session?.expiresAt ?? Date.now() + SESSION_TTL_MS,
+      expiresAt: session?.expiresAt ?? now + SESSION_TTL_MS,
     };
+  },
+});
+
+/**
+ * How long a dead session row is kept before it is deleted.
+ *
+ * An hour, matching `cliAuth`'s sweep of abandoned device codes: the row is
+ * already useless the moment it expires, and the grace exists so a request in
+ * flight against a just-expired session still finds the row and is told
+ * `session_expired` rather than `unauthenticated`. Those say different things
+ * to a developer, and only one of them is true.
+ */
+const REAP_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * Deletes sessions that expired more than an hour ago. Scheduled hourly by
+ * `crons.ts`.
+ *
+ * Nothing reaped these before, which is what made the bounded reads elsewhere
+ * reachable at all: `listMine` takes 50, and `members.setStatus` used to take
+ * 100 and stop. Both numbers are only safe on a table that does not grow
+ * without bound, and a ninety-day TTL with one row per delegated server means
+ * a long-lived member's history outruns them.
+ *
+ * Expiry alone is the cut. A revoked session expires within ninety days and is
+ * swept by the same pass, whereas deleting it the moment it is revoked would
+ * take "revoked <date>" off the dashboard's session list — which is the
+ * evidence a developer looks at to confirm the credential they were worried
+ * about is actually gone.
+ */
+export const reapDead = internalMutation({
+  args: {},
+  returns: v.object({ deleted: v.number() }),
+  handler: async (ctx) => {
+    const cutoff = Date.now() - REAP_GRACE_MS;
+    // TODO(schema): once `cliSessions` carries a `by_expiresAt` index this
+    // becomes
+    //   .withIndex("by_expiresAt", (q) => q.lt("expiresAt", cutoff))
+    // exactly as `cliAuth.reapExpired` does over `cliDeviceCodes`. `filter`
+    // walks the table; the index would not.
+    const dead = await ctx.db
+      .query("cliSessions")
+      // eslint-disable-next-line @convex-dev/no-filter-in-query
+      .filter((q) => q.lt(q.field("expiresAt"), cutoff))
+      .take(500);
+    for (const session of dead) {
+      await ctx.db.delete("cliSessions", session._id);
+    }
+    return { deleted: dead.length };
   },
 });

@@ -48,9 +48,12 @@ export default defineConfig([
         "warn",
         { allowConstantExport: true },
       ],
-      // All of these overrides ease getting into
-      // TypeScript, and can be removed for stricter
-      // linting down the line.
+      // `no-explicit-any` and the five `no-unsafe-*` rules used to be off here,
+      // under a starter-template comment about stricter linting "down the
+      // line". That line arrived: turning them back on is what keeps an id
+      // crossing the Convex boundary an id, rather than something laundered
+      // through `as never` on its way into a mutation that wanted a different
+      // table's. Reach for a type, not for the switch.
 
       // Only warn on unused variables, and ignore variables starting with `_`
       "@typescript-eslint/no-unused-vars": [
@@ -60,17 +63,6 @@ export default defineConfig([
 
       // Allow escaping the compiler
       "@typescript-eslint/ban-ts-comment": "error",
-
-      // Allow explicit `any`s
-      "@typescript-eslint/no-explicit-any": "off",
-
-      // START: Allow implicit `any`s
-      "@typescript-eslint/no-unsafe-argument": "off",
-      "@typescript-eslint/no-unsafe-assignment": "off",
-      "@typescript-eslint/no-unsafe-call": "off",
-      "@typescript-eslint/no-unsafe-member-access": "off",
-      "@typescript-eslint/no-unsafe-return": "off",
-      // END: Allow implicit `any`s
 
       // Allow async functions without await
       // for consistency (esp. Convex `handler`s)

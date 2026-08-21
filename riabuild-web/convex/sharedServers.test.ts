@@ -1,56 +1,30 @@
-/// <reference types="vite/client" />
-import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import { api } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
-import schema from "./schema";
+import {
+  auditRows as auditActions,
+  Role,
+  seedMember,
+  setup,
+  TestConvex,
+} from "./testing.fixtures";
 
-const modules = import.meta.glob("./**/*.ts");
+/**
+ * The dashboard side of the team's shared servers: who may change the list and
+ * what a lead is allowed to type into it. `sharedServersApi.test.ts` covers
+ * what a CLI is then told about the result.
+ */
 
-function setup() {
-  return convexTest(schema, modules);
-}
-
-async function seedMember(
-  t: ReturnType<typeof setup>,
-  role: "candidate" | "developer" | "lead",
-) {
-  return await t.run(async (ctx) => {
-    const userId = await ctx.db.insert("users", {
-      name: "Ada Lovelace",
-      email: "ada@clubria.dev",
-    });
-    const rowId = await ctx.db.insert("members", {
-      userId,
-      githubLogin: role === "lead" ? "grace" : "ada",
-      githubId: "1234",
-      memberId: crypto.randomUUID(),
-      firstName: "Ada",
-      lastName: "Lovelace",
-      email: "ada@clubria.dev",
-      role,
-      status: "active",
-    });
-    return { userId, rowId };
+/** A lead signs in as `grace`, everyone else as `ada`. */
+async function asRole(t: TestConvex, role: Role) {
+  const { userId } = await seedMember(t, {
+    login: role === "lead" ? "grace" : "ada",
+    role,
   });
-}
-
-async function asRole(
-  t: ReturnType<typeof setup>,
-  role: "candidate" | "developer" | "lead",
-) {
-  const { userId } = await seedMember(t, role);
   return t.withIdentity({ subject: `${userId}|session` });
 }
 
 const GPU = { name: "gpu", host: "gpu.internal", port: 2222, user: "ada" };
-
-async function auditActions(t: ReturnType<typeof setup>) {
-  return await t.run(async (ctx) => {
-    const rows = await ctx.db.query("auditLog").collect();
-    return rows.map((row) => ({ action: row.action, meta: row.meta }));
-  });
-}
 
 describe("who may change the list", () => {
   test("a lead adds a server and it comes back in the list", async () => {
@@ -138,7 +112,11 @@ describe("the address a lead types", () => {
     const t = setup();
     const lead = await asRole(t, "lead");
 
-    for (const host of ["ada@gpu.internal", "gpu.internal:22", "gpu internal"]) {
+    for (const host of [
+      "ada@gpu.internal",
+      "gpu.internal:22",
+      "gpu internal",
+    ]) {
       await expect(
         lead.mutation(api.sharedServers.add, { ...GPU, host }),
       ).rejects.toThrow(/hostname/i);

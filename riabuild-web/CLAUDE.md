@@ -13,9 +13,16 @@ Root conventions and the PR workflow rule are in `../CLAUDE.md`. Design is in
 pnpm dev       # convex dev + vite
 pnpm lint      # tsc -b + eslint, zero warnings tolerated
 pnpm test      # vitest — Convex functions
-pnpm ui:check  # Playwright visual suite, all scenarios × 3 viewports
+pnpm ui:check  # the whole Playwright suite — see below
 pnpm build
 ```
+
+`pnpm ui:check` runs **every** Playwright spec, not only the visual one: each `src/dev`
+scenario at 380, 768 and 1440, and `smoke.spec.ts` signing in for real against a local
+Convex deployment. A test tagged `@viewport-agnostic` runs once, at 768 — running one at
+380 and again at 1440 asserts the same thing about the same DOM. The smoke suite skips
+itself when no deployment answers; `RIABUILD_E2E_BACKEND=1` turns that skip into a
+failure, which is what CI sets after standing one up.
 
 ## The dashboard
 
@@ -31,12 +38,20 @@ library in `src/ui/`. Two skills are not optional here:
 Design: `../docs/superpowers/specs/2026-08-05-tui-console-design.md`.
 
 **Components never call `useQuery`.** `src/data/convexProvider.tsx` is the only file in
-`src/` that may import from `convex/react`; everything else reads `useData()`. That
-boundary is what lets `?scenario=<name>` render any data state from fixtures. Check it:
+`src/` that may *use* `convex/react`; everything else reads `useData()`. That boundary is
+what lets `?scenario=<name>` render any data state from fixtures. `src/main.tsx` is the
+one other file that imports the module at all — it constructs the `ConvexReactClient` and
+chooses between the live provider and the fixtures, which is a decision nothing
+downstream can make. Both are named in the check, so it comes back empty:
 
 ```sh
-grep -rn "convex/react" src/ --include=*.tsx | grep -v data/convexProvider   # must be empty
+grep -rn "convex/react" src/ --include=*.tsx \
+  | grep -Ev '^src/(data/convexProvider|main)\.tsx:'   # must be empty
 ```
+
+Run it from `riabuild-web/`. Anchoring each exception to the start of the line and to a
+whole filename is the point: `grep -v data/convexProvider` also excused any future file
+whose *contents* happened to mention it.
 
 ## Local development
 
@@ -136,6 +151,29 @@ is in scope; re-arguing whether the file should be denied is not.
 execute. The Claude settings may name a program riabuild installs from its own binary —
 `statusLine` names `node ~/.riabuild/claude-statusline.js` — but never carry the program.
 See `../CLAUDE.md`.
+
+**`org.update` refuses a settings blob that names a program, and that is a usability lock
+rather than a security control.** Ten top-level keys are refused outright — `hooks`,
+`mcpServers`, `apiKeyHelper` and the rest of `EXECUTES_A_PROGRAM`; `statusLine` is
+accepted only when its `command` is character-for-character `DEFAULT_STATUS_LINE.command`,
+which is what `claude_statusline` installs, because a prefix match would take
+`node ~/.riabuild/claude-statusline.js; curl … | sh`; and `env` is refused for the names
+that decide what a session executes — `NODE_OPTIONS`, `PATH`, `LD_PRELOAD` and the rest of
+`INJECTS_A_PROGRAM`, which are the quietest way left to run code once `hooks` is gone.
+Say the limit out loud rather than trusting the check: the real gate is the CLI's
+`riabuild-cli/crates/tasks/src/org_settings/vetting.rs`, which is the **authority for both
+lists**, and it lives there because the laptop treats this server as untrusted — a
+compromised deployment, a hand-edited `orgConfig` row, or a proxy between the two would
+all sail past anything written here. What the copy buys is a lead being told at *save*
+time, instead of the dashboard accepting a blob the whole fleet then refuses and every
+developer finding out at once on their next run, from a hard failure naming a key they did
+not write. If the two drift, the CLI's list wins and this one is the bug.
+
+It is deliberately only the **first** of the CLI's two tiers. A key riabuild does not
+recognise is stripped on the laptop with a note, and refusing one here would make this
+server the thing that decides what a lead may write — Claude Code adds settings keys on a
+faster clock than riabuild cuts releases, so a lead would be locked out of a new inert
+preference until one shipped.
 
 ## The `/api/v1` contract
 

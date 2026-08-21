@@ -4,6 +4,7 @@ import { Anonymous } from "@convex-dev/auth/providers/Anonymous";
 import { MutationCtx } from "./_generated/server";
 import { Id } from "./_generated/dataModel";
 import { claimOrCreateMember } from "./members";
+import { fetchUpstream } from "./lib/http";
 
 /**
  * The issuer identifier GitHub puts in the `iss` authorization-response
@@ -79,7 +80,7 @@ async function resolveEmail(
   if (profileEmail) return profileEmail;
   if (!accessToken) return undefined;
   try {
-    const response = await fetch("https://api.github.com/user/emails", {
+    const response = await fetchUpstream("https://api.github.com/user/emails", {
       headers: {
         authorization: `Bearer ${accessToken}`,
         accept: "application/vnd.github+json",
@@ -90,7 +91,9 @@ async function resolveEmail(
     const emails = (await response.json()) as unknown;
     if (!Array.isArray(emails)) return undefined;
     const verified = emails.filter(
-      (entry): entry is { email: string; primary: boolean; verified: boolean } =>
+      (
+        entry,
+      ): entry is { email: string; primary: boolean; verified: boolean } =>
         typeof entry === "object" &&
         entry !== null &&
         typeof (entry as { email?: unknown }).email === "string" &&
@@ -120,10 +123,9 @@ const DevProvider = Anonymous({
   id: "dev",
   profile(params) {
     const raw = params.login;
-    const login = (typeof raw === "string" && raw !== "" ? raw : "devuser").slice(
-      0,
-      39,
-    );
+    const login = (
+      typeof raw === "string" && raw !== "" ? raw : "devuser"
+    ).slice(0, 39);
     return {
       name: login,
       email: `${login}@example.invalid`,

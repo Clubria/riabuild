@@ -108,7 +108,14 @@ export default defineSchema({
     delegatedFrom: v.optional(v.id("cliSessions")),
   })
     .index("by_tokenHash", ["tokenHash"])
-    .index("by_memberId", ["memberId"]),
+    .index("by_memberId", ["memberId"])
+    /**
+     * For the sweep that reaps expired sessions, the same way
+     * `cliDeviceCodes.by_expiresAt` serves abandoned logins. Without it the
+     * reaper is a full table scan of every session ever minted, which grows
+     * without bound while the rows worth deleting are a prefix of this index.
+     */
+    .index("by_expiresAt", ["expiresAt"]),
 
   /**
    * Pending device-authorisation requests: one row per `riabuild login`, minted
@@ -146,7 +153,24 @@ export default defineSchema({
 
   /** Single row. Edited by leads in the dashboard, read by every CLI launch. */
   orgConfig: defineTable({
-    /** Org Claude Code settings, stored and served as verbatim JSON text. */
+    /**
+     * Org Claude Code settings, stored and served as verbatim JSON text.
+     *
+     * A `v.string()` is all a table validator can say about a blob whose
+     * structure lives inside the string, and it is worth being explicit that
+     * this is **not** the gate. The CLI is: `tasks::org_settings::vetting`
+     * refuses any key that names a program — `hooks`, `apiKeyHelper`,
+     * `awsCredentialExport`, `mcpServers` and the rest — and accepts
+     * `statusLine.command` only when it is the exact command the
+     * `claude_statusline` task installs. Whatever this column holds, that is
+     * what reaches `claude --settings`.
+     *
+     * Keeping the real check there rather than here is deliberate. This row is
+     * data the CLI treats as untrusted: a hand-edited document, a compromised
+     * deployment, or anything between the two and a laptop would all get past a
+     * validator that only runs on the way in. See "the server ships data, never
+     * logic" in the root `CLAUDE.md`.
+     */
     claudeSettings: v.string(),
     claudeSettingsUpdatedAt: v.number(),
     repoSlug: v.string(),

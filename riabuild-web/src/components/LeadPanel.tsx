@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import { useData } from "../data/context";
 import { AuditEntry, Member, Role } from "../data/types";
 import { readError } from "../lib/errors";
@@ -12,6 +12,7 @@ import {
   DataTable,
   Empty,
   Field,
+  KeyValue,
   Loading,
   Select,
   TextArea,
@@ -35,7 +36,8 @@ export function Members({ viewerId }: { viewerId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
-  if (data.members.state === "loading") return <Loading label="loading members" />;
+  if (data.members.state === "loading")
+    return <Loading label="loading members" />;
   if (data.members.state === "error") {
     return (
       <Alert tone="danger" title="Could not list members">
@@ -68,7 +70,10 @@ export function Members({ viewerId }: { viewerId: string }) {
       header: "member id",
       priority: "wide",
       render: (m) => (
-        <Copyable value={m.memberId} label={`member id for @${m.githubLogin}`} />
+        <Copyable
+          value={m.memberId}
+          label={`member id for @${m.githubLogin}`}
+        />
       ),
     },
     {
@@ -187,6 +192,62 @@ export function Members({ viewerId }: { viewerId: string }) {
   );
 }
 
+/**
+ * The status line riabuild writes, and the only one it will.
+ *
+ * A fourth copy of one string, and each of the three others is load-bearing:
+ * `riabuild-cli/crates/tasks/src/org_settings/vetting.rs` is the authority and
+ * the real gate, `claude_statusline` installs the script it names, and
+ * `DEFAULT_STATUS_LINE` in `convex/org.ts` is what `org.update` refuses to
+ * store anything but. This one exists because a browser bundle cannot import a
+ * Convex server module — and it cannot drift silently: `LeadPanel.test.tsx`
+ * pins it against `convex/org.ts`, and a copy that got past that would be
+ * refused by `org.update` on the next save rather than shipped.
+ */
+const STATUS_LINE = {
+  type: "command",
+  command: "node ~/.riabuild/claude-statusline.js",
+};
+
+/** The settings blob as an object, or `null` if it is not one. */
+function parseSettings(raw: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * What the lead types in: the stored blob with `statusLine` taken out.
+ *
+ * Unchanged when the stored settings do not parse, or carry no status line —
+ * a lead repairing broken JSON has to see exactly what is stored, and
+ * reformatting a blob that needed no edit would show a diff nobody made.
+ */
+function withoutStatusLine(raw: string): string {
+  const parsed = parseSettings(raw);
+  if (parsed === null || parsed.statusLine === undefined) return raw;
+  const { statusLine: _statusLine, ...rest } = parsed;
+  return JSON.stringify(rest, null, 2);
+}
+
+/**
+ * What gets saved: the same blob with riabuild's status line put back.
+ *
+ * Unparseable text is sent as it stands so the server is what says "must be
+ * valid JSON" — one error message for that, from one place.
+ */
+function withStatusLine(raw: string): string {
+  const parsed = parseSettings(raw);
+  if (parsed === null) return raw;
+  return JSON.stringify({ ...parsed, statusLine: STATUS_LINE }, null, 2);
+}
+
 export function OrgSettings() {
   const data = useData();
   const [draft, setDraft] = useState<string | null>(null);
@@ -201,6 +262,21 @@ export function OrgSettings() {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  /**
+   * Removing the team's ngrok token is a two-step act, and the only control on
+   * this page that is.
+   *
+   * Nothing can give the value back — no route returns it, the dashboard has
+   * only ever shown its last four characters, and the lead who pasted it is not
+   * required to have kept a copy. It also sits one button away from "save org
+   * config", so a slipped click destroys a secret while somebody was changing
+   * the repo slug. The confirmation names the token being destroyed and what
+   * stops working, rather than asking "are you sure".
+   */
+  const [confirmingRemoval, setConfirmingRemoval] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const busy = saving || rotating || removing;
 
   if (data.orgConfig.state === "loading") {
     return <Loading label="loading org config" />;
@@ -214,14 +290,38 @@ export function OrgSettings() {
   }
 
   const config = data.orgConfig.value;
-  const settings = draft ?? config.claudeSettings;
+  const settings = draft ?? withoutStatusLine(config.claudeSettings);
   const slug = repoSlug ?? config.repoSlug;
   const latest = latestCli ?? config.latestCliVersion;
   const floor = minCli ?? config.minCliVersion;
   const floorIsChanging = floor.trim() !== config.minCliVersion;
 
+  function save(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setSaving(true);
+    void data
+      .updateOrg({
+        claudeSettings: withStatusLine(settings),
+        repoSlug: slug,
+        latestCliVersion: latest.trim(),
+        minCliVersion: floor.trim(),
+        ...(ngrokToken === null ? {} : { ngrokAuthToken: ngrokToken.trim() }),
+      })
+      .then(() => {
+        setNgrokToken(null);
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      })
+      .catch((cause: unknown) => setError(readError(cause)))
+      .finally(() => setSaving(false));
+  }
+
   return (
-    <div className="max-w-2xl">
+    // A real form, so Enter in the repo slug saves the settings. The two
+    // buttons beside "save org config" are `type="button"` by default and stay
+    // that way: neither is what Enter should reach for.
+    <form className="max-w-2xl" onSubmit={save}>
       <Field
         label="default repository"
         hint="What Enter picks when riabuild asks. Developers can work on any repository they can see."
@@ -232,11 +332,29 @@ export function OrgSettings() {
       <div className="mt-4">
         <TextArea
           label="claude code settings"
-          hint="Layered over every profile at launch. Must be valid JSON."
+          hint="Layered over every profile at launch. Must be valid JSON, and may name no program to run."
           value={settings}
           rows={12}
           onChange={setDraft}
         />
+        <div className="mt-3">
+          <KeyValue
+            rows={[
+              {
+                label: "status line",
+                value: <span className="text-fg">{STATUS_LINE.command}</span>,
+              },
+            ]}
+          />
+        </div>
+        <p className="mt-1 text-xs text-fg-faint wrap-value">
+          Saved with the settings above, and not editable here. riabuild
+          installs that script from inside its own binary, and every
+          developer&rsquo;s CLI refuses team settings naming a different command
+          &mdash; a command typed on this page would be a program the server
+          chose, running on every laptop at every render. Changing what the
+          status line does is a riabuild release.
+        </p>
       </div>
 
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
@@ -294,62 +412,94 @@ export function OrgSettings() {
 
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Button
+          type="submit"
           variant="primary"
           pending={saving}
           pendingLabel="saving"
-          onClick={() => {
-            setError(null);
-            setSaving(true);
-            void data
-              .updateOrg({
-                claudeSettings: settings,
-                repoSlug: slug,
-                latestCliVersion: latest.trim(),
-                minCliVersion: floor.trim(),
-                ...(ngrokToken === null
-                  ? {}
-                  : { ngrokAuthToken: ngrokToken.trim() }),
-              })
-              .then(() => {
-                setNgrokToken(null);
-                setSaved(true);
-                setTimeout(() => setSaved(false), 2000);
-              })
-              .catch((cause: unknown) => setError(readError(cause)))
-              .finally(() => setSaving(false));
-          }}
+          disabled={rotating || removing}
         >
           save org config
         </Button>
         <Button
           variant="quiet"
+          pending={rotating}
+          pendingLabel="marking"
+          disabled={saving || removing}
           onClick={() => {
             setError(null);
+            setRotating(true);
             void data
               .updateOrg({ markSecretsRotated: true })
-              .catch((cause: unknown) => setError(readError(cause)));
+              .catch((cause: unknown) => setError(readError(cause)))
+              .finally(() => setRotating(false));
           }}
         >
           mark secrets rotated
         </Button>
-        {config.ngrokAuthTokenUpdatedAt > 0 && (
+        {config.ngrokAuthTokenUpdatedAt > 0 && !confirmingRemoval && (
           <Button
             variant="quiet"
+            disabled={busy}
             onClick={() => {
               setError(null);
-              void data
-                .updateOrg({ ngrokAuthToken: "" })
-                .then(() => setNgrokToken(null))
-                .catch((cause: unknown) => setError(readError(cause)));
+              setConfirmingRemoval(true);
             }}
           >
             remove ngrok authtoken
           </Button>
         )}
         {saved && (
-          <span className="text-xs tracking-wider text-ok uppercase">saved</span>
+          <span className="text-xs tracking-wider text-ok uppercase">
+            saved
+          </span>
         )}
       </div>
+
+      {confirmingRemoval && (
+        <div className="mt-4">
+          <Alert
+            tone="danger"
+            title={`Remove the ngrok authtoken ending ${config.ngrokAuthTokenHint}?`}
+          >
+            <p className="wrap-value">
+              Nothing can give it back. riabuild-web never shows the token
+              again, no route returns it to a browser, and if nobody kept a copy
+              the team&rsquo;s ngrok account has to issue a new one. Until a
+              lead pastes a replacement, every developer&rsquo;s{" "}
+              <span className="text-fg">ngrok</span> runs unauthenticated on
+              their next tunnel.
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button
+                variant="danger"
+                pending={removing}
+                pendingLabel="removing"
+                onClick={() => {
+                  setError(null);
+                  setRemoving(true);
+                  void data
+                    .updateOrg({ ngrokAuthToken: "" })
+                    .then(() => {
+                      setNgrokToken(null);
+                      setConfirmingRemoval(false);
+                    })
+                    .catch((cause: unknown) => setError(readError(cause)))
+                    .finally(() => setRemoving(false));
+                }}
+              >
+                remove the token
+              </Button>
+              <Button
+                variant="quiet"
+                disabled={removing}
+                onClick={() => setConfirmingRemoval(false)}
+              >
+                keep it
+              </Button>
+            </div>
+          </Alert>
+        </div>
+      )}
 
       <p className="mt-3 text-xs text-fg-faint wrap-value">
         secrets last rotated {formatTime(config.secretsUpdatedAt)} · saved CLI
@@ -363,7 +513,7 @@ export function OrgSettings() {
           </Alert>
         </div>
       )}
-    </div>
+    </form>
   );
 }
 
@@ -429,7 +579,8 @@ export function AuditLog() {
       rowKey={(e) => e._id}
       empty={
         <Empty glyph="∅" title="Nothing has changed yet.">
-          Role promotions, suspensions and session revocations are recorded here.
+          Role promotions, suspensions and session revocations are recorded
+          here.
         </Empty>
       }
     />
