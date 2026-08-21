@@ -98,6 +98,34 @@ function signedIn(page: Page) {
 }
 
 /**
+ * Waits until no panel is still fetching, and is the gate `checkPage` needs.
+ *
+ * `Loading` is the only thing in `src/` that renders `role="status"`, so one
+ * locator finds every panel with a query in flight. It matters because the
+ * dashboard's `<h1>` arrives with the `members.viewer` result and the other
+ * eight queries land after it, each swapping a one-line placeholder for a table
+ * — so a `checkPage` fired the moment the heading appears photographs, measures
+ * overflow on, tabs through and runs axe over whichever half had arrived. That
+ * is a different page on every run, and the focus sweep is the worst of it: it
+ * presses Tab sixty times against a DOM that is still growing new stops
+ * underneath it.
+ *
+ * Web-first and about the condition rather than a duration: a query that never
+ * answers fails here saying a panel is still loading, which is the truth and is
+ * worth a failure.
+ *
+ * Not folded into `checkPage` itself, because the fixture suite deliberately
+ * screenshots permanent loading states — `loading`, `viewer-missing` and
+ * `org-unavailable` are scenarios whose whole subject is a spinner.
+ */
+async function settled(page: Page) {
+  await expect(
+    page.getByRole("status"),
+    "a panel was still loading when the page was checked",
+  ).toHaveCount(0);
+}
+
+/**
  * Tagged so this suite runs under one viewport instead of three.
  *
  * Not because these pages are width-independent — they are the same pages the
@@ -154,6 +182,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     await expect(panel(page, "lead org configuration")).toBeVisible();
     await expect(panel(page, "lead audit log")).toBeVisible();
 
+    await settled(page);
     await checkPage(page, info, consoleErrors, { screenshot: "smoke-lead" });
   });
 
@@ -165,7 +194,14 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     await expect(signedIn(page)).toBeVisible();
 
     await page.goto("/nope");
-    await expect(page.getByText("command not found")).toBeVisible();
+    // The whole line rather than the phrase: `command not found` is a substring
+    // match that would go strict-mode ambiguous the moment a second element
+    // mentions it, and matching the path too is the assertion worth making —
+    // the 404 exists to name what was asked for.
+    await expect(
+      page.getByText("command not found: /nope", { exact: true }),
+    ).toBeVisible();
+    await settled(page);
     await checkPage(page, info, consoleErrors, { screenshot: "smoke-404" });
   });
 
@@ -193,12 +229,49 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
         ),
       );
 
-    expect(
-      await refreshTokens(),
-      "signing in should leave a refresh token to tear",
-    ).not.toEqual([]);
+    await expect
+      .poll(refreshTokens, {
+        message: "signing in should leave a refresh token to tear",
+      })
+      .not.toEqual([]);
 
-    await page.evaluate(() => {
+    /**
+     * The tear happens in the *next* document, before a line of app code runs,
+     * and that is the whole reason this test is deterministic.
+     *
+     * Deleting the JWT from the live page and then reloading is the obvious
+     * way to write it, and it is a race CI lost. `@convex-dev/auth` does not
+     * stop working when `signIn` resolves: it immediately exchanges the stored
+     * refresh token for a fresh pair — a second `POST /api/action` calling
+     * `auth:signIn`, this time with `{ refreshToken }` — and on the response
+     * it writes a new JWT *and* a rotated refresh token back to
+     * `localStorage`. Nothing in the page tells you that is outstanding, and
+     * the dashboard heading above appears while it still is.
+     *
+     * The trace from run 32533013839 has it to the millisecond: JWT deleted at
+     * t+95589, `reload()` issued at t+95610, the exchange's response landing
+     * at t+95694 — 84ms into the gap before the navigation committed at
+     * t+95830. The old document was still alive to receive it, so the JWT went
+     * straight back, the reload found a whole credential, and the app rendered
+     * the signed-in lead dashboard. The failure is `element(s) not found` for
+     * five seconds because the sign-in button was never going to be there, and
+     * the run before it passed on the same commit because that one response
+     * happened to land 20ms earlier.
+     *
+     * An init script closes the window rather than widening it. It runs in the
+     * *next* document, before `ConvexAuthProvider` reads storage, so it cannot
+     * matter whether the exchange landed before the reload, inside the gap, or
+     * not at all — whatever storage holds when the app boots, the JWT is not
+     * in it. Holding that response back and letting it land after the tear
+     * fails the old version every time and this one never.
+     *
+     * Guarded so it fires once. Playwright runs an init script on every later
+     * navigation in this page, and the sign-in at the end of this test must be
+     * allowed to keep its credential.
+     */
+    await page.addInitScript(() => {
+      if (sessionStorage.getItem("e2e-tore-the-jwt") === "1") return;
+      sessionStorage.setItem("e2e-tore-the-jwt", "1");
       for (const key of Object.keys(localStorage)) {
         if (key.startsWith("__convexAuthJWT")) localStorage.removeItem(key);
       }
@@ -228,6 +301,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     // the code box is what this proves renders and accepts input.
     await page.goto("/cli");
     await expect(page.getByLabel(/code from your terminal/i)).toBeVisible();
+    await settled(page);
     await checkPage(page, info, consoleErrors, {
       screenshot: "smoke-authorize",
     });
