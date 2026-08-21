@@ -10,7 +10,24 @@
 //! global-config key list beside `copyOnSelect` and `leftArrowOpensAgents`, not
 //! in the settings schema (verified against 2.1.231). Putting the name in the
 //! dashboard's settings JSON would carry a key Claude Code never reads, on every
-//! laptop, silently. `--settings` cannot reach it; this task is the only route.
+//! laptop, silently. `--settings` cannot reach it; this task is the only route
+//! to the key.
+//!
+//! **The key is not, however, what opens the view for a Clubria developer.**
+//! Claude Code consults `defaultToAgentsView` only when every token on the raw
+//! command line is a debug flag — it tests argv before its own option parsing —
+//! and every launcher `shims` has ever written passes `--settings`. So this key
+//! has never once decided what `~/.riabuild/bin/claude` opened on, and could
+//! not: dropping `--settings` to let it through would drop org policy with it.
+//! The launcher reaches the view by the `agents` positional instead, which is
+//! tested *after* the options Claude Code recognises are stripped, and which
+//! ignores this key entirely. See `shims`, which is where the promise in the
+//! first paragraph is actually kept.
+//!
+//! What the key is still for is a `claude` started from outside
+//! `~/.riabuild/bin` — a developer's own install, an editor integration, a
+//! script. Those get no launcher and no `--settings`, which is exactly the
+//! shape the key is read in, so the task stays.
 //!
 //! **A default, not a policy.** riabuild writes the key only when the account
 //! has no answer of its own, and never overwrites one. Toggling "Open agents
@@ -20,6 +37,15 @@
 //! why their preference kept coming back. That is the difference between this
 //! and its two neighbours: trust and onboarding are facts a developer would
 //! never want undone, and this is a view they might.
+//!
+//! Say the rest of that out loud, because the launcher changed it: through
+//! `~/.riabuild/bin/claude` the developer's `/config` answer no longer decides
+//! anything, since the positional route does not consult the key. Turning the
+//! view off there and getting it anyway is a real surprise, and the honest
+//! remedy is the one Claude Code documents — `CLAUDE_CODE_DISABLE_AGENT_VIEW`,
+//! which the launcher checks precisely so that a developer who wants out has a
+//! way out. What is preserved below is narrower than it was and still worth
+//! preserving: riabuild does not *overwrite* an answer a developer gave.
 //!
 //! Which makes "the account has an answer" the end state `check()` asks about,
 //! and it is a real one — a fresh account has no key at all, and `/config`
