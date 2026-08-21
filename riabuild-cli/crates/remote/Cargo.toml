@@ -38,4 +38,8 @@ riabuild-theme = { workspace = true, features = ["testing"] }
 riabuild-ui = { workspace = true, features = ["testing"] }
 tar.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+# `test-util` for the same reason `riabuild-channel` has it: the channel's
+# holder waits five seconds between asks for the lease, and the test that pins
+# a standing-by session taking the channel over would otherwise sit through
+# that interval for real.
+tokio = { workspace = true, features = ["macros", "test-util"] }

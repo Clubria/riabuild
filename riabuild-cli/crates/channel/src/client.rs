@@ -156,7 +156,17 @@ fn unavailable(socket: &Path, error: &std::io::Error) -> anyhow::Error {
             format!("the clipboard channel is not running — nothing is bound at {path}"),
             reconnect,
         )
-        .detail("The `riabuild remote` session that opened this shell has ended.".to_string())
+        // Not "the session that opened this shell", which is what this said
+        // while a channel belonged to whichever session started it. A sibling
+        // session standing by takes the channel over within seconds of the one
+        // serving it ending, so nothing bound here now means there is no
+        // session left to do that — which is a different fact and the one that
+        // makes the remedy above the only remedy.
+        .detail(
+            "Every `riabuild remote` session this laptop had open to this server has ended. \
+             While one is open it takes the channel over on its own."
+                .to_string(),
+        )
         .into(),
         // A socket file with nobody accepting: a pump killed hard enough that it
         // never unlinked. Told apart because "nothing is bound at this path"

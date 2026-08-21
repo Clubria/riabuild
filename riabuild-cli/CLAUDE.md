@@ -508,7 +508,7 @@ crates form a straight line, each depending only on those above it:
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
-| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run | all of the above |
+| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -631,6 +631,20 @@ it is a predicate rather than three inline conditions because `supervise` takes 
 afterwards: an unrecognised failure cannot be told apart from a server that is slow to come
 back.
 
+**A named wall stops the supervisor for the rest of the session, so `diagnose` is matched
+against why ssh gave up rather than against everything ssh wrote.** `supervisor::decisive`
+drops two kinds of line before any pattern is tried, and both carry words that read as
+decisive while being nothing of the sort. `Warning: Identity file … not accessible: No such
+file or directory.` is ssh saying it will offer one key fewer and then carrying on — left
+in, it turns every ordinary disconnect underneath it into "the server has no `riabuild
+channel pump` to run", permanently, on a server that has one. And **a hostname that will
+not resolve is a laptop that has just woken up**, which is the single most common way this
+connection fails and the one case that must always be retried, since retrying is the whole
+of how the channel survives a closed lid. Resolvers disagree about the words, and one of
+them — `Host not found` — really does contain a pattern above, so the line is dropped by
+what it is about rather than by which spelling it used. Only the *matching* is narrowed:
+`Failure::detail` still carries the whole of stderr.
+
 **"Never connected" is not "never carried a request", and conflating them is a message that
 lies.** Those were one flag. A connection carries a request only when somebody pastes, so on
 a link that drops and rebuilds — which is the whole reason the developer is on mosh — an
@@ -647,12 +661,45 @@ reporting it as "cannot reach this server" sends a developer to look at the one 
 is definitely working. It stays a retry rather than becoming a `diagnose` branch, because it
 resolves itself: the pump holding the socket gives it up within the minute.
 
+**Serving the channel is a lease, and every session keeps asking for it.** One of this
+laptop's sessions to a server serves the channel — a second pump would find the first one's
+socket live and be refused — and the rest *stand by*, asking every five seconds whether the
+lease has fallen free, for as long as their shells are open. `remote::channel::hold` is
+that loop and `remote::channel::lease` is the lease, an `flock` on
+`~/.riabuild/channel-sessions/<hash>/owner.lock`.
+
+It replaces a `Claim`: a `sessions/<pid>` marker per session and one question asked once,
+*am I the first?*. A session that answered no started nothing and never asked again, so
+when the owning session's laptop-side process ended the survivor sat there for the rest of
+its life naming a socket path that was correct and unbound — paste, image paste and
+`xdg-open` all dead, with riabuild running in that very terminal. Two terminals and a
+closed lid is not an exotic case, and the old banner *documenting* the limit ("it ends when
+that one does") did not stop it being reported as a bug.
+
+**The lease is an `flock` and must stay one.** A pid in a file is a claim somebody else has
+to check, and every way of checking it is wrong somewhere: a marker outlives its process,
+so it needs a sweep, and a sweep that runs only at startup cannot see an owner that dies
+later; `kill -0` on a recycled pid says "alive" about the wrong process; and `gh_session`'s
+age cap, which is how that file covers recycling, cannot be used here because a remote
+session outliving a day is the normal case. The kernel releases an `flock` when the holding
+process exits however it exits, so "the owner has gone" and "the lock is free" are one
+question and one syscall. `FileLock::try_acquire` is the try-only sibling `acquire` did not
+have: a session standing by must never *queue*, or it parks a blocking-pool thread for as
+long as its sibling's shell is open and then takes the channel over at the moment that
+shell exits whether or not it is still there to serve it.
+
+What this does **not** move: the laptop is still the side that connects, so when the last
+session to a server ends, a new `riabuild remote` is the only thing that brings the channel
+back. `hold` also stops standing by after a wall `supervise` names — two sessions each
+re-taking a lease they cannot use is a pair of laptops authenticating against a wall in
+turn, for ever.
+
 **`RIABUILD_CHANNEL_SOCKET` outlives the channel, and the shim reports that as a state
 rather than as an `errno`.** The variable is written once into the shell's environment when
 the session opens; the channel is a live resource a laptop-side process owns and can end at
-any moment — the sibling terminal that owned it exited first, a tmux window still open
-tomorrow, a laptop that slept. Nothing reconciles the two and nothing can, because the
-laptop is the side that connects. `client::unavailable` is where that is turned into
+any moment — a tmux window still open tomorrow, a laptop that slept, or every one of this
+laptop's sessions to that server having ended. Nothing on the server reconciles the two and
+nothing can, because the laptop is the side that connects. `client::unavailable` is where that is turned into
 something a developer can act on, and it must stay a `Failure` with the remedy in `action`:
 `channel status` renders the two apart, and a shim with only stderr gets both from
 `Display`. The remedy is real — the socket path is per developer and per server, so a new
