@@ -2,9 +2,9 @@
 # End-to-end proof that `riabuild remote` provisions a real Linux box over a
 # real SSH connection, with two developers sharing one Unix account.
 #
-# What this exercises for real: SSH key generation, the host-key trust
-# prompt (answered non-interactively via `--accept-host-key`, never
-# weakened), authorising a fresh key onto an account that only trusts an
+# What this exercises for real: SSH key generation, host-key trust held to a
+# named fingerprint via `--accept-host-key` rather than pinned on sight,
+# authorising a fresh key onto an account that only trusts an
 # existing one (via an ssh-agent — see the comment above `run_as`), asking
 # the server its own home directory, and the riabuild-web endpoints a run
 # reads — `/api/v1/me`, `/api/v1/org/config` and `/api/v1/org/claude-settings`
@@ -221,8 +221,9 @@ if [ -z "$ready" ]; then
   exit 1
 fi
 
-# The fingerprint answers `--accept-host-key`'s prompt without weakening it:
-# a mismatch still fails host_key::trust_host outright.
+# `--accept-host-key` holds the run to this exact fingerprint: a mismatch
+# fails host_key::trust_host outright, rather than being pinned on sight the
+# way an unadorned run would.
 fingerprint="$(ssh-keyscan -p "$CONTAINER_PORT" -t ed25519 localhost 2>/dev/null \
   | ssh-keygen -lf - | awk '{print $2}')"
 if [ -z "$fingerprint" ]; then
