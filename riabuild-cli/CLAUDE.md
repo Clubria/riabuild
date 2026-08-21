@@ -469,6 +469,40 @@ requests an hour *per address* is a ceiling one office behind one NAT reaches, a
 does, provisioning fails for all of them at once; the whole of `crates/fetch/src/tools/`
 now has no route to that host, deliberately.
 
+**pnpm is also the one tool riabuild installs as a *script* rather than as a binary, and
+that is forced rather than chosen.** What riabuild unpacks is the unscoped `pnpm` package —
+`bin/pnpm.cjs` with `dist/` beside it — started by `~/.riabuild/bin/pnpm`, a shim that
+`exec`s riabuild's own Node against it. Neither of pnpm's platform executables can run on
+the machines this provisions:
+
+- `@pnpm/linux-x64` is `NEEDED: libatomic.so.1`. That file is not in `debian:bookworm-slim`,
+  `debian:12`, `ubuntu:22.04` or `fedora:41` — it arrives with a toolchain, and a machine
+  that already has a toolchain on it is not the machine riabuild is pointed at.
+- `@pnpm/linuxstatic-<arch>` reads like the answer and is not: it is built against **musl**
+  and its interpreter is `/lib/ld-musl-x86_64.so.1`, so on a glibc distribution it does not
+  fail to find a library, it fails to start at all.
+
+Node's own binaries link neither, which is what makes the failure so hard to read: Node
+installs and answers `-v`, `check()` gets past it, and pnpm exits **127** beside it — which
+`reported_version` correctly turns into "pnpm is not installed yet". `apply()` then
+downloads 146 MB, unpacks it perfectly, and the re-check says the same thing. That is the
+apply-did-not-take-effect hard error, for ever, on a machine where nothing is wrong except a
+library nobody named. It is the Codex CLI bug below, one missing thing over, and
+`e2e/remote/run.sh`'s Debian container is where it surfaced.
+
+Two rules fall out of it and both are load-bearing. The shim names **both** paths
+absolutely — `shims::node_shim`, pinned by
+`the_shim_starts_pnpm_with_riabuilds_own_node_by_absolute_path` — because `bin/pnpm.cjs`
+opens `#!/usr/bin/env node` and a server reached by a non-interactive SSH exec has a `PATH`
+of `/usr/local/bin:/usr/bin:/bin` with no Node in it. And the version probe is
+`node <entry> -v` rather than `<binary> -v`, which is why `toolchain` has
+`reported_script_version` beside `reported_version` rather than one function that guesses.
+
+The fix for this is never `apt-get install libatomic1`. `e2e/remote/Dockerfile` says so by
+name, because one line there turns CI green and leaves every developer on a stock server
+hitting the same silent 127 — and "a provisioner that needs a package manager already set
+up cannot be the first thing a developer runs" is the whole of why riabuild exists.
+
 Grok Build's asset is the one that is **not an archive** — xAI serves a bare executable —
 so `archive::Kind::Raw` reads it straight through and `mirror.sh` renames it to `.bin`
 rather than repacking it. Repacking would make the pinned digest describe our own output

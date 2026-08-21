@@ -142,14 +142,28 @@ is a real digest served on a budget a provisioner cannot depend on: **sixty unau
 requests an hour per address**, which one office behind one NAT exhausts, after which
 nobody there can provision anything. Both e2e jobs stopped at exactly that.
 
-So pnpm comes from the **npm registry** instead — `@pnpm/exe` for the JavaScript bundle and
-`@pnpm/<platform>` for the launcher, each verified against the `dist.integrity` sha512 npm
-recorded over the stored tarball, the field every `npm install` already checks, with an
-SLSA provenance attestation beside it and no API ceiling. The rule is unchanged and this is
-what obeying it looked like here: a digest the *publisher* records, checked against the
-complete buffer before anything is unpacked, and a version whose integrity cannot be
-established is an error rather than an unverified download. What must never come back is
-the third option nobody proposes out loud — downloading it because the transfer completed.
+So pnpm comes from the **npm registry** instead — the unscoped `pnpm` package, verified
+against the `dist.integrity` sha512 npm recorded over the stored tarball, the field every
+`npm install` already checks, with an SLSA provenance attestation beside it and no API
+ceiling. The rule is unchanged and this is what obeying it looked like here: a digest the
+*publisher* records, checked against the complete buffer before anything is unpacked, and a
+version whose integrity cannot be established is an error rather than an unverified
+download. What must never come back is the third option nobody proposes out loud —
+downloading it because the transfer completed.
+
+**And pnpm is the tool that shows what "riabuild owns every tool it installs" costs when it
+is meant.** riabuild takes pnpm's *JavaScript* and runs it on the Node it downloaded itself,
+rather than either of the executables pnpm publishes, because neither of those runs on the
+machines this exists to provision: `@pnpm/linux-x64` needs `libatomic.so.1`, which stock
+Debian, Ubuntu and Fedora do not ship, and `@pnpm/linuxstatic-<arch>` is musl and wants a
+loader that is not there either. Node links neither, so the symptom was Node installing
+fine and pnpm exiting 127 beside it — read as "pnpm is not installed", re-installed
+perfectly, and reported as not having taken effect, for ever. The one-line fix is
+`apt-get install libatomic1` on the machine, and it is refused everywhere including in
+`e2e/remote/Dockerfile`'s own comments: a provisioner that needs a package manager already
+set up cannot be the first thing a developer runs, and a green CI job bought that way is
+one every developer on a stock server pays for silently. See
+`riabuild-cli/crates/fetch/src/download/assets.rs`.
 
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever

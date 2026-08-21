@@ -222,15 +222,34 @@ check_contains "riabuild's pnpm is the version it pinned" \
 # True on every path, and worth asking on every path: nothing in riabuild may
 # create `c` any more, including the code that writes the launchers it replaced.
 check "the retired c launcher is gone" test ! -e "$RIA_HOME/bin/c"
-# Written after the task engine finishes, so a run that stops at the sign-in
-# writes none of them. That is the engine's ordinary fail-fast contract rather
-# than anything specific to accounts — a failed `project` task costs the shell
-# too — so there is nothing here to assert short of a completed run.
-if [ "$SIGN_IN" = done ]; then
-  check "the claude launcher is executable" test -x "$RIA_HOME/bin/claude"
-  check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude-1"
+# The Claude Code launchers, on both paths — which they were not until this
+# suite's own CI run said so.
+#
+# `provision` used to write `engine::run_all(…)?`, so the first failed task
+# short-circuited the step that writes them: a machine that stopped at the
+# sign-in had an account, a config directory, and no `claude` to open it with.
+# `provision::after_the_tasks` now lands the launchers whatever the tasks did,
+# which is most of what carrying on past a failure was for. The account box's
+# own advice on exactly this machine is `claude-1 auth login` — a command that
+# has to exist for the advice to be worth printing.
+check "the claude launcher is executable" test -x "$RIA_HOME/bin/claude"
+check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude-1"
+
+# The isolation the per-account launchers exist for, asserted the way the nine
+# codex and grok launchers already are: each pins one account's config
+# directory, and Claude Code keeps sign-ins apart by that directory and nothing
+# else. Nine launchers sharing one would be nine names for a single account, and
+# every other assertion here would still pass.
+check_contains "the claude launcher pins account 1's config directory" \
+  "$(cat "$RIA_HOME/bin/claude-1" 2>/dev/null || echo '')" \
+  "CLAUDE_CONFIG_DIR=\"$RIA_HOME/claude/$CLAUDE_ACCOUNT\""
+
+# `claude` and `claude-1` are one account under two names, the shape `codex` and
+# `grok` already have.
+if cmp -s "$RIA_HOME/bin/claude" "$RIA_HOME/bin/claude-1"; then
+  pass "the bare claude launcher is the first account"
 else
-  info "launchers not checked: the run stopped before the step that writes them"
+  fail "the bare claude launcher is not claude-1"
 fi
 
 check "the checkout is a git repository" test -d "$PROJECT_DIR/.git"

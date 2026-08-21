@@ -83,10 +83,11 @@ pub async fn extract_node_tarball(bytes: Vec<u8>, target: PathBuf) -> Result<()>
 /// Unpacks the npm packages one tool is made of into `target` as a single
 /// tree, stripping the `package/` directory npm wraps every tarball in.
 ///
-/// pnpm is the caller, and it is two packages: `@pnpm/exe` carries the `dist/`
-/// tree and `@pnpm/<platform>` the launcher that loads it from beside itself.
-/// They are unpacked in the order given — the launcher last, over the
-/// placeholder the bundle ships — and land in one `rename`.
+/// pnpm is the caller and is one package — see `download::PNPM_PACKAGE`. More
+/// than one is still accepted, and more than one is still meaningful: they are
+/// unpacked in the order given, later entries overwriting earlier ones, and the
+/// result lands in one `rename` so a co-tenant never reaches a half-assembled
+/// tree.
 pub async fn extract_npm_tarballs(parts: Vec<Vec<u8>>, target: PathBuf) -> Result<()> {
     off_the_reactor(move || staging::extract_npm_tarballs(&parts, &target)).await
 }
@@ -291,29 +292,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn npm_packages_lose_their_package_wrapper_and_land_as_one_tree() {
-        // Every npm tarball wraps its contents in `package/`, and pnpm is two
-        // of them: the bundle's `dist/` and the platform package's launcher,
-        // which loads it from beside itself. The launcher goes last, over the
-        // placeholder the bundle ships in its place.
-        let bundle = tarball(&[
-            (
-                "package/pnpm",
-                b"This file intentionally left blank" as &[u8],
-            ),
+    async fn an_npm_package_loses_its_package_wrapper() {
+        // Every npm tarball wraps its contents in `package/`, and what pnpm
+        // needs out the other side is `bin/pnpm.cjs` with `dist/` beside it.
+        let package = tarball(&[
+            ("package/bin/pnpm.cjs", b"the entry" as &[u8]),
             ("package/dist/pnpm.mjs", b"module"),
         ]);
-        let platform = tarball(&[("package/pnpm", b"the launcher" as &[u8])]);
         let home = tempfile::TempDir::new().unwrap();
         let target = home.path().join("11.11.0");
 
-        extract_npm_tarballs(vec![bundle, platform], target.clone())
+        extract_npm_tarballs(vec![package], target.clone())
             .await
             .unwrap();
 
-        assert_eq!(std::fs::read(target.join("pnpm")).unwrap(), b"the launcher");
+        assert_eq!(
+            std::fs::read(target.join("bin/pnpm.cjs")).unwrap(),
+            b"the entry"
+        );
         assert!(target.join("dist/pnpm.mjs").exists());
         assert!(!target.join("package").exists());
+    }
+
+    #[tokio::test]
+    async fn several_npm_packages_land_as_one_tree_with_the_last_one_winning() {
+        // The multi-part contract, kept because it is the only thing that makes
+        // "a co-tenant never sees half a tool" true of a tool that needs two
+        // packages. pnpm needed exactly this while riabuild installed its
+        // platform executable, and the ordering rule is the half that is easy
+        // to lose: `tar` unlinks and recreates rather than writing in place, so
+        // the later layer wins cleanly.
+        let first = tarball(&[
+            ("package/shared", b"replace me" as &[u8]),
+            ("package/only-in-first", b"kept"),
+        ]);
+        let second = tarball(&[("package/shared", b"the winner" as &[u8])]);
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("11.11.0");
+
+        extract_npm_tarballs(vec![first, second], target.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(target.join("shared")).unwrap(), b"the winner");
+        assert_eq!(
+            std::fs::read(target.join("only-in-first")).unwrap(),
+            b"kept"
+        );
     }
 
     #[test]

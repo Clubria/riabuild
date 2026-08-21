@@ -41,17 +41,13 @@ pub fn extract_node_tarball(bytes: &[u8], target: &Path) -> Result<()> {
 /// Unpacks npm package tarballs into `target` as one tree, stripping the
 /// `package/` directory every one of them wraps its contents in.
 ///
-/// Several, because one pnpm install is two packages: `@pnpm/exe` carries the
-/// `dist/` tree, `@pnpm/<platform>` carries the launcher that loads it from
-/// beside itself, and the two only work in one directory. They are unpacked in
-/// the order given and land as a single `rename`, so a co-tenant never sees a
-/// tree with one half of pnpm in it.
-///
-/// **Order is load-bearing.** `@pnpm/exe` ships a placeholder `pnpm` reading
-/// *"This file intentionally left blank"* — upstream's install script copies
-/// the platform binary over it — so the bundle goes first and the launcher
-/// lands on top of it. `tar`'s unpack unlinks and recreates rather than writing
-/// in place, which is what makes the later layer win cleanly.
+/// A list rather than one buffer, because a tree is not always one archive.
+/// pnpm is one package today — `download::PNPM_PACKAGE`, unpacked and started
+/// by riabuild's own Node — and was two while riabuild installed a platform
+/// executable that needed `@pnpm/exe` beside it. Where there is more than one
+/// they are unpacked **in the order given**, later entries overwriting earlier
+/// ones, and the whole thing lands as a single `rename`, so a co-tenant never
+/// sees a tree with half a tool in it.
 pub fn extract_npm_tarballs(parts: &[Vec<u8>], target: &Path) -> Result<()> {
     let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     extract_tarball(&parts, target, 1)
@@ -456,12 +452,15 @@ mod tests {
 
     #[test]
     fn two_npm_packages_become_one_tree_with_the_later_layer_on_top() {
-        // What pnpm 11 actually is: `@pnpm/exe` carries `dist/` and a `pnpm`
-        // placeholder reading "This file intentionally left blank", and
-        // `@pnpm/<platform>` carries the real launcher. Unpacked in that
-        // order, the launcher wins; reversed, riabuild installs the
-        // placeholder as pnpm and every `pnpm -v` on the machine prints a
-        // sentence.
+        // The ordering contract, kept although the one caller now passes a
+        // single package: pnpm was two of them while riabuild installed a
+        // platform executable — `@pnpm/exe` carrying `dist/` and a `pnpm`
+        // placeholder reading "This file intentionally left blank", the
+        // platform package carrying the real launcher on top of it — and
+        // reversing the order installed the placeholder as pnpm, so every
+        // `pnpm -v` on the machine printed a sentence. Anything assembled from
+        // more than one tarball inherits that hazard, so the guarantee is
+        // pinned here rather than deleted with its last user.
         let bundle = tarball(&[
             (
                 "package/pnpm",
@@ -491,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_second_layer_replaces_the_first_rather_than_writing_over_it() {
-        // The launcher is 146 MB and a co-tenant may be executing the file it
+        // A co-tenant may be executing, or reading, the file a second layer
         // displaces. `tar`'s unpack unlinks and recreates, so the old inode —
         // held here by a hard link, standing in for that running process —
         // keeps its contents. Writing in place would be ETXTBSY at best.

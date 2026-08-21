@@ -30,6 +30,27 @@ FROM debian:bookworm-slim
 # and so is already present. A future missing-tool failure on this container
 # should be read as riabuild having grown a dependency on the host, not as this
 # list being too short.
+#
+# THE FOURTH PACKAGE HAS ALREADY BEEN PROPOSED ONCE, SO HERE IS THAT ONE BY
+# NAME. It is `libatomic1`, and it is not coming either. The first run to reach
+# the toolchain task stopped on `pnpm is not installed yet` after a download
+# that had gone perfectly: pnpm's glibc Linux build — `@pnpm/linux-x64`, the
+# standalone executable riabuild used to install — is linked against
+# `libatomic.so.1`, which is not in this image. `libatomic1` here would have
+# turned that green in one line.
+#
+# It would also have been the only thing standing between a Clubria developer
+# and the same failure on their own server, silently, with no message naming a
+# library. Nothing in `debian:12`, `ubuntu:22.04` or `fedora:41` ships that file
+# — it arrives with a toolchain, and a machine with a toolchain on it already is
+# not the machine riabuild exists to provision. Node's own binaries do not link
+# it, so Node installs and answers `-v` while pnpm exits 127 beside it, which is
+# exactly how "riabuild owns every tool it installs" fails without saying so.
+#
+# The fix is in `download::PNPM_PACKAGE`: riabuild installs pnpm's JavaScript
+# and runs it on the Node it downloaded and verified itself, so there is no
+# host library left to be missing. The reasoning, and why the `linuxstatic`
+# build is not the answer, is written up there.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-server ca-certificates git \
  && rm -rf /var/lib/apt/lists/* \

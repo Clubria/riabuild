@@ -18,13 +18,13 @@ use riabuild_ui::Failure;
 #[async_trait]
 pub(super) trait Downloads: Send + Sync {
     async fn node(&self, version: &str) -> Result<Vec<u8>>;
-    /// The tarballs one pnpm install is made of, in the order they unpack.
+    /// The `pnpm` npm package, at any version pnpm has published.
     ///
-    /// A list because pnpm 11 is two npm packages — the bundle carrying
-    /// `dist/`, then the platform launcher that loads it from beside itself —
-    /// and the launcher has to land last. pnpm 10 and older are one
-    /// self-contained package and come back as one entry.
-    async fn pnpm(&self, version: &str) -> Result<Vec<Vec<u8>>>;
+    /// One package, because what riabuild installs is pnpm's JavaScript rather
+    /// than one of its platform executables — `download::PNPM_PACKAGE` is where
+    /// the reason for that is written down, and it is a shared library rather
+    /// than a preference.
+    async fn pnpm(&self, version: &str) -> Result<Vec<u8>>;
 }
 
 pub(super) struct RealDownloads;
@@ -87,15 +87,14 @@ impl Downloads for RealDownloads {
     /// document with no `dist.integrity`, an integrity in an algorithm riabuild
     /// cannot compute, and bytes that do not match are each an error rather
     /// than an unverified download.
-    async fn pnpm(&self, version: &str) -> Result<Vec<Vec<u8>>> {
-        let mut parts = Vec::new();
-        // The bundle first: its own `pnpm` is a placeholder, and the launcher
-        // below has to land on top of it.
-        if download::pnpm_needs_the_bundle(version) {
-            parts.push(npm_package(download::PNPM_BUNDLE_PACKAGE, version).await?);
-        }
-        parts.push(npm_package(&download::pnpm_platform_package()?, version).await?);
-        Ok(parts)
+    ///
+    /// One package, and never a platform one. `@pnpm/<platform>` is where the
+    /// standalone executable lives and it cannot run on the machines this
+    /// provisions — see `download::PNPM_PACKAGE`. Asking for `pnpm` also means
+    /// there is no per-version branch left here to get wrong: the unscoped
+    /// package is what every pnpm has been published as.
+    async fn pnpm(&self, version: &str) -> Result<Vec<u8>> {
+        npm_package(download::PNPM_PACKAGE, version).await
     }
 }
 
@@ -110,12 +109,9 @@ impl Downloads for RealDownloads {
 ///
 /// Both requests report their own failures and neither is re-wrapped here. A
 /// version the registry does not carry answers 404, which `download` already
-/// reports as a pin that has to be updated — and that is the right reading even
-/// when the cause is not a withdrawn release: pnpm stopped publishing some
-/// platforms part way through a major (`@pnpm/macos-x64` ends at 11.0.4), so an
-/// Intel Mac asking for pnpm 11.11.0 gets a 404 whose remedy is still a pin
-/// somebody has to change. Wrapping both in one pnpm-shaped message would have
-/// told a developer whose VPN was down to go and read `package.json`.
+/// reports as a pin that has to be updated. Wrapping both in one pnpm-shaped
+/// message would have told a developer whose VPN was down to go and read
+/// `package.json`.
 async fn npm_package(package: &str, version: &str) -> Result<Vec<u8>> {
     let metadata = download::fetch_text(&download::npm_metadata_url(package, version)).await?;
     let published = published_integrity(&metadata, package, version)?;

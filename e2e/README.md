@@ -68,19 +68,43 @@ sign-in does not gate — `riabuild claude list`, `riabuild env`, the shell hand
 tell*. That last one is worth its place: unit tests pin riabuild's parse against
 canned JSON, and only a real machine pins the JSON.
 
-Two things genuinely go uncovered, because a run that stops at the last task never
-reaches the step after it: the generated launchers in `~/.riabuild/bin`, and the
-per-account state — the trust keys, the completed first-run setup, and the agents
-view riabuild opens on. That is the
-task engine's ordinary fail-fast contract rather than anything about accounts — a
-failed `project` task costs the shell too.
+One thing genuinely goes uncovered, and it is the per-account state: the trust
+keys, the completed first-run setup, and the agents view riabuild opens on. All
+three write into a `.claude.json` that only exists once an account is signed in,
+so a machine with nobody at the keyboard has nothing for them to write to.
 
-A third, the `applied=[]` idempotency invariant, is substituted rather than lost.
+The generated launchers in `~/.riabuild/bin` used to be the second, and are not
+any more. `provision` wrote `engine::run_all(…)?`, so the first failed task
+short-circuited the step that writes them — and the machine most in need of a
+`claude-1` was the one that did not get one. `provision::after_the_tasks` now
+lands the launchers whatever the tasks did, which is most of what carrying on
+past a failure was for: the account box's advice on exactly that machine is `run
+claude-1 auth login`, and that has to be a command that exists. So the suite
+asserts them on both paths, and `claude` on the environment's `PATH` must be the
+launcher rather than the Node tarball's own copy on both paths too. What a failed
+task still costs is the shell — that much is unchanged, and a failed `project`
+task costs it the same way.
+
+That has one consequence for the `CLAUDE_CONFIG_DIR` assertion, which is
+otherwise easy to get backwards. The launcher `export`s its own account's
+`CLAUDE_CONFIG_DIR` over whatever the caller set, so it can never be the thing
+that answers "does Claude Code still honour the variable" — it answers "does the
+launcher still set it". The suite therefore reads the binary the launcher names
+and puts the question to *that*, and asserts the launcher's half separately, as
+the `CLAUDE_CONFIG_DIR=` line in the generated `claude-1`. Both halves together
+are the isolation; either one alone reads as a pass on a machine that has lost it.
+
+The other thing the missing sign-in reaches is the `applied=[]` idempotency
+invariant, and that is substituted rather than lost.
 Its run log is written after the tasks, so an aborted run produces none; `--check`
 completes where a real run cannot and writes the same line, and it must report
 exactly `claude_accounts,claude_trust,claude_onboarding,claude_agents_view`
 outstanding and nothing else — the latter three each write into a `.claude.json`
 that only exists once an account does, so the missing sign-in blocks all of them.
+The line is read a field at a time rather than matched whole, and `failed` and
+`skipped` have to be empty as well: the engine carries on past a failed task, so
+the same line now names what riabuild could not check and what it never got to,
+and a short to-do list arrived at by not looking is not the invariant.
 `claude_plugins` shares their dependency wave and is deliberately absent: it
 answers satisfied for a checkout that declares no plugins. Their reason
 there is *first run*, not *account 1 is not signed in* — `status_for` answers a

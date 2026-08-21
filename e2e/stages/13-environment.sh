@@ -34,17 +34,19 @@ for sh in zsh bash; do
     check_contains "$sh: node resolves inside the environment" "$SHELL_OUT" \
       "$RIA_HOME/node/$NODE_VERSION/bin/node"
     check_contains "$sh: pnpm resolves inside the environment" "$SHELL_OUT" "$RIA_HOME/bin/pnpm"
-    # Whichever path this run took, `claude` must come out of the tree riabuild
-    # owns and nowhere else — a developer's `claude` resolving to something on the
-    # machine's own PATH is the failure worth catching. The two answers are
-    # different files, so the assertion names the one this run should produce
-    # rather than a prefix both would satisfy.
-    if [ "$SIGN_IN" = done ]; then
-      check_contains "$sh: claude resolves to its launcher" "$SHELL_OUT" "$RIA_HOME/bin/claude"
-    else
-      check_contains "$sh: claude resolves inside riabuild's Node" "$SHELL_OUT" \
-        "$RIA_HOME/node/$NODE_VERSION/bin/claude"
-    fi
+    # Whichever path this run took, `claude` must be riabuild's *launcher* — the
+    # only thing that pins an account's CLAUDE_CONFIG_DIR and layers org policy
+    # over it. A developer's `claude` resolving to something on the machine's own
+    # PATH is the obvious failure to catch; resolving to the raw binary in
+    # riabuild's Node is the quieter one, because it works, and shares one
+    # unnumbered account between every session on the laptop.
+    #
+    # This used to expect the raw binary on a run that stopped at the sign-in,
+    # and that was not a second correct answer — it was a machine with no
+    # launchers, because `provision` short-circuited on the first failed task
+    # before the step that writes them. `provision::after_the_tasks` writes them
+    # whatever the tasks did, so there is one answer again.
+    check_contains "$sh: claude resolves to its launcher" "$SHELL_OUT" "$RIA_HOME/bin/claude"
   fi
 done
 

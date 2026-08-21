@@ -34,9 +34,9 @@ mod digest;
 // answer lives in is this module's business, and a caller that had to know
 // would have to be edited the next time one moves.
 pub use assets::{
-    PNPM_BUNDLE_PACKAGE, node_platform, node_shasums_url, node_tarball_name, node_tarball_url,
-    npm_metadata_url, npm_tarball_url, pnpm_needs_the_bundle, pnpm_platform_package,
-    riabuild_asset, riabuild_asset_url, riabuild_checksums_url, rust_target,
+    PNPM_ENTRY, PNPM_PACKAGE, node_platform, node_shasums_url, node_tarball_name, node_tarball_url,
+    npm_metadata_url, npm_tarball_url, riabuild_asset, riabuild_asset_url, riabuild_checksums_url,
+    rust_target,
 };
 pub use digest::{
     digest_for, digest_from_any, npm_integrity, npm_integrity_digest, sha256_hex, sha512,

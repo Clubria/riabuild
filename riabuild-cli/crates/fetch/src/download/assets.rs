@@ -101,58 +101,49 @@ pub fn node_platform() -> Result<String> {
 /// executes onto a server riabuild controls.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 
-/// The npm package holding the JavaScript bundle a pnpm 11 launcher loads.
+/// The npm package that **is** pnpm, and the file inside it that starts it.
 ///
-/// Its own `pnpm` file is a placeholder reading *"This file intentionally left
-/// blank"* — upstream's install script copies the platform binary over it — so
-/// it is unpacked **first** and the platform package lands on top. Reversing
-/// the order installs the placeholder as pnpm.
-pub const PNPM_BUNDLE_PACKAGE: &str = "@pnpm/exe";
+/// One package, at every version pnpm has published, run on the Node riabuild
+/// already owns — `exec "<node>" "<tree>/bin/pnpm.cjs" "$@"`. Not
+/// `@pnpm/<platform>`, the standalone executable, and the reason is a shared
+/// library rather than a preference.
+///
+/// **pnpm's glibc Linux build needs `libatomic.so.1`, and a stock Linux does
+/// not have it.** Nothing in `debian:bookworm-slim`, `debian:12`, `ubuntu:22.04`
+/// or `fedora:41` ships that file — it arrives with a toolchain, and the
+/// machines this provisions are the ones with no toolchain on them yet. Node's
+/// own binaries do not link it, so the failure is exquisitely misleading: Node
+/// installs and answers `-v`, pnpm installs and exits **127** with `error while
+/// loading shared libraries`, and `toolchain`'s `check()` reads a non-zero exit
+/// as "pnpm is not installed yet". `apply()` then downloads 146 MB, unpacks it
+/// perfectly, and the re-check says the same thing — the
+/// apply-did-not-take-effect hard error, on every run, for ever, on a machine
+/// where nothing is wrong except a library nobody named. That is the shape
+/// `../../../../CLAUDE.md`'s Codex CLI section describes, one missing thing
+/// over, and `e2e/remote/run.sh` hit it against its Debian container.
+///
+/// `@pnpm/linuxstatic-<arch>` is not the answer, however much the name reads
+/// like one: it is built against **musl** and asks for
+/// `/lib/ld-musl-x86_64.so.1`, so on the glibc distributions this is about it
+/// does not fail to find a library, it fails to start at all. There is no
+/// pnpm executable that runs on a bare Linux.
+///
+/// So riabuild runs pnpm's JavaScript on its own Node, which is the one
+/// interpreter on that machine riabuild downloaded, verified and can vouch
+/// for — the same thing `codex_cli` does with `@openai/codex`, and it holds
+/// the same way on macOS. "riabuild owns every tool it installs" cannot
+/// survive installing a binary whose runtime comes from `apt`.
+///
+/// `bin/pnpm.cjs` rather than `bin/pnpm.mjs`: the `.cjs` is the declared
+/// `bin.pnpm` up to pnpm 10 and is kept as an entry point at 11 (where it does
+/// nothing but `import('./pnpm.mjs')`), so it is the one filename every
+/// published version answers to, and there is no version branch here to get
+/// wrong. Either way pnpm's own launcher, not riabuild, is what reports a Node
+/// too old for it — with the version it wants and a link.
+pub const PNPM_PACKAGE: &str = "pnpm";
 
-/// Whether the platform package needs [`PNPM_BUNDLE_PACKAGE`] beside it.
-///
-/// pnpm 10 and older publish one self-contained executable per platform:
-/// `@pnpm/linux-x64@10.20.0` unpacks to a 65 MB binary that runs on its own.
-/// pnpm 11 split the JavaScript out, so `@pnpm/linux-x64@11.11.0` is a Node
-/// launcher that resolves `dist/pnpm.mjs` **beside itself** and exits with
-/// `Cannot find module` when it is not there. The two halves have to land in
-/// one directory.
-///
-/// The boundary is the version asked for rather than today's date, because the
-/// registry still serves each published version exactly as it was published.
-pub fn pnpm_needs_the_bundle(version: &str) -> bool {
-    version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        // An unparseable pin is likelier to be something new than something
-        // ancient, and the split is what pnpm publishes now.
-        .is_none_or(|major| major >= 11)
-}
-
-/// The `@pnpm/<platform>` package carrying the launcher for this machine.
-///
-/// Unversioned, unlike the GitHub asset name it replaces: npm has spelled
-/// macOS `macos` at every version, where the release assets renamed it to
-/// `darwin` at pnpm 11 and made asking for the old name a 404.
-///
-/// `linux-x64` rather than `linuxstatic-x64`, which the registry also carries:
-/// the glibc build is the one the GitHub releases served and the one riabuild
-/// has always installed, and swapping a developer's pnpm for a musl build is
-/// not a change this is making.
-pub fn pnpm_platform_package() -> Result<String> {
-    let os = match std::env::consts::OS {
-        "macos" => "macos",
-        "linux" => "linux",
-        other => return Err(unsupported(format!("the {other} operating system"))),
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => return Err(unsupported(format!("a {other} CPU"))),
-    };
-    Ok(format!("@pnpm/{os}-{arch}"))
-}
+/// The file inside [`PNPM_PACKAGE`] that Node is pointed at. See there.
+pub const PNPM_ENTRY: &str = "bin/pnpm.cjs";
 
 /// One version's document in the registry: a couple of kilobytes of JSON whose
 /// `dist.integrity` is the digest riabuild verifies against.
@@ -232,15 +223,56 @@ mod tests {
             npm_tarball_url("@pnpm/macos-arm64", "11.11.0"),
             "https://registry.npmjs.org/@pnpm/macos-arm64/-/macos-arm64-11.11.0.tgz"
         );
+        // An unscoped package keeps its whole name in the filename, which is
+        // the case riabuild actually takes.
         assert_eq!(
-            npm_tarball_url(PNPM_BUNDLE_PACKAGE, "11.11.0"),
-            "https://registry.npmjs.org/@pnpm/exe/-/exe-11.11.0.tgz"
-        );
-        // An unscoped package keeps its whole name in the filename.
-        assert_eq!(
-            npm_tarball_url("pnpm", "11.11.0"),
+            npm_tarball_url(PNPM_PACKAGE, "11.11.0"),
             "https://registry.npmjs.org/pnpm/-/pnpm-11.11.0.tgz"
         );
+    }
+
+    /// pnpm is one unscoped package at every version, and the same entry file
+    /// at every version — no platform in the name and no version branch, which
+    /// is the whole of why the standalone executable is gone.
+    ///
+    /// Captured from the registry on 2026-08-21: `pnpm@9.15.9` and
+    /// `pnpm@10.20.0` declare `bin.pnpm` as `bin/pnpm.cjs`; `pnpm@11.22.0`
+    /// declares `bin/pnpm.mjs` and ships `bin/pnpm.cjs` beside it as a
+    /// one-line `import('./pnpm.mjs')`. So `.cjs` is the filename all three
+    /// answer to, and `node bin/pnpm.cjs -v` prints `11.22.0` on the 11.
+    #[test]
+    fn pnpm_is_one_package_and_one_entry_file_at_every_version() {
+        for version in ["9.15.9", "10.20.0", "11.22.0"] {
+            assert_eq!(
+                npm_tarball_url(PNPM_PACKAGE, version),
+                format!("https://registry.npmjs.org/pnpm/-/pnpm-{version}.tgz")
+            );
+            assert_eq!(
+                npm_metadata_url(PNPM_PACKAGE, version),
+                format!("https://registry.npmjs.org/pnpm/{version}")
+            );
+        }
+        // Relative, and inside the tree: it is joined onto `pnpm_dir(version)`
+        // to name what Node is handed.
+        assert!(!PNPM_ENTRY.starts_with('/'), "{PNPM_ENTRY}");
+        assert!(!PNPM_ENTRY.contains(".."), "{PNPM_ENTRY}");
+    }
+
+    /// The regression that makes this whole item worth having: nothing riabuild
+    /// installs may need a library the developer has to `apt-get`.
+    ///
+    /// `@pnpm/linux-x64@11.22.0` — the standalone executable riabuild used to
+    /// install — is `NEEDED: libatomic.so.1`, which `debian:bookworm-slim`,
+    /// `debian:12`, `ubuntu:22.04` and `fedora:41` all lack, and
+    /// `@pnpm/linuxstatic-x64` asks for `/lib/ld-musl-x86_64.so.1` instead. A
+    /// pnpm that is a *platform* package is a pnpm with a runtime riabuild did
+    /// not install.
+    #[test]
+    fn the_pnpm_riabuild_installs_is_never_a_platform_executable() {
+        assert!(!PNPM_PACKAGE.contains('/'), "{PNPM_PACKAGE}");
+        for platform in ["linux", "linuxstatic", "macos", "win", "x64", "arm64"] {
+            assert!(!PNPM_PACKAGE.contains(platform), "{PNPM_PACKAGE}");
+        }
     }
 
     #[test]
@@ -255,40 +287,6 @@ mod tests {
             assert!(url.starts_with(NPM_REGISTRY), "{url}");
             assert!(!url.contains("api.github.com"), "{url}");
         }
-    }
-
-    #[test]
-    fn pnpm_11_needs_the_bundle_beside_the_launcher_and_pnpm_10_does_not() {
-        // pnpm 10's platform artifact is a self-contained 65 MB executable;
-        // pnpm 11's is a launcher that resolves `dist/pnpm.mjs` beside itself
-        // and exits with `Cannot find module` when it is not there.
-        assert!(pnpm_needs_the_bundle("11.11.0"));
-        assert!(pnpm_needs_the_bundle("11.0.0"));
-        assert!(pnpm_needs_the_bundle("12.0.0"));
-        assert!(!pnpm_needs_the_bundle("10.34.5"));
-        assert!(!pnpm_needs_the_bundle("9.15.9"));
-        // Something unrecognisable is likelier to be new than ancient.
-        assert!(pnpm_needs_the_bundle("next"));
-    }
-
-    #[test]
-    fn the_platform_package_is_one_npm_publishes_and_does_not_move_with_the_version() {
-        // The host decides the platform, so the set is asserted rather than
-        // one member of it. npm spells macOS `macos` at every version — the
-        // GitHub assets renamed it to `darwin` at pnpm 11, and carrying that
-        // rename over here would ask the registry for a package that has never
-        // existed.
-        let package = pnpm_platform_package().unwrap();
-        assert!(
-            [
-                "@pnpm/macos-arm64",
-                "@pnpm/macos-x64",
-                "@pnpm/linux-arm64",
-                "@pnpm/linux-x64",
-            ]
-            .contains(&package.as_str()),
-            "unexpected package {package}"
-        );
     }
 
     #[test]

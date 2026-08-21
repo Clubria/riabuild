@@ -13,7 +13,7 @@ use super::{Ctx, Status, Task, TaskId};
 use crate::shims;
 use anyhow::Result;
 use async_trait::async_trait;
-use riabuild_fetch::archive;
+use riabuild_fetch::{archive, download};
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
 use riabuild_version as version;
@@ -154,8 +154,38 @@ async fn reported_version(ctx: &Ctx, bin: &Path) -> Result<Option<String>> {
     Ok(output.ok().then(|| output.trimmed().to_string()))
 }
 
+/// What `node <script> -v` answers — [`reported_version`]'s three-way rule for
+/// a tool that is a JavaScript file rather than an executable.
+///
+/// pnpm is that tool: see `download::PNPM_PACKAGE`. Everything the doc comment
+/// on `reported_version` says applies unchanged, including the deliberate
+/// absence of a `cwd` — a probe run inside the checkout would read the repo's
+/// own `packageManager` pin and answer with it.
+async fn reported_script_version(ctx: &Ctx, node: &Path, script: &Path) -> Result<Option<String>> {
+    if !tokio::fs::try_exists(script).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let script = script.to_string_lossy().into_owned();
+    let output = ctx
+        .runner
+        .run(
+            &node.to_string_lossy(),
+            &[script.as_str(), "-v"],
+            &RunOptions::default(),
+        )
+        .await?;
+    Ok(output.ok().then(|| output.trimmed().to_string()))
+}
+
 async fn is_current(ctx: &Ctx, bin: &Path, wanted: &str) -> Result<bool> {
     Ok(matches!(reported_version(ctx, bin).await?, Some(found) if version::same(&found, wanted)))
+}
+
+async fn script_is_current(ctx: &Ctx, node: &Path, script: &Path, wanted: &str) -> Result<bool> {
+    Ok(
+        matches!(reported_script_version(ctx, node, script).await?, Some(found)
+            if version::same(&found, wanted)),
+    )
 }
 
 async fn apply_with(ctx: &mut Ctx, downloads: &dyn Downloads) -> Result<()> {
@@ -164,7 +194,10 @@ async fn apply_with(ctx: &mut Ctx, downloads: &dyn Downloads) -> Result<()> {
     let pnpm_version = desired_pnpm(project.as_deref()).await;
 
     ensure_node(ctx, &node_version, downloads).await?;
-    ensure_pnpm(ctx, &pnpm_version, downloads).await?;
+    // pnpm is a script, so the Node that runs it is part of installing it —
+    // and it is riabuild's own, never whatever `PATH` has.
+    let node = ctx.paths.node_dir(&node_version).join("bin").join("node");
+    ensure_pnpm(ctx, &pnpm_version, &node, downloads).await?;
 
     ctx.update_config(|config| {
         config.node_version = Some(node_version);
@@ -193,48 +226,64 @@ async fn ensure_node(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
     archive::extract_node_tarball(bytes, tree).await
 }
 
-/// pnpm, in the two halves it actually has.
+/// pnpm: a tree of JavaScript under the shared `tools_root()`, started by this
+/// developer's own shim through riabuild's own Node.
 ///
-/// The launcher and the `dist/` tree it loads from beside itself are shared
-/// under `tools_root()`; the shim that starts them is this developer's own,
-/// under `bin_dir()`. A co-tenant's first run on a server has exactly the
-/// second missing and the first perfectly fine — writing the shim from the
-/// launcher already there is the whole repair, and re-extracting 50 MB over a
-/// tree a colleague is running out of is not.
+/// The tree is shared under `tools_root()`; the shim is this developer's alone,
+/// under `bin_dir()`. A co-tenant's first run on a server has exactly the second
+/// missing and the first perfectly fine — writing the shim against the tree
+/// already there is the whole repair, and re-extracting 19 MB over a tree a
+/// colleague is running out of is not.
 ///
-/// One path for every pnpm, where there used to be two. Taking pnpm from npm
-/// removed the branch: the GitHub releases published a bare executable up to
-/// pnpm 10 and a tarball from 11 on, so the old code dropped a file straight
-/// into `bin/` for one and unpacked a tree for the other. Every npm package is
-/// a tarball, so both become a tree under the shared `tools_root()` reached
-/// through a shim — which is also the layout the co-tenant repair above needs,
-/// and pnpm 10 never had it.
-async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Result<()> {
+/// **There is no pnpm executable here, and that is the fix rather than an
+/// oversight.** pnpm's platform packages cannot run on the machines riabuild
+/// provisions: `@pnpm/linux-x64` is linked against `libatomic.so.1`, absent from
+/// stock Debian, Ubuntu and Fedora alike, and `@pnpm/linuxstatic-x64` is musl and
+/// wants a loader that is not there either. Node's own binaries link neither, so
+/// the symptom was Node installing and answering `-v` while pnpm exited 127
+/// beside it and `check()` said `pnpm is not installed yet` about a tree
+/// `apply()` had just written perfectly — the apply-did-not-take-effect hard
+/// error, on every run, for ever. `download::PNPM_PACKAGE` carries the evidence
+/// and `e2e/remote/run.sh`'s container is where it surfaced.
+///
+/// So the probe is `node <entry> -v` rather than `<launcher> -v`, and the shim is
+/// `shims::node_shim` rather than `shims::exec_shim`. Both name Node absolutely:
+/// `bin/pnpm.cjs` opens `#!/usr/bin/env node`, and during provisioning there is
+/// no riabuild Node on `PATH` to find.
+///
+/// One path for every pnpm, where there used to be two. `pnpm` is the package
+/// name at every version pnpm has published and `bin/pnpm.cjs` the entry every
+/// one of them answers to, so nothing here branches on the version.
+async fn ensure_pnpm(
+    ctx: &Ctx,
+    version: &str,
+    node: &Path,
+    downloads: &dyn Downloads,
+) -> Result<()> {
     let bin_dir = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin_dir).await?;
 
     let tree = ctx.paths.pnpm_dir(version);
-    let launcher = tree.join("pnpm");
-    if !is_current(ctx, &launcher, version).await? {
+    let entry = tree.join(download::PNPM_ENTRY);
+    if !script_is_current(ctx, node, &entry, version).await? {
         ctx.ui.note(&format!("Downloading pnpm {version}…"));
-        let parts = downloads.pnpm(version).await?;
-        archive::extract_npm_tarballs(parts, tree).await?;
-        if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
+        let bytes = downloads.pnpm(version).await?;
+        archive::extract_npm_tarballs(vec![bytes], tree).await?;
+        if !tokio::fs::try_exists(&entry).await.unwrap_or(false) {
             return Err(Failure::new(
                 format!("installing pnpm {version}"),
                 "Ask your team lead to check the pnpm version pinned in the repo's package.json.",
             )
             .detail(format!(
-                "the npm packages for pnpm {version} unpacked without a `pnpm` launcher at their \
-                 root"
+                "the npm package for pnpm {version} unpacked without a `{}` in it",
+                download::PNPM_ENTRY
             ))
             .into());
         }
-        archive::make_executable(&launcher).await?;
     }
     write_executable(
         &bin_dir.join("pnpm"),
-        shims::exec_shim(&launcher).as_bytes(),
+        shims::node_shim(node, &entry).as_bytes(),
     )
     .await
 }
@@ -400,114 +449,173 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
-    /// A pnpm whose parts are already verified, and a Node that must never be
-    /// asked for.
-    struct FixedPnpm(Vec<Vec<u8>>);
+    /// A pnpm package whose bytes are already verified, and a Node that must
+    /// never be asked for.
+    struct FixedPnpm(Vec<u8>);
 
     #[async_trait]
     impl Downloads for FixedPnpm {
         async fn node(&self, _version: &str) -> Result<Vec<u8>> {
             panic!("must not download Node on this path");
         }
-        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
+        async fn pnpm(&self, _version: &str) -> Result<Vec<u8>> {
             Ok(self.0.clone())
         }
     }
 
+    /// The Node every pnpm test hands `ensure_pnpm`, and the invocation the
+    /// probe makes with it.
+    ///
+    /// Named here rather than spelled out at each call site because the two
+    /// have to agree: a stub keyed on anything but `node <entry> -v` answers
+    /// nothing, and `FakeRunner` reports an unstubbed call as an exit code
+    /// rather than a panic — which would read as "pnpm is not installed" and
+    /// send every one of these tests down the reinstall path silently.
+    fn node_for(ctx: &Ctx) -> std::path::PathBuf {
+        ctx.paths.node_dir(FALLBACK_NODE).join("bin").join("node")
+    }
+
+    fn probe(node: &Path, entry: &Path) -> String {
+        format!("{} {} -v", node.display(), entry.display())
+    }
+
     #[tokio::test]
-    async fn the_npm_packages_land_the_launcher_where_check_looks_for_it() {
-        // The layout `tools::install` and `check()` both assume: `package/` is
-        // gone, the launcher is at the root of the shared tree with `dist/`
-        // beside it, it is executable — npm stores it 0644 — and this
+    async fn the_npm_package_lands_the_entry_where_the_shim_will_look_for_it() {
+        // The layout `check()` assumes: `package/` is gone, `bin/pnpm.cjs` is
+        // where `download::PNPM_ENTRY` says, `dist/` is beside it, and this
         // developer's own `bin/pnpm` starts it.
         let server = tempfile::TempDir::new().unwrap();
         let paths = riabuild_paths::RealPaths::rooted_at(server.path());
         let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
         ctx.paths = std::sync::Arc::new(paths);
+        let node = node_for(&ctx);
 
-        let parts = vec![
-            npm_tarball(&[
-                ("pnpm", b"This file intentionally left blank" as &[u8]),
-                ("dist/pnpm.mjs", b"the bundle"),
-            ]),
-            npm_tarball(&[("pnpm", b"#!/bin/sh\n" as &[u8])]),
-        ];
-        ensure_pnpm(&ctx, FALLBACK_PNPM, &FixedPnpm(parts))
+        let package = npm_tarball(&[
+            (download::PNPM_ENTRY, b"the entry" as &[u8]),
+            ("dist/pnpm.mjs", b"the bundle"),
+        ]);
+        ensure_pnpm(&ctx, FALLBACK_PNPM, &node, &FixedPnpm(package))
             .await
             .expect("installs pnpm");
 
-        let launcher = ctx.paths.pnpm_dir(FALLBACK_PNPM).join("pnpm");
+        let entry = ctx.paths.pnpm_dir(FALLBACK_PNPM).join(download::PNPM_ENTRY);
         assert_eq!(
-            tokio::fs::read_to_string(&launcher).await.unwrap(),
-            "#!/bin/sh\n",
-            "the platform launcher has to land on top of the bundle's placeholder"
+            tokio::fs::read_to_string(&entry).await.unwrap(),
+            "the entry"
         );
         assert!(
             ctx.paths
                 .pnpm_dir(FALLBACK_PNPM)
                 .join("dist/pnpm.mjs")
                 .exists(),
-            "the launcher loads dist/ from beside itself"
+            "the entry loads dist/ from beside itself"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = tokio::fs::metadata(&launcher)
-                .await
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o111, 0o111, "npm stores it 0644; mode was {mode:o}");
-        }
         let shim = tokio::fs::read_to_string(ctx.paths.bin_dir().join("pnpm"))
             .await
             .expect("the developer's own bin/pnpm is what check() runs");
         assert!(
-            shim.contains(&launcher.to_string_lossy().into_owned()),
+            shim.contains(&entry.to_string_lossy().into_owned()),
             "{shim}"
         );
     }
 
+    /// The shape of `bin/pnpm`, pinned: riabuild's **absolute** Node against the
+    /// **absolute** entry, and nothing resolved through `PATH`.
+    ///
+    /// This is the property that breaks silently. A shim simplified to
+    /// `#!/usr/bin/env node` or to `exec node …` works on every laptop, because
+    /// a developer has a Node — and on a server reached by a non-interactive
+    /// SSH exec, whose `PATH` is `/usr/local/bin:/usr/bin:/bin`, it exits 127,
+    /// which `check()` reads as "pnpm is not installed yet" and `apply()`
+    /// cannot repair. It is the whole reason pnpm can be a script at all: see
+    /// `download::PNPM_PACKAGE` for why it has to be one.
     #[tokio::test]
-    async fn a_pnpm_10_install_is_the_same_tree_and_the_same_shim() {
-        // pnpm 10 and older are one self-contained npm package rather than
-        // two, and that is the only difference. The old GitHub path dropped a
-        // bare executable straight into `bin/`, which is why a co-tenant on a
-        // server could never inherit one.
+    async fn the_shim_starts_pnpm_with_riabuilds_own_node_by_absolute_path() {
         let server = tempfile::TempDir::new().unwrap();
         let paths = riabuild_paths::RealPaths::rooted_at(server.path());
         let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
         ctx.paths = std::sync::Arc::new(paths);
+        let node = node_for(&ctx);
 
-        let parts = vec![npm_tarball(&[("pnpm", b"#!/bin/sh\n" as &[u8])])];
-        ensure_pnpm(&ctx, "10.20.0", &FixedPnpm(parts))
+        let package = npm_tarball(&[(download::PNPM_ENTRY, b"the entry" as &[u8])]);
+        ensure_pnpm(&ctx, FALLBACK_PNPM, &node, &FixedPnpm(package))
             .await
             .expect("installs pnpm");
 
-        let launcher = ctx.paths.pnpm_dir("10.20.0").join("pnpm");
+        let entry = ctx.paths.pnpm_dir(FALLBACK_PNPM).join(download::PNPM_ENTRY);
+        let shim = tokio::fs::read_to_string(ctx.paths.bin_dir().join("pnpm"))
+            .await
+            .unwrap();
+
+        assert!(
+            node.is_absolute() && entry.is_absolute(),
+            "{node:?} {entry:?}"
+        );
+        assert!(
+            shim.contains(&format!(
+                "exec \"{}\" \"{}\"",
+                node.display(),
+                entry.display()
+            )),
+            "the shim has to name both in full: {shim}"
+        );
+        // Neither half may be a bare name, and no shebang may go looking for
+        // one. `env node` would satisfy a `contains("node")` assertion, which
+        // is why this asks the question the other way round.
+        for looked_up in ["#!/usr/bin/env node", "exec node", "\"node\""] {
+            assert!(!shim.contains(looked_up), "{looked_up:?} in {shim}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pnpm_10_install_is_the_same_tree_and_the_same_shim() {
+        // There is no version branch left: `pnpm` is the package at every
+        // version and `bin/pnpm.cjs` the entry every one of them answers to,
+        // so a pnpm 10 install differs from a pnpm 11 install in the version
+        // string and in nothing else. The old GitHub path dropped a bare
+        // executable straight into `bin/`, which is why a co-tenant on a server
+        // could never inherit one.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = riabuild_paths::RealPaths::rooted_at(server.path());
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+        let node = node_for(&ctx);
+
+        let package = npm_tarball(&[(download::PNPM_ENTRY, b"the entry" as &[u8])]);
+        ensure_pnpm(&ctx, "10.20.0", &node, &FixedPnpm(package))
+            .await
+            .expect("installs pnpm");
+
+        let entry = ctx.paths.pnpm_dir("10.20.0").join(download::PNPM_ENTRY);
         assert_eq!(
-            tokio::fs::read_to_string(&launcher).await.unwrap(),
-            "#!/bin/sh\n"
+            tokio::fs::read_to_string(&entry).await.unwrap(),
+            "the entry"
         );
         assert!(ctx.paths.bin_dir().join("pnpm").exists());
     }
 
     #[tokio::test]
-    async fn packages_that_unpack_without_a_launcher_are_a_failure_rather_than_an_install() {
+    async fn a_package_that_unpacks_without_the_entry_is_a_failure_rather_than_an_install() {
         // The failure mode an upstream layout change produces: everything
-        // downloads, everything verifies, and there is no `pnpm` at the root.
+        // downloads, everything verifies, and there is no `bin/pnpm.cjs`.
         // Reported here rather than left for `check()`, which would say "pnpm
         // is not installed yet" about a machine riabuild had just written to.
         let server = tempfile::TempDir::new().unwrap();
         let paths = riabuild_paths::RealPaths::rooted_at(server.path());
         let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
         ctx.paths = std::sync::Arc::new(paths);
+        let node = node_for(&ctx);
 
-        let parts = vec![npm_tarball(&[("dist/pnpm.mjs", b"the bundle" as &[u8])])];
-        let error = ensure_pnpm(&ctx, FALLBACK_PNPM, &FixedPnpm(parts))
+        let package = npm_tarball(&[("dist/pnpm.mjs", b"the bundle" as &[u8])]);
+        let error = ensure_pnpm(&ctx, FALLBACK_PNPM, &node, &FixedPnpm(package))
             .await
             .expect_err("half of pnpm is not pnpm");
         assert!(format!("{error}").contains("installing pnpm"), "{error}");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(
+            failure.detail.contains(download::PNPM_ENTRY),
+            "the detail has to name what was missing: {failure:?}"
+        );
         assert!(!ctx.paths.bin_dir().join("pnpm").exists());
     }
 
@@ -539,42 +647,48 @@ mod tests {
     /// Downloads the pinned pnpm through the real registry, verifies it, and
     /// starts it through the shim riabuild writes.
     ///
-    /// Ignored by default because it pulls ~50 MB from registry.npmjs.org; run
+    /// Ignored by default because it pulls ~10 MB from registry.npmjs.org; run
     /// it with `cargo test -- --ignored` whenever the pinned pnpm major moves.
-    /// Nothing else catches an upstream layout change, and pnpm has made two:
-    /// it renamed its macOS release asset and stopped shipping a bare
-    /// executable at 11, and it splits `dist/` out of the platform package from
-    /// 11 on. The first symptom of each was a laptop, not a test.
+    /// Nothing else catches an upstream layout change, and pnpm has made
+    /// several: it renamed its macOS release asset, stopped shipping a bare
+    /// executable at 11, and split `dist/` out of the platform package. The
+    /// first symptom of each was a laptop, not a test.
+    ///
+    /// What it pins now is the layout `bin/pnpm.cjs` sits in and that a Node
+    /// can start it, which is the whole of how pnpm reaches a machine with no
+    /// `libatomic.so.1` on it. It uses the *host's* Node rather than
+    /// riabuild's, because installing a 200 MB toolchain to run one `-v` is
+    /// not what this test is for — the shim's own shape is pinned without a
+    /// network by `the_shim_starts_pnpm_with_riabuilds_own_node_by_absolute_path`.
     ///
     /// It goes through `RealDownloads` rather than fetching by hand, so the
     /// integrity check is part of what is being exercised: a registry that
     /// stopped publishing `dist.integrity` has to fail here rather than install.
     #[tokio::test]
-    #[ignore = "downloads ~50 MB from registry.npmjs.org; pins pnpm's published layout"]
+    #[ignore = "downloads ~10 MB from registry.npmjs.org; pins pnpm's published layout"]
     async fn the_pinned_pnpm_downloads_and_runs() {
         use riabuild_runner::{CommandRunner, RealRunner};
 
-        let parts = RealDownloads.pnpm(FALLBACK_PNPM).await.expect("verified");
-        assert_eq!(
-            parts.len(),
-            2,
-            "pnpm 11 is the bundle plus the platform launcher"
-        );
+        let bytes = RealDownloads.pnpm(FALLBACK_PNPM).await.expect("verified");
 
         let home = tempfile::TempDir::new().unwrap();
         let tree = home.path().join(FALLBACK_PNPM);
-        archive::extract_npm_tarballs(parts, tree.clone())
+        archive::extract_npm_tarballs(vec![bytes], tree.clone())
             .await
             .unwrap();
-        let launcher = tree.join("pnpm");
+        let entry = tree.join(download::PNPM_ENTRY);
         assert!(
-            tokio::fs::try_exists(&launcher).await.unwrap_or(false),
-            "the npm packages for pnpm {FALLBACK_PNPM} have no launcher at their root"
+            tokio::fs::try_exists(&entry).await.unwrap_or(false),
+            "the npm package for pnpm {FALLBACK_PNPM} has no {} in it",
+            download::PNPM_ENTRY
         );
-        archive::make_executable(&launcher).await.unwrap();
 
+        let Some(node) = RealRunner.which("node") else {
+            eprintln!("no node on PATH to start the entry with; layout still pinned above");
+            return;
+        };
         let shim = home.path().join("pnpm");
-        write_executable(&shim, shims::exec_shim(&launcher).as_bytes())
+        write_executable(&shim, shims::node_shim(&node, &entry).as_bytes())
             .await
             .unwrap();
 
@@ -625,7 +739,7 @@ mod tests {
         async fn node(&self, _version: &str) -> Result<Vec<u8>> {
             panic!("must not download Node on this path");
         }
-        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
+        async fn pnpm(&self, _version: &str) -> Result<Vec<u8>> {
             panic!("must not download pnpm on this path");
         }
     }
@@ -638,7 +752,7 @@ mod tests {
         async fn node(&self, _version: &str) -> Result<Vec<u8>> {
             Ok(self.0.clone())
         }
-        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
+        async fn pnpm(&self, _version: &str) -> Result<Vec<u8>> {
             panic!("must not download pnpm on this path");
         }
     }
@@ -688,9 +802,9 @@ mod tests {
         let server = tempfile::TempDir::new().unwrap();
         let paths = co_tenant_paths(server.path(), "bob-member-id");
         let node_bin = paths.node_dir(FALLBACK_NODE).join("bin").join("node");
-        let launcher = paths.pnpm_dir(FALLBACK_PNPM).join("pnpm");
+        let entry = paths.pnpm_dir(FALLBACK_PNPM).join(download::PNPM_ENTRY);
         write_file(&node_bin, "ada's node\n").await;
-        write_file(&launcher, "ada's pnpm\n").await;
+        write_file(&entry, "ada's pnpm\n").await;
 
         let runner = FakeRunner::new()
             .with(
@@ -699,12 +813,7 @@ mod tests {
                 &format!("v{FALLBACK_NODE}"),
                 "",
             )
-            .with(
-                &format!("{} -v", launcher.to_string_lossy()),
-                0,
-                FALLBACK_PNPM,
-                "",
-            );
+            .with(&probe(&node_bin, &entry), 0, FALLBACK_PNPM, "");
         let (mut ctx, _laptop) = ctx_with(runner).await;
         ctx.paths = std::sync::Arc::new(paths);
 
@@ -725,7 +834,7 @@ mod tests {
             "ada's node\n"
         );
         assert_eq!(
-            tokio::fs::read_to_string(&launcher).await.unwrap(),
+            tokio::fs::read_to_string(&entry).await.unwrap(),
             "ada's pnpm\n"
         );
     }
@@ -1000,12 +1109,32 @@ mod tests {
             args: &[&str],
             options: &RunOptions,
         ) -> Result<riabuild_runner::CommandOutput> {
-            assert_eq!(args, ["-v"], "this task only ever asks for a version");
-            let stdout = if program.ends_with("node") {
+            assert_eq!(
+                args.last(),
+                Some(&"-v"),
+                "this task only ever asks for a version"
+            );
+            // Which tool answers is decided by `args[0]`, not by the program
+            // name. Since pnpm became a script the *program* is riabuild's Node
+            // in both cases — `node -v` for the toolchain's own Node and
+            // `node <tree>/bin/pnpm.cjs -v` for pnpm — so branching on
+            // `program.ends_with("node")` would have made pnpm answer with a
+            // Node version and quietly retired the whole of this double.
+            let asks_pnpm = args
+                .first()
+                .is_some_and(|first| first.ends_with(download::PNPM_ENTRY));
+            let stdout = if asks_pnpm {
+                let dir = riabuild_runner::directory_for_riabuild(options.cwd.as_deref());
+                Self::pinned_at_or_above(dir)
+                    .await
+                    .unwrap_or_else(|| self.pnpm.clone())
+            } else if program.ends_with("node") {
                 // Node reads no manifest and is the control in this test: it
                 // answers the same wherever it is started.
                 format!("v{}", self.node)
             } else {
+                // The shim at `bin/pnpm`, which `check()` runs directly — the
+                // one invocation where the program name is pnpm's.
                 let dir = riabuild_runner::directory_for_riabuild(options.cwd.as_deref());
                 Self::pinned_at_or_above(dir)
                     .await
