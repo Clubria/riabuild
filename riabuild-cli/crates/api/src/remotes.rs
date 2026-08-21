@@ -122,11 +122,15 @@ fn usable(wire: &WireServer) -> Result<SharedServer, String> {
     })
 }
 
-fn is_label_char(character: char) -> bool {
+/// What a name or a username may hold. `pub` because `Remote::parse` holds a
+/// *typed* server to the same rule this holds a served one to — one definition
+/// of "usable", rather than a second copy that can drift from it.
+pub fn is_label_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
-fn is_host_char(character: char) -> bool {
+/// What a hostname may hold. `pub` for the same reason as [`is_label_char`].
+pub fn is_host_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '.')
 }
 

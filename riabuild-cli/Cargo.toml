@@ -34,8 +34,46 @@ publish = false
 # that forgets `[lints] workspace = true` loses the policy *silently*, since
 # clippy stays green when a lint is simply not enabled. `ci.yml` greps every
 # member manifest for the inheritance line for exactly that reason.
+#
+# The four below are one policy, not four preferences: each is a way of
+# spelling "stop here with a Rust backtrace" that the paragraph above rules
+# out. A crate root may exempt its **test** target with
+# `#![cfg_attr(test, allow(…))]` — in a fixture a panic *is* the reporting
+# mechanism — and nothing wider than that. An exemption that also names
+# `feature = "testing"` covers the crate's production code too, because
+# `--all-targets` resolves dev-dependencies and features unify onto the lib
+# target; six crate roots said that and had the whole policy switched off in
+# the one command that enforces it.
 [workspace.lints.clippy]
 unwrap_used = "deny"
+# The same panic wearing a message. `expect` reads as the careful spelling and
+# is not: both abort a provisioning run half-way through, and the message goes
+# to a developer who did not write it and cannot act on it. Where the value
+# genuinely cannot be absent, `anyhow::Context` says so and costs a `?`.
+expect_used = "deny"
+# No production code in this workspace calls `panic!`, so this is a guard rail
+# with nothing behind it today, which is the moment to fit one.
+panic = "deny"
+# Both are `panic!` announcing that the code is unfinished, which is a state a
+# shipped provisioner may not be in. Zero occurrences, likewise deliberate.
+todo = "deny"
+unimplemented = "deny"
+#
+# Two the register proposed and this does **not** take:
+#
+# `unreachable` — the five uses in this workspace are all deliberate markers on
+# an arm the type system cannot rule out (`Role::Muted` after the branch that
+# handles it, `Command::Reset` after the dispatch that returned). Denying it
+# would buy five `#[allow]`s, and the way anyone would avoid those is to
+# replace a loud invariant with a silent fallback. `panic!` above is the one
+# that says "give up"; `unreachable!` says "this arm does not exist", and they
+# are not the same claim.
+#
+# `indexing_slicing` — thirty-three sites, and it is the one on this list whose
+# fixes are not mechanical: `&line[..n]` after a length check and `&line[..n]`
+# without one look identical here and differ entirely on a developer's laptop.
+# It wants its own change, read site by site, not a flag flipped alongside a
+# manifest tidy-up.
 
 # Every developer downloads this binary over a laptop connection, so the release
 # profile optimises for what ships rather than for build time.

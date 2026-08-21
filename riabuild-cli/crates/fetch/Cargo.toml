@@ -15,11 +15,28 @@ workspace = true
 anyhow.workspace = true
 flate2.workspace = true
 reqwest.workspace = true
+# For `Failure`. Downloading and unpacking is the most failure-prone part of
+# provisioning — a flaky link, a corporate proxy, a full disk — and every one of
+# those errors used to reach `main` as an anyhow chain, which is the branch that
+# prints "it is a bug in riabuild". `riabuild-ui` names only `riabuild-theme`
+# and `riabuild-version`, so this crate still cannot reach the API client and a
+# string the server sent still cannot become a URL riabuild downloads from.
+riabuild-ui.workspace = true
 ring.workspace = true
 tar.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+# `rt` for `spawn_blocking`, named here rather than left to feature
+# unification. Unpacking is `tar` plus `std::fs` — synchronous either way, and
+# on a shared `tools_root()` it is a whole tree written, renamed into place and
+# a displaced one deleted — so `archive::off_the_reactor` moves the job to the
+# blocking pool. A feature this crate depends on and does not ask for is not a
+# bound: it holds until the crate that happened to ask for it stops.
+tokio = { workspace = true, features = ["fs", "rt"] }
 zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `net` and `io-util` are for the download tests alone: they stand a one-shot
+# HTTP server on a loopback port and speak the protocol by hand, which is the
+# only way to assert what `fetch_bytes` does with a `Content-Length` before it
+# reads a body. A canned-response crate would be a heavier dependency for less.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }

@@ -10,11 +10,54 @@
 //! handling rewrites line endings and mangles anything non-ASCII.
 
 use super::Clipboard;
+use crate::clipboard::{NOT_FOUND, missing};
 use crate::mime::{self, Vocabulary};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use riabuild_runner::{CommandRunner, RunOptions};
+use riabuild_ui::Failure;
 use std::sync::Arc;
+
+/// Which non-zero exits mean something is *wrong* rather than "nothing copied".
+///
+/// **macOS had no such split, and Linux always has.** Every non-zero exit from
+/// `osascript` became an empty pasteboard, which is right for the ordinary case
+/// — an empty pasteboard really does make `clipboard info` fail — and wrong for
+/// the two that matter. A Mac whose Automation permission has been denied
+/// answers every request with `execution error: Not authorized to send Apple
+/// events … (-1743)`, and riabuild reported "nothing copied" for it, forever,
+/// with a checkbox one click away in System Settings that nobody was ever told
+/// about. `xclip` exiting 127 was correctly a hard fault on the same day.
+///
+/// `None` means the exit is an empty pasteboard and the caller should treat it
+/// as one.
+fn fault(tool: &str, code: Option<i32>, stderr: &str) -> Option<anyhow::Error> {
+    if code == Some(NOT_FOUND) {
+        return Some(missing(tool, stderr));
+    }
+
+    // `-1743` is `errAEEventNotPermitted`, which is what TCC returns for an
+    // Apple event the user has not approved. Matched beside the words because
+    // the words are localised and the number is not.
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("-1743")
+        || lower.contains("not authorized")
+        || lower.contains("not authorised")
+    {
+        return Some(
+            Failure::new(
+                "this Mac has not allowed riabuild to control the pasteboard",
+                "Allow it in System Settings → Privacy & Security → Automation, under the \
+                 terminal app riabuild is running in. Until then paste carries nothing; \
+                 everything else works.",
+            )
+            .detail(stderr.trim().to_string())
+            .into(),
+        );
+    }
+
+    None
+}
 
 pub struct MacOsClipboard {
     runner: Arc<dyn CommandRunner>,
@@ -25,12 +68,20 @@ impl MacOsClipboard {
         Self { runner }
     }
 
+    /// One AppleScript, with a fault told apart from an empty pasteboard.
+    ///
+    /// `Ok(None)` is "the pasteboard has nothing of that kind", which is the
+    /// normal case and must never read as a broken channel. `Err` is the two
+    /// states a developer can actually do something about — see [`fault`].
     async fn osascript(&self, script: &str) -> Result<Option<String>> {
         let output = self
             .runner
             .run("osascript", &["-e", script], &RunOptions::default())
             .await
             .context("could not read the pasteboard with osascript")?;
+        if let Some(error) = fault("osascript", output.code, &output.stderr) {
+            return Err(error);
+        }
         Ok(output.ok().then(|| output.stdout.clone()))
     }
 }
@@ -119,6 +170,12 @@ impl Clipboard for MacOsClipboard {
                 .run_bytes("pbpaste", &[], &RunOptions::default())
                 .await
                 .context("could not read the pasteboard with pbpaste")?;
+            // `pbpaste` ships with macOS, so 127 here is a `PATH` a shim
+            // stripped rather than a package nobody installed — and either way
+            // it is not an empty pasteboard.
+            if let Some(error) = fault("pbpaste", output.code, &output.stderr) {
+                return Err(error);
+            }
             if !output.ok() || output.stdout.is_empty() {
                 return Ok(None);
             }
@@ -152,6 +209,9 @@ impl Clipboard for MacOsClipboard {
                 )
                 .await
                 .context("could not write the pasteboard with pbcopy")?;
+            if let Some(error) = fault("pbcopy", output.code, &output.stderr) {
+                return Err(error);
+            }
             if !output.ok() {
                 anyhow::bail!("`pbcopy` failed: {}", output.stderr.trim());
             }
@@ -182,6 +242,13 @@ impl Clipboard for MacOsClipboard {
             .await
             .context("could not write the pasteboard with osascript")?;
 
+        // The write half needs the same split as the read half. A denied
+        // Automation permission fails a `set the clipboard to` exactly as it
+        // fails a `clipboard info`, and reporting it as an ordinary script
+        // error hides the one thing the developer can act on.
+        if let Some(error) = fault("osascript", output.code, &output.stderr) {
+            return Err(error);
+        }
         if !output.ok() {
             anyhow::bail!(
                 "osascript could not set the pasteboard: {}",
@@ -253,6 +320,71 @@ mod tests {
         let runner = arc(FakeRunner::new().with(CLIPBOARD_INFO, 1, "", "execution error"));
         let clipboard = MacOsClipboard::new(runner);
         assert!(clipboard.targets().await.unwrap().is_empty());
+    }
+
+    /// I096. The fault split Linux always had and macOS never did.
+    ///
+    /// A denied Automation permission fails every `osascript` for ever, and it
+    /// used to be indistinguishable from a pasteboard with nothing on it — so
+    /// riabuild told the developer "nothing copied" on every paste, and the
+    /// checkbox that would have fixed it went unmentioned for the whole life of
+    /// the backend.
+    #[tokio::test]
+    async fn a_denied_automation_permission_is_a_fault_that_names_the_setting() {
+        let runner = arc(FakeRunner::new().with(
+            CLIPBOARD_INFO,
+            1,
+            "",
+            "execution error: Not authorized to send Apple events to System Events. (-1743)",
+        ));
+        let clipboard = MacOsClipboard::new(runner);
+        let error = clipboard
+            .targets()
+            .await
+            .expect_err("a denied permission is not an empty pasteboard")
+            .to_string();
+        assert!(error.contains("Automation"), "{error}");
+        assert!(error.contains("Privacy"), "{error}");
+    }
+
+    /// The number is matched beside the words because the words are localised
+    /// and the number is not.
+    #[test]
+    fn the_permission_fault_is_recognised_by_its_error_number_alone() {
+        assert!(fault("osascript", Some(1), "execution error: … (-1743)").is_some());
+        // …and an ordinary empty pasteboard is still not a fault, which is the
+        // half that must not regress: every paste would report a broken laptop.
+        assert!(fault("osascript", Some(1), "execution error").is_none());
+        assert!(fault("osascript", None, "").is_none());
+    }
+
+    /// The same 127 rule the Linux backend has had from the start.
+    #[test]
+    fn a_missing_tool_is_a_fault_on_macos_too() {
+        let error = fault("osascript", Some(NOT_FOUND), "osascript: command not found")
+            .expect("127 is a fault")
+            .to_string();
+        assert!(error.contains("not installed"), "{error}");
+        assert!(error.contains("osascript"), "{error}");
+    }
+
+    /// The write half has to make the same distinction. A denied permission
+    /// fails `set the clipboard to` exactly as it fails `clipboard info`.
+    #[tokio::test]
+    async fn a_denied_automation_permission_is_a_fault_on_the_write_path_too() {
+        let runner = arc(FakeRunner::new().with(
+            "osascript -",
+            1,
+            "",
+            "execution error: Not authorized to send Apple events. (-1743)",
+        ));
+        let clipboard = MacOsClipboard::new(runner);
+        let error = clipboard
+            .write(PNG, &[0x89, 0x50, 0x4E, 0x47])
+            .await
+            .expect_err("a denied permission is not a refused type")
+            .to_string();
+        assert!(error.contains("Automation"), "{error}");
     }
 
     #[test]

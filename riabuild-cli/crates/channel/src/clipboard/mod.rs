@@ -19,8 +19,37 @@ use async_trait::async_trait;
 use riabuild_runner::CommandRunner;
 use std::sync::Arc;
 
-pub use linux::{WaylandClipboard, X11Clipboard};
+pub use linux::CliClipboard;
 pub use macos::MacOsClipboard;
+
+/// The shell's code for "no such command".
+///
+/// The one exit status that is a genuine fault rather than an empty clipboard:
+/// the tool riabuild was told to use is not installed, and every read will fail
+/// the same way until someone installs it. Shared by both backends because it
+/// is a fact about how a shell reports a missing program, not about `xclip` —
+/// macOS read every non-zero exit as an empty pasteboard and had no such
+/// branch, so a Mac with no `osascript` on `PATH` reported "nothing copied"
+/// forever.
+pub const NOT_FOUND: i32 = 127;
+
+/// A tool that is not there. Reported with its own stderr, because "paste does
+/// not work" is not something a developer can act on.
+pub fn missing(tool: &str, stderr: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`{tool}` is not installed on this laptop: {}",
+        stderr.trim()
+    )
+}
+
+/// A write that the clipboard tool would not take.
+///
+/// A write has no stderr to quote where the tool forks — that fork holds the
+/// pipe — so the exit status is the whole diagnostic and the message has to
+/// carry it.
+pub fn write_failed(tool: &str, code: i32) -> anyhow::Error {
+    anyhow::anyhow!("`{tool}` could not take the laptop's clipboard (exit {code})")
+}
 
 #[async_trait]
 pub trait Clipboard: Send + Sync {
@@ -77,8 +106,8 @@ pub fn detect(
 
 pub fn backend(runner: Arc<dyn CommandRunner>, session: Session) -> Box<dyn Clipboard> {
     match session {
-        Session::X11 => Box::new(X11Clipboard::new(runner)),
-        Session::Wayland => Box::new(WaylandClipboard::new(runner)),
+        Session::X11 => Box::new(CliClipboard::x11(runner)),
+        Session::Wayland => Box::new(CliClipboard::wayland(runner)),
         Session::MacOs => Box::new(MacOsClipboard::new(runner)),
     }
 }

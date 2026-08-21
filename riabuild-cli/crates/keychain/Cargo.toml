@@ -16,11 +16,26 @@ testing = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+# O_NOFOLLOW and the fstat/fchmod that check the namespace directory is ours,
+# neither of which std exposes.
+libc.workspace = true
+# `config::write_atomic`, the one atomic write. The file store is the caller
+# that most needs it — see `set` — and a second copy of it here is exactly the
+# duplication that produced the unsafe one.
+riabuild-paths.workspace = true
 riabuild-runner.workspace = true
 riabuild-ui.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+# `rt` for `spawn_blocking`: the ownership check is POSIX calls tokio has no
+# async wrapper for, and the blocking pool is where they belong. `time` is the
+# bound on `platform::keyring_answers` — named here rather than inherited from
+# `riabuild-runner`'s own feature set, because a bound that compiles only while
+# some other crate happens to ask for the same feature is not a bound.
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "time"] }
 
 [dev-dependencies]
 riabuild-runner = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+# `test-util` for the same reason `riabuild-channel` has it: the probe's
+# timeout is asserted against a paused clock, so the three seconds it waits
+# cost the suite nothing and a regression fails fast rather than hanging.
+tokio = { workspace = true, features = ["macros", "test-util"] }

@@ -13,12 +13,12 @@
 
 mod binary;
 
-use super::{Remote, identity, ssh_once};
+use super::{Remote, ssh_once};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_fetch::download;
 use riabuild_paths::Paths;
-use riabuild_runner::{CommandOutput, CommandRunner, RunOptions};
+use riabuild_runner::{CommandOutput, CommandRunner};
 use riabuild_tasks::Ctx;
 use riabuild_ui::{Failure, Ui};
 use riabuild_version as version;
@@ -28,6 +28,23 @@ use std::sync::Arc;
 /// bundled so threading it through a private call chain does not turn into a
 /// wall of repeated parameters (and the `#[allow(clippy::too_many_arguments)]`
 /// that would otherwise be needed at every stage).
+/// How long the binary push may take before riabuild kills the `ssh`.
+///
+/// `RunOptions`' default is a ten-minute ceiling on a call that has *hung*,
+/// which every other `ssh` in remote mode deserves: they run a command and read
+/// a line back. This one streams a whole riabuild — tens of megabytes — up a
+/// developer's *uplink*, which is the slow half of a domestic connection and
+/// the one nobody quotes. At 1 Mbit/s up, a 40 MB binary is five minutes before
+/// any packet is lost; a hotel or tethered link makes ten minutes an ordinary
+/// afternoon rather than an exotic one. Capping it there would report a timeout
+/// to a developer whose only problem is bandwidth, and leave the server with
+/// a `.part` file and no riabuild.
+///
+/// Half an hour rather than `None`: unlike a clone the size is known and
+/// bounded, and an `ssh` that has genuinely wedged mid-transfer — the peer gone
+/// while the kernel goes on retransmitting — is exactly what a bound is for.
+const PUSH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1800);
+
 struct SshCtx<'a> {
     remote: &'a Remote,
     paths: &'a dyn Paths,
@@ -53,20 +70,16 @@ impl SshCtx<'_> {
 
     /// Same as [`Self::ssh`], but with `stdin` piped to the command — for
     /// streaming the binary itself, which `ssh_once` has no room for.
+    ///
+    /// The one `ssh` in remote mode that names its own [`PUSH_PATIENCE`]: every
+    /// other one asks a question and reads the answer, and this one uploads a
+    /// riabuild.
     async fn ssh_with_stdin(&self, command: String, stdin: Vec<u8>) -> Result<CommandOutput> {
-        let mut args = identity::ssh_options(self.remote, self.paths, true, self.carry);
-        args.push(self.remote.target());
-        args.push(command);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.runner
-            .run(
-                "ssh",
-                &refs,
-                &RunOptions {
-                    stdin: Some(stdin),
-                    ..super::askpass::run_options(self.remote, self.paths)
-                },
-            )
+        crate::ssh::Ssh::to(self.remote, self.paths, self.runner.clone())
+            .carry(self.carry)
+            .stdin(stdin)
+            .patience(PUSH_PATIENCE)
+            .run(&command)
             .await
     }
 }
@@ -319,7 +332,7 @@ mod tests {
     /// lets `FakeRunner::then` sequence responses to *successive* remote
     /// calls in order, regardless of which trailing command each one sends.
     fn ssh_prefix(remote: &Remote, paths: &dyn Paths) -> String {
-        let options = identity::ssh_options(remote, paths, true, None).join(" ");
+        let options = crate::identity::ssh_options(remote, paths, true, None).join(" ");
         format!("ssh {options} {}", remote.target())
     }
 

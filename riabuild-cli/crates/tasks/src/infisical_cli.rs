@@ -3,92 +3,42 @@
 //! **No token is installed.** Credentials are brokered per use by riabuild-web
 //! and piped into `infisical export`. A long-lived Infisical credential on a
 //! laptop is exactly what the brokering design exists to avoid.
+//!
+//! One row in `owned_tool`'s table and nothing else — download the pinned
+//! release, verify it against a digest, land it under `~/.riabuild`, put a shim
+//! in `bin/` — so the row *is* the task. Owning the binary changed where
+//! infisical comes from, not the rule above it.
 
-use super::{Ctx, Status, Task, TaskId};
-use crate::shims;
-use anyhow::Result;
-use async_trait::async_trait;
+use crate::Ctx;
+use crate::owned_tool::{OwnedTool, Shim, exec_shim, no_note, plain_probe};
 use riabuild_fetch::tools;
-use riabuild_runner::RunOptions;
-use riabuild_ui::Failure;
-use riabuild_version as version;
 
-const MIN_VERSION: &str = "0.30.0";
-
-pub struct InfisicalCli;
-
-#[async_trait]
-impl Task for InfisicalCli {
-    fn id(&self) -> TaskId {
-        "infisical_cli"
-    }
-
-    fn title(&self) -> &str {
-        "Infisical CLI"
-    }
-
-    /// Bumped to 2 when riabuild took ownership of `infisical` instead of
-    /// installing it with Homebrew.
-    fn version(&self) -> u32 {
-        2
-    }
-
-    fn depends_on(&self) -> &[TaskId] {
-        &[]
-    }
-
-    async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        let infisical = ctx.infisical();
-        if !tokio::fs::try_exists(&infisical).await.unwrap_or(false) {
-            return Ok(Status::needs(format!(
-                "riabuild has not installed infisical {} yet",
-                tools::INFISICAL_VERSION
-            )));
-        }
-        let output = ctx
-            .runner
-            .run(&infisical, &["--version"], &RunOptions::default())
-            .await?;
-        // Infisical prints its version banner on stderr in some builds, so both
-        // streams are searched.
-        let reported = format!("{}{}", output.stdout, output.stderr);
-        if !version::at_least(&reported, MIN_VERSION) {
-            return Ok(Status::needs(format!(
-                "the infisical in ~/.riabuild reports `{}`, which is not usable",
-                reported.trim()
-            )));
-        }
-        Ok(Status::Satisfied)
-    }
-
-    /// Downloads the pinned `infisical` into `~/.riabuild/infisical/<version>/`.
-    ///
-    /// Still installs **no token**. Credentials are brokered per use and piped
-    /// into `infisical export`; owning the binary changes nothing about that.
-    async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let release = tools::infisical()?;
-        ctx.ui
-            .note(&format!("Downloading infisical {}…", release.version));
-
-        let tool_dir = ctx.paths.tool_dir(release.tool, release.version);
-        tools::install(&release, &tool_dir).await.map_err(|error| {
-            Failure::new(
-                "installing the Infisical CLI",
-                "Check your network connection and run `riabuild` again. If it keeps \
-                 failing, send this to your team lead.",
-            )
-            .detail(format!("{error:#}"))
-        })?;
-
-        shims::write_tool(ctx, "infisical", &release.binary_in(&tool_dir)).await?;
-        Ok(())
-    }
-}
+pub(crate) static INFISICAL_CLI: OwnedTool = OwnedTool {
+    id: "infisical_cli",
+    title: "Infisical CLI",
+    label: "infisical",
+    // 2 since riabuild took ownership of `infisical` instead of installing it
+    // with Homebrew.
+    version: 2,
+    min_version: "0.30.0",
+    pinned_version: tools::INFISICAL_VERSION,
+    release: tools::infisical,
+    binary: Ctx::infisical,
+    probe: plain_probe,
+    shim: Some(Shim {
+        name: "infisical",
+        render: exec_shim,
+        without_it: "so the shell would find whichever infisical the machine already had",
+    }),
+    installing: "installing the Infisical CLI",
+    note: no_note,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{ctx_and_runner, ctx_with, ctx_with_tools, install_owned_tools};
+    use crate::{Status, Task};
     use riabuild_runner::FakeRunner;
 
     fn reporting(version: &str) -> FakeRunner {
@@ -98,7 +48,7 @@ mod tests {
     #[tokio::test]
     async fn a_current_infisical_is_satisfied() {
         let (ctx, _home) = ctx_with_tools(reporting("Infisical CLI v0.43.120")).await;
-        assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
+        assert_eq!(INFISICAL_CLI.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
@@ -108,7 +58,7 @@ mod tests {
         let runner =
             FakeRunner::new().with("infisical --version", 0, "", "Infisical CLI v0.43.120");
         let (ctx, _home) = ctx_with_tools(runner).await;
-        assert_eq!(InfisicalCli.check(&ctx).await.unwrap(), Status::Satisfied);
+        assert_eq!(INFISICAL_CLI.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
@@ -116,7 +66,7 @@ mod tests {
         // The owned copy is a known version, so a low one means a truncated or
         // half-written download rather than an old release.
         let (ctx, _home) = ctx_with_tools(reporting("Infisical CLI v0.12.0")).await;
-        let status = InfisicalCli.check(&ctx).await.unwrap();
+        let status = INFISICAL_CLI.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("not usable"), "{status:?}");
     }
 
@@ -125,11 +75,25 @@ mod tests {
         // Including a system infisical on PATH: it is not the binary riabuild
         // verified, so it does not count.
         let (ctx, _home) = ctx_with(reporting("Infisical CLI v0.43.120")).await;
-        let status = InfisicalCli.check(&ctx).await.unwrap();
+        let status = INFISICAL_CLI.check(&ctx).await.unwrap();
         assert!(
             format!("{status:?}").contains("has not installed infisical"),
             "{status:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_infisical_with_no_shim_is_not_reported_as_satisfied() {
+        // `~/.riabuild/bin` leads `PATH` in the environment shell, so a missing
+        // shim is not "riabuild's copy is second" — it is the machine's own
+        // infisical answering, unverified. This task reported such a machine as
+        // correct until every owned tool went through one table.
+        let (ctx, _home) = ctx_with_tools(reporting("Infisical CLI v0.43.120")).await;
+        tokio::fs::remove_file(ctx.paths.bin_dir().join("infisical"))
+            .await
+            .unwrap();
+        let status = INFISICAL_CLI.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("no launcher"), "{status:?}");
     }
 
     #[tokio::test]
@@ -139,7 +103,7 @@ mod tests {
         // infisical comes from, not that rule.
         let (ctx, _home, runner) = ctx_and_runner(reporting("Infisical CLI v0.43.120")).await;
         install_owned_tools(&ctx).await;
-        InfisicalCli.check(&ctx).await.unwrap();
+        INFISICAL_CLI.check(&ctx).await.unwrap();
         let calls = runner.calls();
         assert!(
             !calls.iter().any(|call| call.contains("login")),

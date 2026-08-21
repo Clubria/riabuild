@@ -13,10 +13,13 @@
 //! keychain — but on a machine with no keyring it is `session.token` inside the
 //! tree, and a reset there signs them out. That is the right outcome (a reset
 //! is "start over", and `login` will simply ask again), and it is not worth a
-//! special case to preserve; it is noted because "your sign-in is safe" is no
-//! longer true everywhere. Their Claude Code sign-ins do go: each account's
-//! login is scoped to the config directory being removed, so `warnings` counts
-//! them and says so.
+//! special case to preserve. It **is** worth saying out loud, and `warnings`
+//! now does: the line used to promise unconditionally that "your riabuild
+//! sign-in is not touched", so on a managed server or a headless Linux box the
+//! developer confirmed a recursive delete against a claim that was false — on
+//! exactly the machines where signing in again is most awkward. Their Claude
+//! Code sign-ins do go: each account's login is scoped to the config directory
+//! being removed, so `warnings` counts them and says so.
 
 use anyhow::Result;
 use riabuild_paths::{Paths, contract_tilde};
@@ -98,7 +101,7 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 
     let shown = contract_tilde(&plan.root, &home);
     ui.info(&format!("riabuild reset will remove {shown}"));
-    for line in warnings(&plan, &paths.claude_dir()).await {
+    for line in warnings(&plan, &paths.claude_dir(), &paths.session_token_file()).await {
         ui.note(&line);
     }
 
@@ -129,6 +132,18 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
         }
     }
 
+    // Taken here rather than at the top, and this is the one destructive
+    // command whose lock must *follow* its question: `acquire` waits for a
+    // holder, and waiting before the prompt would leave a developer looking at
+    // a silent terminal. Everything above this line only reads.
+    //
+    // Held across the removal, because the run this is racing is one unpacking
+    // a toolchain into the tree about to disappear — the case the lock protocol
+    // was written for and the one command that never took it. The lock file
+    // lives inside `plan.root` and goes with it; the guard closes a descriptor
+    // to an unlinked file, which is exactly what dropping it should do.
+    let _provisioning = crate::lock::provisioning_lock(paths, ui, false).await?;
+
     tokio::fs::remove_dir_all(&plan.root)
         .await
         .map_err(|error| {
@@ -158,7 +173,17 @@ pub async fn run(paths: &dyn Paths, ui: &Ui, request: Request) -> Result<i32> {
 /// with four of them is agreeing to lose four sign-ins and four session
 /// histories, and the singular understated that badly enough to read as a
 /// different, smaller operation.
-async fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
+///
+/// The sign-in claim is settled by looking for `session_token`, not by asking
+/// which keychain this machine would use. Those answer the same question where
+/// it matters — a machine with a keyring has no such file, and the two machines
+/// that keep one (a managed server, and a laptop with no Secret Service
+/// answering) keep it at exactly this path, inside the tree — and the file is
+/// the honest test of the two: a machine that has never signed in loses nothing
+/// however it would have stored a token. The line was unconditional, and on
+/// those machines it told the developer their sign-in was safe while the delete
+/// underneath it removed the session.
+async fn warnings(plan: &Plan, claude_dir: &Path, session_token: &Path) -> Vec<String> {
     if plan.entries.is_empty() {
         return vec!["it is empty".to_string()];
     }
@@ -179,7 +204,17 @@ async fn warnings(plan: &Plan, claude_dir: &Path) -> Vec<String> {
             ));
         }
     }
-    lines.push("your checkout and your riabuild sign-in are not touched".to_string());
+    if tokio::fs::try_exists(session_token).await.unwrap_or(false) {
+        lines.push("your checkout is not touched".to_string());
+        lines.push(format!(
+            "this machine has no keyring, so its riabuild sign-in is the file {} inside that \
+             tree — removing it signs this machine out, and `riabuild` will ask you to sign in \
+             again",
+            session_token.display()
+        ));
+    } else {
+        lines.push("your checkout and your riabuild sign-in are not touched".to_string());
+    }
     lines
 }
 
@@ -482,6 +517,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_machine_with_a_keyring_is_told_its_sign_in_is_safe() {
+        // The laptop case: the token is in `security`/`secret-tool`, nothing
+        // in the tree holds it, and the reset really does leave it alone.
+        let (_home, paths) = provisioned().await;
+        assert!(!paths.session_token_file().exists());
+
+        let plan = plan(&paths).await.expect("a provisioned tree");
+        let said = warnings(&plan, &paths.claude_dir(), &paths.session_token_file())
+            .await
+            .join("\n");
+
+        assert!(said.contains("riabuild sign-in are not touched"), "{said}");
+        assert!(!said.contains("signs this machine out"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_keyring_is_told_the_reset_signs_it_out() {
+        // A managed server, or a headless Linux box with no Secret Service
+        // answering: the session token is `session.token` inside the tree
+        // being removed. The warning used to promise the opposite, and it did
+        // so on exactly the machines where signing in again is most awkward.
+        let (_home, paths) = provisioned().await;
+        write_file(&paths.session_token_file(), "rb_live_token").await;
+
+        let plan = plan(&paths).await.expect("a provisioned tree");
+        let said = warnings(&plan, &paths.claude_dir(), &paths.session_token_file())
+            .await
+            .join("\n");
+
+        assert!(said.contains("signs this machine out"), "{said}");
+        assert!(
+            !said.contains("riabuild sign-in are not touched"),
+            "the false claim must be gone, not merely joined by a true one: {said}"
+        );
+        assert!(said.contains("your checkout is not touched"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn the_reset_that_signs_a_machine_out_really_does_remove_the_token() {
+        // The other half: the warning and the behaviour have to agree, so the
+        // file the message names must actually be gone afterwards.
+        let (_home, paths) = provisioned().await;
+        write_file(&paths.session_token_file(), "rb_live_token").await;
+
+        run(
+            &paths,
+            &quiet_ui(),
+            Request {
+                assume_yes: true,
+                dry_run: false,
+                inside_shell: false,
+            },
+        )
+        .await
+        .expect("reset succeeds");
+
+        assert!(!paths.session_token_file().exists());
+    }
+
+    #[tokio::test]
     async fn the_plan_counts_the_accounts_a_reset_would_sign_out() {
         // Three accounts is three sign-ins and three session histories, and a
         // warning that says "your Clubria profile" understates that by a factor
@@ -496,7 +591,9 @@ mod tests {
         }
 
         let plan = plan(&paths).await.expect("a provisioned tree");
-        let said = warnings(&plan, &paths.claude_dir()).await.join("\n");
+        let said = warnings(&plan, &paths.claude_dir(), &paths.session_token_file())
+            .await
+            .join("\n");
 
         assert!(said.contains("3 Claude Code accounts"), "{said}");
         drop(home);
@@ -510,7 +607,9 @@ mod tests {
             .expect("an account directory");
 
         let plan = plan(&paths).await.expect("a provisioned tree");
-        let said = warnings(&plan, &paths.claude_dir()).await.join("\n");
+        let said = warnings(&plan, &paths.claude_dir(), &paths.session_token_file())
+            .await
+            .join("\n");
 
         assert!(said.contains("1 Claude Code account"), "{said}");
         assert!(!said.contains("accounts"), "{said}");
@@ -533,12 +632,16 @@ mod tests {
             entries: vec!["state.json".into()],
         };
 
-        let named = warnings(&with_accounts, &claude).await.join("\n");
+        let named = warnings(&with_accounts, &claude, &paths.session_token_file())
+            .await
+            .join("\n");
         assert!(named.contains("Claude Code account"), "{named}");
 
         // A tree with no `claude` entry has no history to warn about, however
         // many directories the account root turns out to hold.
-        let silent = warnings(&without, &claude).await.join("\n");
+        let silent = warnings(&without, &claude, &paths.session_token_file())
+            .await
+            .join("\n");
         assert!(!silent.contains("Claude Code account"), "{silent}");
     }
 
@@ -551,7 +654,7 @@ mod tests {
         };
 
         assert_eq!(
-            warnings(&plan, &paths.claude_dir()).await,
+            warnings(&plan, &paths.claude_dir(), &paths.session_token_file()).await,
             vec!["it is empty"]
         );
     }

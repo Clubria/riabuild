@@ -35,7 +35,6 @@
 //! it for no one.
 
 use anyhow::Result;
-use riabuild_fetch::archive::make_executable;
 use std::path::Path;
 
 /// How many Grok Build profiles riabuild makes.
@@ -164,19 +163,19 @@ exec "$grok_binary" {flag} {bypass} "$@"
 /// mean profile 1 — the shape `shims::write_all` and `shims::codex::write`
 /// already use.
 ///
-/// Each is landed by rename and then made executable, like every other
-/// generated script: the hazard is an interrupt mid-write leaving a truncated
-/// launcher that fails with a shell syntax error.
+/// Each goes through [`shims::write_script`](super::write_script), like every
+/// other generated script, so it is landed by rename and then made executable:
+/// the hazard is an interrupt mid-write leaving a truncated launcher that fails
+/// with a shell syntax error.
 pub async fn write(ctx: &crate::Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
-    tokio::fs::create_dir_all(&bin).await?;
     let grok = ctx.grok();
 
     for profile in 1..=PROFILES {
         let script = launcher_script(&ctx.paths.grok_profile_dir(profile), &grok, &bin);
-        write_launcher(&bin.join(format!("grok-{profile}")), &script).await?;
+        super::write_script(&bin, &format!("grok-{profile}"), &script).await?;
         if profile == 1 {
-            write_launcher(&bin.join("grok"), &script).await?;
+            super::write_script(&bin, "grok", &script).await?;
         }
     }
     Ok(())
@@ -199,16 +198,11 @@ pub fn profile_of(name: &str) -> usize {
         .unwrap_or(1)
 }
 
-async fn write_launcher(path: &Path, script: &str) -> Result<()> {
-    riabuild_paths::config::write_atomic(path, script.as_bytes()).await?;
-    make_executable(path).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::ctx_with;
+    use riabuild_fetch::archive::make_executable;
     use riabuild_runner::FakeRunner;
 
     fn script() -> String {

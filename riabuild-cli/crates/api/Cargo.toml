@@ -28,4 +28,13 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `FakeRunner`, for the two branches of `auth::open_browser`. A dev-dependency
+# and nothing else: the fake must never be reachable from a shipped binary, and
+# `cargo build` does not resolve this table.
+riabuild-runner = { workspace = true, features = ["testing"] }
+# `net` and `io-util` are for `loopback.rs` alone: it stands a one-shot HTTP
+# server on an ephemeral loopback port and speaks the protocol by hand, which is
+# how this client is tested against real URLs, real headers and real statuses
+# without a mocking crate in the tree. `riabuild-fetch`'s download tests do the
+# same thing for the same reason.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }

@@ -162,15 +162,45 @@ pub fn add(config: &mut UserConfig, id: String) -> Result<usize> {
 /// effect — see the module comment.
 pub fn remove(config: &mut UserConfig, number: usize) -> Result<String> {
     let id = id_of(config, number)?;
-    config.claude_accounts.remove(number - 1);
+    remove_id(config, &id);
     Ok(id)
+}
+
+/// Removes an account by id, and answers whether it was still registered.
+///
+/// **The spelling for a mutation applied under the config lock.** A number is a
+/// *position*, and the list a command read at process start is not the list the
+/// lock hands it: a second terminal that added or deleted an account in between
+/// has shifted every number after it. Re-resolving a number inside the closure
+/// would therefore act on whichever account had moved into that slot. An id is
+/// the account itself, and it is what the directory a delete has already
+/// removed was named for.
+///
+/// A missing id answers `false` rather than failing. Another riabuild having
+/// removed the same account first is the state being asked for, not an error to
+/// report to a developer who asked for exactly that.
+pub fn remove_id(config: &mut UserConfig, id: &str) -> bool {
+    let Some(index) = config.claude_accounts.iter().position(|held| held == id) else {
+        return false;
+    };
+    config.claude_accounts.remove(index);
+    true
 }
 
 /// Makes an account the primary one, preserving the order of the rest.
 pub fn promote(config: &mut UserConfig, number: usize) -> Result<String> {
-    let id = remove(config, number)?;
-    config.claude_accounts.insert(0, id.clone());
+    let id = id_of(config, number)?;
+    promote_id(config, &id);
     Ok(id)
+}
+
+/// Makes an account the primary one by id. Same reasoning as [`remove_id`].
+pub fn promote_id(config: &mut UserConfig, id: &str) -> bool {
+    if !remove_id(config, id) {
+        return false;
+    }
+    config.claude_accounts.insert(0, id.to_string());
+    true
 }
 
 #[cfg(test)]

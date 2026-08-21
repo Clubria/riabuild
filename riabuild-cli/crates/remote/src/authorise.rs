@@ -74,122 +74,23 @@
 //! `ssh-copy-id` was the thing deciding whether the key was installed. That
 //! case names the server-side settings that can produce it instead.
 
-mod copy;
+pub(crate) mod copy;
+mod install;
+mod probe;
+mod words;
+
+use install::finish;
+pub use probe::{can_sign_in, host_key_failure, offered_methods};
+use words::paste;
 
 use super::Remote;
-use super::host_key::entry_host;
-use super::identity::{key_path, ssh_options};
+use super::identity::key_path;
+use super::ssh::Ssh;
 use anyhow::Result;
 use riabuild_paths::Paths;
-use riabuild_runner::{CommandRunner, RunOptions};
-use riabuild_ui::{Detail, Failure, Ui};
+use riabuild_runner::CommandRunner;
+use riabuild_ui::{Failure, Ui};
 use std::sync::Arc;
-
-/// The authentication methods sshd named in its refusal, e.g. `Permission
-/// denied (publickey,password).` → `["publickey", "password"]`. Empty when
-/// the failure was not an authentication refusal at all (a timeout, a closed
-/// port) — there is no method list to read out of those.
-pub fn offered_methods(stderr: &str) -> Vec<String> {
-    let Some(start) = stderr.find("Permission denied (") else {
-        return Vec::new();
-    };
-    let rest = &stderr[start + "Permission denied (".len()..];
-    let Some(end) = rest.find(')') else {
-        return Vec::new();
-    };
-    rest[..end]
-        .split(',')
-        .map(|method| method.trim().to_string())
-        .filter(|method| !method.is_empty())
-        .collect()
-}
-
-/// Did `ssh` refuse over the *server's* identity rather than ours?
-///
-/// A host-key failure aborts the connection before any authentication method
-/// is offered, so its stderr names none — and [`offered_methods`] reads an
-/// empty list as "publickey only". Left to fall through, a stale pin (a VM
-/// rebuilt with a new key, or a box recreated after `remote forget`, which
-/// leaves the pin behind on purpose) is reported as a server that wants a key
-/// pasted into `authorized_keys`. The developer pastes it, nothing changes,
-/// and no riabuild command clears the pin that actually caused it.
-///
-/// Deliberately narrow: OpenSSH's two literals, and only when the stderr does
-/// not also carry an authentication refusal — so a genuine `Permission denied
-/// (publickey,password)` can never be swallowed by, say, a login banner that
-/// quotes the phrase back at us.
-pub fn host_key_failure(stderr: &str) -> bool {
-    (stderr.contains("Host key verification failed")
-        || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"))
-        && !stderr.contains("Permission denied (")
-}
-
-/// The one wording for "`ssh` refused the *server's* identity, so this never
-/// reached authentication at all". Shared rather than written at each site
-/// that can observe it, so the remedy — which names riabuild's own
-/// `known_hosts`, invisible to the developer under `-F /dev/null` — cannot
-/// drift between them.
-fn stale_pin(remote: &Remote, paths: &dyn Paths, stderr: String) -> anyhow::Error {
-    Failure::new(
-        format!("verifying {}'s host key", remote.host),
-        format!(
-            "ssh refused the host key riabuild has pinned for {}, so this never got as \
-             far as authenticating — the key in `authorized_keys` is not the problem. If \
-             that server was rebuilt or replaced, confirm its new fingerprint with \
-             whoever runs it, then remove the {} line from {} and run `riabuild remote` \
-             again.",
-            remote.host,
-            entry_host(remote),
-            paths.known_hosts_file().display()
-        ),
-    )
-    .detail(stderr)
-    .into()
-}
-
-/// Can riabuild's own key sign in, without a password and without falling
-/// back to the developer's own agent or default identities?
-///
-/// `Err` is narrower than "no". A host key that no longer matches the pin
-/// aborts the connection at the host-key step, before any authentication
-/// method is offered, so the honest answer is not "riabuild's key is not
-/// authorised" but "that is not the server riabuild pinned" — and it is
-/// diagnosed here, in the probe every path shares, rather than at one
-/// caller. `riabuild remote --check` calls this *instead of* [`authorise`]
-/// (nothing may write to the server on that path), so a diagnosis living
-/// only inside `authorise` left `--check` against a rebuilt — or
-/// impersonated — box printing "riabuild's key is not authorised there yet"
-/// and exiting 0.
-pub async fn can_sign_in(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: Arc<dyn CommandRunner>,
-) -> Result<bool> {
-    let mut args = vec!["-o".to_string(), "BatchMode=yes".to_string()];
-    // Never a carried identity: the question is whether *riabuild's own* key
-    // signs in, and an issued key answering it would report someone else's
-    // access as ours and skip the install entirely.
-    args.extend(ssh_options(remote, paths, true, None));
-    args.push(remote.target());
-    args.push("true".to_string());
-
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // `RunOptions::default()`, deliberately: this is the *only* family of ssh
-    // calls in remote mode that does not carry `askpass::run_options`. The
-    // question it asks is "can riabuild's key sign in", and an askpass that
-    // could answer a password prompt would let a saved password make the
-    // answer yes on a server where the key does not work at all — which is
-    // exactly the state the warning path exists to report. `BatchMode=yes`
-    // already forbids every prompt, askpass included, so this is belt and
-    // braces; it is written down because the belt is invisible and someone
-    // adding `..run_options(…)` here for consistency would break the probe
-    // without breaking a single test.
-    let probe = runner.run("ssh", &refs, &RunOptions::default()).await?;
-    if host_key_failure(&probe.stderr) {
-        return Err(stale_pin(remote, paths, probe.stderr));
-    }
-    Ok(probe.ok())
-}
 
 /// Installs riabuild's public key on the server, if it is not already there.
 ///
@@ -212,6 +113,14 @@ pub async fn authorise(
     issued: &mut crate::issued::Issued,
 ) -> Result<Option<crate::issued::Working>> {
     if can_sign_in(remote, paths, runner.clone()).await? {
+        // Riabuild's own key works, so no password will be asked for on this
+        // run and any password sitting unconfirmed from a previous one — a run
+        // killed between the askpass helper writing it and `copy`'s verdict —
+        // will never be confirmed by anything. Swept here because this is the
+        // one place that knows that; best effort, because a keyring that will
+        // not answer must not fail a run that has nothing else to do. See
+        // `askpass::discard_pending`.
+        let _ = crate::askpass::discard_pending(remote, paths, runner).await;
         // The early return that makes issued keys free. `issued` is untouched
         // here, so a returning developer fetches nothing, starts no agent, and
         // never has an org private key in this process's memory at all.
@@ -266,18 +175,12 @@ pub async fn authorise(
     // What will the server actually accept? `PreferredAuthentications=none`
     // makes sshd refuse before trying any method, so its refusal names every
     // method it offers rather than just the first one attempted.
-    let mut probe = vec![
-        "-o".to_string(),
-        "PreferredAuthentications=none".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-    ];
-    probe.extend(ssh_options(remote, paths, false, None));
-    probe.push(remote.target());
-    probe.push("true".to_string());
-    let probe_refs: Vec<&str> = probe.iter().map(String::as_str).collect();
-    let refusal = runner
-        .run("ssh", &probe_refs, &RunOptions::default())
+    let refusal = Ssh::to(remote, paths, runner.clone())
+        .every_identity()
+        .option("PreferredAuthentications=none")
+        .option("BatchMode=yes")
+        .without_askpass()
+        .run("true")
         .await?;
     // A stale pin never reaches this line: both probes talk to the same host
     // through the same pinned `known_hosts`, so [`can_sign_in`] above has
@@ -306,216 +209,10 @@ pub async fn authorise(
     finish(remote, paths, runner, ui, &public_key, None, issued).await
 }
 
-/// Installing the key and reporting what came of it — shared by the two ways
-/// in, because only the credential differs.
-///
-/// `entry` is `Some` when an issued key is what authenticates the copy, and
-/// `None` when the account password is. Every branch below is identical either
-/// way: the same script runs on the server, the same three outcomes are
-/// possible, and none of them is a reason to stop a developer who has a working
-/// way onto the machine.
-async fn finish(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: Arc<dyn CommandRunner>,
-    ui: &Ui,
-    public_key: &str,
-    entry: Option<&crate::issued::Working>,
-    issued: &mut crate::issued::Issued,
-) -> Result<Option<crate::issued::Working>> {
-    let fallback = fallback(remote, entry);
-    let installed = match copy::install_key(remote, paths, runner.clone(), public_key, entry).await
-    {
-        Ok(installed) => installed,
-        Err(error) => {
-            // A read-only home, a full disk, a connection that dropped. Not
-            // fatal: there is a working way in — a password, or the issued key
-            // that just proved itself — so this costs the developer a key
-            // rather than the machine.
-            carry_on(
-                ui,
-                remote,
-                public_key,
-                "the key could not be written to the server",
-                &format!("riabuild could not add it to authorized_keys there ({error})"),
-                &fallback,
-            );
-            return carry(ui, runner.clone(), issued, entry).await;
-        }
-    };
-
-    if installed == copy::Installed::AlreadyThere {
-        // Nothing was written, so nothing can have changed the answer
-        // `can_sign_in` gave at the top of this function — re-probing would
-        // spend another connection, and on the very server this branch exists
-        // for, another password round trip, to be told the same thing.
-        //
-        // This warning deliberately does *not* end in `paste`'s remedy. The
-        // line is already in the file: telling the developer to add it is how
-        // they end up pasting a key they have pasted before, and it is what
-        // riabuild itself did on every run for as long as `ssh-copy-id` was
-        // the thing deciding whether the key was installed.
-        ui.unresolved(
-            "Authorised",
-            "the server refuses the key it already has",
-            &[
-                Detail::Prose(&format!(
-                    "riabuild's key is already in ~/.ssh/authorized_keys on {}, and that \
-                     server still refuses it — so riabuild has left the file alone rather \
-                     than adding another copy of the same line.",
-                    remote.host
-                )),
-                Detail::Prose(&fallback),
-                Detail::Prose(&format!(
-                    "Something on {} is not honouring that file. The usual causes are an \
-                     `AuthorizedKeysFile` in sshd_config pointing somewhere else, an \
-                     `AuthenticationMethods` that needs more than a key, or a home \
-                     directory whose mode `StrictModes` rejects.",
-                    remote.host
-                )),
-            ],
-        );
-        return carry(ui, runner.clone(), issued, entry).await;
-    }
-
-    if !can_sign_in(remote, paths, runner.clone()).await? {
-        // The line reached `authorized_keys` just now and sshd still refuses
-        // it — same causes as the branch above, but this run is the one that
-        // put it there, so the developer is hearing it for the first time.
-        // None of them is a reason to stop a developer whose password works.
-        carry_on(
-            ui,
-            remote,
-            public_key,
-            "the key is installed and still refused",
-            "the key was copied, but signing in with it still does not work",
-            &fallback,
-        );
-        return carry(ui, runner.clone(), issued, entry).await;
-    }
-    ui.applied("Authorised");
-    // riabuild's own key works now, so nothing is carried and the agent is
-    // finished with — which is the ordinary outcome and the one that keeps a
-    // server's auth log able to tell developers apart.
-    Ok(None)
-}
-
-/// Commits to using the issued identity for the rest of the run.
-///
-/// Reached only from the three branches where riabuild's own key has been
-/// installed and *still* cannot sign in. On an ordinary server that is a
-/// misconfiguration to report; on a managed SSH gateway it is simply how the
-/// machine works — it accepted the write to `authorized_keys` and authenticates
-/// against its own registry regardless — and there is nothing riabuild can do
-/// to that server to change it.
-///
-/// Before this existed the run fell back to the account password at that point,
-/// which meant an issued key authorised one `ssh-copy-id` for a key that would
-/// never work and then went unused. Now the identity that demonstrably opens
-/// the server is the one that carries the run.
-async fn carry(
-    ui: &Ui,
-    runner: Arc<dyn CommandRunner>,
-    issued: &mut crate::issued::Issued,
-    entry: Option<&crate::issued::Working>,
-) -> Result<Option<crate::issued::Working>> {
-    let Some(entry) = entry else {
-        // No issued key got us in either, so the password is still the answer
-        // and `carry_on` has already said so.
-        return Ok(None);
-    };
-    ui.note(&format!(
-        "riabuild will use the {} key issued to you for the rest of this run, rather than \
-         asking for a password.",
-        entry.label
-    ));
-    // Reloaded without an expiry: the probe's bounded lifetime is right for a
-    // question, and wrong for an identity that has to outlive an interactive
-    // shell.
-    issued.hold(runner, ui).await;
-    Ok(Some(entry.clone()))
-}
-
-/// "Add this line by hand", as a stop.
-///
-/// A free function rather than the closure it used to be, because [`finish`]
-/// needs the identical wording and a closure capturing `authorise`'s locals
-/// could not be reached from there. Two copies of a remedy is how the two drift
-/// apart.
-fn paste(remote: &Remote, public_key: &str) -> Failure {
-    Failure::new(
-        format!("authorising riabuild's key on {}", remote.host),
-        format!(
-            "Add this line to ~/.ssh/authorized_keys on {}, then run `riabuild remote` again:\n{}",
-            remote.host,
-            public_key.trim()
-        ),
-    )
-}
-
-/// What the rest of the run will use, now that riabuild's own key will not.
-///
-/// The two warnings below both have to name it, and they must not name the
-/// wrong one: telling a developer riabuild will "ask for the password once and
-/// remember it" on a server that has no password to ask for is the sentence
-/// this whole feature exists to stop printing.
-///
-/// A whole sentence, capital and full stop, because both warnings set it as a
-/// paragraph of its own rather than splicing it into one.
-fn fallback(remote: &Remote, entry: Option<&crate::issued::Working>) -> String {
-    match entry {
-        Some(entry) => format!(
-            "The rest of this run will use the {} key issued to you.",
-            entry.label
-        ),
-        None => format!(
-            "The rest of this run will use {}'s password instead; riabuild asks for it \
-             once and remembers it.",
-            remote.target()
-        ),
-    }
-}
-
-/// The same remedy as [`paste`], said as a warning rather than as a stop, and
-/// said in the place the `● Authorised` would have gone — the step is over
-/// either way, and a task left at `◐` is the one outcome that is not true.
-///
-/// Deliberately built from the same `public_key`, and deliberately still naming
-/// `authorized_keys`: the developer is getting in either way, and this is how
-/// they stop needing to.
-///
-/// `outcome` is what the task line says and `because` is what the explanation
-/// opens with. They are not the same sentence twice: one has to fit beside the
-/// mark, and the other carries the error the copy actually returned.
-fn carry_on(
-    ui: &Ui,
-    remote: &Remote,
-    public_key: &str,
-    outcome: &str,
-    because: &str,
-    fallback: &str,
-) {
-    ui.unresolved(
-        "Authorised",
-        outcome,
-        &[
-            Detail::Prose(&format!(
-                "riabuild's key cannot sign in to {} yet — {because}.",
-                remote.host
-            )),
-            Detail::Prose(fallback),
-            Detail::Prose(&format!(
-                "To stop relying on that, add this line to ~/.ssh/authorized_keys on {}:",
-                remote.host
-            )),
-            Detail::Verbatim(public_key.trim()),
-        ],
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_key::entry_host;
     use crate::issued::{Issued, Working};
     use riabuild_api::ApiClient;
 
@@ -558,100 +255,6 @@ mod tests {
         .await
         .expect("write pub");
     }
-
-    #[test]
-    fn the_methods_a_server_offers_are_read_from_its_refusal() {
-        assert_eq!(
-            offered_methods("ada@box: Permission denied (publickey,password)."),
-            vec!["publickey".to_string(), "password".to_string()]
-        );
-        assert_eq!(
-            offered_methods("Permission denied (publickey,keyboard-interactive)."),
-            vec!["publickey".to_string(), "keyboard-interactive".to_string()]
-        );
-        assert_eq!(
-            offered_methods("Permission denied (publickey)."),
-            vec!["publickey".to_string()]
-        );
-        assert!(offered_methods("ssh: connect to host box port 22: Connection refused").is_empty());
-    }
-
-    /// What `ssh` really prints when the pinned key no longer matches.
-    const HOST_KEY_CHANGED: &str = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-         @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
-         IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n\
-         Host key verification failed.";
-
-    #[test]
-    fn a_host_key_failure_is_told_apart_from_an_authentication_refusal() {
-        assert!(host_key_failure(HOST_KEY_CHANGED));
-        // A first-connection refusal under StrictHostKeyChecking=yes prints
-        // only the second literal.
-        assert!(host_key_failure(
-            "No ED25519 host key is known for box and you have requested strict checking.\n\
-             Host key verification failed."
-        ));
-        assert!(!host_key_failure(
-            "ada@box: Permission denied (publickey,password)."
-        ));
-        assert!(!host_key_failure(
-            "ssh: connect to host box port 22: Connection refused"
-        ));
-        assert!(!host_key_failure(
-            "Warning: Permanently added 'box' to the list of known hosts."
-        ));
-        // Narrow on purpose: a real refusal wins even where the phrase also
-        // appears, so nothing chatty on stderr can mask a method list.
-        assert!(!host_key_failure(
-            "Host key verification failed.\nPermission denied (publickey,password)."
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_changed_host_key_makes_the_probe_itself_fail_rather_than_answer_no() {
-        // `can_sign_in` is not only `authorise`'s first step: `riabuild remote
-        // --check` calls it *instead of* `authorise`, and reads `false` as
-        // "riabuild's key is not authorised on that server yet" — a note, and
-        // exit 0. So a probe that only reports `output.ok()` hands that
-        // sentence, and a success exit code, to a developer whose server's
-        // host key has changed under them.
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let paths = RealPaths::rooted_at(home.path());
-        let fake =
-            Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 255, "", HOST_KEY_CHANGED));
-
-        let error = can_sign_in(&remote(), &paths, fake)
-            .await
-            .expect_err("a refused host key is not an answer to `can this key sign in?`");
-        let failure = error.downcast_ref::<Failure>().expect("a Failure");
-        assert!(
-            failure.attempting.contains("host key"),
-            "this has to read as a host-key problem: {}",
-            failure.attempting
-        );
-        assert!(
-            failure
-                .action
-                .contains(&paths.known_hosts_file().display().to_string()),
-            "the remedy must name the file holding the stale pin: {}",
-            failure.action
-        );
-
-        // The other direction, so this cannot pass by treating every failed
-        // probe as a host-key problem: an ordinary refusal is still `false`.
-        let denied = Arc::new(FakeRunner::new().with(
-            "ssh -o BatchMode=yes",
-            255,
-            "",
-            "Permission denied (publickey,password).",
-        ));
-        assert!(
-            !can_sign_in(&remote(), &paths, denied)
-                .await
-                .expect("an authentication refusal is an answer, not an error")
-        );
-    }
-
     #[tokio::test]
     async fn a_stale_host_key_pin_is_reported_as_one_not_as_a_keys_only_server() {
         // C3: the probe's stderr names no methods because ssh never got as far
@@ -664,12 +267,12 @@ mod tests {
         write_public_key(&paths).await;
         let fake = Arc::new(
             FakeRunner::new()
-                .with("ssh -o BatchMode=yes", 255, "", HOST_KEY_CHANGED)
+                .with("ssh -o BatchMode=yes", 255, "", probe::HOST_KEY_CHANGED)
                 .with(
                     "ssh -o PreferredAuthentications=none",
                     255,
                     "",
-                    HOST_KEY_CHANGED,
+                    probe::HOST_KEY_CHANGED,
                 ),
         );
 
@@ -710,7 +313,6 @@ mod tests {
             fake.calls()
         );
     }
-
     /// An issued key that has already proved itself against this server.
     fn working() -> Working {
         Working {
@@ -719,7 +321,6 @@ mod tests {
             public_key_path: "/tmp/riabuild-test/k17abc.pub".into(),
         }
     }
-
     #[tokio::test]
     async fn a_keys_only_server_with_an_issued_key_installs_the_key_instead_of_failing() {
         // The case this whole feature exists for, and a hard failure before it:
@@ -774,7 +375,6 @@ mod tests {
         assert!(copy.contains("IdentitiesOnly=yes"), "{copy}");
         assert!(copy.contains("k17abc.pub"), "{copy}");
     }
-
     #[tokio::test]
     async fn an_issued_key_authorises_the_copy_and_nothing_after_it() {
         // The bootstrap rule. If an issued key carried the whole run, every
@@ -823,7 +423,6 @@ mod tests {
             .count();
         assert_eq!(over_issued, 1, "{:?}", fake.calls());
     }
-
     #[tokio::test]
     async fn no_issued_key_leaves_the_keys_only_failure_exactly_as_it_was() {
         // The old behaviour has to survive untouched for the servers this
@@ -862,7 +461,6 @@ mod tests {
         let failure = error.downcast_ref::<Failure>().expect("a Failure");
         assert!(failure.detail.contains("keys only"), "{}", failure.detail);
     }
-
     #[tokio::test]
     async fn a_server_riabuilds_own_key_already_reaches_never_asks_about_issued_keys() {
         // The property that makes this feature free for a returning developer.
@@ -895,7 +493,6 @@ mod tests {
         );
         assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
-
     #[tokio::test]
     async fn a_server_that_will_not_honour_the_copied_key_carries_the_issued_one() {
         // `ssh.cloudcli.ai`, and the reason bootstrap alone was not enough: a
@@ -935,7 +532,6 @@ mod tests {
         let carried = carried.expect("the issued identity must carry the run");
         assert_eq!(carried.label, "prod-bastion");
     }
-
     #[tokio::test]
     async fn a_server_where_riabuilds_own_key_works_carries_nothing() {
         // The ordinary outcome, and the one that keeps a server's auth log able
@@ -973,7 +569,6 @@ mod tests {
             "riabuild's own key works, so nothing may be carried"
         );
     }
-
     #[tokio::test]
     async fn a_password_server_that_refuses_the_copied_key_still_carries_nothing() {
         // No issued key got in, so there is nothing to carry and the password
@@ -1013,7 +608,6 @@ mod tests {
 
         assert!(carried.is_none());
     }
-
     #[tokio::test]
     async fn a_publickey_only_server_gets_the_line_to_paste_rather_than_a_prompt() {
         // Nothing to prompt for: sshd never offers the method, so a password box
@@ -1081,7 +675,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn a_key_that_already_works_is_not_copied_again() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -1100,7 +693,40 @@ mod tests {
         .expect("already fine");
         assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
+    #[tokio::test]
+    async fn a_run_that_needs_no_password_sweeps_one_left_unconfirmed() {
+        // A previous run was killed between the askpass helper writing the
+        // password down and `copy` deciding whether the server took it. This
+        // run's key works, so nothing here will ever confirm it — `accept` and
+        // `forget` both live in the copy, which this run does not perform.
+        // Without the sweep it sat in the keyring indefinitely, for a server
+        // that has not needed a password since.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let unconfirmed = paths.remote_password_file(&format!("{}.pending", remote().hash()));
+        tokio::fs::create_dir_all(unconfirmed.parent().expect("a directory"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&unconfirmed, "typo").await.expect("write");
+        let fake = Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 0, "", ""));
 
+        authorise(
+            &remote(),
+            &paths,
+            fake,
+            &Ui::new(true),
+            &api(),
+            &mut Issued::preset(None),
+        )
+        .await
+        .expect("already fine");
+
+        assert!(
+            tokio::fs::metadata(&unconfirmed).await.is_err(),
+            "{} is still there",
+            unconfirmed.display()
+        );
+    }
     /// The refusal a server that will take a password gives, used by every
     /// test below that needs `authorise` to get past its "is there a way in?"
     /// guard.
@@ -1117,7 +743,6 @@ mod tests {
                 TAKES_A_PASSWORD,
             )
     }
-
     /// The server-side exit status meaning "the key was already there",
     /// shared with the half that emits it rather than written as a literal
     /// here — this is the contract between the two, and a test holding its
@@ -1135,7 +760,6 @@ mod tests {
             .filter(|call| call.contains("authorized_keys"))
             .count()
     }
-
     /// The one warning `authorise` printed, or a panic naming what it did
     /// print instead. Every downgraded path has to *say* something: `Ok(())`
     /// on its own is indistinguishable from a step that silently did nothing.
@@ -1144,7 +768,6 @@ mod tests {
         assert_eq!(warnings.len(), 1, "exactly one warning, not {warnings:?}");
         warnings.into_iter().next().unwrap_or_default()
     }
-
     /// A downgraded outcome still has to hand over the remedy — the key, and
     /// where it goes — or the developer is left typing a password forever
     /// with nothing to do about it.
@@ -1162,7 +785,6 @@ mod tests {
             "…and must say what happens instead, or an `Ok` reads as success: {warning}"
         );
     }
-
     /// The reported bug, from this side of it. A server that does not honour
     /// `authorized_keys` fails [`can_sign_in`] on every run, so `authorise`
     /// reaches the copy step on every run — that part is correct and stays.
@@ -1216,7 +838,6 @@ mod tests {
             "…and pointed at what could actually be wrong on the server: {warning}"
         );
     }
-
     /// Nothing changed on the server, so nothing can have changed the answer
     /// to "can this key sign in?" — and each probe is a full connection that,
     /// on the very server this path exists for, costs the developer a
@@ -1254,7 +875,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn a_key_that_will_not_sign_in_after_copying_warns_instead_of_stopping() {
         // The copy succeeded — the line reached `authorized_keys` — and sshd
@@ -1293,7 +913,6 @@ mod tests {
         );
         assert_carries_the_remedy(&warning);
     }
-
     #[tokio::test]
     async fn a_copy_that_fails_warns_rather_than_ending_the_run() {
         // A read-only home, a full disk, a connection that dropped. The
@@ -1325,7 +944,6 @@ mod tests {
         assert!(warning.contains("could not add it"), "{warning}");
         assert_carries_the_remedy(&warning);
     }
-
     #[tokio::test]
     async fn a_key_that_works_after_being_installed_is_reported_as_success() {
         // The success branch (`ui.applied("Authorised"); Ok(())`) needs a
@@ -1374,7 +992,6 @@ mod tests {
             ui.warned()
         );
     }
-
     #[tokio::test]
     async fn a_missing_public_key_fails_loudly_instead_of_pasting_nothing() {
         // No `.pub` file written: stands in for a crash between key

@@ -154,228 +154,237 @@ pub(super) async fn connect_and_setup(
     // `issued`'s module doc.
     let mut issued = issued::Issued::new();
     let mut carried: Option<issued::Working> = None;
-    if request.check {
-        if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
-            // Probing is a read, so it is allowed on this path — and it is the
-            // difference between a developer knowing to run without `--check`
-            // and a developer filing a ticket. A server riabuild cannot reach
-            // at all and one it can reach with an issued key look identical
-            // without it.
-            let entry = issued
-                .working(
-                    &ctx.api,
-                    &remote,
-                    ctx.paths.as_ref(),
-                    ctx.runner.clone(),
-                    &ctx.ui,
-                )
-                .await
-                .map(|entry| entry.label.clone());
-            match entry {
-                Some(label) => ctx.ui.note(&format!(
-                    "--check: riabuild's key is not authorised on that server yet, but the \
-                     {label} key issued to you can sign in. Run `riabuild remote` without \
-                     --check to finish setting it up.",
-                )),
-                None => ctx.ui.note(
-                    "--check: riabuild's key is not authorised on that server yet, so there is \
-                     nothing here to check. Run `riabuild remote` without --check to install it.",
-                ),
+    // One exit from here on, so there is exactly one place the agent is
+    // stopped.
+    //
+    // `Drop for Agent` guarantees the process dies however this returns, and
+    // that is the backstop rather than the plan: it kills rather than ends,
+    // and it cannot `await` the directory removal, so an orderly `stop` is
+    // still what takes the socket and the public half off disk. Two of the
+    // three ways out of the block below called it and the *success* path —
+    // the one every ordinary run takes — did not. A `?` added inside later
+    // cannot reintroduce that, because there is no longer anywhere to forget
+    // it: every return from the block lands on the line after `.await`.
+    let outcome: Result<i32> = async {
+        if request.check {
+            if !authorise::can_sign_in(&remote, ctx.paths.as_ref(), ctx.runner.clone()).await? {
+                // Probing is a read, so it is allowed on this path — and it is the
+                // difference between a developer knowing to run without `--check`
+                // and a developer filing a ticket. A server riabuild cannot reach
+                // at all and one it can reach with an issued key look identical
+                // without it.
+                let entry = issued
+                    .working(
+                        &ctx.api,
+                        &remote,
+                        ctx.paths.as_ref(),
+                        ctx.runner.clone(),
+                        &ctx.ui,
+                    )
+                    .await
+                    .map(|entry| entry.label.clone());
+                match entry {
+                    Some(label) => ctx.ui.note(&format!(
+                        "--check: riabuild's key is not authorised on that server yet, but the \
+                         {label} key issued to you can sign in. Run `riabuild remote` without \
+                         --check to finish setting it up.",
+                    )),
+                    None => ctx.ui.note(
+                        "--check: riabuild's key is not authorised on that server yet, so there is \
+                         nothing here to check. Run `riabuild remote` without --check to install it.",
+                    ),
+                }
+                return Ok(0);
             }
-            issued.stop().await;
-            return Ok(0);
+        } else {
+            // Persisted *before* `authorise`, not after it succeeds: `ssh-copy-id`
+            // can append riabuild's key to the server's `authorized_keys` and the
+            // sign-in probe after it still fail, which returns `Err`. With no
+            // record on disk, `remote forget build-01` then refuses — "there is no
+            // saved server named build-01" — and that key line, this laptop's
+            // host-key pin, and its key pair are removable by hand only. A record
+            // for a server that never authorised at all is the cheaper mistake.
+            store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
+            // The agent is *not* stopped here. On an ordinary server `authorise`
+            // hands back `None` and everything below runs on riabuild's own key —
+            // which is what keeps `remote forget`'s per-developer cleanup meaning
+            // anything. On a server that accepted the key into `authorized_keys`
+            // and still refuses it, it hands back the issued identity instead, and
+            // that identity has to stay usable for every connection below.
+            match authorise::authorise(
+                &remote,
+                ctx.paths.as_ref(),
+                ctx.runner.clone(),
+                &ctx.ui,
+                &ctx.api,
+                &mut issued,
+            )
+            .await
+            {
+                Ok(entry) => carried = entry,
+                Err(error) => return Err(error),
+            }
         }
-    } else {
-        // Persisted *before* `authorise`, not after it succeeds: `ssh-copy-id`
-        // can append riabuild's key to the server's `authorized_keys` and the
-        // sign-in probe after it still fail, which returns `Err`. With no
-        // record on disk, `remote forget build-01` then refuses — "there is no
-        // saved server named build-01" — and that key line, this laptop's
-        // host-key pin, and its key pair are removable by hand only. A record
-        // for a server that never authorised at all is the cheaper mistake.
-        store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
-        // The agent is *not* stopped here. On an ordinary server `authorise`
-        // hands back `None` and everything below runs on riabuild's own key —
-        // which is what keeps `remote forget`'s per-developer cleanup meaning
-        // anything. On a server that accepted the key into `authorized_keys`
-        // and still refuses it, it hands back the issued identity instead, and
-        // that identity has to stay usable for every connection below.
-        match authorise::authorise(
+        let carry = carried.as_ref();
+
+        // `resolve_home` runs its own command over `ssh_once`, which is refused
+        // outright — before any authentication is even attempted — by a host key
+        // `trust_host` has not pinned yet or a key `authorise` has not put in
+        // `authorized_keys` yet (`StrictHostKeyChecking=yes` fails the whole
+        // connection at the host-key step, before publickey auth is offered a
+        // chance). It has to come after both, or the very first `riabuild
+        // remote <new-server>` — the one case every unit test in this file
+        // sidesteps by pre-seeding `record.home` in its fixture — fails
+        // immediately with a confusing "asking … where your home directory is"
+        // error instead of ever reaching the host-key prompt. Found by actually
+        // running this flow against a fresh container in Task 22's e2e test,
+        // which is the one place a truly new remote is ever exercised.
+        let home = resolve_home(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            store,
+            carry,
+        )
+        .await?;
+        // The second checkpoint: `forget`'s server-side cleanup builds its paths
+        // out of `record.home` and skips entirely when that is empty, so a run
+        // that dies at the very next step (`install::ensure_riabuild`) would leave
+        // a key line on the server that `forget` can no longer reach in to remove.
+        // Conditional because this is the one step `--check` runs against the
+        // server, and saving here unconditionally is what made a read-only probe
+        // show up in `remote list` as a server the developer had set up.
+        if !request.check {
+            store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
+        }
+        let prefix = env_prefix(&home, &member.member_id, &remote.name);
+        let prefix_refs: Vec<(&str, &str)> = prefix
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+
+        let binary = install::ensure_riabuild(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &ctx.ui,
+            &home,
+            &version,
+            carry,
+        )
+        .await?;
+
+        // `--check` stops here. Everywhere else in riabuild that flag means *touch
+        // nothing*, and the steps below mint a bearer token onto a remote
+        // filesystem and hand that server this developer's GitHub identity.
+        if request.check {
+            ctx.ui
+                .note("--check: not minting a session or lending a GitHub sign-in.");
+            let command = env_command(&prefix_refs, &binary, &["--check", "--no-shell"]);
+            let code = shell::run_setup(
+                &remote,
+                ctx.paths.as_ref(),
+                ctx.runner.clone(),
+                &ctx.ui,
+                &command,
+                carry,
+            )
+            .await?;
+            return Ok(code);
+        }
+
+        session::ensure(
             &remote,
             ctx.paths.as_ref(),
             ctx.runner.clone(),
             &ctx.ui,
             &ctx.api,
-            &mut issued,
+            &member,
+            &ctx.cli_version,
+            store,
+            carry,
         )
-        .await
-        {
-            Ok(entry) => carried = entry,
-            Err(error) => {
-                // Stopped before returning, so a failed `authorise` never
-                // leaves an agent holding the org's keys.
-                issued.stop().await;
-                return Err(error);
-            }
+        .await?;
+
+        // `gh-sweep` and `seed-github` both exec the *server's own* riabuild —
+        // which is what makes `scope::detect` see it as remote at all (it reads
+        // `RIABUILD_REMOTE` from that process's own environment) and, through
+        // that, what routes `internal seed-github`'s `gh auth login` into this
+        // developer's own scoped `GH_CONFIG_DIR` rather than a shared default.
+        // `env_command` with no trailing args produces exactly the
+        // `env 'K=V'… '/abs/path/riabuild'` prefix these two internal
+        // subcommands are appended onto as plain, unquoted words.
+        let remote_binary = env_command(&prefix_refs, &binary, &[]);
+        sweep_then_seed(
+            &remote,
+            ctx.paths.as_ref(),
+            ctx.runner.clone(),
+            &ctx.ui,
+            &remote_binary,
+            carry,
+        )
+        .await?;
+
+        ctx.ui.heading(&format!("Checking {}", remote.name));
+        let mut args: Vec<String> = vec!["--no-shell".to_string()];
+        if request.quiet {
+            args.push("--quiet".to_string());
         }
-    }
-    let carry = carried.as_ref();
-
-    // `resolve_home` runs its own command over `ssh_once`, which is refused
-    // outright — before any authentication is even attempted — by a host key
-    // `trust_host` has not pinned yet or a key `authorise` has not put in
-    // `authorized_keys` yet (`StrictHostKeyChecking=yes` fails the whole
-    // connection at the host-key step, before publickey auth is offered a
-    // chance). It has to come after both, or the very first `riabuild
-    // remote <new-server>` — the one case every unit test in this file
-    // sidesteps by pre-seeding `record.home` in its fixture — fails
-    // immediately with a confusing "asking … where your home directory is"
-    // error instead of ever reaching the host-key prompt. Found by actually
-    // running this flow against a fresh container in Task 22's e2e test,
-    // which is the one place a truly new remote is ever exercised.
-    let home = resolve_home(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        store,
-        carry,
-    )
-    .await?;
-    // The second checkpoint: `forget`'s server-side cleanup builds its paths
-    // out of `record.home` and skips entirely when that is empty, and the very
-    // next step (`install::ensure_riabuild`) currently fails on every Linux
-    // server — no published musl asset — so without this the common failure
-    // leaves a key line on the server that `forget` can no longer reach in to
-    // remove. Conditional because this is the one step `--check` runs against
-    // the server, and saving here unconditionally is what made a read-only
-    // probe show up in `remote list` as a server the developer had set up.
-    if !request.check {
-        store::persist_one(ctx.paths.as_ref(), store, &remote.name).await?;
-    }
-    let prefix = env_prefix(&home, &member.member_id, &remote.name);
-    let prefix_refs: Vec<(&str, &str)> = prefix
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-
-    let binary = install::ensure_riabuild(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        &ctx.ui,
-        &home,
-        &version,
-        carry,
-    )
-    .await?;
-
-    // `--check` stops here. Everywhere else in riabuild that flag means *touch
-    // nothing*, and the steps below mint a bearer token onto a remote
-    // filesystem and hand that server this developer's GitHub identity.
-    if request.check {
-        ctx.ui
-            .note("--check: not minting a session or lending a GitHub sign-in.");
-        let command = env_command(&prefix_refs, &binary, &["--check", "--no-shell"]);
+        if let Some(repo) = &request.repo {
+            args.push("--repo".to_string());
+            args.push(repo.clone());
+        }
+        if let Some(project) = &request.project {
+            args.push("--project".to_string());
+            args.push(project.clone());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let setup = env_command(&prefix_refs, &binary, &arg_refs);
+        // `ssh -t`, never mosh. mosh does not propagate the remote command's exit
+        // status, so a failed setup would return 0 and the flow would open a
+        // shell on a broken box. mosh is for the shell, which is the only thing
+        // that benefits from surviving sleep and roaming.
         let code = shell::run_setup(
             &remote,
             ctx.paths.as_ref(),
             ctx.runner.clone(),
             &ctx.ui,
-            &command,
+            &setup,
             carry,
         )
         .await?;
-        return Ok(code);
-    }
+        if code != 0 {
+            return Ok(code);
+        }
 
-    session::ensure(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        &ctx.ui,
-        &ctx.api,
-        &member,
-        &ctx.cli_version,
-        store,
-        carry,
-    )
-    .await?;
-
-    // `gh-sweep` and `seed-github` both exec the *server's own* riabuild —
-    // which is what makes `scope::detect` see it as remote at all (it reads
-    // `RIABUILD_REMOTE` from that process's own environment) and, through
-    // that, what routes `internal seed-github`'s `gh auth login` into this
-    // developer's own scoped `GH_CONFIG_DIR` rather than a shared default.
-    // `env_command` with no trailing args produces exactly the
-    // `env 'K=V'… '/abs/path/riabuild'` prefix these two internal
-    // subcommands are appended onto as plain, unquoted words.
-    let remote_binary = env_command(&prefix_refs, &binary, &[]);
-    sweep_then_seed(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        &ctx.ui,
-        &remote_binary,
-        carry,
-    )
-    .await?;
-
-    ctx.ui.heading(&format!("Checking {}", remote.name));
-    let mut args: Vec<String> = vec!["--no-shell".to_string()];
-    if request.quiet {
-        args.push("--quiet".to_string());
+        store::remember(ctx, store, &remote, &version).await?;
+        if request.no_shell {
+            return Ok(0);
+        }
+        // The clipboard channel comes up with the shell and goes down with it, and
+        // nothing about it may cost the developer that shell — `channel::open_shell`
+        // owns both halves of that. `--check` and `--no-shell` have already
+        // returned above, so neither starts anything.
+        channel::open_shell(channel::Plan {
+            remote: &remote,
+            paths: ctx.paths.as_ref(),
+            runner: ctx.runner.clone(),
+            ui: &ctx.ui,
+            quiet: request.quiet,
+            remote_socket: channel::remote_socket(&session::namespace(&home, &member.member_id)),
+            // The pump carries the same environment every other remote invocation
+            // does, so it binds the socket where this session's shims look for it
+            // rather than where the server would have guessed — which, on a box
+            // several developers share, is one socket for all of them.
+            pump: env_command(&prefix_refs, &binary, &["channel", "pump"]),
+            shell: env_command(&prefix_refs, &binary, &["shell"]),
+            carry,
+        })
+        .await
     }
-    if let Some(repo) = &request.repo {
-        args.push("--repo".to_string());
-        args.push(repo.clone());
-    }
-    if let Some(project) = &request.project {
-        args.push("--project".to_string());
-        args.push(project.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let setup = env_command(&prefix_refs, &binary, &arg_refs);
-    // `ssh -t`, never mosh. mosh does not propagate the remote command's exit
-    // status, so a failed setup would return 0 and the flow would open a
-    // shell on a broken box. mosh is for the shell, which is the only thing
-    // that benefits from surviving sleep and roaming.
-    let code = shell::run_setup(
-        &remote,
-        ctx.paths.as_ref(),
-        ctx.runner.clone(),
-        &ctx.ui,
-        &setup,
-        carry,
-    )
-    .await?;
-    if code != 0 {
-        return Ok(code);
-    }
-
-    store::remember(ctx, store, &remote, &version).await?;
-    if request.no_shell {
-        return Ok(0);
-    }
-    // The clipboard channel comes up with the shell and goes down with it, and
-    // nothing about it may cost the developer that shell — `channel::open_shell`
-    // owns both halves of that. `--check` and `--no-shell` have already
-    // returned above, so neither starts anything.
-    channel::open_shell(channel::Plan {
-        remote: &remote,
-        paths: ctx.paths.as_ref(),
-        runner: ctx.runner.clone(),
-        ui: &ctx.ui,
-        quiet: request.quiet,
-        remote_socket: channel::remote_socket(&session::namespace(&home, &member.member_id)),
-        // The pump carries the same environment every other remote invocation
-        // does, so it binds the socket where this session's shims look for it
-        // rather than where the server would have guessed — which, on a box
-        // several developers share, is one socket for all of them.
-        pump: env_command(&prefix_refs, &binary, &["channel", "pump"]),
-        shell: env_command(&prefix_refs, &binary, &["shell"]),
-        carry,
-    })
-    .await
+    .await;
+    issued.stop().await;
+    outcome
 }
 
 /// Clears a dead session's leftovers, then lends this laptop's GitHub sign-in
@@ -929,9 +938,14 @@ mod tests {
     /// the server's `authorized_keys` — and then dies at the install step must
     /// leave a record behind, or `remote forget` has nothing to act on.
     ///
-    /// This is today's default outcome rather than a corner case:
-    /// `install::ensure_riabuild` fails on every Linux server, because no
-    /// `x86_64-unknown-linux-musl` asset is published yet.
+    /// The install step is the one this is written around, because everything
+    /// it needs — a checksums file, a tarball, a digest that matches — comes
+    /// over the network and none of it is stood up here, so it is where a unit
+    /// test's run reliably ends. (It was once the *default* outcome on a real
+    /// laptop too: no `x86_64-unknown-linux-musl` asset was published, so every
+    /// Linux server failed here. `release.yml` has built and checksummed both
+    /// musl targets since v2026.08.10, so that is history and not the state of
+    /// the world.)
     #[tokio::test]
     async fn a_run_that_touched_the_server_and_then_failed_can_still_be_forgotten() {
         let fake = FakeRunner::new()
@@ -1004,6 +1018,91 @@ mod tests {
             "the key line riabuild added to the server has to be reachable by \
              forget's cleanup: {:?}",
             fake.calls()
+        );
+    }
+
+    /// I034, end to end, on the fixture the bug needed and nothing had: one of
+    /// the team's servers.
+    ///
+    /// `Remote::from(&Record)` carries the *display* name, so everything
+    /// downstream of `choose` is holding `shared-build-01` while the record on
+    /// disk holds the bare `build-01` with a `sharedId` beside it. Both
+    /// write-backs — `resolve_home`'s and `session::ensure`'s — matched on the
+    /// bare `name` field, so for a shared server they found nothing and said
+    /// nothing.
+    ///
+    /// The consequence this asserts is `home`: `forget`'s server-side cleanup
+    /// builds its paths out of that field and returns early when it is empty,
+    /// so an unrecorded home is the namespace and the key line staying on every
+    /// one of the team's servers for ever. The session id is the same miss one
+    /// step further along — it is covered in `session.rs`, where the mint can
+    /// be reached without a real riabuild-web.
+    #[tokio::test]
+    async fn one_of_the_teams_servers_records_what_it_learns_under_the_name_it_is_reached_by() {
+        let fake = FakeRunner::new()
+            .with("ssh-keygen -t ed25519", 0, "", "")
+            .with(
+                &format!(
+                    "ssh-keyscan -t {} -p {} -T 5 {}",
+                    host_key::KEY_TYPES,
+                    remote().port,
+                    remote().host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote().host),
+                "",
+            )
+            .with("ssh-keygen -lf -", 0, GOOD_FINGERPRINT_LINE, "")
+            // riabuild's key already works, so `authorise` is a no-op and the
+            // run reaches `resolve_home` and then the install step, where
+            // `uname -sm` names no Rust target and it stops.
+            .with("ssh -o BatchMode=yes", 0, "", "")
+            .with("ssh", 0, "", "")
+            .containing("printf %s", 0, "/home/dev", "");
+        let (mut ctx, _home, fake) = riabuild_tasks::testing::ctx_and_runner(fake).await;
+        ctx.member = Some(member());
+
+        let mut store = store::Store::default();
+        // As `shared::reconcile` leaves it: refreshed by this run's fetch, and
+        // never connected to, so `home` is empty and has to be learned.
+        store
+            .remotes
+            .push(store::shared_record_for(&remote(), "k17abc"));
+        assert_eq!(store.remotes[0].name, "build-01");
+        assert_eq!(store.remotes[0].display_name(), "shared-build-01");
+
+        let request = Request {
+            target: Some("shared-build-01".to_string()),
+            accept_host_key: Some(GOOD_FINGERPRINT.to_string()),
+            ..Default::default()
+        };
+        connect_and_setup(&mut ctx, &request, &mut store, Vec::new())
+            .await
+            .expect_err("the fake server reports no usable platform");
+
+        assert!(
+            fake.calls().iter().any(|call| call.contains("printf %s")),
+            "only meaningful if the run really asked the server: {:?}",
+            fake.calls()
+        );
+
+        // Read back off the disk, not out of the run's own store: `forget` is
+        // a later process and sees only what `remotes.json` holds.
+        let saved = store::Store::load(ctx.paths.as_ref()).await;
+        let record = saved
+            .find("shared-build-01")
+            .expect("one of the team's servers is still saved under its own row");
+        assert_eq!(
+            record.home, "/home/dev",
+            "the home has to land on the shared record, or `forget` skips the server-side \
+             cleanup entirely and the namespace and key line stay there for ever"
+        );
+        assert_eq!(record.shared_id, "k17abc");
+        assert_eq!(
+            saved.remotes.len(),
+            1,
+            "and no second row under the display name: {:?}",
+            saved.names()
         );
     }
 

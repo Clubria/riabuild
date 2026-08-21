@@ -18,7 +18,7 @@ mod sockets;
 
 pub use sockets::remote_socket;
 
-use super::{Remote, askpass, identity, shell};
+use super::{Remote, askpass, shell};
 use anyhow::Result;
 use hold::{Holder, hold};
 use riabuild_channel::supervisor::{StatusLine, Stop, Tunnel};
@@ -236,7 +236,9 @@ async fn try_start(plan: &Plan<'_>) -> Result<(Started, bool)> {
             // was never passed at all, so the servers riabuild's own key cannot
             // sign in to — the whole reason issued keys exist — could not carry
             // a channel however well the rest of the session worked.
-            options: identity::ssh_options(plan.remote, plan.paths, true, plan.carry),
+            options: crate::ssh::Ssh::to(plan.remote, plan.paths, plan.runner.clone())
+                .carry(plan.carry)
+                .options_only(),
             command: plan.pump.clone(),
             env: askpass::ssh_env(plan.remote, plan.paths),
         },

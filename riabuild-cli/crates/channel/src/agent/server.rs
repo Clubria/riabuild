@@ -6,12 +6,13 @@
 //! a check on a socket that is merely still open.
 
 use super::Agent;
+use crate::line;
 use crate::protocol::{ErrorCode, Request, Response, decode_request, encode_response};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 impl Agent {
@@ -46,8 +47,13 @@ impl Agent {
 
     async fn serve_one(&self, stream: UnixStream) -> Result<()> {
         let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        // Bounded, the same way `mux` and `client` bound theirs. `decode_request`
+        // refuses a body over the cap, and until this existed nothing refused a
+        // *header* that never ended — so a connection to this socket could make
+        // the laptop's own agent allocate without limit.
+        let line = line::read_header_line(&mut reader)
+            .await?
+            .unwrap_or_default();
 
         let (header, body) = match decode_request(&line) {
             Ok(request) => {
@@ -100,6 +106,9 @@ mod tests {
     use crate::mime::TEXT;
     use crate::protocol::{Request, decode_response, encode_request};
     use std::time::Duration;
+    // The tests read replies as lines because a reply *is* one line; only the
+    // production reader has an untrusted peer at the other end of it.
+    use tokio::io::AsyncBufReadExt;
 
     /// Starts an agent and waits for the listener rather than sleeping a fixed
     /// interval.

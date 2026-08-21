@@ -69,19 +69,20 @@ pub async fn fetch(ctx: &Ctx, owner: &str) -> Listing {
 
     let endpoint = format!("orgs/{owner}/repos?type=all&sort=pushed&per_page={PAGE}");
     let args = ["api", endpoint.as_str(), "--jq", JQ];
-    let options = RunOptions::default();
-    let call = ctx.runner.run(&gh, &args, &options);
+    // The bound is the runner's, not a `tokio::time::timeout` around the call.
+    // A wrapper here stops riabuild *waiting* and leaves the `gh` running — one
+    // more process holding the config directory the tasks after this are about
+    // to rewrite — where the runner's own bound drops the child with the
+    // expired future and the kernel reaps it (`RealRunner::start`'s
+    // `kill_on_drop`).
+    let options = RunOptions {
+        timeout: Some(PATIENCE),
+        ..Default::default()
+    };
 
-    // The runner has no timeout of its own, so the bound is here.
-    let output = match tokio::time::timeout(PATIENCE, call).await {
-        Err(_) => {
-            return Listing::Unavailable(format!(
-                "GitHub did not answer within {} seconds",
-                PATIENCE.as_secs()
-            ));
-        }
-        Ok(Err(error)) => return Listing::Unavailable(format!("{error:#}")),
-        Ok(Ok(output)) => output,
+    let output = match ctx.runner.run(&gh, &args, &options).await {
+        Err(error) => return Listing::Unavailable(unanswered(&error)),
+        Ok(output) => output,
     };
 
     if !output.ok() {
@@ -94,6 +95,30 @@ pub async fn fetch(ctx: &Ctx, owner: &str) -> Listing {
     }
 
     Listing::Repos(parse(&output.stdout))
+}
+
+/// What to tell the developer about a `gh` that produced no answer at all.
+///
+/// With the bound at the runner an expired call comes back as an ordinary
+/// `Err` — the runner's own "`gh` did not finish within 8 seconds" — rather
+/// than as an `Elapsed` this could match on the type of. The sentence has to
+/// survive that shape change: what a slow API looks like from here is *GitHub
+/// did not answer*, and that is what the box shows in place of the list. A
+/// path naming riabuild's own copy of `gh` and a number the developer never
+/// chose is a worse answer to the same question.
+///
+/// Everything else — `gh` missing between the `try_exists` above and the spawn,
+/// a broken pipe — keeps the error's own words, for the reason the `!ok()`
+/// branch keeps `gh`'s: none of it is riabuild's to paraphrase.
+fn unanswered(error: &anyhow::Error) -> String {
+    let said = format!("{error:#}");
+    if said.contains("did not finish within") {
+        return format!(
+            "GitHub did not answer within {} seconds",
+            PATIENCE.as_secs()
+        );
+    }
+    said
 }
 
 /// One `slug<TAB>epoch` line per repository.
@@ -120,8 +145,8 @@ pub fn parse(stdout: &str) -> Vec<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{ctx_and_runner, ctx_with, install_owned_tools};
-    use riabuild_runner::FakeRunner;
+    use crate::testing::{Bounds, ctx_and_runner, ctx_with, install_owned_tools};
+    use riabuild_runner::{CommandRunner, FakeRunner};
 
     const TWO_ROWS: &str = "Clubria/ai-builders-hub\t1755000000\nClubria/payments\t1754900000\n";
 
@@ -200,6 +225,58 @@ mod tests {
             ),
             other => panic!("a failing listing must not read as an empty one: {other:?}"),
         }
+    }
+
+    /// The picker's own patience reaches the runner, rather than being a
+    /// wrapper around it that leaves the `gh` running.
+    #[tokio::test]
+    async fn the_listing_holds_github_to_the_pickers_patience() {
+        let runner = FakeRunner::new().containing("api orgs/Clubria/repos", 0, TWO_ROWS, "");
+        let (mut ctx, _home, _fake) = ctx_and_runner(runner).await;
+        install_owned_tools(&ctx).await;
+        let bounds = Bounds::default();
+        ctx.runner = bounds.watching(ctx.runner.clone());
+
+        fetch(&ctx, "Clubria").await;
+
+        assert_eq!(bounds.of("api orgs/"), Some(Duration::from_secs(8)));
+        assert_ne!(
+            bounds.of("api orgs/"),
+            RunOptions::default().timeout,
+            "the first thing a run puts on screen does not wait out the default ceiling"
+        );
+    }
+
+    /// The sentence the developer reads when GitHub says nothing, pinned
+    /// against the error the runner actually produces.
+    ///
+    /// `unanswered` recognises an expired call by the runner's wording, which
+    /// is a coupling between two crates that nothing else would fail on: with
+    /// the bound moved, an `Elapsed` no longer arrives as a type this can
+    /// match. So the real error is made here, by a real child that outlasts a
+    /// real bound, rather than written out by hand — a message reworded in
+    /// `riabuild-runner` has to fail *somewhere*, and this is the somewhere.
+    #[tokio::test]
+    async fn a_github_that_never_answers_is_reported_as_github_not_answering() {
+        let error = riabuild_runner::RealRunner
+            .run(
+                "sleep",
+                &["30"],
+                &RunOptions {
+                    timeout: Some(Duration::from_millis(50)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a child that outlasts its bound is a failure");
+
+        assert_eq!(unanswered(&error), "GitHub did not answer within 8 seconds");
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_a_timeout_keeps_its_own_words() {
+        let error = anyhow::anyhow!("could not start `gh`");
+        assert_eq!(unanswered(&error), "could not start `gh`");
     }
 
     #[tokio::test]

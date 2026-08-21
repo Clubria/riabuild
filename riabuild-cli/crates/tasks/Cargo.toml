@@ -10,6 +10,7 @@ publish = false
 
 [lints]
 workspace = true
+
 [features]
 # The `Ctx` builders — a context pointed at a tempdir with every external
 # process and secret store faked. This is what makes each `check()` a unit test

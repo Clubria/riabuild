@@ -1060,6 +1060,7 @@ dependencies = [
  "anyhow",
  "flate2",
  "reqwest",
+ "riabuild-ui",
  "ring",
  "tar",
  "tempfile",
@@ -1086,6 +1087,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "libc",
+ "riabuild-paths",
  "riabuild-runner",
  "riabuild-ui",
  "tempfile",

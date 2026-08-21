@@ -12,10 +12,20 @@
 
 // `unwrap_used` is denied workspace-wide. In test scaffolding a panic *is* the
 // reporting mechanism for a failed precondition, so unwrapping a fixture is
-// correct. The `feature = "testing"` half matters as much as the `test` half:
-// when a downstream crate turns the feature on, this crate is compiled as a
-// dependency and `cfg(test)` is false, so the exemption would not apply.
-#![cfg_attr(any(test, feature = "testing"), allow(clippy::unwrap_used))]
+// correct — but the exemption is `test` and nothing else, and must stay that
+// way.
+//
+// It read `any(test, feature = "testing")`, which switched the lint off for
+// this crate's *production* code under the one command that enforces it.
+// `cargo clippy --workspace --all-targets` resolves dev-dependencies, a
+// dev-dependency somewhere in the workspace asks for `testing`, and features
+// unify onto the lib target — so the whole crate compiled with the allow on.
+// With `test` alone the lib target is linted again, and the unit-test target
+// that keeps the allow holds no production code the lib target does not.
+//
+// Scaffolding behind `feature = "testing"` carries its own allow where it is
+// defined, which is a hole the size of a module rather than of a crate.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 /// A brand colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

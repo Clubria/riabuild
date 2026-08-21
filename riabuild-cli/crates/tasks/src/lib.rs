@@ -2,10 +2,20 @@
 
 // `unwrap_used` is denied workspace-wide. In test scaffolding a panic *is* the
 // reporting mechanism for a failed precondition, so unwrapping a fixture is
-// correct. The `feature = "testing"` half matters as much as the `test` half:
-// when a downstream crate turns the feature on, this crate is compiled as a
-// dependency and `cfg(test)` is false, so the exemption would not apply.
-#![cfg_attr(any(test, feature = "testing"), allow(clippy::unwrap_used))]
+// correct — but the exemption is `test` and nothing else, and must stay that
+// way.
+//
+// It read `any(test, feature = "testing")`, which switched the lint off for
+// this crate's *production* code under the one command that enforces it.
+// `cargo clippy --workspace --all-targets` resolves dev-dependencies, a
+// dev-dependency somewhere in the workspace asks for `testing`, and features
+// unify onto the lib target — so the whole crate compiled with the allow on.
+// With `test` alone the lib target is linted again, and the unit-test target
+// that keeps the allow holds no production code the lib target does not.
+//
+// Scaffolding behind `feature = "testing"` carries its own allow where it is
+// defined, which is a hole the size of a module rather than of a crate.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 pub mod accounts;
 pub mod claude_accounts;
@@ -16,6 +26,7 @@ pub mod claude_plugins;
 pub mod claude_statusline;
 pub mod claude_trust;
 pub mod codex_cli;
+mod ctx;
 pub mod engine;
 pub mod env_local;
 pub mod git_credentials;
@@ -25,489 +36,44 @@ pub mod infisical_cli;
 pub mod login;
 pub mod ngrok;
 pub mod org_settings;
+pub(crate) mod owned_tool;
 pub mod project;
 pub mod repo;
 pub mod repo_status;
 pub mod scope;
 pub mod shell;
 pub mod shims;
+mod task;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod toolchain;
 
-use crate::scope::Scope;
-use anyhow::Result;
-use async_trait::async_trait;
-use riabuild_api::org::OrgConfig;
-use riabuild_api::{ApiClient, ApiError, Member, Repo};
-use riabuild_keychain::Keychain;
-use riabuild_paths::Paths;
-use riabuild_paths::config::{State, UserConfig};
-use riabuild_runner::CommandRunner;
-use riabuild_ui::Ui;
-use std::sync::Arc;
-
-pub type TaskId = &'static str;
-
-/// Why a task is about to run. Surfaced to the developer, so it reads as an
-/// explanation rather than a status code.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reason {
-    NeverRun,
-    VersionChanged { from: u32, to: u32 },
-    UpstreamChanged(TaskId),
-    CheckFailed(String),
-}
-
-impl Reason {
-    pub fn describe(&self) -> String {
-        match self {
-            Reason::NeverRun => "first run".to_string(),
-            Reason::VersionChanged { from, to } => {
-                format!("riabuild changed what this should look like (v{from} → v{to})")
-            }
-            Reason::UpstreamChanged(id) => format!("{id} changed"),
-            Reason::CheckFailed(detail) => detail.clone(),
-        }
-    }
-
-    /// Stored in `state.json` for the next run to report against.
-    pub fn tag(&self) -> String {
-        match self {
-            Reason::NeverRun => "never_run".into(),
-            Reason::VersionChanged { .. } => "version_changed".into(),
-            Reason::UpstreamChanged(id) => format!("upstream:{id}"),
-            Reason::CheckFailed(_) => "check_failed".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Status {
-    Satisfied,
-    Needs(Reason),
-}
-
-impl Status {
-    /// Convenience for the common `check()` shape.
-    pub fn needs(detail: impl Into<String>) -> Status {
-        Status::Needs(Reason::CheckFailed(detail.into()))
-    }
-}
-
-#[async_trait]
-pub trait Task: Send + Sync {
-    fn id(&self) -> TaskId;
-    fn title(&self) -> &str;
-    /// Forced-rerun escape hatch for drift `check()` genuinely cannot observe.
-    /// `check()` is authoritative; bumping this to paper over a weak check is a
-    /// bug in the check.
-    fn version(&self) -> u32;
-    fn depends_on(&self) -> &[TaskId];
-    async fn check(&self, ctx: &Ctx) -> Result<Status>;
-    async fn apply(&self, ctx: &mut Ctx) -> Result<()>;
-}
-
-/// Everything a task is allowed to touch.
-pub struct Ctx {
-    pub paths: Arc<dyn Paths>,
-    pub runner: Arc<dyn CommandRunner>,
-    pub keychain: Arc<dyn Keychain>,
-    pub api: ApiClient,
-    pub ui: Ui,
-    pub config: UserConfig,
-    pub state: State,
-    pub org: Option<OrgConfig>,
-    /// The repository this run is about, once something has decided which.
-    ///
-    /// Set from `config.active_repo`, from `--repo`, or by the picker — never by
-    /// a task. Tasks read it through `Ctx::repo`, which is the only thing they
-    /// may name a repository by: `org.repo_slug` is the *default* the picker
-    /// offers, and reading it in a task is how a run ends up cloning one
-    /// repository and provisioning another.
-    pub repo: Option<Repo>,
-    pub member: Option<Member>,
-    /// The server this riabuild is managed from, when it is on one.
-    ///
-    /// The only remote-mode fact a task is allowed to branch on. Everything else
-    /// arrives through `ScopedRunner` and `Paths`, precisely so tasks do not
-    /// grow remote-mode branches.
-    pub server: Option<String>,
-    pub cli_version: String,
-    /// Environment the shell will be spawned with.
-    pub env: Vec<(String, String)>,
-    /// Report-only findings, printed after the run. `repo_status` fills this.
-    pub notes: Vec<String>,
-    /// Set when the developer asked for checks only.
-    pub dry_run: bool,
-}
-
-impl Ctx {
-    /// Assembles the `Ctx` a run works against.
-    ///
-    /// Lives beside `Ctx` rather than in `main` so the one field that comes
-    /// from `Scope` — `server` — is testable without standing up
-    /// `RealPaths::new()`, a real `ApiClient`, or a platform keychain.
-    /// `Ctx.server` is the only remote-mode fact a task is allowed to branch
-    /// on (see the field's own comment), and this is the one place it is set
-    /// from the environment riabuild actually found itself in — hardcoding
-    /// `None` here is the regression that leaves per-developer checkout
-    /// namespacing (`paths::remote_project_dir`, `Ctx::default_checkout`) dead
-    /// on every server despite compiling and passing every other test. See
-    /// ruling R11 in `.superpowers/sdd/2026-08-06-remote-mode/decisions.md`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        scope: &Scope,
-        paths: Arc<dyn Paths>,
-        runner: Arc<dyn CommandRunner>,
-        keychain: Arc<dyn Keychain>,
-        ui: Ui,
-        config: UserConfig,
-        state: State,
-        dry_run: bool,
-    ) -> Ctx {
-        Ctx {
-            paths,
-            runner,
-            keychain,
-            api: ApiClient::new(riabuild_version::VERSION),
-            ui,
-            config,
-            state,
-            org: None,
-            repo: None,
-            member: None,
-            server: scope.server.clone(),
-            cli_version: riabuild_version::VERSION.to_string(),
-            env: Vec::new(),
-            notes: Vec::new(),
-            dry_run,
-        }
-    }
-
-    /// Asks riabuild-web who this machine belongs to, before any task runs.
-    ///
-    /// A missing or expired session is not an error here — the `login` task
-    /// exists to fix exactly that. Anything else (suspended, removed from the
-    /// org) is surfaced immediately, because no amount of provisioning will
-    /// help.
-    ///
-    /// Idempotent within a run, and that is load-bearing rather than tidy:
-    /// every command now connects once at startup so `update` can read the
-    /// version floor, and the four flows that connect for themselves
-    /// (`provision`, `remote`, `remote forget`, `login`) must keep doing so —
-    /// none of them may depend on its caller having connected first. Without
-    /// this guard each of them pays for a second `me` and a second
-    /// `org/config` on every run.
-    ///
-    /// The team configuration is the thing to test for. It is set only here
-    /// and in `login::apply`, always together with `member`, and always by a
-    /// live request — so holding one means the question this method asks has
-    /// already been answered. A machine with no session leaves it `None` and
-    /// is asked again, which is exactly what the sign-in flow needs.
-    pub async fn connect(&mut self) -> Result<()> {
-        if self.org.is_some() {
-            return Ok(());
-        }
-        let Some(token) = self.keychain.get().await? else {
-            return Ok(());
-        };
-        self.api.set_token(Some(token));
-
-        match self.api.me().await {
-            Ok(member) => {
-                self.member = Some(member);
-                self.org = Some(riabuild_api::org::fetch_config(&self.api).await?);
-                self.adopt_recorded_repo();
-                Ok(())
-            }
-            Err(error) => match error.downcast_ref::<ApiError>() {
-                Some(api_error) if api_error.needs_login() => {
-                    self.api.set_token(None);
-                    Ok(())
-                }
-                _ => Err(error),
-            },
-        }
-    }
-
-    pub fn org(&self) -> Result<&OrgConfig> {
-        self.org
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("riabuild has not loaded the team configuration yet"))
-    }
-
-    pub fn note(&mut self, note: impl Into<String>) {
-        self.notes.push(note.into());
-    }
-
-    /// Applies `mutate` to the config on disk under the lock, and refreshes this
-    /// run's copy from what actually landed.
-    ///
-    /// `ctx.config` is a read-only snapshot for the run, not the authority —
-    /// which is what it always was in truth. Every write goes through here so
-    /// that the read it is based on happens inside the lock.
-    pub async fn update_config(&mut self, mutate: impl FnOnce(&mut UserConfig)) -> Result<()> {
-        self.config = UserConfig::update(self.paths.as_ref(), mutate).await?;
-        Ok(())
-    }
-
-    /// Applies `mutate` to the state on disk under the lock, and refreshes this
-    /// run's copy from what actually landed.
-    pub async fn update_state(&mut self, mutate: impl FnOnce(&mut State)) -> Result<()> {
-        self.state = State::update(self.paths.as_ref(), mutate).await?;
-        Ok(())
-    }
-
-    /// The repository this run is about: what the picker settled on, else what
-    /// this machine last used, else the org default.
-    ///
-    /// Fallible only in the last case, and only for a dashboard slug nobody
-    /// could clone — see `OrgConfig::default_repo`.
-    pub fn repo(&self) -> Result<Repo> {
-        match &self.repo {
-            Some(repo) => Ok(repo.clone()),
-            None => self.org()?.default_repo(),
-        }
-    }
-
-    /// Takes the repository this machine recorded, so a command that never puts
-    /// the picker's question — `status`, `env`, `shell`, anything under
-    /// `--check` — still reads the checkout of the repository the developer was
-    /// last working on rather than the org default's.
-    ///
-    /// A recorded slug that will not parse is dropped rather than fatal: it can
-    /// only have come from a riabuild that wrote one, and falling back to the
-    /// default repository is a working machine where `?` here would be a broken
-    /// one.
-    fn adopt_recorded_repo(&mut self) {
-        if self.repo.is_some() {
-            return;
-        }
-        self.repo = self
-            .config
-            .active_repo
-            .as_deref()
-            .and_then(|slug| Repo::parse(slug).ok());
-    }
-
-    /// The checkout of the repository this run is about, if it has one.
-    ///
-    /// Falls back to the single path an older riabuild recorded, and only when
-    /// the repository asked about is the org default — the only repository that
-    /// path can be a checkout of. That is what lets `riabuild status`, `riabuild
-    /// env`, `riabuild shell` and `riabuild --check` find an existing checkout
-    /// on a machine whose migration has not run: none of them puts the picker's
-    /// question, and none of them may write. Read both, write one.
-    pub fn project_dir(&self) -> Option<std::path::PathBuf> {
-        let recorded = match self.repo().ok() {
-            Some(repo) => self
-                .config
-                .checkout_of(repo.slug())
-                .or_else(|| self.legacy_checkout_for(&repo)),
-            // Not signed in, and nothing has said which repository this is
-            // about. The one checkout an older riabuild recorded is still the
-            // answer — `riabuild move-project` on a laptop with no session is
-            // the case that reaches this.
-            None => self.config.legacy_checkout(),
-        };
-        recorded.map(|path| riabuild_paths::expand_tilde(path, &self.paths.home()))
-    }
-
-    /// The pre-picker checkout, where it is an answer about `repo`.
-    ///
-    /// Two conditions, and both are about not handing back a path that is a
-    /// checkout of something else. It answers only for the org default, because
-    /// that is the only repository riabuild could have cloned before it asked;
-    /// and only while nothing has chosen, because a machine that has chosen has
-    /// a map, and a path outside it is one the map does not claim.
-    fn legacy_checkout_for(&self, repo: &Repo) -> Option<&str> {
-        if self.config.active_repo.is_some() {
-            return None;
-        }
-        match self.org.as_ref().and_then(|org| org.default_repo().ok()) {
-            Some(default) if *repo != default => None,
-            _ => self.config.legacy_checkout(),
-        }
-    }
-
-    /// Where a checkout goes when the developer has not chosen a place.
-    ///
-    /// On a laptop this is simply the platform default. On a server several
-    /// developers share one Unix account, so the checkout is grouped under the
-    /// developer's own GitHub login instead — never the shared default — so one
-    /// developer's branches, uncommitted work, and `.env.local` never land in
-    /// another's session. See `paths::remote_project_dir`.
-    pub async fn default_checkout(&self) -> std::path::PathBuf {
-        let named = self.repo().ok();
-        let repo = named.as_ref().map(Repo::name).unwrap_or("repo");
-        let home = self.paths.home();
-        let Some(login) = self
-            .server
-            .as_ref()
-            .and(self.member.as_ref())
-            .map(|member| member.github_login.clone())
-        else {
-            return riabuild_paths::default_project_dir(&home, repo);
-        };
-
-        // A GitHub login can be freed and taken by somebody else, and a
-        // directory can predate riabuild. Claim beside it rather than into it.
-        for suffix in 1.. {
-            let name = if suffix == 1 {
-                login.clone()
-            } else {
-                format!("{login}-{suffix}")
-            };
-            let candidate = riabuild_paths::remote_project_dir(&home, &name, repo);
-            let taken = tokio::fs::try_exists(&candidate).await.unwrap_or(false);
-            if !taken || self.owned_by_this_namespace(&candidate).await {
-                return candidate;
-            }
-        }
-        unreachable!("suffix range 1.. never ends")
-    }
-
-    /// Whether a checkout candidate carries this namespace's own `.riabuild-owner`
-    /// marker, so a re-run recognises its own tree rather than claiming the next
-    /// suffix every time. A missing or unreadable marker is treated as "somebody
-    /// else's" — the safe direction, since claiming a directory nobody marked as
-    /// ours is exactly the sharing this exists to prevent.
-    async fn owned_by_this_namespace(&self, candidate: &std::path::Path) -> bool {
-        let marker = candidate.join(".riabuild-owner");
-        tokio::fs::read_to_string(&marker)
-            .await
-            .map(|contents| contents.trim() == self.paths.root().to_string_lossy())
-            .unwrap_or(false)
-    }
-
-    /// The `gh` riabuild owns.
-    ///
-    /// Every call site runs *this* rather than the string `"gh"`. Resolving
-    /// through `PATH` would find whatever the developer happens to have, which
-    /// is not the binary any `check()` verified — and during provisioning
-    /// `~/.riabuild/bin` is not on `PATH` at all, so it would usually not find
-    /// the owned copy even when one is installed.
-    pub fn gh(&self) -> String {
-        self.owned_tool(
-            "gh",
-            riabuild_fetch::tools::GH_VERSION,
-            riabuild_fetch::tools::GH_MEMBER,
-        )
-    }
-
-    /// The `infisical` riabuild owns. Same reasoning as `gh`.
-    pub fn infisical(&self) -> String {
-        self.owned_tool(
-            "infisical",
-            riabuild_fetch::tools::INFISICAL_VERSION,
-            riabuild_fetch::tools::INFISICAL_MEMBER,
-        )
-    }
-
-    /// The `ngrok` riabuild owns. Same reasoning as `gh`, with one addition:
-    /// what `PATH` finds inside the environment shell is the *shim*, which is
-    /// this binary plus the team's authtoken. riabuild's own `check()` wants
-    /// the binary itself, unauthenticated and unwrapped.
-    pub fn ngrok(&self) -> String {
-        self.owned_tool(
-            "ngrok",
-            riabuild_fetch::tools::NGROK_VERSION,
-            riabuild_fetch::tools::NGROK_MEMBER,
-        )
-    }
-
-    /// The Grok Build riabuild owns. Same reasoning as `gh`.
-    ///
-    /// Note what this is *not*: `Ctx::claude()` and `Ctx::codex()` both build a
-    /// path under the pinned Node, because those two are npm packages, and both
-    /// fall back to a bare name before a Node is pinned. Grok Build is a static
-    /// binary riabuild downloads whole, so it is an owned tool like `gh` and
-    /// `ngrok` — always an absolute path, with no Node in the picture and no
-    /// bare-name fallback for a launcher to defend against.
-    pub fn grok(&self) -> String {
-        self.owned_tool(
-            "grok",
-            riabuild_fetch::tools::GROK_VERSION,
-            riabuild_fetch::tools::GROK_MEMBER,
-        )
-    }
-
-    /// The Claude Code riabuild installed, by absolute path.
-    ///
-    /// Same reasoning as `gh()`, with one addition: `which("claude")` reads the
-    /// ambient `PATH`, which during provisioning does not contain riabuild's
-    /// Node — so it finds whatever the developer happens to have installed, or
-    /// nothing at all in the moment just after riabuild installed one. Claude
-    /// Code is installed by riabuild's own npm, so its home is the pinned
-    /// Node's `bin`.
-    ///
-    /// Falls back to the bare name before a Node is pinned, which is the only
-    /// thing a machine with no toolchain yet could use.
-    pub fn claude(&self) -> String {
-        match &self.config.node_version {
-            Some(version) => self
-                .paths
-                .node_dir(version)
-                .join("bin")
-                .join("claude")
-                .to_string_lossy()
-                .into_owned(),
-            None => "claude".to_string(),
-        }
-    }
-
-    /// The Codex CLI riabuild installed, by absolute path.
-    ///
-    /// Same reasoning as `claude()`, and the same fallback: Codex is installed
-    /// by riabuild's own npm, so its home is the pinned Node's `bin`, and
-    /// before a Node is pinned the bare name is the only thing a machine could
-    /// use.
-    pub fn codex(&self) -> String {
-        match &self.config.node_version {
-            Some(version) => self
-                .paths
-                .node_dir(version)
-                .join("bin")
-                .join("codex")
-                .to_string_lossy()
-                .into_owned(),
-            None => "codex".to_string(),
-        }
-    }
-
-    fn owned_tool(&self, tool: &str, version: &str, member: &str) -> String {
-        self.paths
-            .tool_dir(tool, version)
-            .join(member)
-            .to_string_lossy()
-            .into_owned()
-    }
-}
+pub use crate::ctx::Ctx;
+pub use crate::task::{Reason, Status, Task, TaskId};
 
 /// Every task riabuild knows how to perform, in declaration order. The engine
 /// sorts by `depends_on`, so this order is for reading, not execution.
+///
+/// **Nothing here is load-bearing, and that is a recent thing.** `codex_cli`
+/// and `grok_cli` used to be declared ahead of `claude_accounts` with a comment
+/// explaining that a failed `apply()` aborted the whole run, so a task declared
+/// after the one task that waits on a browser would never run on a machine
+/// whose developer walked away from the Claude sign-in. That made the risk a
+/// property of *this list* — invisible to the type system, unenforced by any
+/// test, and undone by anybody who sorted these lines. `engine::run_all` now
+/// carries on past a failed task and skips only its dependents, so the answer
+/// to "what must not wait behind what" is `depends_on()` and nothing else.
 pub fn registry() -> Vec<Box<dyn Task>> {
     vec![
         Box::new(login::Login),
         Box::new(github_cli::GithubCli),
         Box::new(git_credentials::GitCredentials),
-        Box::new(infisical_cli::InfisicalCli),
-        Box::new(ngrok::Ngrok),
+        Box::new(infisical_cli::INFISICAL_CLI),
+        Box::new(ngrok::NGROK),
         Box::new(toolchain::Toolchain),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
-        // Ahead of `claude_accounts`, and that placement is load-bearing rather
-        // than cosmetic. Within a dependency wave tasks run in this order, and
-        // an `apply()` that fails aborts the whole run — so a Codex install
-        // declared after the one task that waits on a browser would never run
-        // on a machine whose developer walked away from the Claude sign-in.
-        // Nothing about Codex depends on that sign-in, so nothing about it
-        // should wait behind it.
         Box::new(codex_cli::CodexCli),
-        // Beside Codex and ahead of `claude_accounts` for the same reason: it
-        // depends on nothing the Claude sign-in provides, so it has no business
-        // waiting behind a task that waits on a browser.
         Box::new(grok_cli::GrokCli),
         Box::new(claude_accounts::ClaudeAccounts),
         Box::new(org_settings::OrgSettings),
@@ -518,46 +84,4 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(claude_statusline::ClaudeStatusline),
         Box::new(claude_plugins::ClaudePlugins),
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::testing::ctx_with;
-    use riabuild_keychain::MemoryKeychain;
-    use riabuild_runner::FakeRunner;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn a_second_connect_in_one_run_does_no_work() {
-        // Every command now connects once at startup, and four of them
-        // (`provision`, `remote`, `remote forget`, `login`) still call
-        // `connect` themselves — as they must, since none of them may depend
-        // on its caller having done it. Without this, each of those pays for a
-        // second `me` and a second `org/config` on every run.
-        //
-        // "Did no work" is only observable as "never read the keychain", which
-        // is the first thing `connect` would do.
-        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        assert!(ctx.org.is_some(), "the test ctx starts already connected");
-        ctx.keychain = Arc::new(MemoryKeychain::unreadable());
-
-        ctx.connect()
-            .await
-            .expect("a connect with the team configuration already loaded");
-    }
-
-    #[tokio::test]
-    async fn claude_is_the_one_riabuilds_node_installed() {
-        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        ctx.config.node_version = Some("22.23.1".into());
-        let claude = ctx.claude();
-        assert!(claude.ends_with("/node/22.23.1/bin/claude"), "{claude}");
-        assert!(claude.starts_with(&ctx.paths.root().to_string_lossy().into_owned()));
-    }
-
-    #[tokio::test]
-    async fn without_a_pinned_node_the_bare_name_is_all_there_is() {
-        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
-        assert_eq!(ctx.claude(), "claude");
-    }
 }

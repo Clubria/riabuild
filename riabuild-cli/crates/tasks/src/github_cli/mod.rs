@@ -19,16 +19,45 @@ use membership::{Membership, membership};
 use sign_in::{run_gh_auth, sign_in};
 
 use super::{Ctx, Status, Task, TaskId};
-use crate::shims;
+use crate::owned_tool::{OwnedTool, Shim, exec_shim, no_note, plain_probe};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_fetch::tools;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
-use riabuild_version as version;
 
-const MIN_VERSION: &str = "2.40.0";
 pub(super) const ORG: &str = "Clubria";
+
+/// The download-and-verify half, shared with every other tool riabuild owns.
+///
+/// `github_cli` keeps its own `Task` because most of what it does is not this:
+/// a sign-in, a scope refresh, and the org membership question. What the row
+/// buys is that the half it *does* share cannot drift from the others — a
+/// deleted `bin/gh` used to report a satisfied machine while the developer's
+/// shell went on finding whatever `gh` the laptop already had.
+pub(crate) static GH: OwnedTool = OwnedTool {
+    id: "github_cli",
+    title: "GitHub CLI",
+    label: "gh",
+    // 2 since riabuild took ownership of `gh` instead of installing it with
+    // Homebrew. Every machine set up before that has a `gh` riabuild does not
+    // manage, and `check()` alone would keep accepting it.
+    version: 2,
+    // The owned copy is a known version, so this catches a truncated or
+    // corrupted install rather than an old release.
+    min_version: "2.40.0",
+    pinned_version: tools::GH_VERSION,
+    release: tools::gh,
+    binary: Ctx::gh,
+    probe: plain_probe,
+    shim: Some(Shim {
+        name: "gh",
+        render: exec_shim,
+        without_it: "so the shell would find whichever gh the machine already had",
+    }),
+    installing: "installing the GitHub CLI",
+    note: no_note,
+};
 
 /// The scope riabuild *requests* when a token cannot read org membership.
 ///
@@ -43,18 +72,15 @@ pub struct GithubCli;
 #[async_trait]
 impl Task for GithubCli {
     fn id(&self) -> TaskId {
-        "github_cli"
+        GH.id
     }
 
     fn title(&self) -> &str {
-        "GitHub CLI"
+        GH.title
     }
 
-    /// Bumped to 2 when riabuild took ownership of `gh` instead of installing
-    /// it with Homebrew. Every machine set up before that has a `gh` riabuild
-    /// does not manage, and `check()` alone would keep accepting it.
     fn version(&self) -> u32 {
-        2
+        GH.version
     }
 
     fn depends_on(&self) -> &[TaskId] {
@@ -62,31 +88,16 @@ impl Task for GithubCli {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        let gh = ctx.gh();
-        if !tokio::fs::try_exists(&gh).await.unwrap_or(false) {
-            return Ok(Status::needs(format!(
-                "riabuild has not installed gh {} yet",
-                tools::GH_VERSION
-            )));
-        }
-
-        // The owned copy is a known version, so this catches a truncated or
-        // corrupted install rather than an old release — which is why it
-        // reports what it found rather than "gh is too old".
-        let version_output = ctx
-            .runner
-            .run(&gh, &["--version"], &RunOptions::default())
-            .await?;
-        if !version::at_least(version_output.trimmed(), MIN_VERSION) {
-            return Ok(Status::needs(format!(
-                "the gh in ~/.riabuild reports `{}`, which is not usable",
-                version_output.trimmed()
-            )));
+        // The binary, its version and the shim in `bin/` — the whole of what
+        // riabuild owning a tool means, and the same three questions every
+        // other owned tool answers.
+        if let Some(drift) = GH.drift(ctx).await? {
+            return Ok(Status::needs(drift));
         }
 
         if !ctx
             .runner
-            .run(&gh, &["auth", "status"], &RunOptions::default())
+            .run(&ctx.gh(), &["auth", "status"], &RunOptions::default())
             .await?
             .ok()
         {
@@ -100,9 +111,11 @@ impl Task for GithubCli {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        if !tokio::fs::try_exists(&ctx.gh()).await.unwrap_or(false) {
-            install(ctx).await?;
-        }
+        // Downloads only when what is there cannot be used, and rewrites the
+        // shim either way: the shim is something `check()` now asks about, and
+        // an `apply()` that could not repair one would be a check its own
+        // repair can never satisfy.
+        GH.ensure(ctx).await?;
 
         if !ctx
             .runner
@@ -182,7 +195,8 @@ impl Task for GithubCli {
     }
 }
 
-/// Downloads the pinned `gh` into `~/.riabuild/gh/<version>/`.
+/// Downloads the pinned `gh` into `~/.riabuild/gh/<version>/` and writes its
+/// shim.
 ///
 /// This used to be `brew install gh`, which meant riabuild could not set up a
 /// machine without Homebrew on it and had nothing to offer on Linux at all.
@@ -190,23 +204,11 @@ impl Task for GithubCli {
 /// `pub` for one caller outside this task, and outside this crate: the binary's
 /// `internal::seed_github`, which runs on a server *before* the setup pass that
 /// would otherwise install this, and so has to be able to put `gh` there
-/// itself. See its doc comment.
+/// itself. See its doc comment. That caller has already decided the binary is
+/// not there, which is why this is the row's unconditional half rather than
+/// `ensure`.
 pub async fn install(ctx: &mut Ctx) -> Result<()> {
-    let release = tools::gh()?;
-    ctx.ui.note(&format!("Downloading gh {}…", release.version));
-
-    let tool_dir = ctx.paths.tool_dir(release.tool, release.version);
-    tools::install(&release, &tool_dir).await.map_err(|error| {
-        Failure::new(
-            "installing the GitHub CLI",
-            "Check your network connection and run `riabuild` again. If it keeps \
-                 failing, send this to your team lead.",
-        )
-        .detail(format!("{error:#}"))
-    })?;
-
-    shims::write_tool(ctx, "gh", &release.binary_in(&tool_dir)).await?;
-    Ok(())
+    GH.install(ctx).await
 }
 
 #[cfg(test)]
@@ -269,6 +271,35 @@ mod tests {
     async fn an_old_gh_is_detected() {
         let runner = healthy().with("gh --version", 0, "gh version 2.10.0 (2023-01-01)", "");
         assert!(reason(runner).await.contains("not usable"));
+    }
+
+    #[tokio::test]
+    async fn a_gh_with_no_shim_is_not_reported_as_satisfied() {
+        // The bug the owned-tool table was folded to remove. `~/.riabuild/bin`
+        // leads `PATH` in the environment shell, so a deleted `bin/gh` is not
+        // "riabuild's copy is second" — it is whatever gh the laptop already
+        // had, answering for a sign-in and a membership riabuild verified
+        // against a different binary. This task reported that machine as
+        // satisfied.
+        let (ctx, _home) = ctx_with_tools(healthy()).await;
+        tokio::fs::remove_file(ctx.paths.bin_dir().join("gh"))
+            .await
+            .unwrap();
+        let status = GithubCli.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("no launcher"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn applying_writes_the_shim_a_developer_deleted() {
+        // The other half: a check nothing can satisfy is worse than no check.
+        // `apply()` here downloads nothing — the binary is fine — and has to
+        // repair the shim anyway.
+        let (mut ctx, _home) = ctx_with_tools(healthy()).await;
+        tokio::fs::remove_file(ctx.paths.bin_dir().join("gh"))
+            .await
+            .unwrap();
+        GithubCli.apply(&mut ctx).await.unwrap();
+        assert_eq!(GithubCli.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]
