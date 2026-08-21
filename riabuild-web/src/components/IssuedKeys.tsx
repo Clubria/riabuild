@@ -1,8 +1,12 @@
-import { useEffect, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useData } from "../data/context";
-import { IssuedKey, Member } from "../data/types";
+import { IssuedKey, Member, MemberId } from "../data/types";
 import { readError } from "../lib/errors";
-import { KeyParseError, ParsedKey, parseOpenSshPrivateKey } from "../lib/opensshKey";
+import {
+  KeyParseError,
+  ParsedKey,
+  parseOpenSshPrivateKey,
+} from "../lib/opensshKey";
 import {
   Alert,
   Badge,
@@ -80,7 +84,8 @@ function usePreview(privateKey: string): Preview {
   if (privateKey.trim() === "") return { state: "blank" };
   // Still parsing this paste, or holding a verdict for an earlier one. Either
   // way there is nothing true to show yet.
-  if (result === null || result.source !== privateKey) return { state: "blank" };
+  if (result === null || result.source !== privateKey)
+    return { state: "blank" };
   return result.preview;
 }
 
@@ -102,7 +107,7 @@ export function IssuedKeys() {
   const [draft, setDraft] = useState<Draft>(BLANK);
   const [replacing, setReplacing] = useState<IssuedKey | null>(null);
   const [issuing, setIssuing] = useState<IssuedKey | null>(null);
-  const [picked, setPicked] = useState<string[]>([]);
+  const [picked, setPicked] = useState<MemberId[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -134,7 +139,9 @@ export function IssuedKeys() {
    * one row a lead most needs to notice, a key still issued to somebody who
    * has been suspended, looked like stale data instead.
    */
-  const loginOf = new Map(everyone.map((member) => [member._id, nameOf(member)]));
+  const loginOf = new Map(
+    everyone.map((member) => [member._id, nameOf(member)]),
+  );
 
   function reset() {
     setDraft(BLANK);
@@ -142,7 +149,8 @@ export function IssuedKeys() {
     setError(null);
   }
 
-  function submit() {
+  function submit(event: FormEvent) {
+    event.preventDefault();
     setError(null);
     setSaving(true);
     const done =
@@ -220,11 +228,12 @@ export function IssuedKeys() {
     <>
       <p className="mb-4 max-w-prose text-fg-dim">
         A key pasted here reaches the developers you issue it to, and lets their{" "}
-        <span className="text-fg">riabuild remote</span> onto a server riabuild&rsquo;s
-        own key cannot sign in to yet &mdash; a managed bastion, or any box with{" "}
-        <span className="text-fg">PasswordAuthentication no</span>. riabuild uses
-        it once, to install that laptop&rsquo;s own key, and every connection
-        after that uses the laptop&rsquo;s.
+        <span className="text-fg">riabuild remote</span> onto a server
+        riabuild&rsquo;s own key cannot sign in to yet &mdash; a managed
+        bastion, or any box with{" "}
+        <span className="text-fg">PasswordAuthentication no</span>. riabuild
+        uses it once, to install that laptop&rsquo;s own key, and every
+        connection after that uses the laptop&rsquo;s.
       </p>
       <p className="mb-4 max-w-prose text-fg-dim">
         The private half is never shown again, here or anywhere. Compare the
@@ -358,7 +367,9 @@ export function IssuedKeys() {
         </div>
       )}
 
-      <div className="mt-6 max-w-2xl">
+      {/* A real form, so Enter in "key name" submits it and the browser
+          refuses an empty one before riabuild-web has to. */}
+      <form className="mt-6 max-w-2xl" onSubmit={submit}>
         <p className="mb-3 flex flex-wrap items-center gap-2 text-fg-dim">
           <span aria-hidden="true" className="text-accent">
             ▸
@@ -375,7 +386,10 @@ export function IssuedKeys() {
 
         {replacing !== null && (
           <div className="mb-4">
-            <Alert tone="warn" title="This replaces the secret, and nothing else">
+            <Alert
+              tone="warn"
+              title="This replaces the secret, and nothing else"
+            >
               <p className="wrap-value">
                 {replacing.label} keeps its name and stays issued to the same
                 people. Nothing on a laptop stores an issued key, so everyone
@@ -398,6 +412,7 @@ export function IssuedKeys() {
               hint="Letters, digits, dots, dashes, underscores. What developers see in their terminal."
               value={draft.label}
               placeholder="prod-bastion"
+              required
               spellCheck={false}
               onChange={(label) => setDraft({ ...draft, label })}
             />
@@ -421,7 +436,11 @@ export function IssuedKeys() {
             <KeyValue
               rows={[
                 { label: "type", value: preview.key.keyType },
-                { label: "fingerprint", value: preview.key.fingerprint, tone: "ok" },
+                {
+                  label: "fingerprint",
+                  value: preview.key.fingerprint,
+                  tone: "ok",
+                },
                 { label: "public key", value: preview.key.publicKey },
               ]}
             />
@@ -430,11 +449,11 @@ export function IssuedKeys() {
 
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <Button
+            type="submit"
             variant="primary"
             pending={saving}
             pendingLabel="saving"
             disabled={busy !== null || preview.state !== "parsed"}
-            onClick={submit}
           >
             {replacing === null ? "add key" : "replace key"}
           </Button>
@@ -452,7 +471,7 @@ export function IssuedKeys() {
             </Alert>
           </div>
         )}
-      </div>
+      </form>
     </>
   );
 }

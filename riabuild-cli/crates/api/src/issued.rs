@@ -85,8 +85,28 @@ fn usable(wire: &WireKey) -> Result<IssuedKey, String> {
     let label = wire.label.trim();
     let id = wire.id.trim();
 
-    if id.is_empty() {
-        return Err(format!("{label:?} arrived without an id"));
+    // Charset-checked, not merely non-empty, and this is the one field where
+    // that is load-bearing rather than tidy: `id` is what
+    // `remote::issued::agent` interpolates into `self.dir.join(format!("{id}.pub"))`,
+    // so it is the only value in this reply that becomes a *path*. An allowlist
+    // rather than a blocklist, for the reason `askpass::hash_of` gives about
+    // the same class of value — a `/` or a `..` in a server-supplied id would
+    // otherwise put a file wherever the server liked, and a leading `-` would
+    // reach `ssh-add`'s argv as an option. 64 rather than the label's 32
+    // because a row id is riabuild-web's to choose, not a person's.
+    // The leading-character rule is the one thing here the label check does
+    // not need: `.` is a perfectly good character inside an id and a fatal one
+    // in front of it (`..` is the parent directory, `.foo` is a dotfile), and
+    // a leading `-` is an option rather than a name wherever the path is
+    // passed as an argument. `remotes::usable` refuses a host beginning `-`
+    // for the second half of that reason.
+    if id.is_empty()
+        || id.len() > 64
+        || !id.chars().all(is_label_char)
+        || id.starts_with('.')
+        || id.starts_with('-')
+    {
+        return Err(format!("{label:?} arrived without a usable id"));
     }
     if label.is_empty() || label.len() > 32 || !label.chars().all(is_label_char) {
         return Err(format!("{label:?} is not a usable key name"));
@@ -279,6 +299,57 @@ mod tests {
             },
         ] {
             assert!(usable(&bad).is_err(), "{:?} must not be usable", bad.label);
+        }
+    }
+
+    #[test]
+    fn an_id_that_would_choose_where_a_file_lands_is_refused() {
+        // `id` is the one field in this reply that becomes a path:
+        // `remote::issued::agent::Agent::add` writes `<agent dir>/<id>.pub`.
+        // A server that sent `../../../.ssh/authorized_keys` would otherwise
+        // be choosing which file riabuild writes a public key into, and a
+        // leading `-` would reach an argv as an option.
+        for bad in [
+            "../../../.ssh/authorized_keys",
+            "..",
+            "a/b",
+            "a\\b",
+            "-oProxyCommand=id",
+            "k17 abc",
+            "k17\nabc",
+            "k17;rm",
+            "$(id)",
+            "\u{2044}",
+        ] {
+            let refused = usable(&WireKey {
+                id: bad.into(),
+                ..wire()
+            });
+            assert!(
+                refused.is_err(),
+                "an id of {bad:?} must not be usable: {:?}",
+                refused.map(|key| key.id)
+            );
+        }
+        // And the length bound, so a row id cannot become a path component of
+        // any size the server likes.
+        assert!(
+            usable(&WireKey {
+                id: "k".repeat(65),
+                ..wire()
+            })
+            .is_err()
+        );
+        // The ordinary shapes riabuild-web actually issues still pass.
+        for good in ["k17abc", "j5-7_x.2", &"k".repeat(64)] {
+            assert!(
+                usable(&WireKey {
+                    id: good.into(),
+                    ..wire()
+                })
+                .is_ok(),
+                "{good:?} is an ordinary row id"
+            );
         }
     }
 

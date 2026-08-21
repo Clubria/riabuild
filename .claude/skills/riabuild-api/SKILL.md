@@ -50,8 +50,35 @@ must not hand out live sessions.
 version floors, brokered tokens. A server-driven task manifest would be remote code
 execution on every developer's laptop. This boundary is load-bearing.
 
-**Never return the secret payload.** Broker a short-lived Infisical access token and let
-the CLI fetch secrets itself. Path scoping belongs to Infisical's RBAC, not to our code.
+**Never return an Infisical secret payload.** Broker a short-lived access token and let
+the CLI fetch the secrets itself. Path scoping belongs to Infisical's RBAC, not to our
+code.
+
+**Two shipped responses do carry a durable credential, and a third would be a decision
+rather than a detail.** `GET /api/v1/issued-keys` returns a private SSH key and
+`GET /api/v1/org/ngrok-token` returns the team's ngrok authtoken. Say the cost out loud
+rather than discovering it later: both are stored in Convex in plaintext, and a dump of
+that database hands out working SSH access and the team's ngrok account. They exist
+because the alternative is not a brokered credential — it is a key arriving over Slack
+and living in someone's `~/.ssh` for ever. Neither expires on its own, so three
+conditions do the work an expiry does everywhere else, and an endpoint that carries a
+durable credential without all three is a bug:
+
+- **write-only from a browser.** A lead sets the value and gets back a fingerprint or the
+  last four characters. `org.get` returns `publicConfigView` and `org.forApi` returns the
+  value, and they are two validators on purpose — one validator serving both a browser
+  and the CLI is how a secret reaches a browser by omission instead of by decision.
+- **the GitHub org re-check is the whole gate.** There is no expiry behind it, so a
+  developer who left yesterday must lose the credential today with nobody remembering to
+  edit a Convex row.
+- **every *fetch* is audited, not merely every change.** For ngrok that row is the only
+  attribution that exists, since one account carries the whole team; for an issued key it
+  is the record of who took a copy of what.
+
+`riabuild-web/CLAUDE.md` is the authority on both, and
+`docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md` and
+`docs/superpowers/specs/2026-08-18-ngrok-design.md` are why they are bounded the way they
+are.
 
 **Log access changes.** Role promotion, suspension, session revocation, and token
 brokering all write `auditLog`.

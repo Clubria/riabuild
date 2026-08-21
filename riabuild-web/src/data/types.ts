@@ -8,6 +8,28 @@
  * Convex one, and a dev-only fixture one. Pages cannot tell them apart.
  */
 
+import type { Id } from "../../convex/_generated/dataModel";
+
+/**
+ * Row ids, kept as the branded types Convex hands out rather than flattened to
+ * `string`.
+ *
+ * A type-only import, so nothing here drags the backend into a bundle — and
+ * `Id<T>` is a string at runtime, so a fixture is still written as one.
+ *
+ * What the brand buys is the boundary in `convexProvider`. Declared as `string`
+ * these arrived at a mutation that wanted `Id<"members">` and were laundered
+ * through `as never` on the way in: eleven casts, each of which would equally
+ * have accepted a session id, a member id or yesterday's date. Now the table an
+ * id belongs to travels with it from the query that produced it to the mutation
+ * that consumes it, and the casts are gone.
+ */
+export type MemberId = Id<"members">;
+export type SessionId = Id<"cliSessions">;
+export type SharedServerId = Id<"sharedServers">;
+export type IssuedKeyId = Id<"issuedKeys">;
+export type AuditEntryId = Id<"auditLog">;
+
 export type Role = "candidate" | "developer" | "lead";
 export type MemberStatus = "active" | "suspended";
 
@@ -17,7 +39,8 @@ export type Loadable<T> =
   | { state: "error"; message: string };
 
 export type Member = {
-  _id: string;
+  _id: MemberId;
+  /** The UUID a developer copies into their terminal. Not a row id. */
   memberId: string;
   githubLogin: string;
   githubId: string;
@@ -54,7 +77,7 @@ export type OrgCandidate = {
 };
 
 export type Session = {
-  _id: string;
+  _id: SessionId;
   deviceLabel: string;
   cliVersion: string;
   createdAt: number;
@@ -75,7 +98,7 @@ export type Session = {
 };
 
 export type AuditEntry = {
-  _id: string;
+  _id: AuditEntryId;
   at: number;
   action: string;
   actorLogin: string | null;
@@ -109,7 +132,7 @@ export type OrgConfig = {
  * stores that prefix — which is why nothing here does either.
  */
 export type SharedServer = {
-  _id: string;
+  _id: SharedServerId;
   name: string;
   host: string;
   port: number;
@@ -133,22 +156,18 @@ export type SharedServerAddress = {
  * they confirm which key a row holds, without the row ever handing it back.
  */
 export type IssuedKey = {
-  _id: string;
+  _id: IssuedKeyId;
   label: string;
   keyType: string;
   publicKey: string;
   fingerprint: string;
   /** Member row ids. Resolved against `members` for display. */
-  issuedTo: string[];
+  issuedTo: MemberId[];
   updatedAt: number;
 };
 
 export type MembershipStatus =
-  | "member"
-  | "not_member"
-  | "unavailable"
-  | "signed_out"
-  | "checking";
+  "member" | "not_member" | "unavailable" | "signed_out" | "checking";
 
 export type Membership = {
   org: string;
@@ -190,12 +209,23 @@ export type Data = {
   /** Ticking clock, so "expired" is computed rather than frozen at mount. */
   now: number;
 
-  updateProfile(p: {
+  /**
+   * Every action below is declared as a property holding a function, not as a
+   * method.
+   *
+   * A page is expected to pull one out and keep it — `CliAuthorize` holds
+   * `lookupDeviceCode` in an effect's dependency list, which is what stopped
+   * that effect re-running on every clock tick. A method shorthand says the
+   * opposite: that it wants to be called with a receiver, which is what
+   * `@typescript-eslint/unbound-method` objects to when it is detached. None of
+   * these reads `this`, and both providers build them as closures.
+   */
+  updateProfile: (p: {
     firstName: string;
     lastName: string;
     email: string;
-  }): Promise<void>;
-  setRole(p: { memberId: string; role: Role }): Promise<void>;
+  }) => Promise<void>;
+  setRole: (p: { memberId: MemberId; role: Role }) => Promise<void>;
   /**
    * Everyone in the GitHub org, so a lead picks a name instead of typing one.
    *
@@ -203,61 +233,69 @@ export type Data = {
    * a call to GitHub, and a lead who never invites anybody should never spend
    * it. Called when the invite form opens.
    */
-  listOrgMembers(): Promise<OrgCandidate[]>;
+  listOrgMembers: () => Promise<OrgCandidate[]>;
   /**
    * Records a role — and the keys they hold — before this person has ever
    * signed in. Grants nothing on its own; the row it writes cannot authenticate
    * anything until a real GitHub sign-in claims it.
    */
-  inviteMember(p: {
+  inviteMember: (p: {
     githubLogin: string;
     githubId: string;
     role: Role;
-    issuedKeys: string[];
-  }): Promise<void>;
+    issuedKeys: IssuedKeyId[];
+  }) => Promise<void>;
   /**
    * Withdraws an invitation, and refuses anyone who has already arrived — for
    * them the action is `setStatus`, which also revokes their sessions.
    */
-  withdrawInvite(p: { memberId: string }): Promise<void>;
-  setStatus(p: { memberId: string; status: MemberStatus }): Promise<void>;
-  revokeSession(p: { sessionId: string }): Promise<void>;
-  updateOrg(p: OrgUpdate): Promise<void>;
-  addSharedServer(p: SharedServerAddress): Promise<void>;
+  withdrawInvite: (p: { memberId: MemberId }) => Promise<void>;
+  setStatus: (p: { memberId: MemberId; status: MemberStatus }) => Promise<void>;
+  revokeSession: (p: { sessionId: SessionId }) => Promise<void>;
+  updateOrg: (p: OrgUpdate) => Promise<void>;
+  addSharedServer: (p: SharedServerAddress) => Promise<void>;
   /**
    * Editing an address is editing an identity: riabuild keys a server's SSH
    * key, its saved password and its session off `user@host:port`. Every
    * developer's CLI retires the old one on its next connect, but until it runs
    * their credentials point at the machine that name used to mean.
    */
-  updateSharedServer(p: SharedServerAddress & { id: string }): Promise<void>;
-  removeSharedServer(p: { id: string }): Promise<void>;
-  addIssuedKey(p: { label: string; privateKey: string }): Promise<void>;
+  updateSharedServer: (
+    p: SharedServerAddress & { id: SharedServerId },
+  ) => Promise<void>;
+  removeSharedServer: (p: { id: SharedServerId }) => Promise<void>;
+  addIssuedKey: (p: { label: string; privateKey: string }) => Promise<void>;
   /**
    * Rotation. The row, its name and the people it is issued to all survive;
    * only the secret changes. Nothing on a laptop stores an issued key, so a
    * developer's next run picks the new one up with no action from them.
    */
-  replaceIssuedKey(p: { id: string; privateKey: string }): Promise<void>;
-  setIssuedKeyMembers(p: { id: string; issuedTo: string[] }): Promise<void>;
-  removeIssuedKey(p: { id: string }): Promise<void>;
-  signIn(p?: { redirectTo?: string }): Promise<void>;
+  replaceIssuedKey: (p: {
+    id: IssuedKeyId;
+    privateKey: string;
+  }) => Promise<void>;
+  setIssuedKeyMembers: (p: {
+    id: IssuedKeyId;
+    issuedTo: MemberId[];
+  }) => Promise<void>;
+  removeIssuedKey: (p: { id: IssuedKeyId }) => Promise<void>;
+  signIn: (p?: { redirectTo?: string }) => Promise<void>;
   /**
    * Present only in dev builds, and only works against a deployment that sets
    * `RIABUILD_DEV_AUTH=1`. Optional on the type so a production build has no
    * expression referring to it at all.
    */
-  devSignIn?(login: string): Promise<void>;
-  signOut(): Promise<void>;
+  devSignIn?: (login: string) => Promise<void>;
+  signOut: () => Promise<void>;
   /**
    * Looks up the code a developer read off their terminal.
    *
    * A promise rather than a `Loadable` field because the argument comes from a
    * text box: there is nothing to load until someone has typed something.
    */
-  lookupDeviceCode(p: { userCode: string }): Promise<DeviceRequest>;
-  approveDeviceCode(p: { userCode: string }): Promise<DeviceDecision>;
-  denyDeviceCode(p: { userCode: string }): Promise<DeviceDecision>;
+  lookupDeviceCode: (p: { userCode: string }) => Promise<DeviceRequest>;
+  approveDeviceCode: (p: { userCode: string }) => Promise<DeviceDecision>;
+  denyDeviceCode: (p: { userCode: string }) => Promise<DeviceDecision>;
 };
 
 /** A pending `riabuild login`, as shown to whoever is asked to approve it. */

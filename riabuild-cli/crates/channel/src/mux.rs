@@ -22,11 +22,10 @@
 //! sixteen thousand would otherwise be cut short by a byte that happened to be
 //! `\n`.
 
+use crate::line::{self, MAX_HEADER};
 use crate::protocol::MAX_PAYLOAD;
 use serde::{Deserialize, Serialize};
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Which connection a frame belongs to, and how many bytes it carries.
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,10 +119,21 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Option<Frame>, FrameError>
 where
     R: AsyncBufRead + AsyncRead + Unpin,
 {
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
-        return Ok(None);
-    }
+    // Bounded, and that is the half `MAX_PAYLOAD` never covered. The cap below
+    // stops a peer *announcing* four gigabytes; without this one a peer that
+    // simply never sends a newline makes this reader allocate for as long as it
+    // keeps typing, which is the cheaper attack and the one the comment under
+    // the cap used to deny.
+    let line = match line::read_header_line(reader).await {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(None),
+        Err(error) if line::is_overrun(&error) => {
+            return Err(FrameError::Malformed(format!(
+                "a frame header ran past {MAX_HEADER} bytes with no newline in it"
+            )));
+        }
+        Err(error) => return Err(FrameError::Io(error)),
+    };
     if line.trim().is_empty() {
         return Err(FrameError::Malformed("an empty header line".into()));
     }
@@ -243,6 +253,30 @@ mod tests {
     async fn a_body_shorter_than_its_header_promised_is_an_error() {
         let mut reader = BufReader::new(&b"{\"id\":1,\"len\":64}\nshort"[..]);
         assert!(read_frame(&mut reader).await.is_err());
+    }
+
+    /// The other half of the same rule, and the one that was missing.
+    ///
+    /// `MAX_PAYLOAD` bounds a body a peer *announces*; it says nothing about
+    /// the announcement. A peer that streams bytes with no newline among them
+    /// used to make this reader grow one buffer until the process died — on
+    /// whichever end it was pointed at, since the pump and the laptop share
+    /// this function.
+    #[tokio::test]
+    async fn a_header_that_never_ends_is_refused_before_it_is_allocated() {
+        let flood = vec![b'{'; MAX_HEADER * 2];
+        let mut reader = BufReader::new(flood.as_slice());
+        let error = read_frame(&mut reader)
+            .await
+            .expect_err("an endless header must be refused");
+        assert!(
+            matches!(error, FrameError::Malformed(_)),
+            "{error} should name a malformed frame"
+        );
+        assert!(
+            error.to_string().contains(&MAX_HEADER.to_string()),
+            "{error}"
+        );
     }
 
     #[tokio::test]

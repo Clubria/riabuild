@@ -13,219 +13,171 @@
 //! Owning the tarball is a few dozen lines and removes a class of
 //! works-in-my-shell failures.
 //!
+//! pnpm comes from the **npm registry** rather than from pnpm's GitHub
+//! releases, which publish no checksum file: `dist.integrity` is a digest the
+//! publisher recorded, served with no API budget to run out of. See
+//! `NPM_REGISTRY` in `assets`.
+//!
 //! The same reasoning extends to `gh` and `infisical` — see `tools.rs`, which
 //! describes where their releases live and what the assets are called.
+//!
+//! Three files, split where the questions are different. `assets` is where
+//! each release lives and what its asset is called on this platform; `digest`
+//! is what the bytes have to hash to; and this file is the transfer itself —
+//! the one place bytes cross the network, and every failure a developer can be
+//! told about on the way.
 
-use anyhow::{Context, Result, anyhow};
+mod assets;
+mod digest;
+
+// Re-exported so every caller keeps naming `download::…`. Which file each
+// answer lives in is this module's business, and a caller that had to know
+// would have to be edited the next time one moves.
+pub use assets::{
+    PNPM_ENTRY, PNPM_PACKAGE, node_platform, node_shasums_url, node_tarball_name, node_tarball_url,
+    npm_metadata_url, npm_tarball_url, riabuild_asset, riabuild_asset_url, riabuild_checksums_url,
+    rust_target,
+};
+pub use digest::{
+    digest_for, digest_from_any, npm_integrity, npm_integrity_digest, sha256_hex, sha512,
+};
+
+use crate::{CHECK_THE_NETWORK, Failure, TELL_YOUR_LEAD, UPSTREAM_MOVED};
+use anyhow::Result;
 use std::time::Duration;
 
-/// The ceiling ureq's `take()` used to enforce while streaming. reqwest buffers
-/// the body in one call, so the cap is checked after the fact instead.
-const MAX_DOWNLOAD: usize = 400 * 1024 * 1024;
-
-const RELEASES: &str = "https://github.com/Clubria/riabuild/releases/download";
-
-/// The Rust target triple a server's `uname -sm` corresponds to.
+/// The ceiling on a body riabuild will hold in memory.
 ///
-/// Remote mode provisions a server that is frequently a different platform
-/// than the laptop driving it, so — unlike `node_platform` above — this takes
-/// the platform as an argument rather than reading `std::env::consts` for the
-/// host riabuild happens to be running on.
-pub fn rust_target(uname_s: &str, uname_m: &str) -> Result<String> {
-    let arch = match uname_m.trim() {
-        "x86_64" | "amd64" => "x86_64",
-        "arm64" | "aarch64" => "aarch64",
-        other => return Err(anyhow!("riabuild does not publish a build for {other}")),
-    };
-    match uname_s.trim() {
-        "Darwin" => Ok(format!("{arch}-apple-darwin")),
-        // musl rather than gnu: one Linux build then runs on any distribution
-        // instead of only on distributions with a glibc at least as new as the
-        // one the release runner happened to build against.
-        "Linux" => Ok(format!("{arch}-unknown-linux-musl")),
-        other => Err(anyhow!("riabuild does not publish a build for {other}")),
-    }
-}
+/// Consulted twice, because neither answer is sufficient on its own: against
+/// `Content-Length` before a byte is read, which is what lets an absurd asset
+/// be refused without allocating for it, and against what has actually arrived
+/// as each chunk lands, because the header is a claim and a chunked response
+/// carries none at all. It used to be neither — `response.bytes()` buffered the
+/// whole body and the cap was compared against the allocation it exists to
+/// prevent.
+const MAX_DOWNLOAD: u64 = 400 * 1024 * 1024;
 
-/// The release asset name for a given version and target triple, e.g.
-/// `riabuild-2026.08.06-aarch64-apple-darwin.tar.gz`. Matches the tarball
-/// name `.github/workflows/release.yml`'s Package step produces.
-pub fn riabuild_asset(version: &str, target: &str) -> String {
-    format!("riabuild-{version}-{target}.tar.gz")
-}
-
-pub fn riabuild_asset_url(version: &str, target: &str) -> String {
-    format!("{RELEASES}/v{version}/{}", riabuild_asset(version, target))
-}
-
-pub fn riabuild_checksums_url(version: &str) -> String {
-    format!("{RELEASES}/v{version}/riabuild-{version}-checksums.txt")
-}
-
-/// The Node distribution name for this machine, e.g. `darwin-arm64`.
-pub fn node_platform() -> Result<String> {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
-        other => return Err(anyhow!("riabuild does not support {other} yet")),
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => return Err(anyhow!("riabuild does not support {other} CPUs yet")),
-    };
-    Ok(format!("{os}-{arch}"))
-}
-
-/// pnpm 11 and newer publish a tarball; 10 and older publish a bare executable.
+/// Reaching the host, not reading from it.
 ///
-/// The boundary is the pinned version rather than today's date, because GitHub
-/// still serves each release exactly as it was published.
-pub fn pnpm_ships_a_tarball(version: &str) -> bool {
-    version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        // An unparseable pin is likelier to be something new than something
-        // ancient, and a tarball is what pnpm publishes now.
-        .is_none_or(|major| major >= 11)
-}
+/// One deadline used to cover both, and the body is the half that legitimately
+/// takes minutes — see [`READ_TIMEOUT`]. Split apart, this one can be short
+/// enough that a host riabuild cannot reach says so rather than looking like a
+/// hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The asset name for a pnpm release, which changed shape at pnpm 11.
+/// The gap riabuild will tolerate between two chunks — **not** a deadline on
+/// the whole body.
 ///
-/// Up to pnpm 10 a release published bare executables named `pnpm-macos-arm64`.
-/// pnpm 11 renamed macOS to `darwin` *and* switched to
-/// `pnpm-darwin-arm64.tar.gz`, an archive holding a launcher and the `dist/`
-/// tree it loads at startup — so it is no longer something that can be dropped
-/// onto `PATH`. Asking for the old name against a new release is a 404, which
-/// is how this was found.
-pub fn pnpm_asset(version: &str) -> Result<String> {
-    let tarball = pnpm_ships_a_tarball(version);
-    let os = match std::env::consts::OS {
-        "macos" if tarball => "darwin",
-        "macos" => "macos",
-        "linux" => "linux",
-        other => return Err(anyhow!("riabuild does not support {other} yet")),
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => return Err(anyhow!("riabuild does not support {other} CPUs yet")),
-    };
-    Ok(if tarball {
-        format!("pnpm-{os}-{arch}.tar.gz")
-    } else {
-        format!("pnpm-{os}-{arch}")
-    })
-}
-
-pub fn node_tarball_name(version: &str, platform: &str) -> String {
-    format!("node-v{version}-{platform}.tar.gz")
-}
-
-pub fn node_tarball_url(version: &str, platform: &str) -> String {
-    format!(
-        "https://nodejs.org/dist/v{version}/{}",
-        node_tarball_name(version, platform)
-    )
-}
-
-pub fn node_shasums_url(version: &str) -> String {
-    format!("https://nodejs.org/dist/v{version}/SHASUMS256.txt")
-}
-
-pub fn pnpm_url(version: &str, asset: &str) -> String {
-    format!("https://github.com/pnpm/pnpm/releases/download/v{version}/{asset}")
-}
-
-/// Finds the expected digest for one file in a `SHASUMS256.txt` body.
-pub fn digest_for(shasums: &str, filename: &str) -> Option<String> {
-    shasums.lines().find_map(|line| {
-        let (digest, name) = line.split_once("  ")?;
-        (name.trim() == filename).then(|| digest.trim().to_string())
-    })
-}
-
-/// Finds a digest across several published checksum files, trying each in turn.
+/// A single 300 s timeout over the complete response is a bandwidth floor in
+/// disguise: Node is around 130 MB, so every link below roughly 450 KB/s failed
+/// a download that was arriving perfectly steadily, and the developer was told
+/// it was a bug in riabuild. Measured per read, a transfer still making
+/// progress is never cut off, and one that has genuinely stalled still ends
+/// inside a minute.
 ///
-/// A list rather than a URL because Infisical publishes three files and the one
-/// named after the release is not the one with the digests in it:
-///
-/// | File | Covers |
-/// |---|---|
-/// | `cli_<version>_checksums.txt` | one line, for `windows_amd64` |
-/// | `checksums.txt` | everything **except** darwin |
-/// | `checksums-darwin.txt` | the two darwin tarballs |
-///
-/// The darwin builds are produced separately — presumably notarised on a macOS
-/// runner — and their digests never reach the main file. Reading only the file
-/// named after the release finds nothing on any platform riabuild ships.
-///
-/// A digest in none of them is an error, never a skipped verification: an
-/// unverified download of a credential tool is worse than no download.
-pub async fn digest_from_any(urls: &[String], filename: &str) -> Result<String> {
-    let mut failures = Vec::new();
-    for url in urls {
-        match fetch_text(url).await {
-            Ok(body) => {
-                if let Some(digest) = digest_for(&body, filename) {
-                    return Ok(digest);
-                }
-                failures.push(format!("{url} does not list it"));
-            }
-            // A checksum file that 404s is ordinary — the list is deliberately
-            // wider than any one release needs — so it only matters if every
-            // entry fails.
-            Err(error) => failures.push(format!("{url} could not be read: {error}")),
-        }
-    }
-    Err(anyhow!(
-        "riabuild could not find a published checksum for {filename}, so it \
-         refused to install it ({})",
-        failures.join("; ")
-    ))
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    digest
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
+/// There is deliberately **no** deadline over the whole request beside it. A
+/// hang has to present as a failure rather than as a slow run, and this is what
+/// covers that: the way a download hangs is that the bytes stop, which is what
+/// this measures. Restoring a total would only reintroduce the bandwidth floor
+/// at a different number, and [`MAX_DOWNLOAD`] is what bounds how long a
+/// transfer that never stalls can go on for.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Reads a whole distribution into memory.
 ///
-/// Deliberately not streamed to disk: the sha256 in `verify` is checked against
-/// the complete buffer *before* anything is extracted. Streaming would mean
-/// writing unverified bytes into a developer's toolchain directory and checking
-/// them afterwards, which is a weaker property for a tool that installs
-/// executables.
+/// Deliberately not streamed *to disk*: the sha256 in `verify` is checked
+/// against the complete buffer **before** anything is extracted. Streaming to a
+/// file would mean writing unverified bytes into a developer's toolchain
+/// directory and checking them afterwards, which is a weaker property for a
+/// tool that installs executables.
+///
+/// It is streamed into memory all the same, chunk by chunk, and that is a
+/// different question: `response.bytes()` allocates the entire body and only
+/// then hands it over, so [`MAX_DOWNLOAD`] was consulted *after* the allocation
+/// it exists to prevent. Accumulating gives the cap somewhere to be enforced
+/// while there is still something to refuse.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
-        .with_context(|| format!("could not download {url}"))?
+        .map_err(|error| unreachable(url, &error))?;
+
+    let mut response = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("could not download {url}"))?
+        .map_err(|error| unreachable(url, &error))?
         .error_for_status()
-        .with_context(|| format!("could not download {url}"))?;
+        .map_err(|error| refused(url, &error))?;
 
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("download of {url} was cut short"))?;
-
-    if bytes.len() > MAX_DOWNLOAD {
-        return Err(anyhow!(
-            "{url} is {} bytes, more than riabuild will download",
-            bytes.len()
-        ));
+    // A first chance to refuse, not the check itself: the header is upstream's
+    // claim about a body riabuild has not read, and a chunked response carries
+    // none at all.
+    if let Some(claimed) = response.content_length()
+        && claimed > MAX_DOWNLOAD
+    {
+        return Err(too_large(url, claimed));
     }
-    Ok(bytes.to_vec())
+
+    // Reserving the claimed length turns a 130 MB download into one allocation
+    // rather than two dozen, and the cap above is what keeps a hostile claim
+    // from being a way to ask riabuild for memory.
+    let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| cut_short(url, &error))?
+    {
+        let arrived = bytes.len() as u64 + chunk.len() as u64;
+        if arrived > MAX_DOWNLOAD {
+            return Err(too_large(url, arrived));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// riabuild never got an answer out of the host.
+///
+/// The three causes are always the same and naming them is the whole value: a
+/// developer told to "check your network" on a laptop whose browser works fine
+/// has been told nothing.
+fn unreachable(url: &str, error: &reqwest::Error) -> anyhow::Error {
+    Failure::new(format!("downloading {url}"), CHECK_THE_NETWORK)
+        .detail(format!("{error}"))
+        .into()
+}
+
+/// The host answered, and the answer was not the file. A 404 here is an
+/// upstream release that has moved out from under a pin in this repository,
+/// which is nothing the developer can fix and nothing a re-run will change.
+fn refused(url: &str, error: &reqwest::Error) -> anyhow::Error {
+    Failure::new(format!("downloading {url}"), UPSTREAM_MOVED)
+        .detail(format!("{error}"))
+        .into()
+}
+
+/// The body stopped arriving part way through — a dropped link, a proxy that
+/// cut the connection, or a transfer that stalled past [`READ_TIMEOUT`].
+fn cut_short(url: &str, error: &reqwest::Error) -> anyhow::Error {
+    Failure::new(
+        format!("downloading {url} — the transfer stopped part way through"),
+        CHECK_THE_NETWORK,
+    )
+    .detail(format!("{error}"))
+    .into()
+}
+
+fn too_large(url: &str, size: u64) -> anyhow::Error {
+    Failure::new(
+        format!(
+            "downloading {url} — it is {size} bytes, more than the {MAX_DOWNLOAD} riabuild will \
+             hold in memory"
+        ),
+        TELL_YOUR_LEAD,
+    )
+    .into()
 }
 
 pub async fn fetch_text(url: &str) -> Result<String> {
@@ -235,65 +187,92 @@ pub async fn fetch_text(url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn builds_the_urls_node_actually_publishes() {
-        assert_eq!(
-            node_tarball_url("22.23.1", "darwin-arm64"),
-            "https://nodejs.org/dist/v22.23.1/node-v22.23.1-darwin-arm64.tar.gz"
-        );
-        assert_eq!(
-            node_shasums_url("22.23.1"),
-            "https://nodejs.org/dist/v22.23.1/SHASUMS256.txt"
-        );
-        assert_eq!(
-            pnpm_url("11.11.0", "pnpm-darwin-arm64.tar.gz"),
-            "https://github.com/pnpm/pnpm/releases/download/v11.11.0/pnpm-darwin-arm64.tar.gz"
-        );
+    /// A loopback HTTP server that answers exactly one request with `head`
+    /// followed by each of `body`, and then waits for the client to hang up.
+    ///
+    /// Written by hand rather than through a canned-response crate because
+    /// what these tests need to control is the shape of the *response* — a
+    /// `Content-Length` describing a body that is never sent, a body arriving
+    /// in pieces — which is the layer such a crate hides.
+    async fn serve_once(head: &'static str, body: &'static [&'static [u8]]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            for piece in body {
+                if socket.write_all(piece).await.is_err() {
+                    return;
+                }
+            }
+            // Hold the connection open until the client is done with it, so
+            // that a response the client refuses to read is not also a
+            // connection that closed underneath it.
+            let _ = socket.read(&mut request).await;
+        });
+        format!("http://{address}/node-v22.23.1-linux-x64.tar.gz")
     }
 
-    #[test]
-    fn pnpm_11_is_a_tarball_and_pnpm_10_is_not() {
-        // Asking for the old asset name against a new release is a 404, which
-        // is exactly how riabuild stopped being able to install pnpm at all.
-        assert!(pnpm_ships_a_tarball("11.11.0"));
-        assert!(pnpm_ships_a_tarball("12.0.0"));
-        assert!(!pnpm_ships_a_tarball("10.20.0"));
-        assert!(!pnpm_ships_a_tarball("9.15.9"));
-        // Something unrecognisable is likelier to be new than ancient.
-        assert!(pnpm_ships_a_tarball("next"));
+    #[tokio::test]
+    async fn a_body_the_header_says_is_too_large_is_refused_before_it_is_read() {
+        // The reported bug: `response.bytes()` buffered the whole body and
+        // `MAX_DOWNLOAD` was compared against the allocation it exists to
+        // prevent. This server sends a `Content-Length` of 8 GB and then no
+        // body at all — the only way the call can return is by refusing on the
+        // header, because there is nothing to read.
+        let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 8589934592\r\n\r\n", &[]).await;
+        let error = fetch_bytes(&url).await.expect_err("8 GB is too much");
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("a size refusal is something the developer can be told about");
+        assert!(failure.attempting.contains("8589934592"), "{failure}");
+        assert!(failure.attempting.contains("more than"), "{failure}");
     }
 
-    #[test]
-    fn the_asset_name_follows_the_pinned_version() {
-        // The host decides the platform, so only the shape is asserted here.
-        let modern = pnpm_asset("11.11.0").unwrap();
-        assert!(modern.ends_with(".tar.gz"), "{modern}");
-        assert!(
-            !modern.contains("macos"),
-            "pnpm 11 calls macOS darwin: {modern}"
-        );
-
-        let legacy = pnpm_asset("10.20.0").unwrap();
-        assert!(!legacy.ends_with(".tar.gz"), "{legacy}");
-        assert!(
-            !legacy.contains("darwin"),
-            "pnpm 10 calls macOS macos: {legacy}"
-        );
+    #[tokio::test]
+    async fn a_body_that_arrives_in_pieces_is_reassembled_whole() {
+        // The other half of not calling `bytes()`: the cap is now enforced
+        // while the body accumulates, so the accumulation itself has to be
+        // right. A tarball arrives in as many chunks as the network feels like.
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n",
+            &[b"node", b"-v22", b"1234"],
+        )
+        .await;
+        assert_eq!(fetch_bytes(&url).await.unwrap(), b"node-v221234");
     }
 
-    #[test]
-    fn finds_the_digest_for_one_file_among_many() {
-        let shasums = "\
-aaaa1111  node-v22.23.1-linux-x64.tar.gz
-bbbb2222  node-v22.23.1-darwin-arm64.tar.gz
-cccc3333  node-v22.23.1-darwin-arm64.tar.xz
-";
-        assert_eq!(
-            digest_for(shasums, "node-v22.23.1-darwin-arm64.tar.gz").as_deref(),
-            Some("bbbb2222")
-        );
-        assert_eq!(digest_for(shasums, "node-v99.0.0-linux-x64.tar.gz"), None);
+    #[tokio::test]
+    async fn a_host_that_answers_with_a_404_names_the_pin_rather_than_the_network() {
+        // An upstream release that moved is not a connectivity problem, and
+        // telling the developer to check their network would send them to look
+        // at the one thing that is working.
+        let url = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", &[]).await;
+        let error = fetch_bytes(&url).await.expect_err("404");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(failure.action.contains("pinned to has moved"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_connection_riabuild_cannot_make_is_not_reported_as_a_bug_in_riabuild() {
+        // Port 1 on loopback, which nothing is listening on. Before this crate
+        // could produce a `Failure` every one of these reached `main`'s
+        // unknown-error branch and printed "it is a bug in riabuild" at a
+        // developer whose VPN was down.
+        let error = fetch_bytes("http://127.0.0.1:1/node.tar.gz")
+            .await
+            .expect_err("nothing is listening there");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(failure.action.contains("VPN"), "{failure}");
+        assert!(!failure.detail.is_empty(), "the cause is still carried");
     }
 
     /// Proves this build can resolve a name, complete a TLS handshake, and
@@ -315,86 +294,6 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         assert!(
             digest_for(&shasums, "node-v22.23.1-linux-x64.tar.gz").is_some(),
             "reached nodejs.org but the body was not SHASUMS256.txt"
-        );
-    }
-
-    #[test]
-    fn hashes_match_the_published_format() {
-        // Lowercase hex, the same shape SHASUMS256.txt uses.
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn platform_names_are_the_ones_upstream_publishes() {
-        let platform = node_platform().unwrap();
-        assert!(
-            ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"].contains(&platform.as_str()),
-            "unexpected platform {platform}"
-        );
-    }
-
-    #[test]
-    fn uname_output_maps_to_the_target_the_release_publishes() {
-        // Captured from real `uname -sm` output. Apple's arm64 is Rust's aarch64,
-        // and Linux binaries are musl so one build runs on every distribution rather
-        // than on everything newer than the runner's glibc.
-        assert_eq!(
-            rust_target("Darwin", "arm64").expect("mac"),
-            "aarch64-apple-darwin"
-        );
-        assert_eq!(
-            rust_target("Darwin", "x86_64").expect("mac"),
-            "x86_64-apple-darwin"
-        );
-        assert_eq!(
-            rust_target("Linux", "x86_64").expect("linux"),
-            "x86_64-unknown-linux-musl"
-        );
-        assert_eq!(
-            rust_target("Linux", "aarch64").expect("linux"),
-            "aarch64-unknown-linux-musl"
-        );
-        // Some distributions report arm64 rather than aarch64.
-        assert_eq!(
-            rust_target("Linux", "arm64").expect("linux"),
-            "aarch64-unknown-linux-musl"
-        );
-        // `uname` output arrives with a trailing newline.
-        assert_eq!(
-            rust_target("Linux\n", "x86_64\n").expect("linux"),
-            "x86_64-unknown-linux-musl"
-        );
-    }
-
-    #[test]
-    fn an_unpublished_platform_is_an_error_rather_than_a_guess() {
-        // Installing the wrong architecture produces an exec format error on the
-        // server with nothing in it that names riabuild.
-        assert!(rust_target("Linux", "i686").is_err());
-        assert!(rust_target("Linux", "armv7l").is_err());
-        assert!(rust_target("FreeBSD", "x86_64").is_err());
-        assert!(rust_target("Darwin", "ppc").is_err());
-    }
-
-    #[test]
-    fn asset_names_match_what_the_release_workflow_uploads() {
-        // release.yml builds `riabuild-$version-$target.tar.gz` and appends each
-        // digest to `riabuild-$version-checksums.txt`. If either is renamed there,
-        // this test is what fails.
-        assert_eq!(
-            riabuild_asset("2026.08.06", "aarch64-apple-darwin"),
-            "riabuild-2026.08.06-aarch64-apple-darwin.tar.gz"
-        );
-        assert_eq!(
-            riabuild_asset_url("2026.08.06", "x86_64-unknown-linux-musl"),
-            "https://github.com/Clubria/riabuild/releases/download/v2026.08.06/riabuild-2026.08.06-x86_64-unknown-linux-musl.tar.gz"
-        );
-        assert_eq!(
-            riabuild_checksums_url("2026.08.06"),
-            "https://github.com/Clubria/riabuild/releases/download/v2026.08.06/riabuild-2026.08.06-checksums.txt"
         );
     }
 }

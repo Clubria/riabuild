@@ -6,41 +6,27 @@
 //! here shares state with the setup flow — it is reached from a different arm
 //! of the same `match`, takes its own arguments, and returns before the setup
 //! path begins — so the split costs no threading.
+//!
+//! [`api`] holds the two calls this makes to riabuild-web, [`session`] is
+//! revoking the server's session, and [`server_side`] is the traces left on
+//! the server itself. What stays here is the command and this laptop's own
+//! records.
 
-use super::{Remote, identity, session, shell_command, shell_quote, ssh_once, store};
+use super::{Remote, identity, store};
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use riabuild_api::{ApiClient, ApiError};
+use riabuild_api::ApiClient;
 use riabuild_keychain as keychain;
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
-use riabuild_ui::{Failure, Ui};
+use riabuild_ui::Ui;
 use std::sync::Arc;
+mod api;
+mod revoke;
+mod server_side;
 
-/// The one network call `forget` makes, behind a seam.
-///
-/// Same shape and same reason as `install.rs`'s `Downloads`: without it, step
-/// 1 is only reachable by a test that stands up a real riabuild-web, which
-/// this crate's scaffolding has never done. Every `forget` test therefore left
-/// `session_id` empty, and the step whose *failure* must stop the whole
-/// function before anything local changes had no coverage at all.
-#[async_trait]
-pub(crate) trait Revokes: Send + Sync {
-    async fn revoke(&self, session_id: &str) -> Result<()>;
-}
-
-/// What production uses: `DELETE /api/v1/cli/sessions/<id>` (Task 3b).
-struct ApiRevokes<'a>(&'a ApiClient);
-
-#[async_trait]
-impl Revokes for ApiRevokes<'_> {
-    async fn revoke(&self, session_id: &str) -> Result<()> {
-        self.0
-            .delete_json::<serde_json::Value>(&format!("/api/v1/cli/sessions/{session_id}"))
-            .await
-            .map(|_| ())
-    }
-}
+use api::{ApiRevokes, Carries, IssuedCarries, Revokes};
+use revoke::revoke_session;
+use server_side::cleanup_server_side;
 
 /// `riabuild remote forget <name>` — done in the one order that is safe to
 /// interrupt: revoke on riabuild-web, then best-effort clean up the server,
@@ -77,15 +63,27 @@ pub async fn forget_remote(
     store: &mut store::Store,
     name: &str,
 ) -> Result<()> {
-    forget_with(paths, runner, ui, &ApiRevokes(api), member_id, store, name).await
+    forget_with(
+        paths,
+        runner,
+        ui,
+        &ApiRevokes(api),
+        &IssuedCarries(api),
+        member_id,
+        store,
+        name,
+    )
+    .await
 }
 
-/// The body of [`forget_remote`], taking [`Revokes`] as a seam.
+/// The body of [`forget_remote`], taking [`Revokes`] and [`Carries`] as seams.
+#[allow(clippy::too_many_arguments)]
 async fn forget_with(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     revokes: &dyn Revokes,
+    carries: &dyn Carries,
     member_id: &str,
     store: &mut store::Store,
     name: &str,
@@ -94,7 +92,7 @@ async fn forget_with(
         return Err(anyhow!("there is no saved server named \"{name}\""));
     };
 
-    retire_identity(paths, runner, ui, revokes, member_id, &record).await?;
+    retire_identity(paths, runner, ui, revokes, carries, member_id, &record).await?;
     super::store::forget_one(paths, store, name).await?;
 
     ui.note(&format!("Forgot {}.", record.display_name()));
@@ -115,11 +113,13 @@ async fn forget_with(
 /// The order is the one [`forget_remote`]'s own doc argues for, and for the
 /// same reason: revoke first, so that anything failing after it leaves a dead
 /// credential rather than a live one nothing on this laptop still records.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn retire_identity(
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     revokes: &dyn Revokes,
+    carries: &dyn Carries,
     member_id: &str,
     record: &store::Record,
 ) -> Result<()> {
@@ -128,12 +128,30 @@ pub(crate) async fn retire_identity(
     // 1. Revoke first. An empty `session_id` means no session was ever
     //    minted for this server (it was only ever added, never connected
     //    to) — nothing to revoke, so this is not skipped as a failure.
-    if !record.session_id.is_empty() {
+    if revocable(&record.session_id) {
         revoke_session(revokes, ui, &record.session_id).await?;
+    } else if !record.session_id.is_empty() {
+        // Not silently skipped: something is recorded there, so a session may
+        // well be live — it just is not an id this can safely put in a URL.
+        ui.warn(&format!(
+            "The session id saved for {} is not one riabuild recognises, so it is not being \
+             revoked. If that server has a live riabuild session, end it from the dashboard's \
+             session list.",
+            record.display_name()
+        ));
     }
 
     // 2. Best-effort cleanup on the server itself.
-    cleanup_server_side(&remote, paths, runner.clone(), ui, record, member_id).await;
+    cleanup_server_side(
+        &remote,
+        paths,
+        runner.clone(),
+        ui,
+        carries,
+        record,
+        member_id,
+    )
+    .await;
 
     // 3. Local delete: the keychain items and the key pair.
     let account = keychain::for_account(
@@ -151,15 +169,55 @@ pub(crate) async fn retire_identity(
     // should no longer be holding.
     super::askpass::forget(&remote, paths, runner).await?;
 
-    match tokio::fs::remove_file(identity::key_path(&remote, paths)).await {
+    // Both halves of the key pair, not just the private one. A `<hash>.pub`
+    // left behind is this laptop still holding a file naming a server the
+    // developer asked it to forget — and `authorise` reads it, so the next run
+    // against a re-added server of the same address would offer a key whose
+    // private half is gone.
+    let key = identity::key_path(&remote, paths);
+    remove_if_present(&key).await?;
+    remove_if_present(&key.with_extension("pub")).await?;
+
+    // And the directory the issued-key agent works in. It holds public halves
+    // of the *org's* keys and, if a run ended badly, a socket that may still
+    // have an `ssh-agent` behind it — neither of which belongs to a server
+    // this laptop has been told to let go of.
+    match tokio::fs::remove_dir_all(paths.agent_dir(&remote.hash())).await {
         Ok(()) => {}
-        // Nothing to remove is success here too — `ensure_key` never ran, or
-        // this is a second `forget` after a first one already got this far.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
 
     Ok(())
+}
+
+/// Deletes a file this laptop should no longer be holding, treating "it was
+/// not there" as done.
+///
+/// Nothing to remove is success: the step that would have created it never
+/// ran, or this is a second `forget` after a first one already got this far.
+async fn remove_if_present(path: &std::path::Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a saved session id is one riabuild will put in a URL path.
+///
+/// It is read straight out of `remotes.json` and formatted into
+/// `/api/v1/cli/sessions/{id}`, which is the one call whose failure must stop
+/// `forget` before anything local changes — so an id carrying a `/`, a `?` or a
+/// `..` would be aiming that stop at a route nobody chose. Convex ids are
+/// `[a-z0-9]` in practice; the set here is the wider one every id riabuild-web
+/// has ever minted fits inside, so this refuses hand edits and encoding
+/// accidents rather than second-guessing the format.
+fn revocable(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 /// Lets go of the machine one of the team's servers used to name, after a lead
@@ -188,111 +246,21 @@ pub async fn retire_superseded(
         ctx.runner.clone(),
         &ctx.ui,
         &ApiRevokes(&ctx.api),
+        &IssuedCarries(&ctx.api),
         member_id,
         superseded,
     )
     .await
 }
 
-/// Step 1 of [`forget_remote`]: revoke this server's session.
-async fn revoke_session(revokes: &dyn Revokes, ui: &Ui, session_id: &str) -> Result<()> {
-    match revokes.revoke(session_id).await {
-        Ok(()) => Ok(()),
-        Err(error) if already_revoked(&error) => {
-            // Not silent: see [`already_revoked`] for why this answer is
-            // genuinely ambiguous and why the ambiguity cannot be resolved
-            // from this side.
-            ui.warn(&format!(
-                "riabuild-web does not recognise this server's session ({session_id}), so it \
-                 is being treated as already revoked. If this laptop has signed in as a \
-                 different member since that session was minted, the token may still be \
-                 live — check the sessions list on the dashboard."
-            ));
-            Ok(())
-        }
-        Err(error) => Err(Failure::new(
-            "revoking this server's riabuild session",
-            "Check your network connection, then run `riabuild remote forget` again — \
-             until this succeeds, the token this laptop minted is still live on the server.",
-        )
-        .detail(error.to_string())
-        .into()),
-    }
-}
-
-/// Whether an error from [`revoke_session`]'s call means the session is
-/// already gone rather than that the call itself failed.
-///
-/// Treating "already gone" as success is what stops a retry after a
-/// half-finished `forget` getting stuck forever: the goal ("no live token")
-/// holds whether this laptop revoked it or something else did — another
-/// laptop's `forget`, an admin, natural expiry.
-///
-/// **The honest caveat, which this function cannot close.** riabuild-web
-/// deliberately answers `session_unknown` for a session that exists but
-/// belongs to a *different* member, so that session ids cannot be probed for
-/// existence by whoever holds one. So `session_unknown` means "gone, or not
-/// yours" — and the second reading is a live token. A hand-edited
-/// `remotes.json`, or an account switch on this laptop, reaches it. Nothing
-/// on the wire distinguishes the two, and trying to would defeat the
-/// endpoint's design, so [`revoke_session`] warns instead: the developer,
-/// unlike this process, can look at the dashboard's session list and tell.
-fn already_revoked(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<ApiError>()
-        .is_some_and(|api_error| api_error.code == "session_unknown")
-}
-
-/// Step 2 of [`forget_remote`]: the namespace and the `authorized_keys` line
-/// this developer's own key added, if either was ever created.
-///
-/// Never fails the caller: an unreachable server here is reported through
-/// `ui.warn` and left for a human to notice, not propagated as an error that
-/// would stop the local delete that follows it.
-async fn cleanup_server_side(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: Arc<dyn CommandRunner>,
-    ui: &Ui,
-    record: &store::Record,
-    member_id: &str,
-) {
-    if record.home.is_empty() {
-        // `resolve_home` never succeeded for this server — nothing was ever
-        // installed on it to clean up.
-        return;
-    }
-
-    let ns = session::namespace(&record.home, member_id);
-    let keys = format!("{}/.ssh/authorized_keys", record.home);
-    // Matched on the member id, as a fixed string via `grep -vF`. On a
-    // shared account every developer's key comment carries the same
-    // `user@host`, so matching on that would delete Bob's and Carla's lines
-    // too and lock them out of the box with no diagnostic anywhere. `sed`
-    // would also read the hostname's dots as wildcards, and `-i.bak` would
-    // leave the "removed" key sitting in a sibling file instead of gone.
-    let cleanup = shell_command(&format!(
-        "rm -rf {ns}; if [ -f {keys} ]; then grep -vF {marker} {keys} {redirect} {keys}.new \
-         && cat {keys}.new {redirect} {keys} && rm -f {keys}.new; fi",
-        ns = shell_quote(&ns),
-        keys = shell_quote(&keys),
-        marker = shell_quote(&identity::key_comment_marker(member_id)),
-        redirect = ">",
-    ));
-
-    let outcome = ssh_once(remote, paths, runner, &cleanup, None).await;
-    let succeeded = matches!(&outcome, Ok(output) if output.ok());
-    if !succeeded {
-        ui.warn(&format!(
-            "Could not reach {}. Its riabuild namespace and authorized_keys line are still there.",
-            remote.host
-        ));
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::api::Carried;
+    use super::revoke::api_error;
     use super::*;
+    use crate::issued;
+    use async_trait::async_trait;
+    use riabuild_api::ApiError;
     use riabuild_runner::FakeRunner;
 
     const MEMBER_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -317,7 +285,6 @@ mod tests {
         call.starts_with("security delete-generic-password")
             || call.starts_with("secret-tool clear")
     }
-
     /// A runner with the keychain CLI of *both* platforms registered, plus
     /// whatever `ssh` behaviour the test needs.
     fn runner_with_ssh(code: i32, stderr: &str) -> Arc<FakeRunner> {
@@ -328,7 +295,6 @@ mod tests {
                 .with("secret-tool", 0, "", ""),
         )
     }
-
     /// A `Revokes` that answers however the test says, and records the
     /// attempt into the same ordered list the runner writes to — which is
     /// what makes "revoke, then SSH, then local delete" assertable as one
@@ -365,12 +331,50 @@ mod tests {
         }
     }
 
-    fn api_error(code: &str, status: u16) -> ApiError {
-        ApiError {
-            status,
-            code: code.into(),
-            message: "x".into(),
-            action: "y".into(),
+    /// The laptop with no issued key that gets in — which is every laptop
+    /// against an ordinary server, and what every test but the gateway one
+    /// below is about. Resolving one for real means a fetch from riabuild-web
+    /// and an `ssh-agent`; this is why the seam exists.
+    struct NoCarry;
+
+    #[async_trait]
+    impl Carries for NoCarry {
+        async fn carry(
+            &self,
+            _remote: &Remote,
+            _paths: &dyn Paths,
+            _runner: Arc<dyn CommandRunner>,
+            _ui: &Ui,
+        ) -> Option<Carried> {
+            None
+        }
+    }
+
+    /// A managed gateway riabuild's own key can never sign in to, and the
+    /// issued identity that can. `Issued::preset(None)` gives `Carried` an
+    /// `Issued` with no agent behind it, so `stop` is a no-op and nothing is
+    /// started.
+    struct GatewayCarry;
+
+    const CARRIED_SOCKET: &str = "/tmp/riabuild-test-agent/agent.sock";
+
+    #[async_trait]
+    impl Carries for GatewayCarry {
+        async fn carry(
+            &self,
+            _remote: &Remote,
+            _paths: &dyn Paths,
+            _runner: Arc<dyn CommandRunner>,
+            _ui: &Ui,
+        ) -> Option<Carried> {
+            Some(Carried {
+                working: issued::Working {
+                    label: "bastion".into(),
+                    socket: CARRIED_SOCKET.into(),
+                    public_key_path: "/tmp/riabuild-test-agent/bastion.pub".into(),
+                },
+                issued: issued::Issued::preset(None),
+            })
         }
     }
 
@@ -384,7 +388,6 @@ mod tests {
         store.remotes.push(record);
         store
     }
-
     /// One of the team's servers, as a run that connected to it left it.
     fn shared_store(fresh: bool) -> store::Store {
         let mut store = store::Store::default();
@@ -396,7 +399,6 @@ mod tests {
         store.remotes.push(record);
         store
     }
-
     async fn key_on_disk(paths: &dyn Paths) {
         tokio::fs::create_dir_all(paths.identity_dir())
             .await
@@ -441,7 +443,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn forgetting_an_unreachable_server_says_what_it_left_behind() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -467,7 +468,6 @@ mod tests {
         // be a server you cannot remove.
         assert!(store.find("build-01").is_none());
     }
-
     /// The three steps, in the one order that is safe to interrupt, asserted
     /// as one sequence. A comment cannot hold this: every reordering of these
     /// three still compiles and still leaves the store entry gone at the end.
@@ -486,6 +486,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "build-01",
@@ -518,7 +519,6 @@ mod tests {
         assert!(store.find("build-01").is_none());
         assert!(!paths.identity_dir().join(remote().hash()).exists());
     }
-
     /// A server the developer has asked riabuild to forget is the clearest
     /// case there is of a secret riabuild should no longer be holding — and a
     /// saved SSH password is a *second* keychain account for the same server,
@@ -541,6 +541,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "build-01",
@@ -564,7 +565,6 @@ mod tests {
             "and the session must still go too: {deletes:?}"
         );
     }
-
     /// The step whose failure must stop everything. Until this test existed,
     /// no test reached the revoke at all, so "stop loudly before touching
     /// anything local" was a doc comment and nothing else.
@@ -583,6 +583,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "build-01",
@@ -607,7 +608,6 @@ mod tests {
             fake.calls()
         );
     }
-
     /// `session_unknown` is the one failure that reads as success — and the
     /// one that riabuild-web deliberately makes ambiguous, because it answers
     /// the same way for a session belonging to somebody else. `forget` still
@@ -631,6 +631,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "build-01",
@@ -645,7 +646,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn a_server_that_never_resolved_a_home_has_nothing_on_it_to_clean_up() {
         // No `record.home` means `resolve_home` never succeeded — the server
@@ -682,7 +682,6 @@ mod tests {
         );
         assert!(store.find("build-01").is_none());
     }
-
     #[tokio::test]
     async fn forgetting_a_server_that_was_never_saved_is_an_error_not_a_silent_no_op() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -703,26 +702,6 @@ mod tests {
         .expect_err("nothing named build-01 was ever saved");
         assert!(error.to_string().contains("build-01"), "{error}");
     }
-
-    #[test]
-    fn a_session_unknown_error_reads_as_already_revoked_not_a_failure() {
-        // Someone else already forgot this server — another laptop, an admin,
-        // natural expiry. The goal ("no live token") already holds, so this
-        // must not block a retry that would otherwise never find anything to
-        // revoke on the second attempt.
-        let error: anyhow::Error = api_error("session_unknown", 404).into();
-        assert!(already_revoked(&error));
-    }
-
-    #[test]
-    fn any_other_failure_is_not_mistaken_for_already_revoked() {
-        let upstream: anyhow::Error = api_error("upstream_error", 503).into();
-        assert!(!already_revoked(&upstream));
-
-        let transport = anyhow!("riabuild could not reach riabuild-web");
-        assert!(!already_revoked(&transport));
-    }
-
     #[tokio::test]
     async fn forgetting_one_of_the_teams_servers_clears_this_laptop_and_nothing_else() {
         // The honest reading of "the CLI cannot remove a shared server": it
@@ -742,6 +721,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "shared-build-01",
@@ -767,7 +747,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn a_server_the_leads_removed_can_still_be_forgotten_by_name() {
         // The case that keeps a removed server's session revocable. Its record
@@ -792,6 +771,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &mut store,
             "shared-build-01",
@@ -808,7 +788,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn retiring_an_edited_address_revokes_the_session_of_the_machine_being_left() {
         // A lead edited the address, so `shared::reconcile` handed back the old
@@ -828,6 +807,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             &revokes,
+            &NoCarry,
             MEMBER_ID,
             &old,
         )
@@ -850,5 +830,209 @@ mod tests {
             !paths.identity_dir().join(remote().hash()).exists(),
             "the key riabuild put on the old machine is no longer this laptop's"
         );
+    }
+    /// I047. On a managed SSH gateway riabuild's own key can never sign in —
+    /// the box accepts the write to `authorized_keys` and then authenticates
+    /// against its own registry regardless, which is the whole reason issued
+    /// keys exist. `cleanup_server_side` hardcoded `carry: None`, so on exactly
+    /// those servers `forget` could never authenticate: it always warned and
+    /// always left the namespace and the key line behind.
+    #[tokio::test]
+    async fn a_gateway_that_refuses_riabuilds_own_key_is_cleaned_up_with_the_issued_one() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+        let mut store = store_with(SESSION_ID);
+        // Every plain `ssh` is refused; the one carrying the agent socket is
+        // not. `FakeRunner` matches the longest registered prefix, so naming
+        // the socket is what tells the two apart.
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh", 255, "", "Permission denied (publickey).")
+                .containing(&format!("IdentityAgent={CARRIED_SOCKET}"), 0, "", "")
+                .with("security", 0, "", "")
+                .with("secret-tool", 0, "", ""),
+        );
+        let revokes = ScriptedRevoke::ok(fake.clone());
+        let ui = Ui::new(false);
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &ui,
+            &revokes,
+            &GatewayCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.contains(CARRIED_SOCKET) && call.contains("rm -rf")),
+            "the cleanup has to be retried through the identity that can actually sign in: {:?}",
+            fake.calls()
+        );
+        assert!(
+            ui.warned().is_empty(),
+            "a server that was cleaned up must not be reported as unreachable: {:?}",
+            ui.warned()
+        );
+    }
+    #[tokio::test]
+    async fn a_server_that_is_simply_off_does_not_pay_for_an_issued_key_hunt() {
+        // The over-correction to guard against: resolving an issued identity
+        // costs a fetch from riabuild-web, an `ssh-agent` and a probe per key.
+        // A box that never answered would pay all of it to be told again that
+        // it never answered.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = store_with(SESSION_ID);
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with(
+                    "ssh",
+                    255,
+                    "",
+                    "ssh: connect to host build-01.fly.dev port 22: Connection refused",
+                )
+                .with("security", 0, "", "")
+                .with("secret-tool", 0, "", ""),
+        );
+        let revokes = ScriptedRevoke::ok(fake.clone());
+        let ui = Ui::new(false);
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &ui,
+            &revokes,
+            &GatewayCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets locally regardless");
+
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|call| call.contains(CARRIED_SOCKET)),
+            "nothing refused us, so there is nothing an issued key would fix: {:?}",
+            fake.calls()
+        );
+        assert!(
+            ui.warned()
+                .iter()
+                .any(|warning| warning.contains("Could not reach")),
+            "{:?}",
+            ui.warned()
+        );
+    }
+    /// I048. The private key was the only thing removed. Both are this
+    /// laptop's own traces of a server it has been told to let go of — and
+    /// `authorise` reads the `.pub`, so leaving it means the next run against a
+    /// re-added server of the same address offers a key whose private half is
+    /// gone.
+    #[tokio::test]
+    async fn forgetting_a_server_removes_the_public_half_and_the_agent_directory_too() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+        let public = paths
+            .identity_dir()
+            .join(remote().hash())
+            .with_extension("pub");
+        tokio::fs::write(&public, "ssh-ed25519 AAAA riabuild")
+            .await
+            .expect("pub");
+        let agent = paths.agent_dir(&remote().hash());
+        tokio::fs::create_dir_all(&agent).await.expect("mkdir");
+        tokio::fs::write(agent.join("org.pub"), "ssh-ed25519 AAAA org")
+            .await
+            .expect("org key");
+
+        let mut store = store_with(SESSION_ID);
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &Ui::new(true),
+            &revokes,
+            &NoCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(!paths.identity_dir().join(remote().hash()).exists());
+        assert!(!public.exists(), "the public half is a trace too");
+        assert!(
+            !agent.exists(),
+            "the agent directory holds public halves of the org's keys and a socket that \
+             may still have an ssh-agent behind it"
+        );
+    }
+    /// I010. The id is read out of `remotes.json` and formatted straight into
+    /// `/api/v1/cli/sessions/{id}`. This is the one call whose failure must
+    /// stop `forget` before anything local changes, so an id carrying a `/` or
+    /// a `..` would be aiming that stop at a route nobody chose.
+    #[tokio::test]
+    async fn a_session_id_that_is_not_an_id_is_not_put_in_a_url() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let mut store = store_with("../../org/members?x=");
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+        let ui = Ui::new(false);
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &ui,
+            &revokes,
+            &NoCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("the rest of forget still runs");
+
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|call| call.contains("/api/v1/cli/sessions/")),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(
+            ui.warned()
+                .iter()
+                .any(|warning| warning.contains("not being")),
+            "a session that may be live must not be dropped in silence: {:?}",
+            ui.warned()
+        );
+        assert!(store.find("build-01").is_none());
+    }
+    #[test]
+    fn what_counts_as_a_revocable_session_id() {
+        assert!(revocable(SESSION_ID));
+        assert!(revocable("a-b_C9"));
+        assert!(!revocable(""));
+        assert!(!revocable("../sessions"));
+        assert!(!revocable("id with space"));
+        assert!(!revocable("id/../.."));
+        assert!(!revocable("id?query=1"));
     }
 }

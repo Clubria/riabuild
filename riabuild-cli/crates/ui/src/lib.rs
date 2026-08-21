@@ -7,15 +7,30 @@
 
 // `unwrap_used` is denied workspace-wide. In test scaffolding a panic *is* the
 // reporting mechanism for a failed precondition, so unwrapping a fixture is
-// correct. The `feature = "testing"` half matters as much as the `test` half:
-// when a downstream crate turns the feature on, this crate is compiled as a
-// dependency and `cfg(test)` is false, so the exemption would not apply.
-#![cfg_attr(any(test, feature = "testing"), allow(clippy::unwrap_used))]
+// correct — but the exemption is `test` and nothing else, and must stay that
+// way.
+//
+// It read `any(test, feature = "testing")`, which switched the lint off for
+// this crate's *production* code under the one command that enforces it.
+// `cargo clippy --workspace --all-targets` resolves dev-dependencies, a
+// dev-dependency somewhere in the workspace asks for `testing`, and features
+// unify onto the lib target — so the whole crate compiled with the allow on.
+// With `test` alone the lib target is linted again, and the unit-test target
+// that keeps the allow holds no production code the lib target does not.
+//
+// Scaffolding behind `feature = "testing"` carries its own allow where it is
+// defined, which is a hole the size of a module rather than of a crate.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 mod art;
 use riabuild_theme::{Role, Theme};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Whether anybody is on the other end of the terminal, and on which stream.
+/// The four sites that used to ask `is_terminal()` for themselves — two here,
+/// two in `prompt`, one in `status_bar` — all read it from one place now.
+pub mod tty;
 
 /// `Ui::ask`, `Ui::confirm`, their must-be-answered counterparts, and the pure
 /// rules behind them — the interactive half of this module, split out because
@@ -43,6 +58,11 @@ pub use status_bar::StatusBar;
 /// and worth asserting on their own, and `Ui` is not.
 mod wrap;
 pub use wrap::Detail;
+mod failure;
+pub use failure::Failure;
+mod report;
+mod words;
+pub use words::{duration_words, plural};
 
 pub struct Ui {
     /// The Clubria palette, bound to what this terminal can render. Every
@@ -106,65 +126,19 @@ pub struct Ui {
     noted: std::sync::Mutex<Vec<String>>,
 }
 
-/// Spaces needed for `line` to cover a status line `previous` columns wide.
-fn cover(previous: usize, line: &str) -> usize {
-    previous.saturating_sub(line.chars().count())
-}
-
-/// A note whose tail is the part the developer has to act on, painted as two
-/// spans rather than one.
+/// Locks one of the recorders above, and never panics doing it.
 ///
-/// The two cannot be nested. `Theme::paint` closes with `\x1b[0m`, which resets
-/// every attribute rather than the one it opened, so a `Strong` value formatted
-/// *into* a `Muted` line would end the dim at the value and leave everything
-/// after it undimmed. Painting the prose and the value separately is what makes
-/// the emphasis local to the value.
-///
-/// Pure, and taking its `Theme`, so a test can assert what each rung of the
-/// ladder receives without owning a terminal — the same reason `depth_for` is
-/// split out of `Theme::detect`.
-fn value_line(theme: Theme, text: &str, value: &str) -> String {
-    format!(
-        "    {} {}",
-        theme.paint(Role::Muted, text),
-        theme.paint(Role::Strong, value)
-    )
-}
-
-/// `1 commit`, `2 commits`.
-///
-/// Regular English `-s` only, which covers every noun riabuild counts. Worth a
-/// function because `commit(s)` is exactly the sort of detail that makes a
-/// tool read as unfinished, and it had spread to four separate messages.
-pub fn plural(count: u64, unit: &str) -> String {
-    if count == 1 {
-        format!("{count} {unit}")
-    } else {
-        format!("{count} {unit}s")
-    }
-}
-
-/// A count of minutes as something a person can judge at a glance.
-///
-/// A brokered credential lasts around a month, and "43199 more minute(s)" is a
-/// number nobody can convert in their head — it reads as an error rather than
-/// as "this is fine for weeks". Zero components are dropped so short durations
-/// stay short.
-pub fn duration_words(minutes: u64) -> String {
-    if minutes == 0 {
-        return "less than a minute".to_string();
-    }
-    let parts = [
-        (minutes / (60 * 24), "day"),
-        ((minutes / 60) % 24, "hour"),
-        (minutes % 60, "minute"),
-    ];
-    parts
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, unit)| plural(*count, unit))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The recorders are `testing`-gated but they are *not* test code: they are
+/// compiled into the lib target of every crate that turns the feature on, so
+/// `unwrap_used` applies to them like any other production line. A poisoned
+/// mutex here means a test panicked while holding one — it has already failed,
+/// and a `PoisonError` raised on top of it would replace the assertion message
+/// with one about locking. `into_inner` takes the data anyway, which is safe
+/// for a `Vec<String>` of things riabuild printed: there is no invariant a
+/// half-finished `push` could have broken.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn recorded<T>(cell: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Default for Ui {
@@ -176,14 +150,8 @@ impl Default for Ui {
 impl Ui {
     pub fn new(quiet: bool) -> Self {
         Self {
-            theme: Theme::detect(std::io::stdout().is_terminal()),
-            // Both halves matter. A piped stdin with a terminal stdout is the
-            // shape a CI job has, and a question asked there blocks until
-            // something times out. `cfg!(test)` is the same hazard indoors: a
-            // test run inherits the terminal `cargo test` was started from.
-            interactive: !cfg!(any(test, feature = "testing"))
-                && std::io::stdin().is_terminal()
-                && std::io::stdout().is_terminal(),
+            theme: Theme::detect(tty::can_paint()),
+            interactive: tty::attended(),
             quiet,
             pending: AtomicUsize::new(0),
             width: wrap::wrap_width(wrap::terminal_columns()),
@@ -203,19 +171,19 @@ impl Ui {
     /// Every question this `Ui` put, in order.
     #[cfg(any(test, feature = "testing"))]
     pub fn asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap().clone()
+        recorded(&self.asked).clone()
     }
 
     /// Every note this `Ui` printed, in order.
     #[cfg(any(test, feature = "testing"))]
     pub fn noted(&self) -> Vec<String> {
-        self.noted.lock().unwrap().clone()
+        recorded(&self.noted).clone()
     }
 
     /// Every warning this `Ui` printed, in order.
     #[cfg(any(test, feature = "testing"))]
     pub fn warned(&self) -> Vec<String> {
-        self.warned.lock().unwrap().clone()
+        recorded(&self.warned).clone()
     }
 
     /// A `Ui` that answers its own questions, for tests.
@@ -301,468 +269,11 @@ impl Ui {
     fn paint(&self, role: Role, text: &str) -> String {
         self.theme.paint(role, text)
     }
-
-    /// The mark, the wordmark, and what this invocation is about to work on.
-    pub fn banner(&self, org: &str) {
-        if self.quiet {
-            return;
-        }
-        println!();
-        for line in art::banner(
-            self.theme,
-            art::glyphs_render(),
-            org,
-            riabuild_version::VERSION,
-        ) {
-            println!("{line}");
-        }
-        println!();
-    }
-
-    pub fn heading(&self, text: &str) {
-        if self.quiet {
-            return;
-        }
-        println!("\n{}", self.paint(Role::Strong, text));
-    }
-
-    /// A task that needed nothing.
-    pub fn satisfied(&self, title: &str) {
-        if self.quiet {
-            return;
-        }
-        println!(
-            "  {} {}",
-            self.paint(Role::Ok, "●"),
-            self.paint(Role::Muted, title)
-        );
-    }
-
-    /// A task about to run, with the reason it is running.
-    pub fn working(&self, title: &str, reason: &str) {
-        if self.quiet {
-            return;
-        }
-        // Measured without the colour escapes, which occupy no columns.
-        self.pending.store(
-            format!("  ◐ {title} — {reason}").chars().count(),
-            Ordering::Relaxed,
-        );
-        print!(
-            "  {} {} {}",
-            self.paint(Role::Busy, "◐"),
-            title,
-            self.paint(Role::Muted, &format!("— {reason}")),
-        );
-        let _ = std::io::stdout().flush();
-    }
-
-    pub fn applied(&self, title: &str) {
-        if self.quiet {
-            return;
-        }
-        // This line is written over the status line, which is longer: it also
-        // carried the reason the task ran. Padding has to cover whatever was
-        // there, not a fixed guess — a fixed ten spaces left the tail of
-        // "— first run" behind, so finished tasks read "● GitHub CLI    un".
-        let line = format!("  ● {title}");
-        let padding = " ".repeat(cover(self.take_pending(), &line));
-        println!("\r  {} {}{}", self.paint(Role::Ok, "●"), title, padding);
-    }
-
-    /// One deliberate blank line, at a handoff.
-    ///
-    /// Spacing across a handoff is nobody's by default, and that is the bug it
-    /// exists to fix: `ssh` prints `Connection to … closed.` the moment the
-    /// remote command ends, `mosh` prints `[mosh is exiting.]` when it lets go,
-    /// and the environment shell prints an accounts box the second it starts.
-    /// None of them know what riabuild printed a line earlier, so the rule is
-    /// riabuild's to keep: **one blank line before handing the terminal to a
-    /// child that prints its own lines, and one after taking it back**.
-    ///
-    /// The other half of the rule is that whatever runs on the far side prints
-    /// none of its own — see `provision::open_shell`, where a laptop separates
-    /// its own shell and a server does not, because the laptop that opened the
-    /// connection already did.
-    ///
-    /// Counted rather than recorded in tests: what a spacing regression looks
-    /// like is a blank line missing or doubled, never one with the wrong text
-    /// in it.
-    pub fn blank(&self) {
-        if self.quiet {
-            return;
-        }
-        // A blank line ends the status line, exactly as a note does.
-        self.take_pending();
-        #[cfg(any(test, feature = "testing"))]
-        self.blanks.fetch_add(1, Ordering::Relaxed);
-        println!();
-    }
-
-    /// How many blank lines this `Ui` printed.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn blanks(&self) -> usize {
-        self.blanks.load(Ordering::Relaxed)
-    }
-
-    pub fn note(&self, text: &str) {
-        if self.quiet {
-            return;
-        }
-        // A note is written on the end of the status line and ends it, so
-        // there is nothing left for `applied` to cover.
-        self.take_pending();
-        #[cfg(any(test, feature = "testing"))]
-        self.noted.lock().unwrap().push(text.to_string());
-        // Recorded whole and printed folded: a test asserting what the
-        // developer was told should not have to know where the terminal
-        // happened to break the sentence.
-        for line in wrap::fold(text, self.width.saturating_sub(wrap::INDENT.len())) {
-            println!("{}{}", wrap::INDENT, self.paint(Role::Muted, &line));
-        }
-    }
-
-    /// A note ending in something the developer has to read off the screen and
-    /// type somewhere else: a device code, a one-time value.
-    ///
-    /// The prose stays `Muted` like every other note; the value does not. A
-    /// device code is transcribed by hand into a browser on another machine,
-    /// and printing it dim makes the one line that has to be legible the least
-    /// legible thing on the screen — under `Signing … in to riabuild` there are
-    /// three dim lines and no way to tell which one is the work.
-    ///
-    /// `Strong` rather than a hue: this is emphasis, not a status. `Brand` and
-    /// `Danger` share `1;31` on a sixteen-colour terminal, so a brand-coloured
-    /// code would read as an error message on exactly the terminals — an old
-    /// server over SSH — where this flow is the entire interface.
-    pub fn note_value(&self, text: &str, value: &str) {
-        if self.quiet {
-            return;
-        }
-        // A note ends the status line; see `note`.
-        self.take_pending();
-        #[cfg(any(test, feature = "testing"))]
-        self.noted.lock().unwrap().push(format!("{text} {value}"));
-        println!("{}", value_line(self.theme, text, value));
-    }
-
-    pub fn warn(&self, text: &str) {
-        // Deliberately not gated on `quiet`, and on stderr: a warning is what
-        // riabuild says in place of stopping, so it is the one line a run
-        // asked to be silent still has to produce.
-        #[cfg(any(test, feature = "testing"))]
-        self.warned.lock().unwrap().push(text.to_string());
-        self.end_status_line();
-        for (index, line) in wrap::fold(text, self.width.saturating_sub(wrap::INDENT.len()))
-            .iter()
-            .enumerate()
-        {
-            if index == 0 {
-                eprintln!("  {} {line}", self.paint(Role::Warn, "▲"));
-            } else {
-                // Under the first word, never under the mark: a hanging indent
-                // is what keeps the block reading as one warning.
-                eprintln!("{}{line}", wrap::INDENT);
-            }
-        }
-    }
-
-    /// A task that could not be finished, and that did not stop the run.
-    ///
-    /// The `▲` counterpart of [`Ui::applied`]. It covers the busy line the same
-    /// way, so the task resolves instead of sitting at `◐` for the rest of the
-    /// run, and it carries the outcome where the reason for running was. The
-    /// explanation follows beneath it, folded and dimmed — one mark for the
-    /// whole block, because a second `▲` under the first says nothing the first
-    /// did not.
-    ///
-    /// Two streams, on purpose. The mark and the outcome belong to the task
-    /// ladder, which is on stdout and is what the busy line has to be covered
-    /// on; the explanation is a warning and joins the rest of them on stderr. A
-    /// run asked to be quiet printed no ladder to cover, so there it goes to
-    /// stderr with the explanation — a warning is the one thing `--quiet` does
-    /// not silence.
-    pub fn unresolved(&self, title: &str, outcome: &str, detail: &[Detail]) {
-        // Recorded as one warning, not as a title and some lines: a test
-        // asserting that a downgraded path told the developer what happened
-        // should not have to know how the block was split up to print it.
-        #[cfg(any(test, feature = "testing"))]
-        self.warned.lock().unwrap().push(
-            std::iter::once(format!("{title} — {outcome}"))
-                .chain(detail.iter().map(|line| line.text().to_string()))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-        // Measured without the colour escapes, exactly as `applied` does.
-        let plain = format!("  ▲ {title} — {outcome}");
-        let padding = " ".repeat(cover(self.take_pending(), &plain));
-        let painted = format!(
-            "  {} {} {}",
-            self.paint(Role::Warn, "▲"),
-            title,
-            self.paint(Role::Muted, &format!("— {outcome}"))
-        );
-        if self.quiet {
-            eprintln!("{painted}");
-        } else {
-            println!("\r{painted}{padding}");
-            let _ = std::io::stdout().flush();
-        }
-        for line in wrap::detail_lines(self.theme, self.width, detail) {
-            eprintln!("{line}");
-        }
-    }
-
-    pub fn info(&self, text: &str) {
-        if self.quiet {
-            return;
-        }
-        println!("{text}");
-    }
-
-    /// The four things every failure must say.
-    pub fn failure(&self, failure: &Failure) {
-        self.end_status_line();
-        eprintln!();
-        eprintln!(
-            "  {} {}",
-            self.paint(Role::Danger, "riabuild stopped:"),
-            failure.attempting
-        );
-        if let Some(command) = &failure.command {
-            eprintln!("    {} {}", self.paint(Role::Muted, "ran"), command);
-        }
-        let body = self.width.saturating_sub(wrap::INDENT.len());
-        for line in failure
-            .detail
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .take(8)
-            .flat_map(|line| wrap::fold(line, body))
-        {
-            eprintln!("{}{}", wrap::INDENT, self.paint(Role::Muted, &line));
-        }
-        // The label is folded *with* the sentence rather than printed in front
-        // of it, so the first line is measured including the nine columns it
-        // occupies. An action is the longest thing a failure carries — the
-        // remedy for a stale host key names a file, a host and two commands —
-        // and it is the line the developer has to act on.
-        let mut paragraphs = failure.action.split('\n');
-        let opening = paragraphs.next().unwrap_or_default().trim();
-        for line in wrap::fold(&format!("do this: {opening}"), body) {
-            match line.strip_prefix("do this:") {
-                Some(rest) => eprintln!(
-                    "{}{}{rest}",
-                    wrap::INDENT,
-                    self.paint(Role::Strong, "do this:")
-                ),
-                None => eprintln!("{}{line}", wrap::INDENT),
-            }
-        }
-        // Anything past the first paragraph is a line to copy — the public key
-        // in `authorise`'s paste-it-by-hand remedy is the only one today — and
-        // gets the same treatment as a warning's. That is what a `\n` in an
-        // action means, and the only thing it means: `Failure` is a plain
-        // struct built at a hundred call sites, so the alternative is asking
-        // each of them to classify a paragraph none of them has.
-        let rest: Vec<Detail> = paragraphs.map(Detail::Verbatim).collect();
-        for line in wrap::detail_lines(self.theme, self.width, &rest) {
-            eprintln!("{line}");
-        }
-        eprintln!(
-            "    {}",
-            self.paint(
-                Role::Muted,
-                if failure.safe_to_rerun {
-                    "running `riabuild` again is safe once that is done"
-                } else {
-                    "do not re-run riabuild until that is done"
-                },
-            )
-        );
-        eprintln!();
-    }
 }
-
-/// A failure a developer can act on.
-#[derive(Debug, Clone)]
-pub struct Failure {
-    /// What riabuild was trying to do, in the developer's words.
-    pub attempting: String,
-    /// The exact command that failed, if there was one.
-    pub command: Option<String>,
-    /// stderr, or whatever else explains it.
-    pub detail: String,
-    /// One concrete next action.
-    pub action: String,
-    pub safe_to_rerun: bool,
-}
-
-impl Failure {
-    pub fn new(attempting: impl Into<String>, action: impl Into<String>) -> Self {
-        Self {
-            attempting: attempting.into(),
-            command: None,
-            detail: String::new(),
-            action: action.into(),
-            safe_to_rerun: true,
-        }
-    }
-
-    pub fn command(mut self, command: impl Into<String>) -> Self {
-        self.command = Some(command.into());
-        self
-    }
-
-    pub fn detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = detail.into();
-        self
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} — {}", self.attempting, self.action)
-    }
-}
-
-impl std::error::Error for Failure {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_finished_task_covers_the_status_line_it_replaces() {
-        // "  ◐ GitHub CLI — first run" is 26 columns and "  ● GitHub CLI" is
-        // 14. The ten fixed spaces this used to print reached column 24 and
-        // left the last two behind, so a satisfied task rendered as
-        // "● GitHub CLI          un".
-        assert_eq!("  ◐ GitHub CLI — first run".chars().count(), 26);
-        assert!(cover(26, "  ● GitHub CLI") > 10);
-        assert_eq!(cover(26, "  ● GitHub CLI"), 12);
-    }
-
-    #[test]
-    fn a_longer_finished_line_is_not_padded_backwards() {
-        assert_eq!(cover(8, "  ● Node and pnpm"), 0);
-    }
-
-    #[test]
-    fn a_note_ends_the_status_line_so_nothing_is_left_to_cover() {
-        let ui = Ui::new(false);
-        ui.working("Infisical CLI", "first run");
-        ui.note("Installing infisical with Homebrew…");
-        assert_eq!(ui.take_pending(), 0);
-    }
-
-    #[test]
-    fn a_device_code_is_not_dimmed_along_with_the_words_in_front_of_it() {
-        use riabuild_theme::Depth;
-        // The dim run closes before the code opens. Written the obvious way —
-        // a `Strong` value formatted into a `Muted` line — the inner reset
-        // would end the dim at the code and leave the rest of the line
-        // undimmed, emphasising everything except the thing to emphasise.
-        let line = value_line(
-            Theme::with_depth(Depth::TrueColor),
-            "Enter code",
-            "DHNT-ZSDM",
-        );
-        assert_eq!(line, "    \x1b[2mEnter code\x1b[0m \x1b[1mDHNT-ZSDM\x1b[0m");
-    }
-
-    #[test]
-    fn a_highlighted_value_still_reads_as_a_sentence_without_colour() {
-        // NO_COLOR, a pipe, a CI log: the emphasis is gone and the line has to
-        // survive being nothing but its words.
-        let line = value_line(Theme::plain(), "Enter code", "DHNT-ZSDM");
-        assert_eq!(line, "    Enter code DHNT-ZSDM");
-        assert!(!line.contains('\x1b'));
-    }
-
-    #[test]
-    fn a_highlighted_value_is_recorded_as_one_note() {
-        // Painted as two spans, recorded as one sentence: a test asserting on
-        // what the developer was told should not have to know the line was
-        // split to colour it.
-        let ui = Ui::new(false);
-        ui.note_value("Enter code", "DHNT-ZSDM");
-        assert_eq!(ui.noted(), vec!["Enter code DHNT-ZSDM"]);
-    }
-
-    #[test]
-    fn a_warning_ends_the_status_line_it_interrupts() {
-        // The reported bug: `warn` writes to stderr, so it cannot carry the
-        // `\r` that covers stdout, and it left the busy line unterminated —
-        // "◐ Authorised — installing the key  ▲ riabuild's key is already…"
-        // on one line, with the task never resolving.
-        let ui = Ui::new(false);
-        ui.working("Authorised", "installing the key");
-        ui.warn("something to say about it");
-        assert_eq!(ui.take_pending(), 0);
-    }
-
-    #[test]
-    fn an_unresolved_task_covers_the_busy_line_like_a_finished_one() {
-        let ui = Ui::new(false);
-        ui.working("Authorised", "installing the key");
-        ui.unresolved("Authorised", "the server refuses it", &[]);
-        assert_eq!(ui.take_pending(), 0);
-    }
-
-    #[test]
-    fn an_unresolved_task_is_recorded_as_one_warning() {
-        // `Ok(())` on its own is indistinguishable from a step that silently
-        // did nothing, so the recorder is what a test asserts a downgraded
-        // path actually spoke up — and it should not have to know the block
-        // was split into a title and three paragraphs to print it.
-        let ui = Ui::new(false);
-        ui.unresolved(
-            "Authorised",
-            "the server refuses it",
-            &[
-                Detail::Prose("It is already in the file."),
-                Detail::Verbatim("ssh-ed25519 AAAA riabuild"),
-            ],
-        );
-        assert_eq!(
-            ui.warned(),
-            vec![
-                "Authorised — the server refuses it It is already in the file. ssh-ed25519 AAAA riabuild"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_status_line_is_only_covered_once() {
-        let ui = Ui::new(false);
-        ui.working("GitHub CLI", "first run");
-        ui.applied("GitHub CLI");
-        assert_eq!(ui.take_pending(), 0);
-    }
-
-    #[test]
-    fn a_months_worth_of_minutes_reads_as_days() {
-        // The number that prompted this: a 30-day Infisical credential, one
-        // minute in, rendered as "43199 more minute(s)".
-        assert_eq!(duration_words(43_199), "29 days 23 hours 59 minutes");
-        assert_eq!(duration_words(43_200), "30 days");
-    }
-
-    #[test]
-    fn empty_components_are_left_out() {
-        assert_eq!(duration_words(1), "1 minute");
-        assert_eq!(duration_words(59), "59 minutes");
-        assert_eq!(duration_words(60), "1 hour");
-        assert_eq!(duration_words(90), "1 hour 30 minutes");
-        assert_eq!(duration_words(1440), "1 day");
-        assert_eq!(duration_words(1500), "1 day 1 hour");
-    }
-
-    #[test]
-    fn an_expired_credential_does_not_read_as_zero_minutes() {
-        assert_eq!(duration_words(0), "less than a minute");
-    }
 
     #[test]
     fn there_is_one_answer_to_whether_a_person_is_here() {
@@ -775,20 +286,5 @@ mod tests {
         assert!(!Ui::new(false).assume_prompts_work(false).interactive());
         // `scripted` models a developer answering, so it is interactive too.
         assert!(Ui::scripted(["y"]).interactive());
-    }
-
-    #[test]
-    fn a_failure_carries_all_four_parts() {
-        let failure = Failure::new("checking your GitHub sign-in", "run `gh auth login`")
-            .command("gh auth status")
-            .detail("You are not logged into any GitHub hosts.");
-
-        assert!(failure.command.is_some());
-        assert!(!failure.detail.is_empty());
-        assert!(failure.safe_to_rerun);
-        assert_eq!(
-            failure.to_string(),
-            "checking your GitHub sign-in — run `gh auth login`"
-        );
     }
 }

@@ -9,13 +9,38 @@
 //! developer keys after the first run, and silently clobbers edits. Layering at
 //! launch means org policy is always current, removals take effect, developer
 //! edits survive, and there is no merge code to maintain.
+//!
+//! **Nothing the server sends is written unread.** `vetting` is the gate, and
+//! `../../../../CLAUDE.md` is the rule it enforces: the org settings may *name*
+//! a program and never *carry* one. This used to write `remote.settings`
+//! verbatim, which made a `hooks` block in the dashboard arbitrary code on every
+//! laptop.
+
+mod vetting;
 
 use super::{Ctx, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_api::org;
+use riabuild_paths::contract_tilde;
 
 pub struct OrgSettings;
+
+/// The status line command the `claude_statusline` task installs on *this*
+/// machine, which is the only one `vetting` will let through.
+///
+/// Derived from `Paths` rather than written out, because the two are not the
+/// same string everywhere: `claude_statusline_file()` hangs off `tools_root()`,
+/// so on a server it is the shared account's `~/.riabuild` and not this
+/// developer's namespace. A constant here would be a fourth place that has to
+/// agree with `riabuild-web`'s `DEFAULT_STATUS_LINE` and would be wrong on
+/// exactly the machines nobody tests by hand.
+fn installed_status_line(ctx: &Ctx) -> String {
+    format!(
+        "node {}",
+        contract_tilde(&ctx.paths.claude_statusline_file(), &ctx.paths.home())
+    )
+}
 
 #[async_trait]
 impl Task for OrgSettings {
@@ -27,8 +52,13 @@ impl Task for OrgSettings {
         "Team Claude Code settings"
     }
 
+    /// 2 for `vetting`. A key that names a program is drift `check()` now sees
+    /// on its own, so the bump is not for that half — it is for the *stripped*
+    /// half. A cached file written verbatim by an older riabuild can carry keys
+    /// this would now leave out, and `updated_at` says nothing about them, so
+    /// without a bump those machines keep a file nobody would write today.
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn depends_on(&self) -> &[TaskId] {
@@ -44,10 +74,22 @@ impl Task for OrgSettings {
         let Ok(text) = tokio::fs::read_to_string(&file).await else {
             return Ok(Status::needs("the cached team settings cannot be read"));
         };
-        if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+        let Ok(cached) = serde_json::from_str::<serde_json::Value>(&text) else {
             // `claude --settings` would fail on this at launch, so it counts as
             // a broken machine even though the file is present.
             return Ok(Status::needs("the cached team settings are not valid JSON"));
+        };
+
+        // The file on disk gets the same reading the server's payload does, and
+        // before the network is consulted. A machine provisioned by a riabuild
+        // released before `vetting` existed has a verbatim copy of whatever the
+        // dashboard held that day sitting in the file every launcher passes to
+        // `claude --settings`, and `updated_at` would call it current forever.
+        // Reporting it here is what makes an upgrade re-write it — or, when it
+        // carries a program, fail loudly on the next run instead of the next
+        // dashboard edit.
+        if let Err(refusal) = vetting::vet(&cached, &installed_status_line(ctx)) {
+            return Ok(Status::needs(refusal.reason().to_string()));
         }
 
         // Nothing to compare against until this machine is signed in, and the
@@ -74,11 +116,35 @@ impl Task for OrgSettings {
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let remote = org::fetch_claude_settings(&ctx.api).await?;
+
+        // Before anything is written, and before `updated_at` is recorded: a
+        // refusal here leaves the previous cached file exactly where it was, so
+        // a dashboard edit that carries a program cannot even blank out the
+        // policy a machine already had.
+        let vetted = vetting::vet(&remote.settings, &installed_status_line(ctx))?;
+        if !vetted.stripped.is_empty() {
+            ctx.ui.note(&format!(
+                "The team Claude Code settings name {} riabuild does not recognise, so {} left \
+                 out: {}",
+                if vetted.stripped.len() == 1 {
+                    "a setting"
+                } else {
+                    "settings"
+                },
+                if vetted.stripped.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                },
+                vetted.stripped.join(", ")
+            ));
+        }
+
         let file = ctx.paths.org_settings_file();
         if let Some(parent) = file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&file, serde_json::to_string_pretty(&remote.settings)?).await?;
+        tokio::fs::write(&file, serde_json::to_string_pretty(&vetted.settings)?).await?;
 
         let updated_at = remote.updated_at;
         ctx.update_config(|config| config.org_settings_updated_at = Some(updated_at))
@@ -174,6 +240,51 @@ mod tests {
             .await
             .expect_err("nothing can be fetched without a session");
         assert!(error.to_string().contains("not signed in"), "{error}");
+    }
+
+    /// A machine provisioned before `vetting` existed can be holding a verbatim
+    /// copy of a `hooks` block in the file every launcher passes to
+    /// `claude --settings`. `updated_at` would call it current, so the file
+    /// itself has to be read — and read before the sign-in guard, or the answer
+    /// on an expired session is "waiting for sign-in" while the hook still runs.
+    #[tokio::test]
+    async fn a_cached_file_carrying_a_hook_is_reported_rather_than_trusted() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_file(
+            &ctx.paths.org_settings_file(),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"id"}]}]}}"#,
+        )
+        .await;
+
+        let status = OrgSettings.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("hooks"), "{status:?}");
+    }
+
+    /// The other half of the same guard: a status line the server rewrote is a
+    /// program too, and it is the one key allowed to name one at all.
+    #[tokio::test]
+    async fn a_cached_file_naming_another_status_line_is_reported() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        write_file(
+            &ctx.paths.org_settings_file(),
+            r#"{"statusLine":{"type":"command","command":"node /tmp/theirs.js"}}"#,
+        )
+        .await;
+
+        let status = OrgSettings.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("statusLine"), "{status:?}");
+    }
+
+    /// What `vetting` is measured against, resolved from this machine's own
+    /// `Paths` — the assertion `claude_statusline`'s suite makes about the file
+    /// it installs, seen from the side that has to match it.
+    #[tokio::test]
+    async fn the_status_line_vetting_allows_is_the_one_that_gets_installed() {
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        assert_eq!(
+            installed_status_line(&ctx),
+            "node ~/.riabuild/claude-statusline.js"
+        );
     }
 
     #[tokio::test]

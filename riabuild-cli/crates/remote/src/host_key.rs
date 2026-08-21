@@ -8,118 +8,40 @@
 //! key pair `ensure_key` generates.
 //!
 //! Nothing here is re-exported from `identity`. `identity::trust_host` would
-//! keep compiling and the split would buy nothing.
+//! keep compiling and the split would buy nothing.//!
+//! [`scan`] reads what `ssh-keyscan` and `ssh-keygen` say; [`pin`] writes the
+//! one line that records the answer. This file is the decision between them.
 
 use super::Remote;
-use super::identity::set_private_dir;
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandRunner, RunOptions};
 use riabuild_ui::{Failure, Ui};
-use std::path::Path;
 use std::sync::Arc;
+mod pin;
+mod scan;
 
-/// `SHA256:…` out of one line of `ssh-keygen -lf` output.
-pub fn fingerprint_of(stdout: &str) -> Option<String> {
-    stdout
-        .split_whitespace()
-        .find(|word| word.starts_with("SHA256:"))
-        .map(str::to_string)
-}
+use pin::pin;
+use scan::fingerprints;
+pub use scan::{KEY_TYPES, entry_host, fingerprint_of, preferred_key};
 
-/// The first field of this server's `known_hosts` line — bare for port 22,
-/// `[host]:port` otherwise. Shared with `authorise`, which has to name the
-/// exact line to remove when `ssh` refuses a stale pin.
+/// riabuild has a host key and cannot say what it is.
 ///
-/// Case-folded, like [`Remote::hash`] and like `ssh` itself: OpenSSH matches
-/// `known_hosts` host patterns case-insensitively (verified against OpenSSH
-/// 9.6 — `ssh-keygen -F Build-01.Fly.Dev` finds a `build-01.fly.dev` line and
-/// vice versa), so one server typed two ways is one pinned line to `ssh` and
-/// has to be one here too. `store::choose` lets the newest spelling win, so
-/// typing `Build-01.Fly.Dev` once rewrites `record.host` permanently; a
-/// case-sensitive first field then missed the line already in the file on
-/// every later run — a re-scan, a fresh trust prompt, and another duplicate
-/// entry appended each time.
-pub fn entry_host(remote: &Remote) -> String {
-    // ASCII-only, the same choice `Remote::hash` documents: hostnames are
-    // ASCII or punycode, so there is no Unicode case-folding to get wrong.
-    let host = remote.host.to_ascii_lowercase();
-    if remote.port == 22 {
-        host
-    } else {
-        format!("[{host}]:{}", remote.port)
-    }
-}
-
-const UNREADABLE: &str = "an unreadable fingerprint";
-
-/// What `ssh-keyscan -t` is asked for, and in [`PREFERRED`] order what riabuild
-/// will pin out of the answer.
-///
-/// Not `ed25519` alone, which is what this was. A single-type scan cannot see a
-/// server that offers only some *other* type, and riabuild has exactly one way
-/// of reporting an empty scan: "reaching <host> on port <port>", which sends
-/// the developer off to check their hostname, their port, and whether the box
-/// is running SSH — for a server that answered on the first connection. SSHPiper,
-/// which fronts several hosted SSH gateways, offers an RSA host key and nothing
-/// else, so *every* riabuild remote behind one hit that dead end.
-pub const KEY_TYPES: &str = "ed25519,ecdsa,rsa";
-
-/// Best first. `ssh-keyscan` returns a line per type it was answered with, and
-/// only one of them may be pinned — see [`preferred_key`].
-const PREFERRED: [&str; 3] = ["ssh-ed25519", "ecdsa-sha2-", "ssh-rsa"];
-
-/// The one line out of a scan that riabuild will show and pin.
-///
-/// Exactly one, and this is load-bearing rather than tidy. The developer is
-/// shown a single fingerprint — the first key's — so pinning every line beside
-/// it would trust keys nobody looked at: approve the RSA fingerprint you were
-/// shown, and an unseen ed25519 key is pinned along with it. That risk is what
-/// the single-type scan this replaces was avoiding; choosing here keeps the
-/// property while letting the scan ask for every type, which is what an
-/// RSA-only server needs.
-///
-/// Pinning one type is enough for `ssh` itself: OpenSSH reorders the host key
-/// algorithms it offers to prefer what `known_hosts` already holds for that
-/// host, so a server offering both keys will be asked for the pinned one.
-///
-/// A type not in [`PREFERRED`] still counts — `-t` cannot return one today, but
-/// a future OpenSSH naming is a key riabuild saw and fingerprinted, not a
-/// reason to declare a reachable server unreachable.
-pub fn preferred_key(scan: &str) -> Option<&str> {
-    let keys: Vec<&str> = scan
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-    PREFERRED
-        .iter()
-        .find_map(|wanted| {
-            keys.iter()
-                .find(|line| {
-                    line.split_whitespace()
-                        .nth(1)
-                        .is_some_and(|kind| kind.starts_with(wanted))
-                })
-                .copied()
-        })
-        .or_else(|| keys.first().copied())
-}
-
-/// Every fingerprint `ssh-keygen -lf -` reports for `keys`, which may be a
-/// freshly scanned key or the lines already in `known_hosts`.
-async fn fingerprints(runner: &dyn CommandRunner, keys: &str) -> Result<Vec<String>> {
-    let shown = runner
-        .run(
-            "ssh-keygen",
-            &["-lf", "-"],
-            &RunOptions {
-                stdin: Some(keys.as_bytes().to_vec()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    Ok(shown.stdout.lines().filter_map(fingerprint_of).collect())
+/// A stop rather than a warning: every caller of [`fingerprints`] is about to
+/// either pin that key or compare it against one the developer named, and both
+/// are decisions about a value riabuild does not have. The remedy is
+/// `ssh-keygen`, because on every machine this has been seen on it was
+/// `ssh-keygen` that was missing or broken — riabuild owns the tools it
+/// installs, and OpenSSH is deliberately not one of them.
+pub(super) fn unreadable(stderr: String) -> anyhow::Error {
+    Failure::new(
+        "reading that server's host key fingerprint",
+        "riabuild will not pin a host key it cannot show you. Check that `ssh-keygen` \
+         is installed and on your PATH, then run `riabuild remote` again.",
+    )
+    .command("ssh-keygen -lf -")
+    .detail(stderr)
+    .into()
 }
 
 /// The alarming case: a fingerprint named in advance did not match. That is
@@ -195,15 +117,18 @@ pub async fn trust_host(
         let Some(expected) = accept else {
             return Ok(());
         };
+        // `?`, and the empty case is gone with it: `fingerprints` now refuses
+        // rather than answering with nothing, so there is no branch here that
+        // could report a pin as "an unreadable fingerprint" and still let the
+        // comparison stand.
         let found = fingerprints(runner.as_ref(), &pinned.join("\n")).await?;
         if !found.iter().any(|seen| seen == expected) {
-            let shown = found.join(", ");
             return Err(mismatch(
                 remote,
                 paths,
                 format!(
                     "expected {expected}, but {host_field} is already pinned as {}",
-                    if shown.is_empty() { UNREADABLE } else { &shown }
+                    found.join(", ")
                 ),
             ));
         }
@@ -244,11 +169,17 @@ pub async fn trust_host(
         .into());
     }
 
+    // No fallback string here either, and that is the point of the `?`: what
+    // this value is about to do is be printed to the developer as the thing
+    // riabuild is trusting, or be compared against a fingerprint they named.
+    // A placeholder standing in for a fingerprint riabuild could not read
+    // makes both of those a lie, and the developer's only signal — the line
+    // they were shown — reads as though the check happened.
     let found = fingerprints(runner.as_ref(), &keys).await?;
     let fingerprint = found
         .first()
         .cloned()
-        .unwrap_or_else(|| UNREADABLE.to_string());
+        .ok_or_else(|| unreadable(String::new()))?;
 
     // A supplied fingerprint answers the prompt without weakening it: it has to
     // match exactly, or this fails rather than prompting on a terminal that
@@ -280,64 +211,11 @@ pub async fn trust_host(
     Ok(())
 }
 
-/// Appends a newly-trusted host key to riabuild's own `known_hosts`,
-/// creating its directory (`0700`) if needed. Shared by the `accept` and
-/// interactive paths so there is exactly one place that writes this file.
-///
-/// **Append-only, no read-modify-write.** A prior version re-read
-/// `known_hosts` right before composing a full rewrite, which closed the
-/// original stale-snapshot window but still let two genuinely concurrent
-/// `pin` calls each read before either wrote (and its temp-file name,
-/// process-id-only, collided between them regardless). `trust_host` only
-/// ever calls this for a host with no existing entry — its `already` check
-/// returns earlier otherwise — so there is nothing here to *replace*, only
-/// to add, and `O_APPEND` has no read step to go stale: the kernel
-/// atomically extends the file and places the write at the new end, so two
-/// concurrent appenders on one local filesystem cannot overwrite each
-/// other's bytes. (This assumes a local filesystem, true here under
-/// `~/.riabuild`; `O_APPEND` is not atomic across clients on NFS.)
-///
-/// The one thing append can get wrong is gluing onto a line missing its
-/// trailing `\n` (a hand-edited file) — guarded by leading with a newline
-/// when the file already has bytes. A race on that check costs at most one
-/// redundant blank line, which `ssh` ignores, never lost or corrupted data.
-async fn pin(paths: &dyn Paths, known_hosts: &Path, keys: &str) -> Result<()> {
-    tokio::fs::create_dir_all(paths.ssh_dir()).await?;
-    set_private_dir(&paths.ssh_dir()).await?;
-    let has_content = tokio::fs::metadata(known_hosts)
-        .await
-        .map(|meta| meta.len() > 0)
-        .unwrap_or(false);
-    let mut entry = String::new();
-    if has_content {
-        entry.push('\n');
-    }
-    entry.push_str(keys);
-    entry.push('\n');
-    append(known_hosts, entry.as_bytes()).await
-}
-
-/// Opens `path` for append (creating it if needed) and writes `bytes`,
-/// flushed before returning — `write_all` alone only queues the bytes for a
-/// blocking-pool task to actually write, the same gap `keychain/file.rs`'s
-/// `write_private_token` was fixed for.
-async fn append(path: &Path, bytes: &[u8]) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(bytes).await?;
-    file.flush().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use riabuild_paths::RealPaths;
-    use riabuild_runner::FakeRunner;
+    use riabuild_runner::{Decoration, Delegating, FakeRunner};
     use riabuild_ui::Ui;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -349,17 +227,6 @@ mod tests {
             port: 2222,
             user: "ada".into(),
         }
-    }
-
-    #[test]
-    fn a_fingerprint_is_read_out_of_ssh_keygen_output() {
-        let line = "256 SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y host (ED25519)";
-        assert_eq!(
-            fingerprint_of(line).as_deref(),
-            Some("SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y")
-        );
-        assert_eq!(fingerprint_of("").as_deref(), None);
-        assert_eq!(fingerprint_of("nothing useful here").as_deref(), None);
     }
 
     fn scan_stub(remote: &Remote, fingerprint_line: &str) -> FakeRunner {
@@ -388,34 +255,6 @@ mod tests {
             remote.host, remote.port, remote.host, remote.host, remote.port
         )
     }
-
-    #[test]
-    fn the_best_key_of_several_is_the_one_chosen() {
-        let scan = "host ssh-rsa AAAArsa\n\
-                    host ecdsa-sha2-nistp256 AAAAecdsa\n\
-                    host ssh-ed25519 AAAAed25519\n";
-        assert_eq!(preferred_key(scan), Some("host ssh-ed25519 AAAAed25519"));
-        assert_eq!(
-            preferred_key("host ssh-rsa AAAArsa\nhost ecdsa-sha2-nistp256 AAAAecdsa\n"),
-            Some("host ecdsa-sha2-nistp256 AAAAecdsa")
-        );
-        // The case this whole change exists for: nothing but RSA on offer.
-        assert_eq!(
-            preferred_key("# host:22 SSH-2.0-SSHPiper\nhost ssh-rsa AAAArsa\n"),
-            Some("host ssh-rsa AAAArsa")
-        );
-        // Comments and blank lines are not keys, and a scan of nothing else
-        // has no key to offer.
-        assert_eq!(preferred_key("# host:22 SSH-2.0-OpenSSH_9.6\n\n"), None);
-        assert_eq!(preferred_key(""), None);
-        // A type riabuild has no opinion about is still a key it saw, and the
-        // fingerprint shown is that line's own.
-        assert_eq!(
-            preferred_key("host ssh-newthing AAAAnew"),
-            Some("host ssh-newthing AAAAnew")
-        );
-    }
-
     #[tokio::test]
     async fn the_scan_asks_for_every_key_type_riabuild_can_pin() {
         // The bug, at its source. Scanning `-t ed25519` alone reports a server
@@ -455,7 +294,6 @@ mod tests {
             );
         }
     }
-
     #[tokio::test]
     async fn a_server_offering_only_an_rsa_host_key_is_pinned_rather_than_called_unreachable() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -486,7 +324,6 @@ mod tests {
             "a banner comment is not a host key: {contents}"
         );
     }
-
     #[tokio::test]
     async fn only_the_one_key_the_developer_was_shown_is_pinned() {
         // Why the scan cannot simply pin everything it is answered with: the
@@ -543,7 +380,6 @@ mod tests {
             "{contents}"
         );
     }
-
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
     const GOOD_FINGERPRINT_LINE: &str =
         "256 SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y host (ED25519)";
@@ -562,7 +398,6 @@ mod tests {
         .await
         .expect("write");
     }
-
     #[test]
     fn the_known_hosts_field_is_case_folded_the_way_ssh_matches_it() {
         let mixed = Remote {
@@ -581,7 +416,6 @@ mod tests {
         // every other test here and `authorise`'s remedy message rely on.
         assert_eq!(entry_host(&remote()), "[build-01.fly.dev]:2222");
     }
-
     #[tokio::test]
     async fn a_host_pinned_in_one_spelling_is_not_re_pinned_when_typed_in_another() {
         // DNS is case-insensitive and so is `ssh`'s own `known_hosts` lookup,
@@ -632,7 +466,6 @@ mod tests {
             );
         }
     }
-
     #[tokio::test]
     async fn an_already_trusted_host_is_not_scanned_again() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -649,7 +482,6 @@ mod tests {
             .await
             .expect("already trusted");
     }
-
     #[tokio::test]
     async fn an_already_pinned_host_matching_the_accepted_fingerprint_is_not_rescanned() {
         // The pin has to be *consulted*, not merely counted. The old
@@ -689,7 +521,6 @@ mod tests {
             fake.calls()
         );
     }
-
     #[tokio::test]
     async fn a_stale_pin_disagreeing_with_the_accepted_fingerprint_is_refused() {
         // The C3 regression. `trust_host` used to return `Ok(())` for any
@@ -747,7 +578,6 @@ mod tests {
             "a mismatch must neither pin nor rewrite: {contents}"
         );
     }
-
     #[tokio::test]
     async fn an_accepted_fingerprint_that_matches_pins_the_key_it_names() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -775,7 +605,6 @@ mod tests {
         };
         assert_eq!(dir_mode & 0o777, 0o700);
     }
-
     #[tokio::test]
     async fn a_host_nobody_has_pinned_yet_is_trusted_without_being_asked_about() {
         // The `[y/N]` is gone: a scanned key is pinned on sight. `Ui::new(true)`
@@ -799,7 +628,6 @@ mod tests {
             "{contents}"
         );
     }
-
     #[tokio::test]
     async fn an_accepted_fingerprint_that_does_not_match_is_refused_and_nothing_is_pinned() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -833,74 +661,30 @@ mod tests {
             "a mismatch must never write a key to known_hosts"
         );
     }
-
     /// Stands in for a second, concurrent `trust_host` call finishing its own
     /// `pin` while this one is still waiting on `ssh-keyscan` — deterministic,
     /// unlike relying on real task scheduling to land in the same window.
-    struct InterleavedRunner {
-        inner: FakeRunner,
+    ///
+    /// A [`Decoration`] rather than a hand-written `impl CommandRunner`: the
+    /// injection is the whole of what this double does, and everything else is
+    /// forwarding that `Delegating` owns. Written out by hand it was six
+    /// bodies, one of which — `spawn_piped` — was missing, so that entry point
+    /// fell through to the trait's refusing default rather than to the runner
+    /// it wrapped, while the comment beside it said "delegated like the rest".
+    struct InjectAConcurrentPin {
         known_hosts: PathBuf,
         injected: &'static str,
     }
 
     #[async_trait::async_trait]
-    impl CommandRunner for InterleavedRunner {
-        async fn run(
-            &self,
-            program: &str,
-            args: &[&str],
-            options: &RunOptions,
-        ) -> Result<riabuild_runner::CommandOutput> {
+    impl Decoration for InjectAConcurrentPin {
+        async fn before(&self, program: &str, _: &[&str], _: &RunOptions) -> Result<()> {
             if program == "ssh-keyscan" {
                 tokio::fs::write(&self.known_hosts, self.injected)
                     .await
                     .expect("inject a concurrent pin");
             }
-            self.inner.run(program, args, options).await
-        }
-
-        // Delegated like the rest: this double exists only to inject a
-        // concurrent `known_hosts` write in the middle of `ssh-keyscan`, so
-        // every other entry point should behave exactly as the wrapped runner
-        // does rather than acquire a second, divergent set of answers.
-        async fn run_bytes(
-            &self,
-            program: &str,
-            args: &[&str],
-            options: &RunOptions,
-        ) -> Result<riabuild_runner::BytesOutput> {
-            self.inner.run_bytes(program, args, options).await
-        }
-
-        async fn run_forking(
-            &self,
-            program: &str,
-            args: &[&str],
-            options: &RunOptions,
-        ) -> Result<i32> {
-            self.inner.run_forking(program, args, options).await
-        }
-
-        async fn spawn(
-            &self,
-            program: &str,
-            args: &[&str],
-            options: &RunOptions,
-        ) -> Result<Box<dyn riabuild_runner::ChildHandle>> {
-            self.inner.spawn(program, args, options).await
-        }
-
-        async fn run_interactive(
-            &self,
-            program: &str,
-            args: &[&str],
-            options: &RunOptions,
-        ) -> Result<i32> {
-            self.inner.run_interactive(program, args, options).await
-        }
-
-        fn which(&self, program: &str) -> Option<PathBuf> {
-            self.inner.which(program)
+            Ok(())
         }
     }
 
@@ -923,11 +707,13 @@ mod tests {
             .await
             .expect("mkdir");
 
-        let runner = InterleavedRunner {
-            inner: scan_stub(&remote, GOOD_FINGERPRINT_LINE),
-            known_hosts: paths.known_hosts_file(),
-            injected: "otherhost ssh-ed25519 OTHERHOSTKEY\n",
-        };
+        let runner = Delegating::around(
+            Arc::new(scan_stub(&remote, GOOD_FINGERPRINT_LINE)),
+            InjectAConcurrentPin {
+                known_hosts: paths.known_hosts_file(),
+                injected: "otherhost ssh-ed25519 OTHERHOSTKEY\n",
+            },
+        );
 
         trust_host(
             &remote,
@@ -951,7 +737,6 @@ mod tests {
             "{contents}"
         );
     }
-
     #[tokio::test]
     async fn two_pins_for_different_hosts_running_concurrently_both_survive() {
         // Round-2 finding: a temp-file-plus-rename `pin` needs a name unique
@@ -981,7 +766,6 @@ mod tests {
         assert!(contents.contains("hostA ssh-ed25519 AAAA"), "{contents}");
         assert!(contents.contains("hostB ssh-ed25519 BBBB"), "{contents}");
     }
-
     #[tokio::test]
     async fn an_unreachable_host_fails_before_ever_asking_about_a_fingerprint() {
         let home = tempfile::TempDir::new().expect("tempdir");
@@ -1007,5 +791,114 @@ mod tests {
         // Distinct from the mismatch wording — no key was ever seen, so this
         // must not talk about what was "offered" or "expected".
         assert!(!message.contains("offered"), "{message}");
+    }
+    /// `ssh-keyscan` answered and `ssh-keygen -lf -` did not — the two ways
+    /// that can happen, as one table.
+    ///
+    /// A broken `ssh-keygen` (missing, refusing the key type) exits non-zero
+    /// with a diagnostic; one handed something it parses but has no
+    /// fingerprint for exits 0 with nothing useful on stdout. Both used to
+    /// come back as an empty `Vec` that `trust_host` turned into the literal
+    /// string `an unreadable fingerprint`.
+    fn keygen_broken(remote: &Remote, code: i32, stdout: &str, stderr: &str) -> FakeRunner {
+        FakeRunner::new()
+            .with(
+                &format!(
+                    "ssh-keyscan -t {KEY_TYPES} -p {} -T 5 {}",
+                    remote.port, remote.host
+                ),
+                0,
+                &format!("{} ssh-ed25519 AAAAstubkeydata\n", remote.host),
+                "",
+            )
+            .with("ssh-keygen -lf -", code, stdout, stderr)
+    }
+    #[tokio::test]
+    async fn a_host_key_whose_fingerprint_cannot_be_read_is_refused_rather_than_pinned() {
+        // The whole point of showing a fingerprint is that somebody can
+        // compare it. riabuild used to substitute the words "an unreadable
+        // fingerprint" for one it could not read, print `fingerprint an
+        // unreadable fingerprint — trusting it`, and pin the key anyway — so
+        // the developer's only signal that the check happened was a line that
+        // said the check had not.
+        for (code, stdout, stderr) in [
+            (1, "", "ssh-keygen: not found"),
+            // Exit 0 and nothing to read: the quieter half of the same bug.
+            (0, "", ""),
+            (0, "no SHA256 anywhere on this line\n", ""),
+        ] {
+            let home = tempfile::TempDir::new().expect("tempdir");
+            let paths = RealPaths::rooted_at(home.path());
+            let remote = remote();
+            let fake = Arc::new(keygen_broken(&remote, code, stdout, stderr));
+
+            let err = trust_host(&remote, &paths, fake, &Ui::new(true), None)
+                .await
+                .expect_err("a fingerprint riabuild cannot read is not one to trust");
+
+            let failure = err
+                .downcast_ref::<Failure>()
+                .unwrap_or_else(|| panic!("an actionable Failure, not a bare error: {err}"));
+            assert!(
+                failure.attempting.contains("fingerprint"),
+                "it has to say which check could not be made: {}",
+                failure.attempting
+            );
+            assert!(
+                failure.action.contains("ssh-keygen"),
+                "and what to do about it: {}",
+                failure.action
+            );
+            // The placeholder is gone, not merely unlikely.
+            assert!(
+                !format!("{err}").contains("unreadable fingerprint"),
+                "{err}"
+            );
+            // And nothing was pinned: the file must not exist at all, so a
+            // second run re-scans rather than trusting a key nobody saw.
+            assert!(
+                tokio::fs::metadata(paths.known_hosts_file()).await.is_err(),
+                "an unreadable fingerprint must pin nothing"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn an_accepted_fingerprint_cannot_be_checked_against_a_pin_that_will_not_read() {
+        // The other caller of `fingerprints`. A `--accept-host-key` compared
+        // against an empty list can never match, so this already failed — but
+        // it failed as a *mismatch*, telling the developer their server had
+        // been rebuilt or replaced and sending them to confirm a new
+        // fingerprint with whoever runs it. The machine is fine; `ssh-keygen`
+        // is not.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        pin_existing(&paths, &remote, "STUBKEYDATA").await;
+        let fake =
+            Arc::new(FakeRunner::new().with("ssh-keygen -lf -", 1, "", "ssh-keygen: broken"));
+
+        let err = trust_host(
+            &remote,
+            &paths,
+            fake,
+            &Ui::new(true),
+            Some(GOOD_FINGERPRINT),
+        )
+        .await
+        .expect_err("a pin that cannot be read cannot be compared");
+
+        let failure = err
+            .downcast_ref::<Failure>()
+            .unwrap_or_else(|| panic!("an actionable Failure: {err}"));
+        assert!(
+            failure.attempting.contains("fingerprint"),
+            "{}",
+            failure.attempting
+        );
+        assert!(
+            !failure.action.contains("rebuilt"),
+            "this is not the man-in-the-middle wording: {}",
+            failure.action
+        );
     }
 }

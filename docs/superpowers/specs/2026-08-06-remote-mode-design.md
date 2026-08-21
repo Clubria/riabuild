@@ -1,14 +1,14 @@
 # Remote mode — Design
 
 **Date:** 2026-08-06
-**Status:** Approved
+**Status:** Implemented
 **Extends:** [`2026-08-04-riabuild-design.md`](2026-08-04-riabuild-design.md),
 [`2026-08-06-linux-support-design.md`](2026-08-06-linux-support-design.md)
 
-**Depends on** the Linux support work, which is unmerged at the time of writing. Remote
-mode needs its owned `gh` and `infisical` (PR A) so that provisioning a server never wants
-Homebrew, and its musl builds (PR B) so that there is a Linux binary to install. The
-macOS-server path depends on neither.
+**Depended on** the Linux support work, which was unmerged when this was written and has
+shipped since. Remote mode needs its owned `gh` and `infisical` (PR A) so that
+provisioning a server never wants Homebrew, and its musl builds (PR B) so that there is a
+Linux binary to install. The macOS-server path depends on neither.
 
 ## Purpose
 

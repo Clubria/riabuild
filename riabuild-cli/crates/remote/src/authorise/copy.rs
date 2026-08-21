@@ -36,7 +36,7 @@
 //! deliberately restricted.
 
 use super::Remote;
-use crate::{askpass, identity, shell_command, shell_quote};
+use crate::{askpass, shell_command, shell_quote, ssh::Ssh};
 use anyhow::{Result, anyhow};
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
@@ -113,6 +113,18 @@ pub fn script(public_key: &str) -> Result<String> {
         // does not lock riabuild out — its own line would simply be invalid —
         // it locks out whoever owns the line above.
         //
+        // The comment filter in front of the `grep -qF` is what stops a
+        // *disabled* line reading as an installed one. `grep -qF <body>` is an
+        // unanchored substring match over the whole file, so a line somebody
+        // commented out — `# ssh-ed25519 <body> old`, which is how an
+        // administrator retires a key without deleting it — answered "already
+        // there". riabuild then skipped the copy and told the developer their
+        // sshd was not honouring `authorized_keys`, for a key that was never
+        // in it. sshd ignores those lines, so this has to as well: `#` first
+        // on the line, leading whitespace allowed, exactly what sshd skips.
+        // The pipeline's status is the second `grep`'s, so an empty file still
+        // reads as "not there".
+        //
         // `restorecon` for the same reason `ssh-copy-id` runs it: on an
         // SELinux server a `.ssh` created by this script gets a context sshd
         // will not read, and the failure looks exactly like a key that was
@@ -122,7 +134,7 @@ pub fn script(public_key: &str) -> Result<String> {
          f=\"$d/authorized_keys\"\n\
          mkdir -p \"$d\" || exit 1\n\
          if [ ! -f \"$f\" ]; then : > \"$f\" || exit 1; fi\n\
-         if grep -qF {body} \"$f\"; then exit {already}; fi\n\
+         if grep -v '^[[:space:]]*#' \"$f\" | grep -qF {body}; then exit {already}; fi\n\
          if [ -s \"$f\" ] && [ -n \"$(tail -c 1 \"$f\")\" ]; then printf '\\n' >> \"$f\" || exit 1; fi\n\
          printf '%s\\n' {line} >> \"$f\" || exit 1\n\
          if command -v restorecon >/dev/null 2>&1; then restorecon -F \"$d\" \"$f\" >/dev/null 2>&1 || true; fi\n\
@@ -143,9 +155,10 @@ pub fn script(public_key: &str) -> Result<String> {
 /// helper's stdio — so capturing costs nothing and makes stderr available to
 /// say *why* a failure failed.
 ///
-/// `identities_only` is false, for the reason [`identity::ssh_options`]
-/// gives: on the common cloud VM the developer's existing key, or their
-/// agent, is what proves who we are while the new key is being installed.
+/// `every_identity` — no `IdentitiesOnly=yes` — for the reason
+/// [`crate::identity::ssh_options`] gives: on the common cloud VM the
+/// developer's existing key, or their agent, is what proves who we are while
+/// the new key is being installed.
 /// `BatchMode` is likewise absent — a password is a legitimate way in here,
 /// and this is the one step whose whole job is to make it unnecessary later.
 ///
@@ -168,26 +181,39 @@ pub async fn install_key(
     // come back "already there".
     let script = script(public_key)?;
 
-    let mut args = identity::ssh_options(remote, paths, false, None);
-    if let Some(entry) = entry {
-        // `IdentitiesOnly=yes` here too, and it is doing work: without it the
-        // agent offers every key it holds before this one, and a server with a
-        // low `MaxAuthTries` can drop the connection before reaching the key
-        // that was just proved to work.
-        args.push("-o".to_string());
-        args.push(format!("IdentityAgent={}", entry.socket.to_string_lossy()));
-        args.push("-o".to_string());
-        args.push("IdentitiesOnly=yes".to_string());
-        args.push("-i".to_string());
-        args.push(entry.public_key_path.to_string_lossy().into_owned());
+    // With no issued identity this is the one step that offers the developer's
+    // own agent and `~/.ssh` as well — that existing key is often what
+    // authorises the new one. With one, `IdentitiesOnly=yes` comes back and is
+    // doing work: without it the agent offers every key it holds before this
+    // one, and a server with a low `MaxAuthTries` can drop the connection
+    // before reaching the key that was just proved to work.
+    let mut ssh = Ssh::to(remote, paths, runner.clone()).carry(entry);
+    if entry.is_none() {
+        ssh = ssh.every_identity();
     }
-    args.push(remote.target());
-    args.push(shell_command(&script));
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = ssh.run(&shell_command(&script)).await?;
 
-    let output = runner
-        .run("ssh", &refs, &askpass::run_options(remote, paths))
-        .await?;
+    // This is the first — and on almost every run the only — `ssh` in remote
+    // mode that can be answered by a password the developer types, so it is
+    // where what the server made of that password is decided. Nothing riabuild
+    // was handed is kept until sshd has taken it, and a refusal clears what was
+    // stored rather than leaving it to be replayed at every connection of every
+    // future run until the account locks. See `askpass::Slots`.
+    //
+    // Best effort, both ways: a keyring that will not answer must not turn a
+    // key that installed perfectly well into a failed run. The cost of failing
+    // to promote is one extra prompt; `answer` has already told the developer
+    // if it could not write at all.
+    match askpass::verdict(output.code, &output.stderr) {
+        askpass::Verdict::Accepted => {
+            let _ = askpass::accept(remote, paths, runner.clone()).await;
+        }
+        askpass::Verdict::Rejected => {
+            let _ = askpass::forget(remote, paths, runner.clone()).await;
+        }
+        askpass::Verdict::Unanswered => {}
+    }
+
     match output.code {
         Some(0) => Ok(Installed::Added),
         Some(ALREADY_THERE) => Ok(Installed::AlreadyThere),
@@ -417,6 +443,151 @@ mod tests {
             authorized_keys(home.path()).await,
             pile,
             "riabuild must not tidy a file it was only asked to add to"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_key_that_is_only_there_as_a_comment_is_not_there() {
+        // I046. `grep -qF <body>` is an unanchored substring match over the
+        // whole file, comments included, so a line an administrator had
+        // *retired* — the ordinary way to take a key out without deleting it —
+        // answered "already there". riabuild then skipped the copy and told
+        // the developer their sshd was not honouring `authorized_keys`, for a
+        // key that had never been in it and never would be. sshd ignores those
+        // lines; so must this.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let retired = format!(
+            "# ssh-ed25519 {BODY} riabuild retired-2026-07\n   #  ssh-ed25519 {BODY} indented\n"
+        );
+        seed(home.path(), &retired).await;
+
+        let output = run_on(home.path(), KEY).await;
+
+        assert_eq!(
+            output.code,
+            Some(0),
+            "a commented-out line is not an installed key: {}",
+            output.stderr
+        );
+        let file = authorized_keys(home.path()).await;
+        let lines: Vec<&str> = file.lines().collect();
+        assert_eq!(lines.len(), 3, "{file:?}");
+        assert_eq!(
+            lines[0],
+            "# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild retired-2026-07",
+            "and the retired lines are still nobody's to delete but the account owner's: {file:?}"
+        );
+        assert_eq!(lines[2], KEY);
+
+        // Idempotence survives it: the line riabuild just added is a real one,
+        // so a second run still reports it as already there rather than
+        // appending a line a day.
+        let second = run_on(home.path(), KEY).await;
+        assert_eq!(second.code, Some(3), "{}", second.stderr);
+        assert_eq!(
+            authorized_keys(home.path())
+                .await
+                .lines()
+                .filter(|line| line.contains(BODY))
+                .count(),
+            3,
+            "two comments and exactly one key"
+        );
+    }
+
+    // ---- what the server made of the password -----------------------------
+
+    /// The keychain CLI of both platforms, so the assertion below reads the
+    /// same on a Mac and on Linux — `forget`'s own test does this for the same
+    /// reason. Which of the two riabuild reaches for is
+    /// `keychain::select_password_store`'s decision and not this file's.
+    fn keychain_delete(call: &str) -> bool {
+        call.starts_with("security delete-generic-password")
+            || call.starts_with("secret-tool clear")
+    }
+
+    fn copy_runner(code: i32, stderr: &str) -> Arc<FakeRunner> {
+        Arc::new(
+            FakeRunner::new()
+                .with("ssh", code, "", stderr)
+                .with("security", 0, "", "")
+                .with("secret-tool", 0, "", ""),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_password_the_server_refuses_is_forgotten_rather_than_replayed() {
+        // I036's other half, at the one connection that can observe it. Until
+        // this existed nothing anywhere called `askpass::forget` except
+        // `remote forget`, so a password sshd had just refused stayed in the
+        // keychain and was offered again at every connection of every future
+        // run — which is how an account gets locked out by a typo.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = copy_runner(
+            255,
+            "ada@build-01.fly.dev: Permission denied (publickey,password).",
+        );
+
+        let error = install_key(&remote(), &paths, fake.clone(), KEY, None)
+            .await
+            .expect_err("a refused connection installs nothing");
+        assert!(format!("{error}").contains("Permission denied"), "{error}");
+
+        let deletes: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| keychain_delete(call))
+            .collect();
+        assert!(
+            deletes
+                .iter()
+                .any(|call| call.contains(&askpass::account(&remote()))),
+            "the refused password is still in the keychain: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_the_server_authenticated_keeps_the_password_it_used() {
+        // The complement, and the one that stops the fix above from being
+        // "clear it always": nine more connections follow this one, and they
+        // are silent only because the password survives.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = copy_runner(0, "");
+
+        assert_eq!(
+            install_key(&remote(), &paths, fake.clone(), KEY, None)
+                .await
+                .expect("installs"),
+            Installed::Added
+        );
+
+        assert!(
+            !fake.calls().iter().any(|call| keychain_delete(call)),
+            "a password the server took must not be thrown away: {:?}",
+            fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_the_server_refuses_is_not_a_password_the_server_refuses() {
+        // An issued key turned away by a keys-only server says nothing about
+        // the account password, and clearing one there would cost the
+        // developer a prompt for a secret that is perfectly good.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = copy_runner(255, "ada@build-01.fly.dev: Permission denied (publickey).");
+
+        install_key(&remote(), &paths, fake.clone(), KEY, None)
+            .await
+            .expect_err("still a failed copy");
+
+        assert!(
+            !fake.calls().iter().any(|call| keychain_delete(call)),
+            "{:?}",
+            fake.calls()
         );
     }
 

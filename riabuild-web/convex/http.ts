@@ -2,7 +2,6 @@ import { httpRouter } from "convex/server";
 import { httpAction, ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { auth } from "./auth";
-import { Id } from "./_generated/dataModel";
 import {
   formatUserCode,
   randomToken,
@@ -10,27 +9,18 @@ import {
   sha256Hex,
 } from "./lib/crypto";
 import { DEVICE_CODE_TTL_MS, POLL_INTERVAL_SECONDS } from "./cliAuth";
-import { meetsMinimum } from "./lib/version";
 import { ApiFailure, apiError, fail, jsonResponse } from "./lib/responses";
-import { checkOrgMembership, orgLogin } from "./github";
+import {
+  guard,
+  requireOrgMembership,
+  versionGate,
+  type MemberView,
+} from "./lib/guard";
 import { brokerToken, environmentsForRole } from "./infisical";
-import { RETIRED_DEFAULT_PROJECT_PATH, type OrgConfig } from "./org";
+import { RETIRED_DEFAULT_PROJECT_PATH } from "./org";
 
 const http = httpRouter();
 auth.addHttpRoutes(http);
-
-type MemberView = {
-  _id: Id<"members">;
-  memberId: string;
-  githubLogin: string;
-  githubId: string;
-  firstName: string;
-  lastName: string;
-  email: string;
-  role: "candidate" | "developer" | "lead";
-  status: "active" | "suspended";
-  joinedAt: number;
-};
 
 /** Wraps a handler so `fail(...)` unwinds to the prepared error response. */
 function endpoint(
@@ -52,71 +42,6 @@ function endpoint(
   };
 }
 
-function bearerToken(req: Request): string {
-  const header = req.headers.get("authorization") ?? "";
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  if (match === null) {
-    fail(
-      401,
-      "unauthenticated",
-      "riabuild is not signed in on this machine.",
-      "Run `riabuild login`.",
-    );
-  }
-  return match[1].trim();
-}
-
-async function authenticate(
-  ctx: ActionCtx,
-  req: Request,
-): Promise<{ member: MemberView; sessionId: Id<"cliSessions"> }> {
-  const tokenHash = await sha256Hex(bearerToken(req));
-  const result = await ctx.runMutation(internal.sessions.authenticate, {
-    tokenHash,
-    now: Date.now(),
-  });
-
-  if (result.status === "ok") {
-    return { member: result.member, sessionId: result.sessionId };
-  }
-  if (result.status === "expired") {
-    fail(
-      401,
-      "session_expired",
-      "Your riabuild session has expired.",
-      "Run `riabuild login` to sign in again.",
-    );
-  }
-  if (result.status === "revoked") {
-    fail(
-      401,
-      "session_revoked",
-      "This machine's riabuild session was revoked.",
-      "Run `riabuild login` to sign in again.",
-    );
-  }
-  if (result.status === "suspended") {
-    // 403, not 401: re-authenticating would succeed and change nothing, so the
-    // CLI must stop and explain rather than loop through the browser.
-    fail(
-      403,
-      "suspended",
-      "Your riabuild account is suspended.",
-      "Ask your team lead to reactivate it.",
-    );
-  }
-  fail(
-    401,
-    "unauthenticated",
-    "riabuild is not signed in on this machine.",
-    "Run `riabuild login`.",
-  );
-}
-
-async function loadConfig(ctx: ActionCtx): Promise<OrgConfig> {
-  return await ctx.runQuery(internal.org.forApi, {});
-}
-
 /**
  * The dashboard a developer is sent to, which is not this origin — `/api/v1` is
  * served from the Convex deployment while the pages are on Cloudflare.
@@ -130,43 +55,6 @@ async function loadConfig(ctx: ActionCtx): Promise<OrgConfig> {
 function dashboardUrl(): string {
   const configured = process.env.SITE_URL ?? "https://riabuild.clubria.com";
   return configured.replace(/\/+$/, "");
-}
-
-/**
- * `/org/config` and `/cli/token` deliberately never enforce this: the first is
- * how a CLI learns it must upgrade, and the second is how it signs in to be told
- * so. Enforcing everywhere would leave an old CLI with no path forward.
- */
-function enforceMinVersion(req: Request, config: OrgConfig): void {
-  const version = req.headers.get("x-riabuild-cli-version");
-  if (version === null) return;
-  if (meetsMinimum(version, config.minCliVersion)) return;
-  fail(
-    409,
-    "cli_too_old",
-    `This riabuild is ${version}; the team requires ${config.minCliVersion} or newer.`,
-    "Run `brew upgrade clubria/tap/riabuild`.",
-  );
-}
-
-async function requireOrgMembership(login: string): Promise<void> {
-  const result = await checkOrgMembership(login);
-  if (result.status === "member") return;
-  if (result.status === "not_member") {
-    fail(
-      403,
-      "not_org_member",
-      `Your GitHub account @${login} is not in the ${orgLogin()} organisation.`,
-      "Ask your team lead to re-invite you on GitHub.",
-    );
-  }
-  console.error("org membership check unavailable:", result.detail);
-  fail(
-    503,
-    "org_check_unavailable",
-    "riabuild could not check your GitHub organisation membership.",
-    "Try again in a minute; if it persists, tell your team lead.",
-  );
 }
 
 function memberPayload(member: MemberView) {
@@ -200,8 +88,8 @@ http.route({
   method: "POST",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
+      // No session yet, so the version floor is all there is to enforce.
+      await versionGate(ctx, req);
 
       const body: unknown = await req.json().catch(() => null);
       const rawLabel = (body as { deviceLabel?: unknown } | null)?.deviceLabel;
@@ -273,6 +161,11 @@ http.route({
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The version floor is deliberately not enforced here: this is how a CLI below
+ * the floor signs in so `/api/v1/org/config` can tell it to upgrade. Org
+ * membership *is* re-verified, below — a stale floor is a compatibility
+ * problem, a stale org row is an access one.
+ *
  * Polling states come back as 200 with a discriminated body rather than RFC
  * 8628's `400 authorization_pending`. "Not yet" is the expected answer in a
  * loop that runs dozens of times per login, and the CLI turns every non-2xx
@@ -328,6 +221,31 @@ http.route({
         );
       }
 
+      // Identity is GitHub, authorization is Convex — and this route was the
+      // hole in that sentence. GitHub OAuth still succeeds for someone who was
+      // removed from the org, so they could sign in, approve their own device
+      // code and walk away holding a live 90-day session, refused only later
+      // and only by whichever endpoint remembered to ask. `/api/v1/cli/sessions`
+      // mints the identical credential and has always re-verified here.
+      //
+      // The floor stays exempt on this route (see the comment above it), but
+      // membership is not a version question.
+      try {
+        await requireOrgMembership(result.member.githubLogin);
+      } catch (error) {
+        // `redeem` already burned the device code and inserted the row, so a
+        // refusal here leaves a session nobody will ever hold the token for —
+        // it is generated in this handler and discarded with the request. Left
+        // alone it would still show up in the dashboard as live for ninety
+        // days, so it is revoked on the way out.
+        await ctx.runMutation(internal.sessions.revokeById, {
+          sessionId: result.sessionId,
+          actorId: result.member._id,
+          isLead: false,
+        });
+        throw error;
+      }
+
       return jsonResponse({
         status: "ok",
         token,
@@ -374,12 +292,12 @@ http.route({
   method: "POST",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member, sessionId } = await authenticate(ctx, req);
       // Non-negotiable, as on /secrets/token: this hands out a live 90-day
       // credential, so a Convex row cannot outvote GitHub.
-      await requireOrgMembership(member.githubLogin);
+      const { member, sessionId } = await guard(ctx, req, {
+        version: true,
+        org: true,
+      });
 
       const body: unknown = await req.json().catch(() => null);
       const rawLabel = (body as { deviceLabel?: unknown } | null)?.deviceLabel;
@@ -405,6 +323,27 @@ http.route({
         cliVersion,
       });
 
+      // `delegate` re-reads the parent row rather than trusting what
+      // `authenticate` saw a GitHub round trip ago, so these two are reachable
+      // even though the request authenticated: the session was revoked or
+      // expired in between. They are 401s, not 403s — signing in again is the
+      // fix and it will work.
+      if (result.status === "revoked") {
+        fail(
+          401,
+          "session_revoked",
+          "This machine's riabuild session was revoked while it was signing the server in.",
+          "Run `riabuild login` to sign in again, then `riabuild remote`.",
+        );
+      }
+      if (result.status === "expired") {
+        fail(
+          401,
+          "session_expired",
+          "This machine's riabuild session expired while it was signing the server in.",
+          "Run `riabuild login` to sign in again, then `riabuild remote`.",
+        );
+      }
       if (result.status !== "ok") {
         // 403 rather than 401: this session is valid and will stay valid, so
         // re-authenticating would succeed and change nothing. The CLI has to
@@ -438,9 +377,10 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member } = await authenticate(ctx, req);
+      // No org re-check: this returns a member's own profile and brokers
+      // nothing, so it costs a GitHub round trip on every `riabuild --check`
+      // and buys no access decision.
+      const { member } = await guard(ctx, req, { version: true, org: false });
       return jsonResponse({ member: memberPayload(member) });
     }),
   ),
@@ -455,8 +395,13 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const { member } = await authenticate(ctx, req);
-      const config = await loadConfig(ctx);
+      // `version: false` is the documented exemption, not an oversight: this
+      // is the route a CLI below the floor reads to learn it is below the
+      // floor, and enforcing here would leave it no path forward.
+      const { member, config } = await guard(ctx, req, {
+        version: false,
+        org: false,
+      });
       return jsonResponse({
         repoSlug: config.repoSlug,
         // Frozen, not read from config: this field is retired and only still
@@ -490,9 +435,7 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      await authenticate(ctx, req);
+      const { config } = await guard(ctx, req, { version: true, org: false });
 
       let settings: unknown;
       try {
@@ -535,13 +478,13 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member } = await authenticate(ctx, req);
       // `members.role` is never the sole gate: a developer who left the org
       // yesterday must lose the team's tunnel today, without anyone
       // remembering to edit a Convex row.
-      await requireOrgMembership(member.githubLogin);
+      const { member, config } = await guard(ctx, req, {
+        version: true,
+        org: true,
+      });
 
       if (config.ngrokAuthToken === "") {
         // Nothing is broken and the CLI says so in the developer's terms — the
@@ -577,13 +520,10 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member } = await authenticate(ctx, req);
       // Re-verified here as everywhere: identity lives in GitHub, and someone
       // removed from the org must stop being handed the team's machines
       // without anyone remembering to update their Convex row.
-      await requireOrgMembership(member.githubLogin);
+      const { member } = await guard(ctx, req, { version: true, org: true });
 
       // A candidate gets an empty list and a 200, never a 403. `riabuild
       // remote` is also how they reach the server they set up themselves, and
@@ -621,13 +561,10 @@ http.route({
   method: "GET",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member } = await authenticate(ctx, req);
       // `members.role` is never the sole gate, and on this endpoint that is not
       // a formality: a stale Convex row would otherwise keep handing a departed
       // developer a key that opens a machine indefinitely.
-      await requireOrgMembership(member.githubLogin);
+      const { member } = await guard(ctx, req, { version: true, org: true });
 
       // A candidate gets an empty list and a 200, for the reason
       // /api/v1/remotes/shared does. Returned before `serveForApi` rather than
@@ -654,12 +591,11 @@ http.route({
   method: "POST",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const config = await loadConfig(ctx);
-      enforceMinVersion(req, config);
-      const { member } = await authenticate(ctx, req);
-
       // The non-negotiable one: a Convex row cannot outvote GitHub.
-      await requireOrgMembership(member.githubLogin);
+      const { member, config } = await guard(ctx, req, {
+        version: true,
+        org: true,
+      });
 
       const broker = await brokerToken(member.role);
       if (broker.status === "not_configured") {
@@ -718,10 +654,17 @@ http.route({
   method: "DELETE",
   handler: httpAction(
     endpoint(async (ctx, req) => {
-      const { member } = await authenticate(ctx, req);
       // The non-negotiable one, same as /secrets/token: a Convex row cannot
       // outvote GitHub. Revocation changes access, so it re-verifies too.
-      await requireOrgMembership(member.githubLogin);
+      //
+      // `version: false` is the third opt-out, and unlike the other two it is
+      // being written down here for the first time — this route simply never
+      // had the check. Keeping it out is the deliberate answer rather than the
+      // inherited one: `riabuild remote forget` is how a leaked 90-day
+      // credential gets pulled, and refusing to revoke a session because the
+      // laptop asking is a version behind would block the one command that
+      // must always work.
+      const { member } = await guard(ctx, req, { version: false, org: true });
 
       const id = new URL(req.url).pathname.split("/").pop() ?? "";
       const result = await ctx.runMutation(internal.sessions.revokeById, {

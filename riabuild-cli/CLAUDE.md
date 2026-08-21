@@ -158,7 +158,7 @@ never `std::fs` or `std::process`. A blocking call on the runtime thread stalls 
 other future on it, and the symptom is a provisioner that hangs on someone else's laptop
 with no output and no error to send anyone.
 
-The exception is **stdio**. `ui.rs` writes with `println!`/`eprintln!`, and
+The exception is **stdio**. `riabuild-ui` writes with `println!`/`eprintln!`, and
 `run_interactive` hands the terminal to a child process — that is a handoff, not IO
 riabuild performs. Async stdout buys nothing for line-at-a-time terminal output.
 
@@ -183,11 +183,23 @@ it hands over the terminal, removes the question rather than answering it.
 So the test for a new subdued site is not "is its output untidy" but "does it ask" — plain
 text and a wait for a person is fine, a full-screen prompt library is not.
 
-Three things are synchronous because they are not IO, and are not exceptions to anything:
-`paths.rs` computes paths without touching the disk, `CommandRunner::which` stats `PATH`
-candidates, and tarball extraction is CPU work over an in-memory buffer — `extract_tarball`
-writes through the `tar` crate, which is synchronous, so making the directory calls around
-it async would be theatre.
+Two things are synchronous because they are not IO, and are not exceptions to anything:
+`riabuild-paths` computes paths without touching the disk, and `CommandRunner::which`
+stats `PATH` candidates.
+
+Tarball extraction is the one that genuinely is IO. `extract_tarball` writes through the
+`tar` crate, which is synchronous and has no async spelling, so the whole of it is
+`std::fs` — the tree it unpacks into a staging directory, the `rename` that installs it,
+and the recursive removes that clear up after a failure. Making the directory calls around
+a synchronous writer async would be theatre, which is why they are not.
+
+**Where the blocking work is not `tokio::fs`-shaped, it goes on the blocking pool.**
+Opening a directory by descriptor and `fstat`/`fchmod`-ing it, `access(2)`, and the
+blocking `lock()` a contended file lock falls back to are POSIX calls tokio has no async
+wrapper for; each is run through `tokio::task::spawn_blocking`, never inline on the
+reactor thread and never `block_in_place` — that one needs `rt-multi-thread`, which a
+current-thread runtime is not, and it borrows a worker rather than leaving it to the
+dedicated pool.
 
 Note that `tokio::fs` is `std::fs` on a blocking threadpool: no portable async file API
 exists. "Current-thread" describes the reactor, not the process, and the binary does have
@@ -243,7 +255,7 @@ token the server was holding. A first run is a reason to *ask* `check()`, never 
 to skip it.
 
 **No secrets in `~/.riabuild/`.** The riabuild session token goes in the Keychain via
-`keychain.rs`. Infisical tokens are short-lived, brokered per use, and piped straight into
+`riabuild-keychain`. Infisical tokens are short-lived, brokered per use, and piped straight into
 `infisical export` — never written down.
 
 A riabuild-managed **server** is the one exception: it may hold its own session
@@ -416,6 +428,26 @@ package manager to install a dependency. Run them through `ctx.gh()`, `ctx.infis
 is not on
 `PATH`, so the bare name finds a binary no `check()` verified, or nothing at all.
 
+**A tool becomes owned by being a row in `owned_tool`, never by a fourth copy of the four
+steps.** `crates/tasks/src/owned_tool.rs` is one table, and a row carries the pinned
+release, the digest the download is verified against, the environment the `--version`
+probe runs in, and what `~/.riabuild/bin` gets — so downloading, verifying, landing the
+tree under `~/.riabuild/<tool>/<version>/` and putting something on the developer's `PATH`
+are properties of the table rather than of whoever wrote the task. They used to be four
+copies of those steps, and copies drift: only ngrok checked its own shim, so a deleted
+`bin/gh` reported a satisfied machine while the shell went on finding whatever `gh` the
+laptop already had. Where rows differ they differ as **data** — ngrok's shim is a script
+that fetches the team's authtoken per invocation rather than an `exec` line, which is the
+whole reason that token lands on no filesystem.
+
+`infisical` and `ngrok` are nothing but a row, so the row *is* the task. `github_cli` and
+`grok_cli` compose a row and keep their own `Task`, because signing the developer in and
+asking GitHub about their membership, and making nine profile directories, are work that
+is genuinely theirs rather than a field the table is missing. The Codex CLI is
+deliberately **not** a row: it is an npm package installed with the Node riabuild owns, so
+it has no release, no asset and no digest of its own, and a row describing it would be
+empty in every field this table exists for.
+
 ngrok and Grok Build are the two whose digests are **not** published by their own
 projects, and `tools::Checksum` is where that shows up. `Published(urls)` is the normal
 case — gh and infisical fetch the checksum files their releases carry. `Pinned(digest)` is
@@ -426,6 +458,50 @@ as `Clubria/riabuild` releases and the digests are constants in this repository.
 for `Pinned` for a tool that *does* publish digests would freeze a value that moves with
 every upstream release; reaching for a server-supplied digest would hand riabuild-web the
 choice of what executes.
+
+**pnpm is in neither arm and is not a row in `owned_tool` either**, because its version
+comes from the checkout at runtime rather than from a constant here — `tasks::toolchain`
+owns it. It publishes no checksum file, so it takes the third route: the **npm registry**,
+whose `dist.integrity` is a sha512 the publisher recorded over the stored tarball and is
+served with no API budget to run out of. Do not reintroduce `api.github.com` to get a
+digest, however tempting the per-asset one GitHub records looks. Sixty unauthenticated
+requests an hour *per address* is a ceiling one office behind one NAT reaches, and when it
+does, provisioning fails for all of them at once; the whole of `crates/fetch/src/tools/`
+now has no route to that host, deliberately.
+
+**pnpm is also the one tool riabuild installs as a *script* rather than as a binary, and
+that is forced rather than chosen.** What riabuild unpacks is the unscoped `pnpm` package —
+`bin/pnpm.cjs` with `dist/` beside it — started by `~/.riabuild/bin/pnpm`, a shim that
+`exec`s riabuild's own Node against it. Neither of pnpm's platform executables can run on
+the machines this provisions:
+
+- `@pnpm/linux-x64` is `NEEDED: libatomic.so.1`. That file is not in `debian:bookworm-slim`,
+  `debian:12`, `ubuntu:22.04` or `fedora:41` — it arrives with a toolchain, and a machine
+  that already has a toolchain on it is not the machine riabuild is pointed at.
+- `@pnpm/linuxstatic-<arch>` reads like the answer and is not: it is built against **musl**
+  and its interpreter is `/lib/ld-musl-x86_64.so.1`, so on a glibc distribution it does not
+  fail to find a library, it fails to start at all.
+
+Node's own binaries link neither, which is what makes the failure so hard to read: Node
+installs and answers `-v`, `check()` gets past it, and pnpm exits **127** beside it — which
+`reported_version` correctly turns into "pnpm is not installed yet". `apply()` then
+downloads 146 MB, unpacks it perfectly, and the re-check says the same thing. That is the
+apply-did-not-take-effect hard error, for ever, on a machine where nothing is wrong except a
+library nobody named. It is the Codex CLI bug below, one missing thing over, and
+`e2e/remote/run.sh`'s Debian container is where it surfaced.
+
+Two rules fall out of it and both are load-bearing. The shim names **both** paths
+absolutely — `shims::node_shim`, pinned by
+`the_shim_starts_pnpm_with_riabuilds_own_node_by_absolute_path` — because `bin/pnpm.cjs`
+opens `#!/usr/bin/env node` and a server reached by a non-interactive SSH exec has a `PATH`
+of `/usr/local/bin:/usr/bin:/bin` with no Node in it. And the version probe is
+`node <entry> -v` rather than `<binary> -v`, which is why `toolchain` has
+`reported_script_version` beside `reported_version` rather than one function that guesses.
+
+The fix for this is never `apt-get install libatomic1`. `e2e/remote/Dockerfile` says so by
+name, because one line there turns CI green and leaves every developer on a stock server
+hitting the same silent 127 — and "a provisioner that needs a package manager already set
+up cannot be the first thing a developer runs" is the whole of why riabuild exists.
 
 Grok Build's asset is the one that is **not an archive** — xAI serves a bare executable —
 so `archive::Kind::Raw` reads it straight through and `mirror.sh` renames it to `.bin`
@@ -461,12 +537,26 @@ bugs the older build still had, reappearing on a laptop that carries the fixes, 
 nothing in the terminal naming a version. That is why `connect` says out loud when the
 server will run something other than what the laptop is running.
 
-**Self-update asks what owns the binary, never what is installed.** `update.rs` runs
-`dpkg -S` and then `rpm -qf` against the running executable. A Fedora machine can have
-`apt` on it, and a riabuild built with `cargo` is owned by nothing — `sudo apt-get install
-riabuild` there installs a *second* riabuild elsewhere and leaves this one in place, so
-every upgrade reports success and nothing changes. That case prints the command and never
-sudoes.
+**Self-update asks what owns the binary, never what is installed.** On Linux `update.rs`
+runs `dpkg -S` and then `rpm -qf` against the running executable; on macOS it asks
+Homebrew, and Homebrew is asked two questions because either alone is the wrong answer.
+`brew --prefix` names the one tree brew installs into — the Cellar and the `bin` symlinks
+into it both sit under it — so an executable that is not under it was put there by
+something else; and `brew list --formula riabuild` says whether there is a formula to
+upgrade at all. It is `brew --prefix` rather than a hardcoded `/opt/homebrew` because
+Apple silicon and Intel disagree about that path and a developer may have moved it.
+Anything that answers no is `Unmanaged`. A Fedora machine can have `apt` on it, and a
+riabuild built with `cargo` is owned by nothing — `sudo apt-get install riabuild` there
+installs a *second* riabuild elsewhere and leaves this one in place, so every upgrade
+reports success and nothing changes. That case prints the command and never sudoes.
+
+macOS used to answer `Homebrew` with no probe at all, which is that same failure on the
+platform where a `cargo build` riabuild is most common, since this is the repository
+developers work on from Macs: `brew upgrade clubria/tap/riabuild` poured a second copy
+under the prefix and left this one running, for ever, reporting success every time. The
+platform reaches `strategy_on` as a **parameter** for the reason `keychain::select` does —
+with `cfg!` inline the other branch is compiled out of the test binary, so each test
+asserted only whichever half its host happened to be.
 
 **riabuild updates itself on every command whose stdout is a terminal a human is
 reading.** `main::keep_current` runs it once, at the top of `run_inner`, for every
@@ -510,16 +600,16 @@ crates form a straight line, each depending only on those above it:
 |---|---|---|
 | `theme` | the Clubria palette, by role, and the depth ladder under it | — |
 | `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
-| `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | — |
+| `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | ui |
 | `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
 | `runner` | `CommandRunner` — all subprocesses. `subdue` is the line filter a subdued child's output goes through; `pty` is the terminal it gets instead of riabuild's own | theme |
 | `paths` | path resolution (trait), `config` (`~/.riabuild` and state), `filelock` (the lock both are read and written under) | ui |
-| `keychain` | secret storage: the trait, the two platform CLIs, the file store for machines with no keyring, and `keyring_answers` — whether a Secret Service actually replies | runner, ui |
+| `keychain` | secret storage: the trait, the two platform CLIs, the file store for machines with no keyring, and `keyring_answers` — whether a Secret Service actually replies | paths, runner, ui |
 | `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
-| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
-| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
+| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
+| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -589,7 +679,11 @@ one bug. The `claude` launcher claims `WAYLAND_DISPLAY` where riabuild's own `wl
 what the probe will find and the machine has no display of its own. Verified against
 2.1.232; both this and the `unset` above are undocumented, so re-read them when the
 pinned Claude Code version moves. Design:
-`../docs/superpowers/specs/2026-08-07-clipboard-channel-design.md`.
+`../docs/superpowers/specs/2026-08-07-clipboard-channel-design.md`, whose transport
+sections were superseded by
+`../docs/superpowers/specs/2026-08-13-exec-channel-transport-design.md` — read both, in
+that order, because the older one still describes the `ssh -N -R` reverse forward that
+the paragraph below says must never come back.
 
 **The transport is `ssh -T <host> riabuild channel pump`, and it must stay that way.** The
 channel asks an SSH server to run a command and for nothing else — no `-R`, no
@@ -610,10 +704,12 @@ ordinary `unlink` by its owner — and a socket that still *answers* is refused 
 taken, because taking one silently cuts a colleague's session.
 
 **The channel's `ssh` is reached by remote mode's own rules, never by an argv the
-supervisor composes.** `supervisor::Tunnel` takes `options: Vec<String>` — the list
-`identity::ssh_options` builds, the same one behind the setup run, the mosh bootstrap and
-the developer's shell — and `ssh_args` adds only what is its own: `-T`, the keepalives,
-`BatchMode=yes`. It used to take a `port` and an `identity` and build `-p`/`-i` itself,
+supervisor composes.** `supervisor::Tunnel` takes `options: Vec<String>` — what
+`ssh::Ssh::options_only` hands it, off the same builder behind the setup run, the mosh
+bootstrap and the developer's shell — and `ssh_args` adds only what is its own: `-T`, the
+keepalives, `BatchMode=yes`. `identity::ssh_options` is `pub(crate)` and reached through
+`Ssh` rather than called at a call site, so the base list is not something a caller can
+half-assemble. It used to take a `port` and an `identity` and build `-p`/`-i` itself,
 which looked complete and quietly reached servers by different rules than the connection
 beside it. Two omissions were fatal and neither said so:
 
@@ -1000,7 +1096,7 @@ shell script. Run `cargo test -- --ignored` when the pin moves. Design:
 
 ## Colour
 
-Every colour riabuild prints comes from `theme.rs`, chosen by **role** — `Ok`, `Busy`,
+Every colour riabuild prints comes from `riabuild-theme`, chosen by **role** — `Ok`, `Busy`,
 `Danger`, `Brand`, `Muted` — never by writing an escape code at the call site. A role
 renders itself at each rung of a depth ladder (24-bit → 256 → the original sixteen →
 nothing), so a terminal that cannot do truecolor still gets something deliberate, and

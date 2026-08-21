@@ -138,10 +138,14 @@ label alongside, or is itself the accessible label.
 ## Data
 
 Components never call `useQuery`. **`src/data/convexProvider.tsx` is the only file in
-`src/` that may import from `convex/react`.** Verify with:
+`src/` that may *use* `convex/react`.** `src/main.tsx` is the one other file that imports
+the module at all — it constructs the `ConvexReactClient` and picks the live provider or
+the fixtures, which is a decision nothing downstream can make. Both are named in the
+check, anchored to the start of the line and to a whole filename, so it comes back empty:
 
 ```sh
-grep -rn "convex/react" src/ --include=*.tsx | grep -v data/convexProvider   # must be empty
+grep -rn "convex/react" src/ --include=*.tsx \
+  | grep -Ev '^src/(data/convexProvider|main)\.tsx:'   # must be empty
 ```
 
 Pages read `useData()`; leaf presenters take props. This is what makes every state

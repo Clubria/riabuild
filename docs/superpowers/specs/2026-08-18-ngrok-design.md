@@ -1,7 +1,7 @@
 # ngrok, owned and authenticated
 
-Date: 2026-08-18
-Status: approved
+**Date:** 2026-08-18
+**Status:** Implemented
 
 ## Why
 
@@ -65,10 +65,16 @@ release URL beside an inline `sha256`, and Homebrew already refuses the download
 they disagree. ngrok is now fetched on exactly those terms, and a digest committed to
 this repository is stronger evidence than one fetched from the same host as the artifact.
 
-`packaging/ngrok/mirror.sh` does the human half — downloads all four builds, prints the
-version each one reports and its sha256, and uploads them under `ngrok-v<version>`. Its
-output is what a maintainer pastes into `tools.rs`, so bumping ngrok stays an ordinary
-reviewable code change, exactly like bumping `GH_VERSION`.
+`packaging/ngrok/mirror.sh` does the human half — takes the version to mirror as an
+argument, downloads all four builds, prints their sha256s, and uploads them under
+`ngrok-v<version>`. It executes exactly one of the four, the build for the host it is
+running on, and only in order to *refuse*: if that binary does not report the version it
+was asked for, the channel has moved on and nothing is published. Naming the version up
+front is the point. The script used to unpack the host's download and read the version
+out of it, which is running an unverified binary to decide what to trust — the one act
+this whole mirror exists to avoid on a laptop. Its output is what a maintainer pastes
+into `tools.rs`, so bumping ngrok stays an ordinary reviewable code change, exactly like
+bumping `GH_VERSION`.
 
 **The mirror is a release step, not a build step.** A `tools.rs` that names a version
 nobody has mirrored yet is a 404 on every laptop. Publishing the assets comes before

@@ -68,19 +68,43 @@ sign-in does not gate — `riabuild claude list`, `riabuild env`, the shell hand
 tell*. That last one is worth its place: unit tests pin riabuild's parse against
 canned JSON, and only a real machine pins the JSON.
 
-Two things genuinely go uncovered, because a run that stops at the last task never
-reaches the step after it: the generated launchers in `~/.riabuild/bin`, and the
-per-account state — the trust keys, the completed first-run setup, and the agents
-view riabuild opens on. That is the
-task engine's ordinary fail-fast contract rather than anything about accounts — a
-failed `project` task costs the shell too.
+One thing genuinely goes uncovered, and it is the per-account state: the trust
+keys, the completed first-run setup, and the agents view riabuild opens on. All
+three write into a `.claude.json` that only exists once an account is signed in,
+so a machine with nobody at the keyboard has nothing for them to write to.
 
-A third, the `applied=[]` idempotency invariant, is substituted rather than lost.
+The generated launchers in `~/.riabuild/bin` used to be the second, and are not
+any more. `provision` wrote `engine::run_all(…)?`, so the first failed task
+short-circuited the step that writes them — and the machine most in need of a
+`claude-1` was the one that did not get one. `provision::after_the_tasks` now
+lands the launchers whatever the tasks did, which is most of what carrying on
+past a failure was for: the account box's advice on exactly that machine is `run
+claude-1 auth login`, and that has to be a command that exists. So the suite
+asserts them on both paths, and `claude` on the environment's `PATH` must be the
+launcher rather than the Node tarball's own copy on both paths too. What a failed
+task still costs is the shell — that much is unchanged, and a failed `project`
+task costs it the same way.
+
+That has one consequence for the `CLAUDE_CONFIG_DIR` assertion, which is
+otherwise easy to get backwards. The launcher `export`s its own account's
+`CLAUDE_CONFIG_DIR` over whatever the caller set, so it can never be the thing
+that answers "does Claude Code still honour the variable" — it answers "does the
+launcher still set it". The suite therefore reads the binary the launcher names
+and puts the question to *that*, and asserts the launcher's half separately, as
+the `CLAUDE_CONFIG_DIR=` line in the generated `claude-1`. Both halves together
+are the isolation; either one alone reads as a pass on a machine that has lost it.
+
+The other thing the missing sign-in reaches is the `applied=[]` idempotency
+invariant, and that is substituted rather than lost.
 Its run log is written after the tasks, so an aborted run produces none; `--check`
 completes where a real run cannot and writes the same line, and it must report
 exactly `claude_accounts,claude_trust,claude_onboarding,claude_agents_view`
 outstanding and nothing else — the latter three each write into a `.claude.json`
 that only exists once an account does, so the missing sign-in blocks all of them.
+The line is read a field at a time rather than matched whole, and `failed` and
+`skipped` have to be empty as well: the engine carries on past a failed task, so
+the same line now names what riabuild could not check and what it never got to,
+and a short to-do list arrived at by not looking is not the invariant.
 `claude_plugins` shares their dependency wave and is deliberately absent: it
 answers satisfied for a checkout that declares no plugins. Their reason
 there is *first run*, not *account 1 is not signed in* — `status_for` answers a
@@ -156,24 +180,131 @@ connection, which is the shape `riabuild remote` exists for. Both run in
 
 | | | |
 |---|---|---|
-| `run.sh` | `riabuild remote` end to end: SSH keys, host-key trust, authorising a key onto a shared account, two developers in separate namespaces | needs `RIABUILD_E2E_GH_TOKEN` |
-| `channel.sh` | the clipboard channel end to end: a real `xclip` on a real X display, a real reverse forward, a real shim on the server | needs no token |
+| `run.sh` | `riabuild remote` end to end: SSH keys, host-key trust, authorising a key onto a shared account, installing and verifying a published release, then the server's own task DAG driven by this branch's binary | needs `RIABUILD_E2E_GH_TOKEN` and `RIABUILD_SERVER_BIN` |
+| `channel.sh` | the clipboard channel end to end: a real `xclip` on a real X display, the real `ssh -T … riabuild channel pump` transport, a real shim on the server | needs `RIABUILD_SERVER_BIN`, no token |
 
-`run.sh` stops at the binary-install step today — no published release carries
-an `x86_64-unknown-linux-musl` checksum — and says so under a banner, after
-asserting against the container that the stages before it really ran. Its own
-header is the authority on that gap.
+`run.sh` gets one stage further than that. The musl gap is closed — `release.yml`
+assembles the checksums file from a spelled-out list of all four targets and
+fails the release outright if a tarball is missing, so from v2026.08.10 onward a
+Linux server installs for real. Signing the server in is closed too: `stub_web.py`
+now implements `do_POST`, minting a delegated session and reproducing the real
+endpoint's gates — an authenticated caller, one hop only, a reply shaped exactly
+as `ServerSessionReply` deserialises.
+
+Closing that immediately uncovered the next thing, which is the shape this keeps
+taking. With the sign-in working, the run reached the task DAG and stopped three
+tasks in: the container had no `git`, so `gh auth setup-git` could not run. That
+is riabuild refusing a machine it genuinely cannot provision, not a gap in the
+harness, and the gate correctly declined to forgive it — so the fix is in
+`Dockerfile`, where `git` is now installed. It is the only tool riabuild expects
+a server to already have; everything else it downloads, verifies and unpacks
+itself, so the next "command not found" in there would mean riabuild had grown a
+dependency on the host.
+
+What stops the run now is the size of the stand-in rather than a missing handler.
+Past the sign-in the server runs the whole task DAG, and there is no Infisical
+stand-in reachable from the container. Making the bottom assertions *pass* is a
+piece of work of that size, not a fix, so **they still DO NOT RUN** — the
+script's own header is the authority.
+
+## Why `run.sh` is in two acts
+
+`riabuild remote` puts riabuild on a server by downloading a **published
+release** and verifying its digest. There is no flag and no environment
+variable that points it at a local build, and there must not be one: a server
+binary chosen by anything other than a signed release is the server-supplied
+task manifest the root `CLAUDE.md` forbids. So in a run of this script the
+laptop half is the code under review and the server half is whatever shipped
+last.
+
+That is only a curiosity until the job is asked to gate a pull request, at which
+point it is the same defect as a test that cannot fail — a server-side
+regression the change introduces cannot turn it red, and a server-side bug the
+change fixes cannot turn it green. It was found the second way round.
+v2026.08.21.1's pnpm is linked against `libatomic.so.1`, which no stock Linux
+ships, so the released server stopped on `Node and pnpm (it did not take
+effect)` for three rounds running — while the fix for exactly that sat in the
+branch the job was supposedly gating.
+
+So the script runs twice against the one container.
+
+**Act one — the laptop, and the install.** `riabuild remote` end to end: SSH,
+host-key trust held to a named fingerprint, authorising a fresh key, resolving
+the server's home directory, `install::ensure_riabuild` fetching the checksums
+file and then the tarball from real GitHub and refusing without a digest,
+signing the server in, and lending it the laptop's GitHub sign-in. All of that
+is the branch's code, and act one judges it — including a new assertion that
+the binary which landed *is* the published release, proved by running it on the
+server and reading the version back.
+
+Past that assertion act one stops judging, because past it the server is
+executing a released binary. A run that falls over before the install is still
+fatal; a run that stops after it is handed to act two rather than forgiven.
+`known_gap` is unchanged and no branch was added to it.
+
+The hand-off is decided on the server's own `state.json`, and the first version
+of this split decided it on the server's *run log* instead — which a released
+server that fails does not write, because v2026.08.21.1's `provision` is
+`engine::run_all(&registry, ctx).await?` and the `?` short-circuits past
+`log_run`. Act one saw no evidence, took the fatal branch, and act two never
+ran. `state.json` is written by the engine as the DAG walks, so it survives that
+short-circuit, and nothing on the laptop writes it — `session::ensure` puts
+`session.token`, `gitconfig` and `owner.json` in the namespace and nothing else.
+
+**Act two — the server, running the branch.** The musl build named by
+`RIABUILD_SERVER_BIN` is copied in, and the three invocations `flow::connect`
+composes are made against it over the same SSH, in the same order: `internal
+gh-sweep`, `internal seed-github` with the token on stdin, and the
+`env 'K=V' … '/abs/riabuild' --no-shell` setup run. Each is riabuild's own
+subcommand; act two composes the call, never the behaviour.
+
+Its assertions are the ones a released server cannot satisfy: the run log has
+to name a local build (`9999.0.0-dev`, the sentinel `version::VERSION` uses when
+no release tag injected one), `toolchain` must not appear among the tasks
+riabuild recorded as failed, and pnpm has to answer `-v` through its shim on a
+container with no `libatomic.so.1`. Those fail against v2026.08.21.1 and pass
+with the fix, which is what makes this job a gate rather than a report.
+
+Act two brackets itself with `=== ACT TWO: START ===` and
+`=== ACT TWO: PASSED ===` (or `FAILED`), so one grep over a CI log answers which
+act judged the run — and the `cleanup` trap refuses to let the script exit 0
+unless act two actually ran. Losing the gate by falling into the fatal branch
+and losing it by falling through to a quiet `exit 0` are the same bug from
+either side; the evidence above closes the first and the trap closes the second.
+
+Act two is **not** a substitute for the gated block at the bottom of the script.
+It drives the server for one developer with a prefix it composed itself; that
+block is two developers, each arriving through a whole `riabuild remote`, and
+the isolation between them. Act two's exit status is not asserted either, for
+act one's reason turned around: past the toolchain the DAG wants an Infisical
+the container cannot reach, so act two asserts what it can observe and names
+what it could not reach.
+
+What did change is that the gate can no longer forgive silently. The old one
+matched `BaseHTTPRequestHandler`'s stock 501, which every unimplemented route
+returned by accident; there is no stock 501 left, every unhandled route logs one
+`stub_web: UNIMPLEMENTED <method> <path>` line, and the gate forgives only on that
+evidence plus riabuild's own words. The banner names the routes the run actually
+asked for and did not get, instead of reciting a paragraph written months ago.
+Everything else — including a hang — fails for real, and only after asserting
+against the container that the earlier stages ran: a key pair on the laptop, a
+host key pinned, riabuild's key in the container's `authorized_keys`.
 
 `channel.sh` runs to the end. It sidesteps the install by copying a locally
-built musl binary in, which is the same target a real install downloads, and so
-covers everything after the step `run.sh` stops at. Two properties:
+built musl binary in, which is the same target a real install downloads — the
+trick `run.sh`'s act two now borrows, so the two scripts differ in what they
+point it at rather than in whether they use it. Two properties:
 
 - a PNG and a UTF-8 string put on the laptop's clipboard paste on the server
   byte for byte, and a copy made on the server lands back on the laptop
-- the tunnel is killed mid-session and **only** the clipboard fails: setup
+- the pump is killed mid-session and **only** the clipboard fails: setup
   re-runs and still reaches riabuild-web, the environment shell still opens
   with riabuild's `PATH`, a paste degrades to an empty clipboard rather than
   hanging, and a copy fails loudly rather than losing what was copied
+- the pump binds the namespaced socket the environment prefix named, a second
+  pump is refused while the first is serving and the first keeps its socket, a
+  pump killed with `SIGKILL` leaves a stale socket that the next one replaces,
+  and a pump whose laptop stops answering unbinds rather than holding the name
 
 The laptop side runs under `Xvfb` with a real `xclip` rather than a scripted
 stand-in, because a stand-in is what `clipboard/linux.rs`'s unit tests already
@@ -181,19 +312,31 @@ use — only the real tool can prove riabuild's argv is one xclip accepts and
 that a PNG survives X11's atoms in both directions. It costs two packages on
 the runner and about a second.
 
-Neither script *observes* remote mode's own channel wiring — the supervisor
-holding the tunnel up, `RIABUILD_CHANNEL_SOCKET` arriving in the environment
-prefix, the banner line — nor a real secrets re-pull. `channel.sh` stands the
-first three up by hand, and owns its tunnel deliberately: a supervisor that
-rebuilds a killed tunnel is correct behaviour and the wrong thing to test a
-degradation against.
+`channel.sh` drives the transport riabuild actually ships: one `ssh -T` whose
+remote command is the same `env 'RIABUILD_CHANNEL_SOCKET=…' … riabuild channel
+pump` that `remote::flow::connect` composes, with argv built to
+`supervisor::ssh_args`' shape. It used to stand up an `ssh -N -R` reverse forward
+that the exec-transport design deleted, and passed anyway — sshd still forwarded
+the socket to an agent that still served it — so `pump`, `mux`, the keepalive and
+the socket rebind had no coverage at all. The one `-R` that remains is a plain
+TCP forward giving the container a riabuild-web; it is harness plumbing, not the
+channel, and is marked as such at the call site.
+
+What still is not covered end to end: `Agent::serve_pipe` and the argv
+`supervisor` builds. The laptop half of the pipe is a named stand-in,
+`laptop_pipe.py`, because `serve_pipe` is reachable only through a complete
+`riabuild remote` run — there is no command line for it. A hidden
+`riabuild channel agent --stdio`, about ten lines in `dispatch.rs`, would let
+`channel.sh` drop the stand-in and exercise the real laptop half. Nor does either
+script cover a real secrets re-pull.
 
 ```sh
+RIABUILD_BIN=… RIABUILD_SERVER_BIN=… e2e/remote/run.sh
 RIABUILD_BIN=… RIABUILD_SERVER_BIN=… e2e/remote/channel.sh
 ```
 
-Both binaries are checked up front and named with the exact `cargo` line that
-builds them. Docker, `ssh`, `Xvfb`, `xclip` and `python3` are checked the same
+Both scripts take both binaries, and both check them up front and name them
+with the exact `cargo` line that builds them. Docker, `ssh`, `Xvfb`, `xclip` and `python3` are checked the same
 way, each with a sentence saying what it is for — a missing one otherwise
 surfaces mid-run as something that reads like a product bug.
 

@@ -1,7 +1,7 @@
 # Grok Build, owned and permissive
 
-Date: 2026-08-21
-Status: approved
+**Date:** 2026-08-21
+**Status:** Implemented
 
 ## Why
 

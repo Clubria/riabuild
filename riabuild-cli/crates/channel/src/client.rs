@@ -5,12 +5,13 @@
 //! the alternative is Claude Code stopping dead on Ctrl+V, which reads as the
 //! editor being broken rather than the channel being down.
 
+use crate::line;
 use crate::protocol::{Request, Response, decode_response, encode_request};
 use anyhow::{Context, Result, bail};
 use riabuild_ui::Failure;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// The socket is local — a forwarded one either answers immediately or is not
@@ -212,11 +213,14 @@ async fn exchange(mut stream: UnixStream, request: &Request, body: &[u8]) -> Res
         .context("could not finish sending the request to the laptop channel")?;
 
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    // Bounded. The deadline around this exchange caps how *long* an answer that
+    // never ends can take, and until this cap existed nothing capped how large
+    // it could get: a peer streaming bytes with no newline in them was a shim
+    // allocating until the server ran out of memory, inside the paste path.
+    let line = line::read_header_line(&mut reader)
         .await
-        .context("the laptop channel closed before replying")?;
+        .context("the laptop channel closed before replying")?
+        .unwrap_or_default();
     if line.trim().is_empty() {
         bail!("the laptop channel replied with nothing");
     }
@@ -244,6 +248,9 @@ async fn exchange(mut stream: UnixStream, request: &Request, body: &[u8]) -> Res
 mod tests {
     use super::*;
     use crate::protocol::{ErrorCode, encode_response};
+    // The scripted agent below reads a line because a request *is* one line;
+    // only the production reader has an untrusted peer at the other end of it.
+    use tokio::io::AsyncBufReadExt;
 
     /// A scripted agent: one canned reply per connection.
     fn serve(socket: &Path, header: Response, body: &'static [u8]) {

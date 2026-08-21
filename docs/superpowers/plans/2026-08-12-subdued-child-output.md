@@ -1,6 +1,10 @@
 # Subdued child output — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Completed — historical record, do not execute.** Shipped in #48, 2026-08-12. The
+> unchecked `- [ ]` boxes below are how the plan was written and not work outstanding, and
+> the instruction to an agentic worker to implement it task-by-task that stood here has
+> been removed: acting on it would rebuild something that already ships. See
+> [`README.md`](README.md) for the index, and the design spec for what the code does now.
 
 **Goal:** Run riabuild's provisioning subprocesses under a pty riabuild owns, discard every escape sequence they emit, and print what remains one dimmed line at a time.
 

@@ -182,6 +182,16 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
 /// `list` and `forget` are whole commands rather than variations on the
 /// default flow — neither connects to a server — so they are named calls here
 /// rather than an `Option<RemoteAction>` threaded down into `flow`.
+///
+/// `forget` is the one that has to read `--check`. It revokes the server's
+/// riabuild session at the API, clears this laptop's key out of the server's
+/// `authorized_keys`, and deletes the saved password and cached session from
+/// the keychain — three irreversible things under a flag documented as
+/// changing nothing. The guard is here rather than in `remote/` because
+/// `remote::Request` is what that crate is handed, and `forget` takes a name
+/// rather than a request: `dispatch` is where the global flags of this
+/// invocation and the library call meet, which is the whole reason this
+/// module exists.
 pub async fn remote(
     ctx: &mut Ctx,
     action: Option<RemoteAction>,
@@ -189,7 +199,17 @@ pub async fn remote(
 ) -> Result<i32> {
     match action {
         Some(RemoteAction::List) => remote::list(ctx).await,
-        Some(RemoteAction::Forget { name }) => remote::forget_server(ctx, &name).await,
+        Some(RemoteAction::Forget { name }) => {
+            if ctx.dry_run {
+                ctx.ui.info(&format!(
+                    "--check: this would revoke {name}'s riabuild session, remove riabuild's key \
+                     from it, and delete the session and password this machine saved for it. \
+                     Nothing was changed."
+                ));
+                return Ok(0);
+            }
+            remote::forget_server(ctx, &name).await
+        }
         None => remote::run(ctx, request).await,
     }
 }
@@ -223,8 +243,56 @@ mod tests {
     use super::*;
     use crate::cli::Command;
     use clap::Parser;
+    use riabuild_runner::FakeRunner;
+    use riabuild_tasks::testing::{ctx_and_runner, write_file};
 
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";
+
+    #[tokio::test]
+    async fn check_forgets_no_server() {
+        // `riabuild --check remote forget build-01` used to revoke the
+        // session, strip the key and drop the saved password — everything the
+        // real command does, under a flag that promises to do none of it.
+        let (mut ctx, _home, runner) = ctx_and_runner(FakeRunner::new()).await;
+        ctx.dry_run = true;
+        let remotes = ctx.paths.remotes_file();
+        write_file(&remotes, "{\"remotes\":[]}").await;
+        let before = tokio::fs::read_to_string(&remotes).await.unwrap();
+
+        let code = remote(
+            &mut ctx,
+            Some(RemoteAction::Forget {
+                name: "build-01".into(),
+            }),
+            remote::Request {
+                target: None,
+                accept_host_key: None,
+                check: true,
+                quiet: true,
+                no_shell: false,
+                project: None,
+                repo: None,
+            },
+        )
+        .await
+        .expect("a dry run succeeds");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            tokio::fs::read_to_string(&remotes).await.unwrap(),
+            before,
+            "the record of the server must survive --check"
+        );
+        assert_eq!(
+            ctx.keychain.get().await.unwrap().as_deref(),
+            Some("rb_test_token"),
+            "and so must this machine's own session"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may be run against the server either"
+        );
+    }
 
     /// `channel status` has to tell "there is no channel here" apart from "the
     /// channel is down", because only one of them has anything to reconnect.

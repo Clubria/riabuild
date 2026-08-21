@@ -1,6 +1,7 @@
 # Subdued child output
 
-**Status:** accepted, 2026-08-12
+**Date:** 2026-08-12
+**Status:** Implemented
 **Amends:** the stdio exception in `riabuild-cli/CLAUDE.md`
 
 ## Problem

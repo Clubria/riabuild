@@ -6,7 +6,7 @@ import { Dashboard, DASHBOARD_TABS } from "./routes/Dashboard";
 import { CliAuthorize } from "./routes/CliAuthorize";
 import { NotFound } from "./routes/NotFound";
 import { SignIn } from "./components/SignIn";
-import { Button, Dot, Loading, Screen } from "./ui";
+import { Alert, Button, Dot, Loading, Screen } from "./ui";
 
 /**
  * The gallery imports the fixtures, so it must not merely be unreachable in
@@ -126,7 +126,32 @@ function Body({
     return <Loading label="checking your access" />;
   }
   if (data.viewer.state === "error") {
-    return <Loading label={data.viewer.message} />;
+    // Not a `Loading`: this is the end of the road for the page, and a spinner
+    // labelled with a backend error string reads as a page still working on it.
+    // The sentence is fixed in production for the reason the error boundary's
+    // is — an error string can carry backend detail — and the detail is right
+    // there in a dev build, where the person reading it wrote the query.
+    return (
+      <div className="mx-auto max-w-xl py-4">
+        <Alert tone="danger" title="Could not check your access">
+          <p className="max-w-prose">
+            riabuild reached the backend but could not read your account, so
+            there is nothing here it can safely show you. Reload in a moment; if
+            it keeps happening, tell a lead.
+          </p>
+          {import.meta.env.DEV && (
+            <p className="mt-3 text-xs text-fg-faint wrap-value">
+              {data.viewer.message}
+            </p>
+          )}
+          <div className="mt-4">
+            <Button variant="primary" onClick={() => window.location.reload()}>
+              reload
+            </Button>
+          </div>
+        </Alert>
+      </div>
+    );
   }
   if (data.viewer.value === null) {
     return (
@@ -166,7 +191,9 @@ function StatusLeft() {
       {viewer !== null && (
         <span className="min-w-0 text-accent wrap-value">{viewer.role}</span>
       )}
-      {membership.status === "member" && <Dot tone="ok" label={membership.org} />}
+      {membership.status === "member" && (
+        <Dot tone="ok" label={membership.org} />
+      )}
       {membership.status === "checking" && (
         <Dot tone="muted" label="checking github" />
       )}

@@ -1,6 +1,7 @@
 # Inviting members ahead of their first sign-in
 
-2026-08-14
+**Date:** 2026-08-14
+**Status:** Implemented
 
 ## The problem
 

@@ -13,63 +13,27 @@
 //!   manpages, completions, and a licence riabuild has no use for
 //!
 //! And one project ships no container at all — see [`Kind::Raw`].
+//!
+//! Three files. `kind` is which container an asset arrived in, `member` is
+//! lifting one named file out of one, and `staging` is how a finished tree
+//! lands. What is left here is the async surface every caller reaches through,
+//! and the guards — a path that may not leave its target, a disk that would
+//! not take it.
 
-use anyhow::{Context, Result, anyhow};
-use std::io::Read;
+mod kind;
+mod member;
+
+// Re-exported so a caller keeps naming `archive::Kind` and
+// `archive::extract_single_file`. Which file each lives in is this module's
+// business, and a caller that had to know would have to be edited the next
+// time one moves.
+pub use kind::Kind;
+pub use member::extract_single_file;
+
+use crate::{Failure, UPSTREAM_MOVED};
+use anyhow::Result;
+use member::{tar_member, zip_member};
 use std::path::{Component, Path, PathBuf};
-
-/// The container an upstream release happens to use.
-///
-/// `gh` publishes Linux as tar.gz and macOS as zip — there is no macOS tar.gz,
-/// and the only other macOS asset is a `.pkg` installer that writes to
-/// `/usr/local` with sudo. So the container is a property of the asset rather
-/// than of riabuild, and both have to be supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    TarGz,
-    Zip,
-    /// No container: the download *is* the binary.
-    ///
-    /// Grok Build is the one that forces this. xAI serves an uncompressed
-    /// executable straight from `https://x.ai/cli/grok-<version>-<platform>`,
-    /// with no tarball, no zip, and nothing beside it. The two ways to avoid a
-    /// third variant were both worse. Repacking it into a tarball in
-    /// `packaging/grok/mirror.sh` would mean the digest pinned in `tools.rs` is
-    /// the digest of *riabuild's repack* rather than of the bytes xAI served,
-    /// which puts an unverifiable transformation between what a maintainer
-    /// checked and what a laptop runs — the opposite of what pinning is for.
-    /// Downloading it outside `tools::install` would put a second, unverified
-    /// fetch path in the codebase.
-    ///
-    /// So the bytes are mirrored byte-for-byte and this reads them straight
-    /// through. `member` is not consulted for a `Raw` asset, because there is
-    /// no archive to look inside.
-    Raw,
-}
-
-impl Kind {
-    /// Picked from the asset name, so it stays wrong-proof when a new asset is
-    /// added: the name and the container cannot drift apart.
-    ///
-    /// `Raw` is spelled `.bin` rather than inferred from "no extension I
-    /// recognise". Inferring it would make every future typo and every asset in
-    /// a container riabuild has not learned yet — a `.pkg`, a `.deb`, an
-    /// `.xz` — install as though it were an executable, which fails at the
-    /// moment the developer runs it rather than here. Renaming a file does not
-    /// change its bytes, so the mirrored `.bin` still hashes to exactly what
-    /// upstream served.
-    pub fn of(asset: &str) -> Result<Self> {
-        if asset.ends_with(".tar.gz") || asset.ends_with(".tgz") {
-            Ok(Kind::TarGz)
-        } else if asset.ends_with(".zip") {
-            Ok(Kind::Zip)
-        } else if asset.ends_with(".bin") {
-            Ok(Kind::Raw)
-        } else {
-            Err(anyhow!("riabuild does not know how to unpack {asset}"))
-        }
-    }
-}
 
 mod staging;
 
@@ -79,7 +43,54 @@ mod staging;
 // followed by an unpack. This module used to carry a simpler pair that opened
 // with `remove_dir_all(target)` — correct on a single-user laptop, and a way to
 // delete the Node a colleague's `pnpm dev` is running out of anywhere else.
-pub use staging::{extract_node_tarball, extract_pnpm_tarball};
+// They are reached through the `async` wrappers below and never directly.
+// The same pair lands the one file `extract_member` writes. A binary is not a
+// tree, but *how* it arrives is the same question and must not grow a second
+// answer beside this one.
+use staging::{install_staged, staging_beside};
+
+/// Runs one unpacking job on tokio's blocking pool.
+///
+/// Unpacking *looks* like the CPU work `../../CLAUDE.md` exempts — the `tar`
+/// crate reading an in-memory buffer — and it is not only that. Every entry is
+/// a `create_dir_all` and a write, and landing the result is a `rename` over a
+/// path under `tools_root()` plus a `remove_dir_all` of the tree it displaced:
+/// ~130 MB of filesystem work against a shared directory, none of which that
+/// exemption covers. Left on the reactor thread it stalls every other future in
+/// the process for as long as the disk takes.
+///
+/// `spawn_blocking` rather than `block_in_place`: riabuild runs on a
+/// current-thread runtime, where `block_in_place` is not available. Everything
+/// the job touches is owned, because as far as the borrow checker is concerned
+/// a blocking task outlives the future that spawned it.
+///
+/// A `JoinError` here can only be the job panicking — nothing cancels it — and
+/// that is a bug in riabuild rather than something a developer can act on, so
+/// it travels as the `anyhow` chain it is instead of wearing a `Failure`'s
+/// remedy.
+async fn off_the_reactor<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work).await?
+}
+
+/// Unpacks a `node-v*.tar.gz` into `target` so that `target/bin/node` is the
+/// binary: Node wraps everything in one `node-v22.23.1-darwin-arm64/` directory.
+pub async fn extract_node_tarball(bytes: Vec<u8>, target: PathBuf) -> Result<()> {
+    off_the_reactor(move || staging::extract_node_tarball(&bytes, &target)).await
+}
+
+/// Unpacks the npm packages one tool is made of into `target` as a single
+/// tree, stripping the `package/` directory npm wraps every tarball in.
+///
+/// pnpm is the caller and is one package — see `download::PNPM_PACKAGE`. More
+/// than one is still accepted, and more than one is still meaningful: they are
+/// unpacked in the order given, later entries overwriting earlier ones, and the
+/// result lands in one `rename` so a co-tenant never reaches a half-assembled
+/// tree.
+pub async fn extract_npm_tarballs(parts: Vec<Vec<u8>>, target: PathBuf) -> Result<()> {
+    off_the_reactor(move || staging::extract_npm_tarballs(&parts, &target)).await
+}
 
 /// Writes one file out of an archive to `destination`, executable.
 ///
@@ -93,7 +104,35 @@ pub use staging::{extract_node_tarball, extract_pnpm_tarball};
 /// The mode is set here rather than taken from the archive. Every caller wants
 /// an executable, and a zip written on a machine that does not model the Unix
 /// permission bits stores 0 for all of them.
-pub fn extract_member(bytes: &[u8], kind: Kind, member: &str, destination: &Path) -> Result<()> {
+///
+/// It **lands by rename**, for `staging`'s reason rather than a second one of
+/// its own. `install` reinstalls a version that is already there — `apply()` is
+/// safe to run twice, and re-running it is the ordinary repair — so
+/// `destination` is routinely a `gh`, `infisical`, `ngrok` or `grok` binary
+/// that exists. Writing over it in place truncates a file a co-tenant may be
+/// executing, which is `ETXTBSY` if riabuild is lucky and a half-written binary
+/// that passes the next existence check if it is not. Written beside it and
+/// renamed on, the running process keeps the inode it opened and every later
+/// lookup finds a whole binary.
+///
+/// Owned arguments and a hop onto the blocking pool, for [`off_the_reactor`]'s
+/// reason: reading the member is CPU work over a buffer, and landing it is not.
+pub async fn extract_member(
+    bytes: Vec<u8>,
+    kind: Kind,
+    member: &'static str,
+    destination: PathBuf,
+) -> Result<()> {
+    off_the_reactor(move || extract_member_blocking(&bytes, kind, member, &destination)).await
+}
+
+/// The body, on the blocking pool.
+fn extract_member_blocking(
+    bytes: &[u8],
+    kind: Kind,
+    member: &str,
+    destination: &Path,
+) -> Result<()> {
     let found = match kind {
         Kind::TarGz => tar_member(bytes, member)?,
         Kind::Zip => zip_member(bytes, member)?,
@@ -102,70 +141,55 @@ pub fn extract_member(bytes: &[u8], kind: Kind, member: &str, destination: &Path
         // caller's business rather than this function's.
         Kind::Raw => Some(bytes.to_vec()),
     };
-    let found = found.ok_or_else(|| {
-        anyhow!(
-            "the archive riabuild downloaded does not contain {member}, so nothing was installed"
+    let Some(found) = found else {
+        return Err(Failure::new(
+            format!(
+                "installing {member} — the archive riabuild downloaded and verified does not \
+                 contain it, so nothing was installed"
+            ),
+            UPSTREAM_MOVED,
         )
-    })?;
+        .into());
+    };
 
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|error| cannot_write(parent, &error))?;
     }
-    std::fs::write(destination, found)
-        .with_context(|| format!("could not write {}", destination.display()))?;
-    set_executable(destination)?;
-    Ok(())
+    let staging = staging_beside(destination, "part");
+    std::fs::write(&staging, found).map_err(|error| cannot_write(&staging, &error))?;
+    if let Err(error) = set_executable(&staging) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    install_staged(&staging, destination, None)
 }
 
-fn tar_member(bytes: &[u8], member: &str) -> Result<Option<Vec<u8>>> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let path = entry.path()?.into_owned();
-        if !is_member(&path.to_string_lossy(), member) {
-            continue;
-        }
-        let mut contents = Vec::new();
-        entry.read_to_end(&mut contents)?;
-        return Ok(Some(contents));
-    }
-    Ok(None)
+/// A disk riabuild could not write to: no space, no permission, a read-only
+/// mount. Every one of those is something the developer can see and fix, and
+/// none of them is a bug in riabuild.
+fn cannot_write(path: &Path, error: &std::io::Error) -> anyhow::Error {
+    Failure::new(
+        format!("writing {}", path.display()),
+        "Check that there is free disk space and that you can write to that directory, then run \
+         `riabuild` again.",
+    )
+    .detail(format!("{error}"))
+    .into()
 }
 
-fn zip_member(bytes: &[u8], member: &str) -> Result<Option<Vec<u8>>> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .context("that download is not a readable zip archive")?;
-
-    for index in 0..archive.len() {
-        let mut file = archive.by_index(index)?;
-        if file.is_dir() {
-            continue;
-        }
-        // `name()` is the raw archived path. It is only compared here, never
-        // joined onto a destination, so a hostile entry cannot escape anywhere
-        // — `extract_member` writes to the path its caller chose.
-        if !is_member(file.name(), member) {
-            continue;
-        }
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
-        return Ok(Some(contents));
-    }
-    Ok(None)
-}
-
-/// Whether an archived path names the member being looked for.
+/// A buffer that matched its published digest and is still not an archive.
 ///
-/// Anchored to a path boundary so asking for `infisical` finds the binary at
-/// the archive root without also matching `completions/infisical.bash` or
-/// `manpages/infisical.1.gz`, both of which are in the same tarball.
-fn is_member(path: &str, member: &str) -> bool {
-    let path = path.trim_start_matches("./");
-    path == member || path.ends_with(&format!("/{member}"))
+/// One sentence for gzip, tar and zip alike, because the developer's position
+/// is the same in all three and there is nothing in it they can change: the
+/// bytes are the ones upstream published, and riabuild cannot read them.
+pub(super) fn unreadable(error: &dyn std::fmt::Display) -> anyhow::Error {
+    Failure::new(
+        "unpacking a download that matched the checksum published for it and is still not a \
+         readable archive",
+        UPSTREAM_MOVED,
+    )
+    .detail(format!("{error}"))
+    .into()
 }
 
 /// Joins an archived path onto a destination, refusing anything that would
@@ -182,39 +206,21 @@ fn safe_join(target: &Path, relative: &Path) -> Result<PathBuf> {
         match component {
             Component::Normal(_) | Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!(
-                    "that archive contains an entry that would be written outside \
-                     {} ({}), so riabuild refused to unpack it",
-                    target.display(),
-                    relative.display()
-                ));
+                return Err(Failure::new(
+                    format!(
+                        "unpacking an archive into {} — it contains an entry that would be \
+                         written outside it, so riabuild refused to unpack it",
+                        target.display()
+                    ),
+                    "Send this to your team lead — the archive riabuild downloaded is not the \
+                     one it expected, and nothing has been installed.",
+                )
+                .detail(format!("the entry is {}", relative.display()))
+                .into());
             }
         }
     }
     Ok(target.join(relative))
-}
-
-/// One named member of a gzipped tarball, returned in memory.
-///
-/// The sibling of [`extract_member`], for the one caller that wants bytes
-/// rather than a file: the release tarball holds `riabuild` at its root, and
-/// those bytes go straight down an SSH pipe to a server rather than landing on
-/// this machine at all. Writing them out only to read them back would put a
-/// second copy of the binary on the laptop for no reason.
-pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        let matches = path.file_name().is_some_and(|found| found == name);
-        if matches {
-            let mut buffer = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buffer)?;
-            return Ok(buffer);
-        }
-    }
-    anyhow::bail!("{name} is not in that archive")
 }
 
 #[cfg(unix)]
@@ -250,31 +256,6 @@ pub async fn make_executable(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_single_member_is_lifted_out_of_a_tarball() {
-        // Built in memory, so the test needs no fixture file and no network.
-        let mut archive = tar::Builder::new(Vec::new());
-        let payload = b"\x7fELF fake binary";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "riabuild", &payload[..])
-            .expect("append");
-        let tar_bytes = archive.into_inner().expect("finish");
-
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
-        let gz = encoder.finish().expect("gzip");
-
-        assert_eq!(
-            extract_single_file(&gz, "riabuild").expect("extract"),
-            payload
-        );
-        assert!(extract_single_file(&gz, "not-there").is_err());
-    }
-
     pub fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -301,27 +282,63 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
-    #[test]
-    fn a_node_archive_loses_its_wrapper_directory() {
+    #[tokio::test]
+    async fn a_node_archive_loses_its_wrapper_directory() {
         let bytes = tarball(&[("node-v22.23.1-darwin-arm64/bin/node", b"binary")]);
         let home = tempfile::TempDir::new().unwrap();
         let target = home.path().join("22.23.1");
-        extract_node_tarball(&bytes, &target).unwrap();
+        extract_node_tarball(bytes, target.clone()).await.unwrap();
         assert!(target.join("bin/node").exists());
     }
 
-    #[test]
-    fn a_pnpm_archive_keeps_its_launcher_beside_the_dist_tree() {
-        // pnpm's archive has no wrapper directory. Stripping one anyway would
-        // throw the launcher away and leave a `dist/` nothing can start — and
-        // the launcher loads `dist/` from beside itself, so the two cannot be
-        // separated either.
-        let bytes = tarball(&[("pnpm", b"launcher"), ("dist/pnpm.mjs", b"module")]);
+    #[tokio::test]
+    async fn an_npm_package_loses_its_package_wrapper() {
+        // Every npm tarball wraps its contents in `package/`, and what pnpm
+        // needs out the other side is `bin/pnpm.cjs` with `dist/` beside it.
+        let package = tarball(&[
+            ("package/bin/pnpm.cjs", b"the entry" as &[u8]),
+            ("package/dist/pnpm.mjs", b"module"),
+        ]);
         let home = tempfile::TempDir::new().unwrap();
         let target = home.path().join("11.11.0");
-        extract_pnpm_tarball(&bytes, &target).unwrap();
-        assert!(target.join("pnpm").exists());
+
+        extract_npm_tarballs(vec![package], target.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("bin/pnpm.cjs")).unwrap(),
+            b"the entry"
+        );
         assert!(target.join("dist/pnpm.mjs").exists());
+        assert!(!target.join("package").exists());
+    }
+
+    #[tokio::test]
+    async fn several_npm_packages_land_as_one_tree_with_the_last_one_winning() {
+        // The multi-part contract, kept because it is the only thing that makes
+        // "a co-tenant never sees half a tool" true of a tool that needs two
+        // packages. pnpm needed exactly this while riabuild installed its
+        // platform executable, and the ordering rule is the half that is easy
+        // to lose: `tar` unlinks and recreates rather than writing in place, so
+        // the later layer wins cleanly.
+        let first = tarball(&[
+            ("package/shared", b"replace me" as &[u8]),
+            ("package/only-in-first", b"kept"),
+        ]);
+        let second = tarball(&[("package/shared", b"the winner" as &[u8])]);
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("11.11.0");
+
+        extract_npm_tarballs(vec![first, second], target.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(target.join("shared")).unwrap(), b"the winner");
+        assert_eq!(
+            std::fs::read(target.join("only-in-first")).unwrap(),
+            b"kept"
+        );
     }
 
     #[test]
@@ -342,18 +359,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_container_is_read_off_the_asset_name() {
-        assert_eq!(
-            Kind::of("gh_2.97.0_linux_amd64.tar.gz").unwrap(),
-            Kind::TarGz
-        );
-        assert_eq!(Kind::of("gh_2.97.0_macOS_arm64.zip").unwrap(), Kind::Zip);
-        assert!(Kind::of("gh_2.97.0_macOS_universal.pkg").is_err());
-    }
-
-    #[test]
-    fn finds_a_binary_under_the_versioned_prefix_gh_uses() {
+    #[tokio::test]
+    async fn finds_a_binary_under_the_versioned_prefix_gh_uses() {
         // The prefix carries the version, which is why members are matched by
         // suffix rather than by full path.
         let bytes = tarball(&[
@@ -363,12 +370,14 @@ mod tests {
         ]);
         let home = tempfile::TempDir::new().unwrap();
         let destination = home.path().join("gh/2.97.0/bin/gh");
-        extract_member(&bytes, Kind::TarGz, "bin/gh", &destination).unwrap();
+        extract_member(bytes, Kind::TarGz, "bin/gh", destination.clone())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"the binary");
     }
 
-    #[test]
-    fn finds_a_binary_at_the_archive_root_without_matching_its_neighbours() {
+    #[tokio::test]
+    async fn finds_a_binary_at_the_archive_root_without_matching_its_neighbours() {
         // Infisical's tarball has the binary at the root, beside completions
         // and manpages that all begin with the same word.
         let bytes = tarball(&[
@@ -379,24 +388,28 @@ mod tests {
         ]);
         let home = tempfile::TempDir::new().unwrap();
         let destination = home.path().join("infisical/0.43.120/infisical");
-        extract_member(&bytes, Kind::TarGz, "infisical", &destination).unwrap();
+        extract_member(bytes, Kind::TarGz, "infisical", destination.clone())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"the binary");
     }
 
-    #[test]
-    fn reads_a_member_out_of_a_zip_the_way_gh_ships_macos() {
+    #[tokio::test]
+    async fn reads_a_member_out_of_a_zip_the_way_gh_ships_macos() {
         let bytes = zipball(&[
             ("gh_2.97.0_macOS_arm64/LICENSE", b"licence" as &[u8]),
             ("gh_2.97.0_macOS_arm64/bin/gh", b"the binary"),
         ]);
         let home = tempfile::TempDir::new().unwrap();
         let destination = home.path().join("gh/2.97.0/bin/gh");
-        extract_member(&bytes, Kind::Zip, "bin/gh", &destination).unwrap();
+        extract_member(bytes, Kind::Zip, "bin/gh", destination.clone())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"the binary");
     }
 
-    #[test]
-    fn an_extracted_binary_is_executable() {
+    #[tokio::test]
+    async fn an_extracted_binary_is_executable() {
         // Without this the install completes, the check runs the binary, and
         // the developer is told `gh` is missing on a machine where it is not.
         #[cfg(unix)]
@@ -405,7 +418,9 @@ mod tests {
             let bytes = tarball(&[("infisical", b"the binary")]);
             let home = tempfile::TempDir::new().unwrap();
             let destination = home.path().join("infisical");
-            extract_member(&bytes, Kind::TarGz, "infisical", &destination).unwrap();
+            extract_member(bytes, Kind::TarGz, "infisical", destination.clone())
+                .await
+                .unwrap();
             let mode = std::fs::metadata(&destination)
                 .unwrap()
                 .permissions()
@@ -414,41 +429,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_missing_member_says_nothing_was_installed() {
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn reinstalling_replaces_the_binary_rather_than_writing_over_it() {
+        // `install` reinstalls a version that is already there — `apply()` is
+        // safe to run twice and re-running it is the ordinary repair — so this
+        // path routinely lands on a `gh` or `infisical` a co-tenant on a shared
+        // box is executing out of `tools_root()`. `std::fs::write` truncates
+        // that file in place: ETXTBSY if riabuild is lucky, and a half-written
+        // binary that passes the next existence check if it is not.
+        //
+        // The old inode stands in for the running process here, held by a hard
+        // link. A rename leaves it alone; a write through the path does not.
+        let home = tempfile::TempDir::new().unwrap();
+        let destination = home.path().join("gh/2.97.0/bin/gh");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"the gh a colleague is running").unwrap();
+        let held_open = home.path().join("still-running");
+        std::fs::hard_link(&destination, &held_open).unwrap();
+
+        let bytes = tarball(&[("gh_2.97.0_linux_amd64/bin/gh", b"a newly downloaded gh")]);
+        extract_member(bytes, Kind::TarGz, "bin/gh", destination.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"a newly downloaded gh"
+        );
+        assert_eq!(
+            std::fs::read(&held_open).unwrap(),
+            b"the gh a colleague is running",
+            "the binary a co-tenant is executing was written over in place"
+        );
+
+        // And the staging copy is not left lying beside it: `tools_root()` is
+        // shared and nothing anywhere sweeps it.
+        let mut beside: Vec<String> = std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        beside.sort();
+        assert_eq!(beside, vec!["gh".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_member_says_nothing_was_installed() {
         // The failure mode this guards is an upstream rename: the download
         // succeeds, the digest matches, and the binary never appears.
         let bytes = tarball(&[("gh_2.97.0_linux_amd64/LICENSE", b"licence" as &[u8])]);
         let home = tempfile::TempDir::new().unwrap();
-        let error = extract_member(&bytes, Kind::TarGz, "bin/gh", &home.path().join("gh"))
+        let error = extract_member(bytes, Kind::TarGz, "bin/gh", home.path().join("gh"))
+            .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("bin/gh"), "{error}");
         assert!(error.contains("nothing was installed"), "{error}");
     }
-}
 
-#[cfg(test)]
-mod raw_tests {
-    use super::*;
-
-    #[test]
-    fn a_bare_binary_is_recognised_by_its_name_and_nothing_else() {
-        // The whole point of spelling `Raw` as `.bin`: a container riabuild has
-        // not learned yet must fail here, not install as an executable and fail
-        // when the developer runs it.
-        assert_eq!(Kind::of("grok-1.0.5-linux-x86_64.bin").unwrap(), Kind::Raw);
-        assert_eq!(
-            Kind::of("ngrok-3.39.11-linux-amd64.tgz").unwrap(),
-            Kind::TarGz
-        );
-        assert!(Kind::of("grok-1.0.5-linux-x86_64").is_err());
-        assert!(Kind::of("grok.pkg").is_err());
-        assert!(Kind::of("grok.deb").is_err());
+    #[tokio::test]
+    async fn every_unpacking_failure_is_one_a_developer_can_act_on() {
+        // `main` downcasts to `Failure` and prints "Send this to your team lead
+        // — it is a bug in riabuild" for anything else. Unpacking is where an
+        // upstream rename, a hostile archive and a full disk all surface, and
+        // none of those is a bug in riabuild.
+        let home = tempfile::TempDir::new().unwrap();
+        let errors = vec![
+            Kind::of("gh_2.97.0_macOS_universal.pkg").expect_err("container"),
+            extract_member(
+                tarball(&[("gh_2.97.0_linux_amd64/LICENSE", b"licence" as &[u8])]),
+                Kind::TarGz,
+                "bin/gh",
+                home.path().join("gh"),
+            )
+            .await
+            .expect_err("member"),
+            extract_single_file(b"not a gzip stream", "riabuild").expect_err("single file"),
+            safe_join(home.path(), Path::new("../../etc/profile")).expect_err("traversal"),
+        ];
+        for error in errors {
+            let failure = error
+                .downcast_ref::<riabuild_ui::Failure>()
+                .unwrap_or_else(|| panic!("not a Failure: {error:#}"));
+            assert!(!failure.attempting.is_empty(), "{failure}");
+            assert!(!failure.action.is_empty(), "{failure}");
+        }
     }
 
-    #[test]
-    fn a_raw_download_is_written_through_byte_for_byte() {
+    #[tokio::test]
+    async fn a_raw_download_is_written_through_byte_for_byte() {
         // xAI serves an uncompressed executable, so what riabuild verified and
         // what it writes have to be the same bytes — a repack in between would
         // make the pinned digest describe riabuild's own output rather than
@@ -457,7 +527,9 @@ mod raw_tests {
         let home = tempfile::TempDir::new().unwrap();
         let destination = home.path().join("grok").join("1.0.5").join("grok");
 
-        extract_member(payload, Kind::Raw, "grok", &destination).expect("extract");
+        extract_member(payload.to_vec(), Kind::Raw, "grok", destination.clone())
+            .await
+            .expect("extract");
 
         assert_eq!(std::fs::read(&destination).unwrap(), payload);
         #[cfg(unix)]

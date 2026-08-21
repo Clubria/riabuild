@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import { useData } from "../data/context";
-import { OrgCandidate, Role } from "../data/types";
+import { IssuedKeyId, OrgCandidate, Role } from "../data/types";
 import { readError } from "../lib/errors";
 import { Alert, Badge, Button, Empty, Loading, Select } from "../ui";
 
@@ -50,13 +50,14 @@ export function Invite() {
   const [catalogue, setCatalogue] = useState<Catalogue>({ state: "idle" });
   const [pickedId, setPickedId] = useState<string | null>(null);
   const [role, setRole] = useState<Role>("developer");
-  const [keys, setKeys] = useState<string[]>([]);
+  const [keys, setKeys] = useState<IssuedKeyId[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [invited, setInvited] = useState<string | null>(null);
 
   const members = data.members.state === "ready" ? data.members.value : [];
-  const issuedKeys = data.issuedKeys.state === "ready" ? data.issuedKeys.value : [];
+  const issuedKeys =
+    data.issuedKeys.state === "ready" ? data.issuedKeys.value : [];
 
   /**
    * Everyone GitHub reported who has no riabuild row yet — invited or arrived,
@@ -73,7 +74,8 @@ export function Invite() {
     catalogue.state === "ready"
       ? catalogue.candidates.filter(
           (person) =>
-            !taken.has(person.githubId) && !taken.has(person.login.toLowerCase()),
+            !taken.has(person.githubId) &&
+            !taken.has(person.login.toLowerCase()),
         )
       : [];
   /**
@@ -95,7 +97,8 @@ export function Invite() {
     );
   }
 
-  function submit() {
+  function submit(event: FormEvent) {
+    event.preventDefault();
     if (picked === undefined) return;
     setError(null);
     setInvited(null);
@@ -142,8 +145,8 @@ export function Invite() {
             </Button>
           }
         >
-          riabuild asks GitHub who is in the org when you press this, rather than
-          on every visit to this page.
+          riabuild asks GitHub who is in the org when you press this, rather
+          than on every visit to this page.
         </Empty>
       )}
 
@@ -164,14 +167,16 @@ export function Invite() {
 
       {catalogue.state === "ready" && picked === undefined && (
         <Empty glyph="✓" title="Everyone in the org is already here.">
-          Every GitHub account in the org has a riabuild row, invited or arrived.
-          Somebody missing? Send them the GitHub org invite first &mdash;
-          riabuild can only offer people GitHub already knows about.
+          Every GitHub account in the org has a riabuild row, invited or
+          arrived. Somebody missing? Send them the GitHub org invite first
+          &mdash; riabuild can only offer people GitHub already knows about.
         </Empty>
       )}
 
       {catalogue.state === "ready" && picked !== undefined && (
-        <div className="max-w-2xl">
+        // A real form: Enter on the person picker invites them, which is what
+        // the browser does everywhere else and what this panel did nowhere.
+        <form className="max-w-2xl" onSubmit={submit}>
           <div className="grid gap-4 sm:grid-cols-2">
             <Select
               label="person"
@@ -246,10 +251,10 @@ export function Invite() {
 
           <div className="mt-5 flex flex-wrap items-center gap-2">
             <Button
+              type="submit"
               variant="primary"
               pending={saving}
               pendingLabel="inviting"
-              onClick={submit}
             >
               invite @{picked.login} as {role}
             </Button>
@@ -262,7 +267,7 @@ export function Invite() {
               </span>
             )}
           </div>
-        </div>
+        </form>
       )}
 
       {error !== null && (

@@ -28,7 +28,10 @@ pub fn rcfile(home: &Path, environment: &str, banner: &str, prompt: &str) -> Str
 /// `if` rather than `&&` so a non-terminal shell does not start with a
 /// non-zero `$?` for the developer's prompt to report as a failure.
 pub fn banner_command(text: &str) -> String {
-    format!("if [ -t 1 ]; then printf '%s\\n' {}; fi", shell_quote(text))
+    format!(
+        "if [ -t 1 ]; then printf '%s\\n' {}; fi",
+        super::shell_quote(text)
+    )
 }
 
 /// Prefixes `PS1` from a `PROMPT_COMMAND` hook rather than assigning it once.
@@ -64,12 +67,8 @@ case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
     declare\ -a*|typeset\ -a*) PROMPT_COMMAND+=(_riabuild_prompt) ;;
     *) PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}}_riabuild_prompt" ;;
 esac"#,
-        prefix = shell_quote(&prefix),
+        prefix = super::shell_quote(&prefix),
     )
-}
-
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 pub async fn prepare(

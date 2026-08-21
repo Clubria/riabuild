@@ -2,129 +2,23 @@
 //!
 //! Minted by the laptop, labelled after the server so the dashboard lists it as
 //! its own revocable device, and written to the server's namespace at 0600 —
-//! the one amendment to "no secrets in ~/.riabuild", argued in the design.
+//! the one amendment to "no secrets in ~/.riabuild", argued in the design.//!
+//! [`namespace`] is where a developer's things live on the server and how a
+//! file gets there; this file is whether the session already on it is still
+//! worth reusing, and minting a new one when it is not.
 
-use super::{Remote, identity, shell_command, shell_quote};
+use super::Remote;
 use anyhow::Result;
 use riabuild_api::{ApiClient, Member, auth};
 use riabuild_keychain as keychain;
-use riabuild_paths::{Paths, RealPaths};
-use riabuild_runner::{CommandRunner, RunOptions};
+use riabuild_paths::Paths;
+use riabuild_runner::CommandRunner;
 use riabuild_ui::{Failure, Ui};
-use std::path::Path;
 use std::sync::Arc;
+mod namespace;
 
-/// The namespace as a string, for a remote command line.
-///
-/// Delegates to `paths::remote_namespace` rather than formatting its own copy:
-/// this value is what `forget` hands to `rm -rf`, and two spellings of one
-/// layout is exactly the drift that makes that dangerous.
-///
-/// Absolute, never `~`: `mosh`, `fish`, and `csh` do not expand a `~` in the
-/// positions remote mode uses it, and an unexpanded one reaching
-/// `paths::root_for` is refused outright rather than defaulting (R1 in
-/// `decisions.md` — this file's own interface line and test used to say
-/// otherwise; both were stale).
-pub fn namespace(home: &str, member_id: &str) -> String {
-    riabuild_paths::remote_namespace(Path::new(home), member_id)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// A `Paths` view of `member_id`'s namespace on a server with home `home`.
-///
-/// Exists so a file this module writes into that namespace — `owner.json`
-/// today — has its basename read out of the one shared layout definition in
-/// `paths.rs` rather than formatted a second time here (R10 in
-/// `decisions.md`). `RealPaths::with_root` is exactly the mechanism `paths.rs`
-/// documents for evaluating that layout against a remote home instead of this
-/// laptop's own.
-fn remote_layout(home: &str, member_id: &str) -> RealPaths {
-    RealPaths::with_root(
-        home,
-        riabuild_paths::remote_namespace(Path::new(home), member_id),
-    )
-}
-
-/// The final path component of `path`, or an empty string.
-///
-/// Never panics: every `Paths` layout method joins a literal onto a root, so
-/// the `None` arm is unreachable in practice, but a filename is worth reading
-/// out of one place (`paths.rs`) rather than asserting it can't fail.
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-/// Writes one file into the namespace, through a shell riabuild names and with
-/// every path quoted. The bytes go on stdin so a secret never reaches argv.
-///
-/// Calls `runner.run` directly rather than `ssh_once`: `ssh_once` always runs
-/// with `RunOptions::default()`, which carries no stdin, so a write routed
-/// through it would open the remote `cat` against a closed pipe and produce an
-/// empty file instead of `contents`.
-async fn write_into_namespace(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: &Arc<dyn CommandRunner>,
-    ns: &str,
-    name: &str,
-    contents: Vec<u8>,
-    carry: Option<&crate::issued::Working>,
-) -> Result<()> {
-    let target = format!("{ns}/{name}");
-    let script = shell_command(&format!(
-        "umask 077 && mkdir -p {ns} && cat > {target} && chmod 600 {target}",
-        ns = shell_quote(ns),
-        target = shell_quote(&target),
-    ));
-    let mut args = identity::ssh_options(remote, paths, true, carry);
-    args.push(remote.target());
-    args.push(script);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = runner
-        .run(
-            "ssh",
-            &refs,
-            &RunOptions {
-                stdin: Some(contents),
-                ..super::askpass::run_options(remote, paths)
-            },
-        )
-        .await?;
-    if !output.ok() {
-        return Err(Failure::new(
-            format!("writing {name} on {}", remote.host),
-            "Check there is space in your home directory on that server, then run `riabuild remote` again.",
-        )
-        .detail(output.stderr)
-        .into());
-    }
-    Ok(())
-}
-
-/// Who a namespace belongs to, for whoever has a shell on the box and finds a
-/// directory named after a UUID.
-///
-/// Through `serde_json`, not `format!`: the name is whatever the developer
-/// typed into their profile, and one containing a quote or a backslash would
-/// otherwise produce a file riabuild cannot read back when it names the other
-/// people sharing an account.
-pub fn owner_json(login: &str, name: &str, email: &str) -> String {
-    serde_json::json!({ "githubLogin": login, "name": name, "email": email }).to_string()
-}
-
-/// The git identity for this namespace.
-///
-/// `GIT_CONFIG_GLOBAL` makes git stop reading `~/.gitconfig` altogether, so
-/// setting that variable without writing this file is worse than doing
-/// neither: the first commit on the server fails with "Please tell me who you
-/// are", on a box where the developer never configured git in the first
-/// place.
-pub fn gitconfig(name: &str, email: &str) -> String {
-    format!("[user]\n\tname = {name}\n\temail = {email}\n")
-}
+use namespace::{basename, remote_layout, write_into_namespace};
+pub use namespace::{gitconfig, namespace, owner_json};
 
 /// Whether the store's record of this session's expiry is recent enough that
 /// probing the server for liveness is worth the round trip at all.
@@ -138,6 +32,90 @@ pub fn gitconfig(name: &str, email: &str) -> String {
 /// `check()`.
 fn expires_soon(record: &super::store::Record) -> bool {
     record.session_expires_at <= riabuild_paths::config::now_millis()
+}
+
+/// What a probe of the cached token actually established, and therefore
+/// whether the token may still be used.
+///
+/// Split out because the three answers are what the bug conflated. `me()`
+/// returning `Err` used to mean "mint a new one", and it has two very
+/// different causes:
+///
+/// - **The token is dead.** riabuild-web says so — `unauthenticated`,
+///   `session_expired`, `session_revoked`, which is `ApiError::needs_login`.
+///   Another laptop's `forget` revoked it, or it ran out. Minting is right.
+/// - **riabuild-web could not answer.** A timeout, a 503, a 409, a captive
+///   portal. Nothing was established about the token at all — and minting on
+///   that answer overwrites `session_id` with a new row, orphaning the
+///   previous session: still live on the server, and no longer nameable by
+///   `remote forget`. On a blip that resolves in the seconds between the probe
+///   and the mint, that is exactly what happened.
+///
+/// So an ambiguous answer keeps the token. The record has already been checked
+/// against its expiry by [`expires_soon`], so what is being reused is a
+/// credential this laptop has every local reason to believe in — and the
+/// alternative is not a better token, it is two.
+///
+/// Takes the probe's `Result` rather than making the call, because the call is
+/// the one thing this crate's scaffolding cannot stand up (see [`expires_soon`]),
+/// and a decision nothing can test is how this shipped.
+fn usable_token(token: String, probe: Result<Member>, ui: &Ui) -> Option<String> {
+    match probe {
+        Ok(_) => Some(token),
+        Err(error) if dead_session(&error) => None,
+        Err(error) => {
+            ui.note(&format!(
+                "Could not check this server's saved session with riabuild-web ({error}), so \
+                 riabuild is reusing it rather than minting a second one that would leave the \
+                 first live and unrevocable."
+            ));
+            Some(token)
+        }
+    }
+}
+
+/// Whether riabuild-web said the token is no longer good, as opposed to not
+/// answering. Only an `ApiError` can say so; a transport failure says nothing.
+fn dead_session(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<riabuild_api::ApiError>()
+        .is_some_and(riabuild_api::ApiError::needs_login)
+}
+
+/// Records what minting a session produced, on the record it belongs to.
+///
+/// A miss is an error rather than the silent nothing it used to be. By the time
+/// this is reached the token has been minted *and* is about to be written onto
+/// the server, so a write-back that quietly does nothing produces the one state
+/// `session_id` exists to prevent: a live 90-day session that no `riabuild
+/// remote forget` can name.
+///
+/// `find_mut`, not a match on the bare `name`. `remote.name` is the *display*
+/// name, so for one of the team's servers (`shared-gpu`) it never equalled the
+/// record's own bare `gpu` — which is how every run re-minted, wrote another
+/// token onto the server, and recorded none of them.
+fn remember_session(
+    store: &mut super::store::Store,
+    name: &str,
+    session_id: String,
+    expires_at: u64,
+) -> Result<()> {
+    let Some(saved) = store.find_mut(name) else {
+        return Err(Failure::new(
+            format!("recording the riabuild session for {name}"),
+            "Run `riabuild remote list` and check that server is still saved, then revoke the \
+             session riabuild just minted from the dashboard's session list.",
+        )
+        .detail(format!(
+            "a session ({session_id}) was minted for \"{name}\" but there is no record of that \
+             server in remotes.json to record it on, so `riabuild remote forget` would never \
+             be able to revoke it"
+        ))
+        .into());
+    };
+    saved.session_expires_at = expires_at;
+    saved.session_id = session_id;
+    Ok(())
 }
 
 /// Mints (or reuses) the session a server's own riabuild runs as, and writes
@@ -191,7 +169,10 @@ pub async fn ensure(
         (Some(token), Some(record)) if !expires_soon(record) => {
             let mut probe = ApiClient::new(version);
             probe.set_token(Some(token.clone()));
-            probe.me().await.is_ok().then_some(token)
+            // Not `.is_ok().then_some(token)`: see `usable_token` for why "the
+            // token was rejected" and "riabuild-web did not answer" must not
+            // be the same answer.
+            usable_token(token, probe.me().await, ui)
         }
         _ => None,
     };
@@ -225,10 +206,7 @@ pub async fn ensure(
             // The expiry is the server's own answer rather than a TTL computed
             // here, which is what removes the last copy of riabuild-web's 90
             // days from this file.
-            if let Some(saved) = store.remotes.iter_mut().find(|r| r.name == remote.name) {
-                saved.session_expires_at = expires_at;
-                saved.session_id = session_id;
-            }
+            remember_session(store, &remote.name, session_id, expires_at)?;
             super::store::persist_one(paths, store, &remote.name).await?;
             token
         }
@@ -282,56 +260,7 @@ pub async fn ensure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use riabuild_runner::FakeRunner;
-
-    fn remote() -> Remote {
-        Remote {
-            name: "build-01".into(),
-            host: "build-01.fly.dev".into(),
-            port: 22,
-            user: "ada".into(),
-        }
-    }
-
-    #[test]
-    fn a_namespace_is_named_after_the_immutable_id_and_is_never_a_tilde() {
-        // Not the login: a GitHub rename would otherwise orphan a developer's
-        // whole environment and silently re-provision them from scratch. And
-        // absolute, per R1: a `~` reaching the server is either expanded by
-        // some shells and not others, or refused outright by `paths::root_for`.
-        let ns = namespace("/home/dev", "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(
-            ns,
-            "/home/dev/.riabuild-remote/550e8400-e29b-41d4-a716-446655440000"
-        );
-        assert!(!ns.contains('~'), "{ns}");
-    }
-
-    #[test]
-    fn the_owner_file_says_who_this_is_in_words() {
-        let json = owner_json("ada", "Ada Lovelace", "ada@clubria.dev");
-        assert!(json.contains("\"githubLogin\":\"ada\""), "{json}");
-        assert!(json.contains("Ada Lovelace"), "{json}");
-        // No secret ever goes in here: it is a label, readable by everyone who
-        // shares the account.
-        assert!(!json.contains("token"), "{json}");
-    }
-
-    #[test]
-    fn a_quote_in_a_name_does_not_produce_unreadable_json() {
-        // The reason this goes through serde_json rather than format!: a
-        // developer's profile name is not riabuild's to sanitise.
-        let json = owner_json("ada", "Ada \"Countess\" Lovelace", "ada@clubria.dev");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["name"], "Ada \"Countess\" Lovelace");
-    }
-
-    #[test]
-    fn the_gitconfig_names_who_committed() {
-        let config = gitconfig("Ada Lovelace", "ada@clubria.dev");
-        assert!(config.contains("name = Ada Lovelace"), "{config}");
-        assert!(config.contains("email = ada@clubria.dev"), "{config}");
-    }
+    use crate::remote_fixture as remote;
 
     fn record_expiring_at(millis: u64) -> super::super::store::Record {
         let mut record = super::super::store::record_for(&remote());
@@ -344,7 +273,6 @@ mod tests {
         assert!(expires_soon(&record_expiring_at(0)));
         assert!(expires_soon(&record_expiring_at(1)));
     }
-
     #[test]
     fn a_record_expiring_well_in_the_future_is_worth_probing() {
         // Ninety days, the same order as the expiry riabuild-web hands back —
@@ -353,82 +281,94 @@ mod tests {
         let far_future = riabuild_paths::config::now_millis() + 90 * 24 * 60 * 60 * 1000;
         assert!(!expires_soon(&record_expiring_at(far_future)));
     }
-
-    #[tokio::test]
-    async fn a_write_carries_its_secret_on_stdin_never_in_the_command_line() {
-        let laptop = tempfile::TempDir::new().expect("tempdir");
-        let paths = riabuild_paths::RealPaths::rooted_at(laptop.path());
-        let fake = Arc::new(FakeRunner::new().containing("cat", 0, "", ""));
-
-        write_into_namespace(
-            &remote(),
-            &paths,
-            &(fake.clone() as Arc<dyn CommandRunner>),
-            "/home/dev/.riabuild-remote/abc",
-            "session.token",
-            b"rb_live_secret_token".to_vec(),
-            None,
-        )
-        .await
-        .expect("writes");
-
-        assert!(
-            !fake
-                .calls()
-                .iter()
-                .any(|call| call.contains("rb_live_secret_token")),
-            "the token must never appear in an argument list: {:?}",
-            fake.calls()
-        );
-        assert!(
-            fake.calls().iter().any(|call| call.contains("chmod 600")),
-            "{:?}",
-            fake.calls()
-        );
-        // The other half, and the half the two assertions above cannot see.
-        // Deleting `stdin: Some(contents)` from `write_into_namespace` leaves
-        // both of them green — the token is still absent from argv, `chmod
-        // 600` still runs, `ssh` still exits 0 — while the remote `cat` reads
-        // a closed pipe and the server gets a zero-byte `session.token`
-        // reported as a success. That regression happened on this branch once
-        // already; this assertion is what would have caught it.
-        assert_eq!(
-            fake.stdin_text_of("ssh").as_deref(),
-            Some("rb_live_secret_token"),
-            "the token must actually reach the remote `cat` on stdin"
-        );
+    fn api_error(code: &str, status: u16) -> riabuild_api::ApiError {
+        riabuild_api::ApiError {
+            status,
+            code: code.into(),
+            message: "x".into(),
+            action: "y".into(),
+        }
     }
 
-    #[tokio::test]
-    async fn a_failed_write_is_reported_with_an_actionable_next_step() {
-        let laptop = tempfile::TempDir::new().expect("tempdir");
-        let paths = riabuild_paths::RealPaths::rooted_at(laptop.path());
-        let fake = Arc::new(FakeRunner::new().containing("cat", 1, "", "No space left on device"));
+    /// I039. The three answers a probe can give, and the two that used to be
+    /// one. Minting on an answer that established nothing overwrites
+    /// `session_id` with a new row and leaves the old session live on the
+    /// server with nothing left on this laptop able to name it.
+    #[test]
+    fn a_riabuild_web_that_could_not_answer_is_not_a_dead_session() {
+        let ui = Ui::new(true);
 
-        let error = write_into_namespace(
-            &remote(),
-            &paths,
-            &(fake as Arc<dyn CommandRunner>),
-            "/home/dev/.riabuild-remote/abc",
-            "session.token",
-            b"token".to_vec(),
-            None,
-        )
-        .await
-        .expect_err("no space");
+        for (code, status) in [
+            ("upstream_error", 503),
+            ("rate_limited", 429),
+            ("conflict", 409),
+        ] {
+            assert_eq!(
+                usable_token("tok".into(), Err(api_error(code, status).into()), &ui),
+                Some("tok".to_string()),
+                "{code} says nothing about the token, so re-minting orphans the live one"
+            );
+        }
 
+        // A transport failure — no `ApiError` at all — is the same case.
+        assert_eq!(
+            usable_token(
+                "tok".into(),
+                Err(anyhow::anyhow!("riabuild could not reach riabuild-web")),
+                &ui
+            ),
+            Some("tok".to_string())
+        );
+    }
+    #[test]
+    fn a_token_riabuild_web_rejected_is_replaced() {
+        // The other direction, and the reason the probe exists at all: a
+        // session another laptop's `forget` revoked must not be written onto
+        // the server, or whoever lands there gets a 401 from their own
+        // riabuild.
+        let ui = Ui::new(true);
+        for code in ["unauthenticated", "session_expired", "session_revoked"] {
+            assert_eq!(
+                usable_token("tok".into(), Err(api_error(code, 401).into()), &ui),
+                None,
+                "{code}"
+            );
+        }
+    }
+    /// I034. `Remote::from(&Record)` carries the display name, so for one of
+    /// the team's servers `remote.name` is `shared-build-01` while the record
+    /// holds the bare `build-01`. The write-back matched on the bare field,
+    /// found nothing, and said nothing — so every run minted another 90-day
+    /// session, wrote another token onto the server, and recorded none of
+    /// them for `forget` to revoke.
+    #[test]
+    fn one_of_the_teams_servers_records_the_session_it_just_minted() {
+        let mut store = super::super::store::Store::default();
+        store
+            .remotes
+            .push(super::super::store::shared_record_for(&remote(), "k17abc"));
+        let shared: Remote = (&store.remotes[0]).into();
+        assert_eq!(shared.name, "shared-build-01");
+
+        remember_session(&mut store, &shared.name, "sess_live".into(), 99).expect("records it");
+
+        assert_eq!(store.remotes[0].session_id, "sess_live");
+        assert_eq!(store.remotes[0].session_expires_at, 99);
+    }
+    /// I040. The token has been minted and is about to be written onto the
+    /// server by the time this runs, so "no record to put it on" is the one
+    /// state that must never pass quietly: it is a live session no `riabuild
+    /// remote forget` could ever name.
+    #[test]
+    fn a_minted_session_with_no_record_to_hold_it_is_an_error_not_a_shrug() {
+        let mut store = super::super::store::Store::default();
+
+        let error = remember_session(&mut store, "build-01", "sess_live".into(), 99)
+            .expect_err("a session nothing can revoke is not a success");
         let failure = error
             .downcast_ref::<Failure>()
             .expect("must be the actionable Failure");
-        assert!(failure.action.contains("space"), "{}", failure.action);
-    }
-
-    #[test]
-    fn the_owner_file_basename_comes_from_the_shared_layout_not_a_second_literal() {
-        // R10: the basename `ensure` writes under must be read out of
-        // `Paths::owner_file` rather than hardcoded a second time here.
-        let layout = remote_layout("/home/dev", "550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(basename(&layout.owner_file()), "owner.json");
-        assert_eq!(basename(&layout.session_token_file()), "session.token");
+        assert!(failure.detail.contains("sess_live"), "{}", failure.detail);
+        assert!(failure.action.contains("dashboard"), "{}", failure.action);
     }
 }

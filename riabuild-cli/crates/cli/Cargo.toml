@@ -24,7 +24,6 @@ anyhow.workspace = true
 clap.workspace = true
 riabuild-api.workspace = true
 riabuild-channel.workspace = true
-riabuild-fetch.workspace = true
 riabuild-gh-session.workspace = true
 riabuild-keychain.workspace = true
 riabuild-paths.workspace = true
@@ -47,6 +46,12 @@ tokio = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# Only `internal::tests::gh_path` names this, to build the absolute `gh` path a
+# `FakeRunner` stub has to match. It was in `[dependencies]`, where it claimed
+# the binary reaches the download-and-verify crate directly — it does not, and
+# a reader checking "does the CLI decide where bytes come from?" would have
+# found a dependency edge saying yes.
+riabuild-fetch.workspace = true
 riabuild-keychain = { workspace = true, features = ["testing"] }
 riabuild-paths = { workspace = true, features = ["testing"] }
 riabuild-runner = { workspace = true, features = ["testing"] }

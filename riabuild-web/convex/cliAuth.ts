@@ -151,7 +151,10 @@ async function decide(
   }
 
   const now = Date.now();
-  const found = classify(await byUserCode(ctx, normaliseUserCode(userCode)), now);
+  const found = classify(
+    await byUserCode(ctx, normaliseUserCode(userCode)),
+    now,
+  );
   if (found.status !== "pending") return { status: found.status };
   const record = found.record;
 
@@ -166,7 +169,8 @@ async function decide(
   await writeAudit(ctx, {
     actorId: member._id,
     subjectId: member._id,
-    action: decision === "approve" ? "cli.device_approved" : "cli.device_denied",
+    action:
+      decision === "approve" ? "cli.device_approved" : "cli.device_denied",
     meta: { deviceLabel: record.deviceLabel, cliVersion: record.cliVersion },
   });
 

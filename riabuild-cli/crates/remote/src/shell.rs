@@ -8,7 +8,7 @@
 //! printed one of its own puts it at the top of a fresh mosh screen where
 //! there is nothing above it to separate from.
 
-use super::{NO_TMUX, Remote, askpass, identity};
+use super::{NO_TMUX, Remote, askpass, ssh::Ssh};
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
@@ -21,12 +21,9 @@ async fn has_mosh_server(
     runner: &Arc<dyn CommandRunner>,
     carry: Option<&crate::issued::Working>,
 ) -> bool {
-    let mut args = identity::ssh_options(remote, paths, true, carry);
-    args.push(remote.target());
-    args.push("command -v mosh-server".to_string());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    runner
-        .run("ssh", &refs, &askpass::run_options(remote, paths))
+    Ssh::to(remote, paths, runner.clone())
+        .carry(carry)
+        .run("command -v mosh-server")
         .await
         .map(|output| output.ok())
         .unwrap_or(false)
@@ -55,10 +52,8 @@ const SESSION_TOLERANCE: u32 = 9;
 /// run it again.
 const SETUP_TOLERANCE: u32 = 3;
 
-/// Seconds to wait for a connection to be established, per attempt.
-const CONNECT_TIMEOUT: u32 = 15;
-
-/// The options that decide how much network trouble a connection survives.
+/// How much network trouble a *live* connection survives, which is the only
+/// thing that genuinely differs between these two call sites.
 ///
 /// `TCPKeepAlive=no` is the one that looks like it is switching resilience
 /// *off*. It is not: it is on by default, it is answered by the kernel below
@@ -66,26 +61,20 @@ const CONNECT_TIMEOUT: u32 = 15;
 /// upper bound rather than the answer. One mechanism decides when a connection
 /// is dead, and it is the one whose numbers are written down here.
 ///
-/// These live beside the two call sites rather than in
-/// [`identity::ssh_options`], which every probe, `ssh-copy-id` and issued-key
-/// check also goes through. A probe is a question with a caller waiting on it,
-/// and three minutes is the wrong answer to a question — the two paths here are
-/// the ones that carry a developer's session or a whole task DAG.
+/// The `ConnectTimeout`/`ConnectionAttempts` pair used to be in this list and
+/// is now in [`identity::ssh_options`], where every connection gets it. The
+/// argument for keeping it here was that a probe should not wait three
+/// minutes — true of the tolerance above, and backwards for the dial, which
+/// with no bound at all falls back to the kernel's SYN retry. What is left
+/// here is what the tolerance argument actually varies.
+///
+/// [`identity::ssh_options`]: super::identity::ssh_options
 fn resilience_options(tolerance: u32) -> Vec<String> {
-    [
+    vec![
         format!("ServerAliveInterval={ALIVE_INTERVAL}"),
         format!("ServerAliveCountMax={tolerance}"),
         "TCPKeepAlive=no".to_string(),
-        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
-        // A lost SYN is a retry, not a failed run. ssh sleeps a second between
-        // attempts, so the bound above is what keeps this from doubling an
-        // unreachable server's wait rather than merely surviving a dropped
-        // packet.
-        "ConnectionAttempts=2".to_string(),
     ]
-    .into_iter()
-    .flat_map(|option| ["-o".to_string(), option])
-    .collect()
 }
 
 /// Provisioning: always `ssh -t`, never mosh.
@@ -108,14 +97,11 @@ pub async fn run_setup(
     command: &str,
     carry: Option<&crate::issued::Working>,
 ) -> Result<i32> {
-    let mut args = vec!["-t".to_string()];
-    args.extend(identity::ssh_options(remote, paths, true, carry));
-    args.extend(resilience_options(SETUP_TOLERANCE));
-    args.push(remote.target());
-    args.push(command.to_string());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let code = runner
-        .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
+    let code = Ssh::to(remote, paths, runner)
+        .carry(carry)
+        .tty()
+        .options(resilience_options(SETUP_TOLERANCE))
+        .interactive(command)
         .await;
     ui.blank();
     code
@@ -133,7 +119,10 @@ pub async fn open(
     if local_mosh && has_mosh_server(remote, paths, &runner, carry).await {
         let ssh = format!(
             "ssh {}",
-            identity::ssh_options(remote, paths, true, carry).join(" ")
+            Ssh::to(remote, paths, runner.clone())
+                .carry(carry)
+                .options_only()
+                .join(" ")
         );
         let args = [
             format!("--ssh={ssh}"),
@@ -204,17 +193,14 @@ pub async fn open(
     // that starts tmux with no interactivity guard, and it does nothing without
     // a matching `AcceptEnv` on the server while failing outright on an ssh
     // older than 7.8 — a certain cost against a hypothetical gain.
-    let mut args = vec!["-t".to_string()];
-    args.extend(identity::ssh_options(remote, paths, true, carry));
-    args.extend(resilience_options(SESSION_TOLERANCE));
-    args.push(remote.target());
-    args.push(command.to_string());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     // The same gap mosh gets above, and here it separates the session from the
     // note or warning immediately in front of it as well.
     ui.blank();
-    runner
-        .run_interactive("ssh", &refs, &askpass::run_options(remote, paths))
+    Ssh::to(remote, paths, runner)
+        .carry(carry)
+        .tty()
+        .options(resilience_options(SESSION_TOLERANCE))
+        .interactive(command)
         .await
 }
 

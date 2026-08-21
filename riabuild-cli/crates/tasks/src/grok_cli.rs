@@ -26,22 +26,41 @@
 //! precisely what a stray `export PATH="$HOME/.grok/bin:$PATH"` would defeat.
 
 use super::{Ctx, Status, Task, TaskId};
+use crate::owned_tool::{OwnedTool, no_note};
 use crate::shims;
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_fetch::tools;
 use riabuild_runner::RunOptions;
-use riabuild_ui::Failure;
-use riabuild_version as version;
 
-/// Low enough that only a truncated or half-written download fails it. A *bump*
-/// of the pinned version is caught by the path instead — `ctx.grok()` names the
-/// version, so a new pin is a file that is not there yet.
+/// The download-and-verify half, shared with every other tool riabuild owns.
 ///
-/// The version the launcher's behaviour was actually read out of is 1.0.5; that
-/// is recorded in `shims::grok` beside the flags it depends on, and pinned by
-/// the `#[ignore]`d smoke tests there rather than by a floor here.
-const MIN_VERSION: &str = "1.0.0";
+/// `shim: None` is the interesting field. Every other row's entry in
+/// `~/.riabuild/bin` is one file the row itself writes; Grok Build's is ten
+/// launchers, each pinning its own `GROK_HOME` and carrying the bypass flag,
+/// and nine directories beside them that `check()` asserts. That belongs to the
+/// task, so the row asks for none and `apply()` writes them after `ensure`.
+///
+/// `MIN_VERSION` is low enough that only a truncated or half-written download
+/// fails it. A *bump* of the pinned version is caught by the path instead —
+/// `ctx.grok()` names the version, so a new pin is a file that is not there
+/// yet. The version the launcher's behaviour was actually read out of is 1.0.5;
+/// that is recorded in `shims::grok` beside the flags it depends on, and pinned
+/// by the `#[ignore]`d smoke tests there rather than by a floor here.
+pub(crate) static GROK: OwnedTool = OwnedTool {
+    id: "grok_cli",
+    title: "Grok Build",
+    label: "Grok Build",
+    version: 1,
+    min_version: "1.0.0",
+    pinned_version: tools::GROK_VERSION,
+    release: tools::grok,
+    binary: Ctx::grok,
+    probe: probe_options,
+    shim: None,
+    installing: "installing Grok Build",
+    note: no_note,
+};
 
 /// The environment a `grok --version` probe runs in.
 ///
@@ -72,64 +91,20 @@ fn probe_options(ctx: &Ctx) -> RunOptions {
     }
 }
 
-/// What the Grok Build riabuild owns has to say for itself.
-#[derive(Debug, PartialEq, Eq)]
-enum Installed {
-    /// There and runnable.
-    Usable,
-    /// Not there at all.
-    Missing,
-    /// There, and reporting this — which is not a version we can use.
-    Unusable(String),
-}
-
-/// Asks the installed Grok Build what it is.
-///
-/// Asked by `check()` and again by `apply()`, which is the point. Asking about
-/// the *version* rather than the file's existence is what keeps `apply()`'s
-/// shortcut honest: a truncated download would otherwise be left in place for a
-/// `check()` that could then never go green — a check its own repair cannot
-/// satisfy. That matters more here than for any other owned tool, because the
-/// download is 134–167 MB and therefore the most likely of them to arrive
-/// half-written.
-async fn installed(ctx: &Ctx) -> Result<Installed> {
-    let grok = ctx.grok();
-    // Existence before invocation: `RealRunner::run` returns `Err` when the
-    // program is not there — a spawn failure, not an exit code — so asking
-    // `--version` first would propagate an `anyhow` chain instead of reaching
-    // the install.
-    if !tokio::fs::try_exists(&grok).await.unwrap_or(false) {
-        return Ok(Installed::Missing);
-    }
-    let output = ctx
-        .runner
-        .run(&grok, &["--version"], &probe_options(ctx))
-        .await?;
-    // `grok --version` answers on stdout — `grok 1.0.5 (5115b46bc9)`, verified
-    // against 1.0.5 — and stderr is read too, for the reason `ngrok` reads it:
-    // a build that banners on the other stream reads as unusable.
-    let reported = format!("{}{}", output.stdout, output.stderr);
-    if version::at_least(&reported, MIN_VERSION) {
-        Ok(Installed::Usable)
-    } else {
-        Ok(Installed::Unusable(reported.trim().to_string()))
-    }
-}
-
 pub struct GrokCli;
 
 #[async_trait]
 impl Task for GrokCli {
     fn id(&self) -> TaskId {
-        "grok_cli"
+        GROK.id
     }
 
     fn title(&self) -> &str {
-        "Grok Build"
+        GROK.title
     }
 
     fn version(&self) -> u32 {
-        1
+        GROK.version
     }
 
     fn depends_on(&self) -> &[TaskId] {
@@ -140,21 +115,11 @@ impl Task for GrokCli {
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
-        match installed(ctx).await? {
-            Installed::Usable => {}
-            Installed::Missing => {
-                return Ok(Status::needs(format!(
-                    "riabuild has not installed Grok Build {} yet",
-                    tools::GROK_VERSION
-                )));
-            }
-            // The owned copy is a known version, so a low one means a truncated
-            // or half-written download rather than an old release.
-            Installed::Unusable(reported) => {
-                return Ok(Status::needs(format!(
-                    "the Grok Build in ~/.riabuild reports `{reported}`, which is not usable"
-                )));
-            }
+        // The binary and its version. The row asks nothing about `bin/`,
+        // because Grok Build's ten launchers are this task's own and are
+        // checked below.
+        if let Some(drift) = GROK.drift(ctx).await? {
+            return Ok(Status::needs(drift));
         }
 
         // Each is named, because "a Grok config directory is missing" does not
@@ -193,26 +158,13 @@ impl Task for GrokCli {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        let release = tools::grok()?;
-        let tool_dir = ctx.paths.tool_dir(release.tool, release.version);
-
-        // Not unconditional, for the reason `ngrok::apply` gives and more so:
-        // this `apply()` runs for a drifted launcher far more often than for a
-        // missing binary, and re-fetching 167 MB to rewrite twenty lines of
-        // shell would make every riabuild release a download each laptop pays
-        // for.
-        if installed(ctx).await? != Installed::Usable {
-            ctx.ui
-                .note(&format!("Downloading Grok Build {}…", release.version));
-            tools::install(&release, &tool_dir).await.map_err(|error| {
-                Failure::new(
-                    "installing Grok Build",
-                    "Check your network connection and run `riabuild` again. If it keeps \
-                     failing, send this to your team lead.",
-                )
-                .detail(format!("{error:#}"))
-            })?;
-        }
+        // The download is not unconditional — see `OwnedTool::ensure`, and more
+        // so here: this `apply()` runs for a drifted launcher far more often
+        // than for a missing binary, and re-fetching 167 MB to rewrite twenty
+        // lines of shell would make every riabuild release a download each
+        // laptop pays for. The row writes no shim, so this is the download and
+        // nothing else.
+        GROK.ensure(ctx).await?;
 
         // Before the launchers, so that a profile riabuild has announced is one
         // that is already there.
@@ -316,8 +268,8 @@ mod tests {
         // after it would go on skipping the download.
         let (ctx, _home) = ctx_with_grok(reporting("grok 0.1.0")).await;
         assert_eq!(
-            installed(&ctx).await.unwrap(),
-            Installed::Unusable("grok 0.1.0".into())
+            GROK.installed(&ctx).await.unwrap(),
+            crate::owned_tool::Installed::Unusable("grok 0.1.0".into())
         );
         let status = GrokCli.check(&ctx).await.unwrap();
         assert!(format!("{status:?}").contains("not usable"), "{status:?}");

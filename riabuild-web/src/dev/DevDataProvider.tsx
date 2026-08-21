@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { ReactNode, useMemo } from "react";
 import { DataContext } from "../data/context";
 import { Data } from "../data/types";
 import { SCENARIOS, SCENARIO_NAMES } from "./scenarios";
@@ -18,7 +18,22 @@ export function DevDataProvider({ children }: { children: ReactNode }) {
   const name = scenarioName();
   const build = name === null ? undefined : SCENARIOS[name];
 
-  if (build === undefined) {
+  /**
+   * Built once, like the real provider builds its own.
+   *
+   * A fresh fixture on every render means fresh function identities on every
+   * render, and a page that depends on one — `CliAuthorize` depends on
+   * `lookupDeviceCode` — would re-run its effect, set state, and render again
+   * for as long as the tab was open. The `boom` scenario still throws from in
+   * here, which is the point of it: a throw during render is what reaches the
+   * error boundary.
+   */
+  const data: Data | null = useMemo(
+    () => (build === undefined ? null : build()),
+    [build],
+  );
+
+  if (build === undefined || data === null) {
     return (
       <div className="min-h-dvh bg-bg-sunk p-4">
         <Panel title="unknown scenario" tone="danger" index="dev">
@@ -41,10 +56,6 @@ export function DevDataProvider({ children }: { children: ReactNode }) {
       </div>
     );
   }
-
-  // Thrown here rather than swallowed, so the `boom` scenario reaches the error
-  // boundary the same way a real render failure would.
-  const data: Data = build();
 
   return <DataContext.Provider value={data}>{children}</DataContext.Provider>;
 }

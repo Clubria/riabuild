@@ -226,11 +226,12 @@ impl Issued {
 
     /// Ends the agent, if one was ever started.
     ///
-    /// Called on every path out of `connect`, including the failing ones. The
-    /// keys go with the process, so the cost of forgetting this is a stray
-    /// `ssh-agent` rather than a leak — but `-t 900` exists because "the cost
-    /// is only a stray process" is exactly the reasoning that leaves one
-    /// running.
+    /// The orderly teardown, to be called on every path out of `connect` that
+    /// can reach it. It is deliberately no longer the *guarantee*: this doc
+    /// used to claim every path called it, and only `--check` and a failed
+    /// `authorise` did, which left the agent directory behind on every
+    /// successful run. `Drop for Agent` is what makes teardown unmissable —
+    /// see its comment for what each half of it is actually cleaning up.
     pub async fn stop(&mut self) {
         if let Some(agent) = self.agent.take() {
             agent.stop().await;

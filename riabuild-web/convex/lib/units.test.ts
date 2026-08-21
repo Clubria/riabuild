@@ -64,7 +64,6 @@ describe("token minting", () => {
     expect(await sha256Hex("hello")).toBe(hash);
     expect(await sha256Hex("hellp")).not.toBe(hash);
   });
-
 });
 
 describe("user codes", () => {

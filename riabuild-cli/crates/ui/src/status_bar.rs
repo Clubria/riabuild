@@ -29,7 +29,7 @@
 use crate::wrap;
 use riabuild_theme::{Role, Theme};
 use std::fs::File;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::sync::Mutex;
 
 /// The row the bar is drawn on, counting from one.
@@ -81,13 +81,7 @@ impl StatusBar {
     /// that finds it disabled prints the ordinary way instead; see
     /// `supervisor::report`.
     pub fn on_second_line(quiet: bool) -> Self {
-        // The `testing` half is not belt and braces: `cfg!(test)` is false in
-        // this crate while a *downstream* crate's tests run, and `cargo test`
-        // inherits a real terminal from the shell that started it. Without it,
-        // one of `remote`'s tests would paint a bar over the developer's
-        // screen and leave it there.
-        let usable =
-            !quiet && !cfg!(any(test, feature = "testing")) && std::io::stderr().is_terminal();
+        let usable = !quiet && crate::tty::can_pin_a_line();
         let tty = usable
             .then(|| {
                 std::fs::OpenOptions::new()

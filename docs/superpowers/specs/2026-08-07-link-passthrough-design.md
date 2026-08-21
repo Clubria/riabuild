@@ -1,5 +1,10 @@
 # Opening links on the laptop
 
+**Date:** 2026-08-07
+**Status:** Implemented
+**Extends:**
+[`2026-08-07-clipboard-channel-design.md`](2026-08-07-clipboard-channel-design.md)
+
 A remote Claude Code session that wants to open a URL has two bad options today: render
 it in a terminal browser on the server, or print it and make the developer copy it across
 by hand. This adds a third — the server asks the laptop to open it, over the channel the

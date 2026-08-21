@@ -19,4 +19,19 @@ crons.interval(
   {},
 );
 
+/**
+ * `cliSessions` needed the same treatment and never had it. A session lives
+ * ninety days, a member collects one per laptop and one per delegated server,
+ * and nothing deleted the row when it died — so the table only ever grew, and
+ * the bounded reads over it (`sessions.listMine` takes 50; `members.setStatus`
+ * pages a member's sessions) were being asked to work on a set with no ceiling.
+ * An unreaped table is what turns a `take(n)` into a silent truncation.
+ */
+crons.interval(
+  "reap dead CLI sessions",
+  { hours: 1 },
+  internal.sessions.reapDead,
+  {},
+);
+
 export default crons;

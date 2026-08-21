@@ -10,7 +10,9 @@
 //! machine every developer has, this command is exactly what it was.
 
 use crate::fs_move::move_tree;
+use crate::lock::provisioning_lock;
 use anyhow::Result;
+use riabuild_api::Repo;
 use riabuild_paths::{contract_tilde, expand_tilde};
 use riabuild_tasks::Ctx;
 use riabuild_tasks::repo;
@@ -56,7 +58,7 @@ pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
         return Ok(0);
     }
 
-    if let Some(refusal) = refusal(&from, &to).await {
+    if let Some(refusal) = refusal(&from, &to, &ctx.paths.root()).await {
         return Err(Failure::new(
             format!("moving your checkout to {}", to.display()),
             "Give a path that does not exist yet, outside the checkout you are moving.",
@@ -88,33 +90,48 @@ pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
         })?;
     }
 
+    // Held across the move and the record that follows it, and taken only
+    // after both prompts above: a `move-project` that renames the checkout out
+    // from under a running task is the second thing the lock protocol was
+    // written for, and this command took nothing at all. Waiting before the
+    // questions would have left a developer looking at a silent terminal.
+    let _provisioning = provisioning_lock(ctx.paths.as_ref(), &ctx.ui, ctx.dry_run).await?;
+
     ctx.ui.note(&format!(
         "Moving {} → {}…",
         contract_tilde(&from, &home),
         contract_tilde(&to, &home)
     ));
-    move_tree(&from, &to).await.map_err(|error| {
-        Failure::new(
+
+    // Recorded **before** the tree moves, and rolled back if it does not.
+    //
+    // The record and the move are two writes and something can land between
+    // them: a full disk, a `^C`, a laptop that slept. Recording afterwards
+    // meant the window between them was the one where the checkout is at the
+    // new path and `config.json` still names the old one — riabuild then looks
+    // where nothing is, clones a second copy there, and the developer's own
+    // work sits at a path nothing on the machine refers to any more. That is
+    // the failure this module's own opening paragraph exists to describe.
+    // Recording first inverts the window into one where the tree has not moved
+    // and both paths are still findable by hand.
+    remember_checkout(ctx, moving.as_ref(), &to).await?;
+
+    if let Err(error) = move_tree(&from, &to).await {
+        let failure = Failure::new(
             format!("moving {} to {}", from.display(), to.display()),
             "Your checkout has been left where it was. Check there is room for it at the new path.",
-        )
-        .detail(format!("{error:#}"))
-    })?;
-
-    let destination = to.to_string_lossy().into_owned();
-    match &moving {
-        // The moved repository's own entry, and nothing else: the other
-        // checkouts on this machine have not gone anywhere. Which repository is
-        // *active* is untouched too — this is a question about a directory.
-        Some(repo) => {
-            let slug = repo.slug().to_string();
-            ctx.update_config(|config| config.set_checkout(&slug, destination))
-                .await?;
-        }
-        None => {
-            ctx.update_config(|config| config.project_path = Some(destination))
-                .await?;
-        }
+        );
+        // The tree did not move, so the record must not go on claiming it did.
+        return Err(match remember_checkout(ctx, moving.as_ref(), &from).await {
+            Ok(()) => failure.detail(format!("{error:#}")).into(),
+            Err(second) => failure
+                .detail(format!(
+                    "{error:#}\nand riabuild could not put the old path back in config.json \
+                     ({second:#}) — your checkout is at {}",
+                    from.display()
+                ))
+                .into(),
+        });
     }
 
     ctx.ui.info(&format!(
@@ -129,6 +146,28 @@ pub async fn run(ctx: &mut Ctx, requested: Option<&str>) -> Result<i32> {
             .warn("this shell is still in the old directory — type `exit`, then run `riabuild`");
     }
     Ok(0)
+}
+
+/// Writes down where the checkout being moved lives.
+///
+/// The moved repository's own entry, and nothing else: the other checkouts on
+/// this machine have not gone anywhere. Which repository is *active* is
+/// untouched too — this is a question about a directory. `None` is a machine
+/// with nothing recorded but the single pre-picker path, which is the field
+/// `project_dir` still reads there.
+async fn remember_checkout(ctx: &mut Ctx, moving: Option<&Repo>, path: &Path) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    match moving {
+        Some(repo) => {
+            let slug = repo.slug().to_string();
+            ctx.update_config(|config| config.set_checkout(&slug, path))
+                .await
+        }
+        None => {
+            ctx.update_config(|config| config.project_path = Some(path))
+                .await
+        }
+    }
 }
 
 /// The checkout riabuild is currently looking after.
@@ -156,7 +195,15 @@ async fn recorded_checkout(ctx: &Ctx, home: &Path) -> Result<PathBuf> {
 }
 
 /// Why the checkout cannot move to `to`, if it cannot.
-async fn refusal(from: &Path, to: &Path) -> Option<String> {
+///
+/// `root` is `~/.riabuild`, and a destination inside it is refused for a
+/// reason none of the others cover: nothing about the move itself would fail.
+/// `riabuild reset` recursively removes that tree — while printing "your
+/// checkout is not touched" — so a checkout parked there is a developer's
+/// uncommitted work deleted by a command that promised not to. riabuild owns
+/// everything under `root()` and reconstructs all of it on demand, which is
+/// precisely why nothing a developer authored may live there.
+async fn refusal(from: &Path, to: &Path, root: &Path) -> Option<String> {
     if !to.is_absolute() {
         return Some(format!(
             "{} is relative — give a path starting with / or ~/",
@@ -168,6 +215,14 @@ async fn refusal(from: &Path, to: &Path) -> Option<String> {
         return Some(format!(
             "{} is inside the checkout being moved",
             to.display()
+        ));
+    }
+
+    if to.starts_with(root) {
+        return Some(format!(
+            "{} is inside {}, which riabuild owns — `riabuild reset` removes that whole tree",
+            to.display(),
+            root.display()
         ));
     }
 
@@ -452,6 +507,71 @@ mod tests {
                 .unwrap(),
             "mine\n",
             "a refused move must not touch what is already there"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_destination_inside_riabuilds_own_directory() {
+        // `~/.riabuild` is riabuild's to recreate, and `riabuild reset`
+        // recursively removes it while saying "your checkout is not touched".
+        // A checkout parked there is uncommitted work deleted by a command
+        // that promised not to.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let from = home.path().join("code/hub");
+        recorded(&mut ctx, &from).await;
+        let to = ctx.paths.root().join("hub");
+
+        let error = run(&mut ctx, Some(to.to_string_lossy().as_ref()))
+            .await
+            .expect_err("riabuild's own directory is not somewhere to park a checkout");
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("a refusal is something the developer can act on");
+        // Named in the refusal, because "riabuild owns that directory" is not
+        // a reason anyone can act on until it says what happens to a checkout
+        // left there.
+        assert!(failure.detail.contains("riabuild reset"), "{failure:?}");
+        assert!(from.join(".git/HEAD").exists(), "the checkout must survive");
+        assert!(!to.exists());
+    }
+
+    #[tokio::test]
+    async fn a_move_that_fails_leaves_the_recorded_path_where_the_tree_is() {
+        // The destination is recorded before the tree moves, so that an
+        // interruption between the two writes cannot lose where the
+        // developer's source is. The other side of that is this: a move that
+        // fails outright has to put the old path back, or the next run looks
+        // at an empty destination and clones a second copy.
+        //
+        // `to` is an existing *file*, which `refusal` allows through (nothing
+        // is in it) and `rename` then refuses.
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let from = home.path().join("code/hub");
+        let to = home.path().join("work/hub");
+        recorded(&mut ctx, &from).await;
+        write_file(&to, "not a directory\n").await;
+
+        let error = run(&mut ctx, Some(to.to_string_lossy().as_ref()))
+            .await
+            .expect_err("a checkout cannot be renamed onto a file");
+        assert!(
+            format!("{error:#}").contains("left where it was"),
+            "{error:#}"
+        );
+
+        assert!(from.join(".git/HEAD").exists(), "the tree did not move");
+        assert_eq!(
+            ctx.config.project_path.as_deref(),
+            Some(from.to_string_lossy().as_ref()),
+            "so the record must still name where it is"
+        );
+        // Read back off the disk, not from the in-memory snapshot: the next
+        // run reads the file.
+        let landed = riabuild_paths::config::UserConfig::load(ctx.paths.as_ref()).await;
+        assert_eq!(
+            landed.project_path.as_deref(),
+            Some(from.to_string_lossy().as_ref())
         );
     }
 

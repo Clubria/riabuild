@@ -9,7 +9,7 @@
 //! written; both have since been split for the same reason, which is the
 //! argument for doing it up front rather than after a file has grown.
 
-use super::{Remote, identity};
+use super::Remote;
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandRunner, RunOptions};
@@ -65,22 +65,12 @@ pub async fn seed_github(
     // for several seconds reads as riabuild having hung.
     ui.note("Lending this laptop's GitHub sign-in to the server…");
 
-    let mut args = identity::ssh_options(remote, paths, true, carry);
-    args.push(remote.target());
-    args.push(format!("{riabuild_path} internal seed-github"));
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let seeded = runner
-        .run(
-            "ssh",
-            &refs,
-            &RunOptions {
-                // On stdin, never in argv: `ps` is readable by everyone, and
-                // on a shared server that means every other developer's
-                // session too.
-                stdin: Some(token.trimmed().as_bytes().to_vec()),
-                ..super::askpass::run_options(remote, paths)
-            },
-        )
+    let seeded = crate::ssh::Ssh::to(remote, paths, runner.clone())
+        .carry(carry)
+        // On stdin, never in argv: `ps` is readable by everyone, and on a
+        // shared server that means every other developer's session too.
+        .stdin(token.trimmed().as_bytes().to_vec())
+        .run(&format!("{riabuild_path} internal seed-github"))
         .await?;
     if !seeded.ok() {
         // With the reason, not without it. This note used to be the only trace

@@ -1,7 +1,7 @@
 # SSH keys the org issues
 
-Date: 2026-08-13
-Status: approved
+**Date:** 2026-08-13
+**Status:** Implemented
 
 ## Why
 
