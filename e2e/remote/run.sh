@@ -23,31 +23,52 @@
 #    script checks for one up front and refuses to start without it, rather
 #    than discovering it four steps in.
 #
-# 2. A published release with an `x86_64-unknown-linux-musl` checksum.
-#    `install::ensure_riabuild` downloads a real release from real GitHub.
-#    The musl *tarball* now ships (release.yml gained a Linux matrix), but
-#    the Linux job never appends to `riabuild-$version-checksums.txt` — that
-#    file is written only by the macOS job. `ensure_riabuild` fetches the
-#    checksums before the tarball and refuses without a digest, which is the
-#    right way round to fail: it will not install a binary it cannot verify.
-#    Until the Linux job publishes its digests, the run cannot get past the
-#    install step.
+# 2. A published release the container's platform can install from.
+#    `install::ensure_riabuild` downloads a real release from real GitHub,
+#    fetches `riabuild-$version-checksums.txt` before the tarball, and
+#    refuses without a digest — the right way round to fail: it will not
+#    install a binary it cannot verify.
 #
-# Because of (2) the assertions at the bottom DO NOT RUN yet.
-# This script does not paper over that: it asserts positively, against the
-# container and this laptop's own filesystem, that the stages it claims to
-# cover actually happened — a key pair on the laptop, a host key pinned, a
-# new key in the container's authorized_keys — and it fails if they did not.
-# "Stopped at the install step" is only an acceptable outcome once those
+#    THIS ONE IS CLOSED, and the paragraph is kept because the shape of it
+#    recurs. It read, for a long time and for two versions after it stopped
+#    being true, that the Linux job never appended to the checksums file. It
+#    does: `release.yml`'s assembly step walks all four targets — both darwin,
+#    both musl — and errors if a tarball is missing, and v2026.08.10 was the
+#    first release to publish the lot. The install completes.
+#
+#    Getting there took three fixes, each hidden behind the one before it,
+#    none of which any test could see because this script had never run in CI:
+#
+#      a. The `gh api` call that resolves the release ran without a token and
+#         without `|| true`, so it exited 4 and `set -euo pipefail` ended the
+#         script four lines before the fallback that exists for that very case.
+#      b. `ssh-copy-id` builds its temporary directory under the developer's
+#         `~/.ssh` and fails when there is none. riabuild never created it — a
+#         real bug on any laptop that has not used ssh before, which is exactly
+#         the machine riabuild claims to be the first thing run on. (Since
+#         `authorise` grew its own copy step, riabuild no longer runs
+#         `ssh-copy-id` at all, and needs no local `~/.ssh` to install a key.)
+#      c. `ensure_matching_binary` compared the *binary* on the server against
+#         the *tarball's* digest, which is what a release publishes. Those are
+#         never equal, so remote mode could not install on any platform. The
+#         unit tests scripted the server's `sha256sum` to answer with the value
+#         the assertion was about to compare against, so they agreed with
+#         themselves.
+#
+# This script does not paper over a run that stopped early. It asserts
+# positively, against the container and this laptop's own filesystem, that the
+# stages it claims to cover actually happened — a key pair on the laptop, a
+# host key pinned, a new key in the container's authorized_keys — and it fails
+# if they did not. "Stopped early" is only an acceptable outcome once those
 # have been proven; on its own it is indistinguishable from "stopped at step
 # one", which is exactly how an earlier version of this script reported a
 # hang as a success.
 #
-# WHAT A LINUX/MUSL CHECKSUM ALONE WILL NOT UNBLOCK. An earlier version of
-# this comment claimed the assertions would start running the moment
-# that asset shipped, with no edit needed here. That is false, and saying so
-# is the point of this paragraph — the next step after the install is
-# `session::ensure`, and it needs three things this setup does not have:
+# WHAT A LINUX/MUSL CHECKSUM ALONE DID NOT UNBLOCK, and what is left of it.
+# An old version of this comment promised the assertions would start running
+# the moment that asset shipped, with no edit needed here. It was wrong four
+# times over, and the list is kept because each entry closing is what moved
+# this script one stage further along.
 #
 #   a. CLOSED — a keyring is no longer needed. This used to read:
 #      `session::ensure` calls `keychain::for_account(…, None)`, which on
@@ -65,47 +86,46 @@
 #      password already did. `RIABUILD_TOKEN` still cannot answer this, and
 #      still should not: it is this machine's own override, and honouring it
 #      here would hand every server the same token.
-#   b. `POST` in the stub. `stub_web.py` implements only `do_GET` and
-#      `do_DELETE`, so a POST gets BaseHTTPRequestHandler's stock 501.
-#   c. A reply to that POST. This item has shrunk twice. It first read "an
-#      answer to the loopback browser callback", which #30 made obsolete when
-#      `auth::login` stopped opening a local port. It then read "both the
-#      device and token endpoints, *and* something to play the approving
-#      human" — a stub that has to impersonate a person clicking approve.
-#      That is now gone too: signing a server in is one authenticated
-#      `POST /api/v1/cli/sessions`, so the stub needs one `do_POST` returning
-#      `{token, sessionId, expiresAt}` and no notion of a human at all.
+#   b. CLOSED — `POST` in the stub. `stub_web.py` implemented only `do_GET`
+#      and `do_DELETE`, so `session::ensure`'s `POST /api/v1/cli/sessions`
+#      got `BaseHTTPRequestHandler`'s stock 501. That 501 was matched as a
+#      tracked gap, and the script exited 0 immediately above the assertion
+#      block — so *none of those assertions had ever run once*, under a banner
+#      saying which stages had been proven. It now mints a delegated session,
+#      and no stock 501 is left anywhere for `known_gap` to lean on.
+#   c. CLOSED with (b), and kept only for the shape of it. This item first
+#      read "an answer to the loopback browser callback", which #30 made
+#      obsolete when `auth::login` stopped opening a local port. It then read
+#      "both the device and token endpoints, *and* something to play the
+#      approving human". Signing a server in is one authenticated POST under
+#      the laptop's own token, so the stub needs no notion of a human at all.
+#   d. The server's own riabuild has to be able to reach this stand-in, and
+#      nothing riabuild does will point it there. The server runs as
+#      `env 'K=V' … '/abs/riabuild'` and `remote::env_prefix` puts four
+#      variables in that prefix — none of them `RIABUILD_API_URL`. Left alone,
+#      a server talks to `DEFAULT_API_URL`, the real deployment, holding a
+#      token this stand-in minted and the real one has never heard of. There
+#      is no CLI flag for this and there should not be one, so the answer is
+#      on the *container's* side: an `~/.ssh/environment` that sshd applies to
+#      every session, and a reverse forward carrying the stub's port in. Both
+#      are set up below; both are the harness's own container; neither
+#      changes a line of riabuild.
+#   e. OPEN, and unbounded from here. Past the sign-in the server runs the
+#      whole task DAG — a Node toolchain, `gh`, `infisical`, a real clone,
+#      real secrets — and this stand-in answers three GET routes and one POST.
+#      Every route it does not implement logs `UNIMPLEMENTED <method> <path>`,
+#      and that line, not riabuild's error text, is what `known_gap` reads. So
+#      the missing piece is *named* in the banner instead of guessed at.
+#      Adding those routes, and an Infisical stand-in the container can reach,
+#      is the work that finally makes the block at the bottom run.
 #
-# None of that is written yet, on purpose: it is a second piece of work, not
-# a line to sneak into this file. It is, however, now small enough to be
-# worth doing — closing (b) and (c) is one handler.
-#
-# WHERE IT ACTUALLY STOPS TODAY, which is further than any of the above
-# predicted. v2026.08.10 publishes the musl checksum, so the install now
-# completes — and getting there took three fixes, each hidden behind the one
-# before it, none of which any test could see because this script had never
-# run in CI:
-#
-#   1. The `gh api` call that resolves the release ran without a token and
-#      without `|| true`, so it exited 4 and `set -euo pipefail` ended the
-#      script four lines before the fallback that exists for that very case.
-#   2. `ssh-copy-id` builds its temporary directory under the developer's
-#      `~/.ssh` and fails when there is none. riabuild never created it — a
-#      real bug on any laptop that has not used ssh before, which is exactly
-#      the machine riabuild claims to be the first thing run on. (Since
-#      `authorise` grew its own copy step, riabuild no longer runs
-#      `ssh-copy-id` at all, and needs no local `~/.ssh` to install a key.)
-#   3. `ensure_matching_binary` compared the *binary* on the server against
-#      the *tarball's* digest, which is what a release publishes. Those are
-#      never equal, so remote mode could not install on any platform. The
-#      unit tests scripted the server's `sha256sum` to answer with the value
-#      the assertion was about to compare against, so they agreed with
-#      themselves.
-#
-# It now stops at (b): the CLI POSTs `/api/v1/cli/sessions` and the stub
-# answers 501. The `known_gap` check below correctly refuses to forgive that,
-# and this paragraph is the reminder — the same role the previous one played,
-# now one stage further along.
+# WHERE IT STOPS IS NO LONGER SOMETHING THIS HEADER PREDICTS. It said "the
+# binary-install step" for two releases after the install started working, and
+# then "the sign-in step" while that was true. Both were paragraphs a reader
+# had to trust and nothing had to keep honest. `known_gap` below now decides
+# from evidence instead — the stand-in's own log, naming the route it does not
+# implement — and the banner it prints is written from the run rather than
+# from here.
 #
 # THE CLIPBOARD CHANNEL IS NOT TESTED HERE. `channel.sh`, beside this file,
 # covers it — and runs to the end, because it copies a musl binary onto the
@@ -122,18 +142,58 @@ repo_root="$(cd "$here/../.." && pwd)"
 work="$(mktemp -d)"
 
 RIABUILD_BIN="${RIABUILD_BIN:-$repo_root/riabuild-cli/target/release/riabuild}"
-STUB_PORT="${STUB_PORT:-8791}"
-CONTAINER_PORT="${CONTAINER_PORT:-2222}"
 MEMBER_A="11111111-1111-4111-8111-111111111111"
 MEMBER_B="22222222-2222-4222-8222-222222222222"
 
+# NOTHING THIS RUN OWNS IS NAMED THE SAME WAY TWICE.
+#
+# This script used to hard-code the container name `riabuild-e2e`, the image
+# tag `riabuild-e2e`, port 2222 and stub port 8791, and its cleanup ran
+# `docker rm -f riabuild-e2e` unconditionally. Two runs at once — two
+# worktrees, a developer poking at it while CI runs on the same self-hosted
+# box — therefore deleted each other's container mid-assertion, and the loser
+# reported a product failure. `channel.sh` documents avoiding exactly this
+# collision against *this* script, and this script never got the other half.
+#
+# The token comes from `mktemp -d`, which the kernel already made unique for
+# this process, so nothing new has to be seeded or guarded.
+token="$(basename "$work")"
+CONTAINER="riabuild-e2e-$token"
+IMAGE="riabuild-e2e:$token"
+
+# Ports asked of the kernel rather than picked. A fixed 2222 is somebody's
+# existing tunnel as often as it is free, and a fixed stub port is the same
+# collision one layer up: two runs would each bind one and the second would
+# fail at a place that reads like the stub being broken.
+#
+# The bind-and-release window is a race in principle. In practice the port is
+# taken again microseconds later by this run, and the alternative — a fixed
+# number — is not a smaller race but a guaranteed collision.
+free_port() {
+  python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+}
+# Assigned after the tool checks below, not here: `free_port` needs python3,
+# and a missing one has to surface as the sentence that names what python3 is
+# for rather than as a syntax error out of a `$(...)`.
+STUB_PORT="${STUB_PORT:-}"
+CONTAINER_PORT="${CONTAINER_PORT:-}"
+
 stub_pid=""
 agent_pid=""
+api_tunnel_pid=""
 cleanup() {
   [ -n "$stub_pid" ] && kill "$stub_pid" >/dev/null 2>&1 || true
   [ -n "$agent_pid" ] && kill "$agent_pid" >/dev/null 2>&1 || true
-  docker rm -f riabuild-e2e >/dev/null 2>&1 || true
-  rm -f "$here/authorized_keys"
+  [ -n "$api_tunnel_pid" ] && kill "$api_tunnel_pid" >/dev/null 2>&1 || true
+  # By this run's own name, never by a name a second run also answers to.
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # And the image with it: a tag per run would otherwise leave one dangling
+  # layer set per invocation on whatever machine this is.
+  docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -166,6 +226,9 @@ command -v ssh-keygen >/dev/null 2>&1 && command -v ssh-keyscan >/dev/null 2>&1 
   exit 1
 }
 
+[ -n "$STUB_PORT" ] || STUB_PORT="$(free_port)"
+[ -n "$CONTAINER_PORT" ] || CONTAINER_PORT="$(free_port)"
+
 # Prerequisite 1. Checked here, before a container is built, because the
 # failure four steps in is unreadable: riabuild would report a GitHub
 # membership problem and nothing would say the test was simply never given a
@@ -196,15 +259,24 @@ fi
 # identities are still offered — the same property `ssh-copy-id` relied on
 # when this step was still shelling out to it.
 ssh-keygen -t ed25519 -N "" -f "$work/seed" -C "riabuild e2e" >/dev/null
-cp "$work/seed.pub" "$here/authorized_keys"
+
+# A build context of this run's own, never the source tree. `cp … "$here/
+# authorized_keys"` wrote a key into the checkout and deleted it in the trap,
+# so an interrupted run left one behind and two concurrent runs overwrote each
+# other's — the loser building an image trusting a key it does not hold.
+# `channel.sh` already builds this way and says so; this is the other half.
+ctx="$work/context"
+mkdir -p "$ctx"
+cp "$here/Dockerfile" "$ctx/Dockerfile"
+cp "$work/seed.pub" "$ctx/authorized_keys"
 
 eval "$(ssh-agent -s)" >/dev/null
 agent_pid="$SSH_AGENT_PID"
 ssh-add "$work/seed" >/dev/null 2>&1
 
 echo "-- building the container"
-docker build -q -t riabuild-e2e "$here" >/dev/null
-docker run -d --name riabuild-e2e -p "$CONTAINER_PORT:22" riabuild-e2e >/dev/null
+docker build -q -t "$IMAGE" "$ctx" >/dev/null
+docker run -d --name "$CONTAINER" -p "$CONTAINER_PORT:22" "$IMAGE" >/dev/null
 
 echo "-- waiting for sshd"
 ready=""
@@ -217,15 +289,15 @@ for _ in $(seq 1 30); do
 done
 if [ -z "$ready" ]; then
   echo "sshd never came up in the container" >&2
-  docker logs riabuild-e2e >&2 || true
+  docker logs "$CONTAINER" >&2 || true
   exit 1
 fi
 
 # `--accept-host-key` holds the run to this exact fingerprint: a mismatch
 # fails host_key::trust_host outright, rather than being pinned on sight the
 # way an unadorned run would.
-fingerprint="$(ssh-keyscan -p "$CONTAINER_PORT" -t ed25519 localhost 2>/dev/null \
-  | ssh-keygen -lf - | awk '{print $2}')"
+ssh-keyscan -p "$CONTAINER_PORT" -t ed25519 localhost 2>/dev/null > "$work/known_hosts"
+fingerprint="$(ssh-keygen -lf "$work/known_hosts" 2>/dev/null | awk '{print $2}')"
 if [ -z "$fingerprint" ]; then
   echo "could not read a host key fingerprint from the container" >&2
   exit 1
@@ -301,10 +373,10 @@ cat > "$work/members.json" <<JSON
 JSON
 
 # Logged to a file as well as shown, because `known_gap` needs to read what
-# the stub was actually asked for. Which *endpoint* returned 501 is the whole
-# difference between "this harness has no `do_POST` yet", which is tracked,
-# and "riabuild started calling something unexpected", which is a bug — and
-# from riabuild's side both look like `replied with HTTP 501`.
+# the stub was actually asked for. *Which route* the stand-in had no answer
+# for is the whole difference between "this harness is incomplete", which is
+# tracked, and "riabuild started calling something unexpected", which is a bug
+# — and from riabuild's side the two are one HTTP status.
 # A plain redirect, deliberately not `| tee`: in a pipeline `$!` is the *last*
 # element, so `stub_pid` would name `tee` and the teardown below would leave
 # python3 holding the port. The log is printed on any failure that is not a
@@ -312,12 +384,87 @@ JSON
 python3 "$here/stub_web.py" "$STUB_PORT" "$work/members.json" \
   >"$work/stub_web.log" 2>&1 &
 stub_pid=$!
-for _ in $(seq 1 20); do
+stub_ready=""
+for _ in $(seq 1 40); do
   if curl -sf "http://127.0.0.1:$STUB_PORT/api/v1/org/config" >/dev/null 2>&1; then
+    stub_ready=1
     break
   fi
-  sleep 0.2
+  sleep 0.25
 done
+if [ -z "$stub_ready" ]; then
+  echo "stub_web.py never answered on $STUB_PORT" >&2
+  cat "$work/stub_web.log" >&2 || true
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# The stand-in riabuild-web, reachable from inside the container
+# ---------------------------------------------------------------------------
+#
+# Item (d) in the header. The laptop is told which dashboard to use with
+# `RIABUILD_API_URL` below; the *server* is not, because `env_prefix` carries
+# four variables and that is not one of them. Two pieces close the gap, and
+# both belong to the container rather than to riabuild:
+#
+#   * a plain TCP reverse forward, so `127.0.0.1:$STUB_PORT` means the same
+#     thing on both sides of the connection. TCP, not the unix-domain
+#     `streamlocal-forward@openssh.com` the clipboard channel used to use and
+#     the 2026-08-13 exec-transport design removed — this is the harness
+#     wiring its own container up, not riabuild asking a server for a
+#     permission. `ExitOnForwardFailure` so a port already taken inside the
+#     container is an ssh that exits rather than one that looks connected and
+#     forwards nothing;
+#   * `~/.ssh/environment`, which sshd applies to every session on this
+#     account — including the non-interactive `env … riabuild` remote mode
+#     runs. `env` adds to the environment it inherits rather than replacing
+#     it, so riabuild's own four variables and these two all arrive.
+#
+# Written at 0600 and owned by `shared`: sshd refuses to read the file
+# otherwise, and refuses silently.
+echo "-- pointing the container at the stand-in riabuild-web"
+docker exec -u shared "$CONTAINER" sh -c \
+  "umask 077 && printf 'RIABUILD_API_URL=http://127.0.0.1:%s\nRIABUILD_WEB_URL=http://127.0.0.1:%s\n' \
+     '$STUB_PORT' '$STUB_PORT' > ~/.ssh/environment"
+
+ssh -N -R "$STUB_PORT:127.0.0.1:$STUB_PORT" \
+  -F /dev/null -p "$CONTAINER_PORT" -i "$work/seed" \
+  -o UserKnownHostsFile="$work/known_hosts" \
+  -o StrictHostKeyChecking=yes \
+  -o IdentitiesOnly=yes \
+  -o ExitOnForwardFailure=yes \
+  shared@localhost >"$work/api-tunnel.log" 2>&1 &
+api_tunnel_pid=$!
+
+# Proven, not assumed, and before anything depends on it: an unreachable
+# stand-in otherwise surfaces four steps later as riabuild failing to sign the
+# server in, which reads exactly like the product bug it is not.
+#
+# `bash`'s `/dev/tcp`, because the image has neither `curl` nor `wget` and
+# adding one to it would be adding a tool to the machine this test is meant to
+# find riabuild unprovisioned. A status line is asked for and read: sshd
+# creates the listener before the forward is usable, so "the port accepts a
+# connection" is not the same fact as "the stand-in answered".
+api_reachable=""
+for _ in $(seq 1 40); do
+  if docker exec -u shared "$CONTAINER" bash -c \
+    "exec 3<>/dev/tcp/127.0.0.1/$STUB_PORT \
+       && printf 'GET /api/v1/org/config HTTP/1.0\r\n\r\n' >&3 \
+       && head -1 <&3" 2>/dev/null | grep -q '200 OK'; then
+    api_reachable=1
+    break
+  fi
+  sleep 0.25
+done
+if [ -z "$api_reachable" ]; then
+  echo "the stand-in riabuild-web is not reachable from inside the container." >&2
+  echo "Without it the server's own riabuild talks to the real deployment with" >&2
+  echo "a token this stand-in minted, and every failure after this point is a" >&2
+  echo "harness problem wearing riabuild's error messages." >&2
+  cat "$work/api-tunnel.log" >&2 || true
+  exit 1
+fi
+echo "-- the container reaches the stand-in on 127.0.0.1:$STUB_PORT"
 
 # `timeout` is not belt-and-braces here: an earlier version of this script sat
 # for ten minutes because `gh auth login --web` waits on a person who does not
@@ -339,7 +486,7 @@ run_as() {                       # run_as <member-id> <login> <token>
       --accept-host-key "$fingerprint" --no-shell --quiet
 }
 
-in_container() { docker exec riabuild-e2e su - shared -c "$1"; }
+in_container() { docker exec "$CONTAINER" su - shared -c "$1"; }
 
 echo "-- running as ada (member $MEMBER_A)"
 mkdir -p "$work/laptop-ada"
@@ -373,42 +520,66 @@ known_gap() {
     && grep -q "no checksum for riabuild-.*-x86_64-unknown-linux-musl" "$work/ada.log" \
     && return 0
 
-  # Branch 3, and the one that fires today. v2026.08.10 publishes the musl
-  # checksum, so the install completes and the run reaches `session::ensure`,
-  # which asks riabuild-web to sign the server in — and `stub_web.py`
-  # implements only `do_GET`/`do_DELETE`, so that POST gets
-  # BaseHTTPRequestHandler's stock 501. That is item (b) in this file's
-  # header: a limitation of this harness, not of riabuild.
+  # Branch 3 is the one that changed shape, and the shape is the point.
   #
-  # The path is `/api/v1/cli/sessions`, not `/api/v1/cli/device`: a laptop no
-  # longer runs a second device-code flow to sign a server in, it asks under
-  # its own token. Note the 501 still reads as a 501 — `auth::for_server`
-  # rewrites only a 404, because only a 404 means "this dashboard has no such
-  # endpoint", and swallowing every status would hide a real outage behind a
-  # sentence about deploying.
+  # It used to be `replied with HTTP 501` in riabuild's log plus
+  # `POST /api/v1/cli/sessions.* 501` in the stub's — matching the stock 501
+  # `BaseHTTPRequestHandler` gives an *unimplemented method*. `stub_web.py`
+  # had no `do_POST`, so `session::ensure`'s very first request matched, this
+  # function returned 0, and the script exited before every assertion below
+  # it. It reported a pass, for years, having tested none of what it names.
+  # The stub implements `do_POST` now and no stock 501 is reachable, so that
+  # pattern is gone rather than kept as a comment about something that cannot
+  # happen.
   #
-  # Both greps, and the endpoint named exactly. A bare "501" would forgive any
-  # unimplemented method on any path, including one riabuild had started
-  # calling by mistake — and the whole purpose of this function is that a
-  # non-start must never be mistaken for a tracked gap. When the stub grows a
-  # `do_POST`, this branch stops matching on its own and the assertions
-  # below start running.
-  grep -q "replied with HTTP 501" "$work/ada.log" \
-    && grep -q "POST /api/v1/cli/sessions.* 501" "$work/stub_web.log" 2>/dev/null \
-    && return 0
+  # What replaces it forgives a *fact this run recorded*, never a sentence
+  # riabuild happened to print. `stub_web.py` writes one line —
+  # `UNIMPLEMENTED <method> <path>` — before it answers a route it does not
+  # have, so "this harness is incomplete" is a statement the harness makes
+  # about itself. Anything else is riabuild's failure and is fatal below.
+  #
+  # Three guards on it, because "the log has a line in it somewhere" would
+  # forgive a genuine failure that happened to follow a harmless unimplemented
+  # call:
+  #
+  #   * the stand-in has to have refused a route, and the path has to look like
+  #     `/api/v1/…`, so a bogus route cannot be swallowed as a stand-in gap;
+  #   * that refusal has to be *what riabuild is complaining about*. The
+  #     stand-in answers with an error envelope, so its own sentence — "stub_web
+  #     has no route for …" — is printed verbatim by the CLI. Requiring it here
+  #     is what ties the forgiveness to the failure rather than to the log;
+  #   * and every unimplemented route is named in the banner, so a route nobody
+  #     expected is *read* rather than counted.
+  #
+  # If riabuild ever stops relaying that sentence, this branch stops matching
+  # and the run fails loudly. That is the safe direction to be wrong in, and
+  # the opposite of the direction the old 501 branch was wrong in.
+  if grep -qE '^stub_web: UNIMPLEMENTED [A-Z]+ /api/v1/' "$work/stub_web.log" 2>/dev/null \
+    && grep -q "stub_web has no route for" "$work/ada.log"; then
+    return 0
+  fi
 
   # There is no branch 4. It used to forgive item (a) — a runner with no
   # libsecret, where `for_account` errored instead of falling back, stopping
   # CI one stage *earlier* than a developer machine with a keyring. That was
   # a real gap in riabuild rather than in this harness, and it is fixed: a
   # machine whose keyring does not answer now keeps a server's session in a
-  # 0600 file. So CI and a laptop stop at the same place, branch 3, and this
-  # job stops being the one that proves least.
+  # 0600 file. So CI and a laptop stop at the same place, and this job stops
+  # being the one that proves least.
   #
   # Do not restore it. A keyring failure reaching this script again is a
   # regression in `keychain::keyring_answers`, and forgiving it here is how
   # it would ship unnoticed.
   return 1
+}
+
+# Every route the stand-in was asked for and had no answer to, deduplicated
+# and one per line. Printed in the banner: a gap that is named is a gap
+# somebody can close, and it is the only thing standing between this run and
+# the block of assertions at the bottom.
+unimplemented_routes() {
+  sed -n 's/^stub_web: UNIMPLEMENTED /  /p' "$work/stub_web.log" 2>/dev/null \
+    | sort -u
 }
 
 if [ "$ada_status" -eq 124 ]; then
@@ -476,36 +647,32 @@ assert_reached_the_server() {
 if [ "$ada_status" -ne 0 ] && known_gap; then
   assert_reached_the_server
   echo
-  # Which gap, in the run's own words rather than a fixed paragraph. The
-  # previous version of this banner named the musl checksum unconditionally,
-  # so once that shipped it went on announcing a gap that no longer existed
-  # while the run was in fact stopping somewhere else entirely.
-  if grep -q "replied with HTTP 501" "$work/ada.log"; then
-    stopped_at="the sign-in step, one stage past the install"
-    because="stub_web.py implements only do_GET and do_DELETE, so the
-# device-code POST this release's CLI makes gets a stock 501. That is a
-# limitation of this harness, not of riabuild: item (b) in this file's
-# header. Closing it needs a do_POST and something to approve the code."
-  else
-    stopped_at="the binary-install step"
-    because="riabuild v$version publishes an x86_64-unknown-linux-musl
-# tarball but no checksum for it. Releases from v2026.08.10 onward do
-# publish one, so this branch should only fire against an older tag."
-  fi
+  # Which gap, in the run's own words rather than a fixed paragraph. Two
+  # earlier versions of this banner named a cause from a constant here: one
+  # went on announcing a missing musl checksum for two releases after that
+  # shipped, and the next announced a stub with no `do_POST` while the run was
+  # in fact stopping somewhere else. Nothing below is written in advance —
+  # `stub_web.py` says which routes it has no answer for, and this prints
+  # them.
   echo "############################################################"
-  echo "# KNOWN GAP, not a regression: remote mode stopped at"
-  echo "# $stopped_at."
+  echo "# KNOWN GAP, not a regression: the stand-in riabuild-web is"
+  echo "# missing routes this run needed."
   echo "#"
-  echo "# $because"
+  echo "# stub_web.py was asked for, and has no answer to:"
+  unimplemented_routes | sed 's/^/# /'
+  echo "#"
+  echo "# That is a limitation of this harness, not of riabuild — see"
+  echo "# item (e) in this file's header. Each route added there gets"
+  echo "# the run one step further; the block of assertions below runs"
+  echo "# when none are left."
   echo "#"
   echo "# Asserted just now, not assumed: a key pair was generated,"
   echo "# the container's host key was pinned, and riabuild's key was"
   echo "# authorised on the container. Those stages ran for real."
   echo "#"
   echo "# The assertions this test names were NOT run."
-  echo "# They need a provisioned server, which needs a session, which"
-  echo "# needs the sign-in above. Nothing in CI has yet proved the"
-  echo "# namespace isolation remote mode rests on."
+  echo "# They need a fully provisioned server. Nothing in CI has yet"
+  echo "# proved the namespace isolation remote mode rests on."
   echo "#"
   echo "# The clipboard channel is NOT among what went untested here:"
   echo "# channel.sh covers it against this same container and runs to"
@@ -525,7 +692,21 @@ if [ "$ada_status" -ne 0 ]; then
   exit 1
 fi
 
-echo "-- ada's run reached the end: a Linux release exists now. Running the real assertions."
+# EVERYTHING BELOW THIS LINE IS GATED, AND HAS NEVER RUN.
+#
+# Not gated by a flag and not skipped: the `exit 0` above is reached first,
+# every time, because the run stops short of a provisioned server. What stops
+# it is `stub_web.py` — three GET routes and one POST against a server that
+# runs riabuild's whole task DAG — and the banner above names the exact routes
+# the last run wanted. Item (e) in this file's header is the same fact stated
+# once, up there, for a reader who starts at the top.
+#
+# It is written down here rather than in the header alone because this is
+# where somebody stands when they wonder why an assertion they can read is not
+# protecting them. Until `known_gap` stops matching, none of these lines has
+# ever executed — including the two below that were added specifically to
+# catch a bug that had already shipped.
+echo "-- ada's run reached the end. Running the real assertions."
 
 echo "-- running as bob (member $MEMBER_B)"
 mkdir -p "$work/laptop-bob"

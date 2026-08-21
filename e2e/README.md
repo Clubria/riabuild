@@ -157,12 +157,31 @@ connection, which is the shape `riabuild remote` exists for. Both run in
 | | | |
 |---|---|---|
 | `run.sh` | `riabuild remote` end to end: SSH keys, host-key trust, authorising a key onto a shared account, two developers in separate namespaces | needs `RIABUILD_E2E_GH_TOKEN` |
-| `channel.sh` | the clipboard channel end to end: a real `xclip` on a real X display, a real reverse forward, a real shim on the server | needs no token |
+| `channel.sh` | the clipboard channel end to end: a real `xclip` on a real X display, the real `ssh -T … riabuild channel pump` transport, a real shim on the server | needs no token |
 
-`run.sh` stops at the binary-install step today — no published release carries
-an `x86_64-unknown-linux-musl` checksum — and says so under a banner, after
-asserting against the container that the stages before it really ran. Its own
-header is the authority on that gap.
+`run.sh` gets one stage further than that. The musl gap is closed — `release.yml`
+assembles the checksums file from a spelled-out list of all four targets and
+fails the release outright if a tarball is missing, so from v2026.08.10 onward a
+Linux server installs for real. Signing the server in is closed too: `stub_web.py`
+now implements `do_POST`, minting a delegated session and reproducing the real
+endpoint's gates — an authenticated caller, one hop only, a reply shaped exactly
+as `ServerSessionReply` deserialises.
+
+What stops the run now is the size of the stand-in rather than a missing handler.
+Past the sign-in the server runs the whole task DAG, and there is no Infisical
+stand-in reachable from the container and no toolchain. Making the bottom
+assertions *pass* is a piece of work of that size, not a fix, so **they still DO
+NOT RUN** — the script's own header is the authority.
+
+What did change is that the gate can no longer forgive silently. The old one
+matched `BaseHTTPRequestHandler`'s stock 501, which every unimplemented route
+returned by accident; there is no stock 501 left, every unhandled route logs one
+`stub_web: UNIMPLEMENTED <method> <path>` line, and the gate forgives only on that
+evidence plus riabuild's own words. The banner names the routes the run actually
+asked for and did not get, instead of reciting a paragraph written months ago.
+Everything else — including a hang — fails for real, and only after asserting
+against the container that the earlier stages ran: a key pair on the laptop, a
+host key pinned, riabuild's key in the container's `authorized_keys`.
 
 `channel.sh` runs to the end. It sidesteps the install by copying a locally
 built musl binary in, which is the same target a real install downloads, and so
@@ -170,10 +189,14 @@ covers everything after the step `run.sh` stops at. Two properties:
 
 - a PNG and a UTF-8 string put on the laptop's clipboard paste on the server
   byte for byte, and a copy made on the server lands back on the laptop
-- the tunnel is killed mid-session and **only** the clipboard fails: setup
+- the pump is killed mid-session and **only** the clipboard fails: setup
   re-runs and still reaches riabuild-web, the environment shell still opens
   with riabuild's `PATH`, a paste degrades to an empty clipboard rather than
   hanging, and a copy fails loudly rather than losing what was copied
+- the pump binds the namespaced socket the environment prefix named, a second
+  pump is refused while the first is serving and the first keeps its socket, a
+  pump killed with `SIGKILL` leaves a stale socket that the next one replaces,
+  and a pump whose laptop stops answering unbinds rather than holding the name
 
 The laptop side runs under `Xvfb` with a real `xclip` rather than a scripted
 stand-in, because a stand-in is what `clipboard/linux.rs`'s unit tests already
@@ -181,12 +204,23 @@ use — only the real tool can prove riabuild's argv is one xclip accepts and
 that a PNG survives X11's atoms in both directions. It costs two packages on
 the runner and about a second.
 
-Neither script *observes* remote mode's own channel wiring — the supervisor
-holding the tunnel up, `RIABUILD_CHANNEL_SOCKET` arriving in the environment
-prefix, the banner line — nor a real secrets re-pull. `channel.sh` stands the
-first three up by hand, and owns its tunnel deliberately: a supervisor that
-rebuilds a killed tunnel is correct behaviour and the wrong thing to test a
-degradation against.
+`channel.sh` drives the transport riabuild actually ships: one `ssh -T` whose
+remote command is the same `env 'RIABUILD_CHANNEL_SOCKET=…' … riabuild channel
+pump` that `remote::flow::connect` composes, with argv built to
+`supervisor::ssh_args`' shape. It used to stand up an `ssh -N -R` reverse forward
+that the exec-transport design deleted, and passed anyway — sshd still forwarded
+the socket to an agent that still served it — so `pump`, `mux`, the keepalive and
+the socket rebind had no coverage at all. The one `-R` that remains is a plain
+TCP forward giving the container a riabuild-web; it is harness plumbing, not the
+channel, and is marked as such at the call site.
+
+What still is not covered end to end: `Agent::serve_pipe` and the argv
+`supervisor` builds. The laptop half of the pipe is a named stand-in,
+`laptop_pipe.py`, because `serve_pipe` is reachable only through a complete
+`riabuild remote` run — there is no command line for it. A hidden
+`riabuild channel agent --stdio`, about ten lines in `dispatch.rs`, would let
+`channel.sh` drop the stand-in and exercise the real laptop half. Nor does either
+script cover a real secrets re-pull.
 
 ```sh
 RIABUILD_BIN=… RIABUILD_SERVER_BIN=… e2e/remote/channel.sh
