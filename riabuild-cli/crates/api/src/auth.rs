@@ -252,6 +252,33 @@ async fn open_browser(runner: &dyn CommandRunner, url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The one link a developer is given, whether they click it or copy it.
+///
+/// `verificationUriComplete` when the server sent one: the same `/cli` page
+/// with `?code=` on it, which fills the box in on arrival. The browser opened
+/// locally already used that link; printing something *else* left the
+/// developer signing in over SSH — where nothing is opened for them and the
+/// link is carried to a browser on another machine by hand — as the only one
+/// who had to copy the code separately, which is exactly backwards.
+///
+/// Prefilling is not approving. The page fills the field and stops: it still
+/// names the machine asking and still waits for a click, because a URL that
+/// approved on sight would sign in whoever got a developer to follow it. That
+/// is why the code keeps a line of its own — it is what the developer checks
+/// the browser against, not merely something to type.
+///
+/// Falls back to the bare URI rather than appending `?code=` here. What the
+/// dashboard reads out of a query string is the dashboard's to decide, and a
+/// riabuild-web that offers no complete link is one this side has no business
+/// guessing the shape of; the bare link and the code line still sign the
+/// machine in.
+fn verification_link(start: &DeviceStart) -> &str {
+    start
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&start.verification_uri)
+}
+
 /// Asks the server to start a device authorisation.
 async fn start_device(api: &ApiClient, label: &str) -> Result<DeviceStart> {
     api.post_json(
@@ -364,19 +391,14 @@ pub async fn login(
     // Over SSH this is the whole interface, and on a laptop it is what the
     // developer checks the browser against.
     // The code is highlighted and the link is not: the link is the one a
-    // terminal makes clickable on its own, while the code is typed by hand off
-    // this screen into a browser that may be on another machine.
-    ui.note(&format!("Open {}", start.verification_uri));
+    // terminal makes clickable on its own, while the code is read off this
+    // screen and checked against the machine named in the browser.
+    let link = verification_link(&start);
+    ui.note(&format!("Open {link}"));
     ui.note_value("Enter code", &start.user_code);
 
-    if browser_available(current_browser_env()) {
-        let target = start
-            .verification_uri_complete
-            .as_deref()
-            .unwrap_or(&start.verification_uri);
-        if !open_browser(runner, target).await {
-            ui.note("Could not open your browser — use the link above.");
-        }
+    if browser_available(current_browser_env()) && !open_browser(runner, link).await {
+        ui.note("Could not open your browser — use the link above.");
     }
 
     ui.info("");
@@ -562,6 +584,39 @@ mod tests {
         assert_eq!(start.device_code, "dc_1");
         assert_eq!(start.user_code, "WXZB-CDFG");
         assert_eq!(start.expires_in, Some(900));
+    }
+
+    #[test]
+    fn the_link_a_developer_is_shown_carries_the_code() {
+        // The whole point: a developer who copies this line out of an SSH
+        // session lands on a page with the box already filled, instead of
+        // going back to the terminal for the code as a second copy-paste.
+        let start: DeviceStart = serde_json::from_str(
+            r#"{"deviceCode":"dc_1","userCode":"WXZB-CDFG",
+                "verificationUri":"https://riabuild.clubria.com/cli",
+                "verificationUriComplete":"https://riabuild.clubria.com/cli?code=WXZB-CDFG"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verification_link(&start),
+            "https://riabuild.clubria.com/cli?code=WXZB-CDFG"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_that_offers_no_prefill_still_gets_a_link_printed() {
+        // Losing the prefill costs a developer one typed code. Printing no
+        // link, or one this side invented a query string for, costs them the
+        // login.
+        let start: DeviceStart = serde_json::from_str(
+            r#"{"deviceCode":"dc_1","userCode":"WXZB-CDFG",
+                "verificationUri":"https://riabuild.clubria.com/cli"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verification_link(&start),
+            "https://riabuild.clubria.com/cli"
+        );
     }
 
     #[test]
