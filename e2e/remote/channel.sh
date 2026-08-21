@@ -491,6 +491,19 @@ start_pump() {                    # start_pump [extra laptop_pipe args...]
   set +m
 }
 
+# What the *current* connection has carried so far, as `laptop_pipe.py` has
+# recorded it. Read through a function because two sections below ask, and
+# because `start_pump` resets the file: a count is always about the connection
+# running now, never a total for the run.
+carried() {                       # carried <requests|keepalives>
+  if [ ! -f "$work/pipe-stats.json" ]; then
+    echo 0
+    return
+  fi
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' \
+    "$work/pipe-stats.json" "$1" 2>/dev/null || echo 0
+}
+
 # Poll the server's own probe rather than the socket file: the pump creates the
 # node before it is serving, so its existence is not the channel being up. This
 # is also the first assertion — `channel status` is what a developer runs to
@@ -896,39 +909,28 @@ fi
 echo
 echo "-- what that first connection turned out to have carried"
 
-# `laptop_pipe.py` counts the frames it answered, and both numbers are worth an
-# assertion for different reasons.
+# `laptop_pipe.py` counts the frames it answered, and the requests are the
+# clipboard traffic above: their count is what says the frames really crossed
+# the pipe rather than the shim having found some other way to an answer.
 #
-# The requests are the clipboard traffic above, and their count is what says
-# the frames really crossed the pipe rather than the shim having found some
-# other way to an answer.
-#
-# The keepalives are the half that had no coverage at all and cost a real
-# outage. `pump::keepalive` sends an empty `id: 0` frame every fifteen seconds
-# and gives up KEEPALIVE_DEADLINE after the last thing it heard; before it
-# existed, a laptop that dropped off left a pump bound to the socket for as
-# long as the kernel kept retransmitting — a quarter of an hour — during which
-# every paste timed out, every reconnecting pump was refused, and the
-# supervisor reported a server it had reached on every attempt as unreachable.
-# One frame answered is the whole mechanism working.
-if [ -f "$work/pipe-stats.json" ]; then
-  carried_requests="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["requests"])' \
-    "$work/pipe-stats.json" 2>/dev/null || echo 0)"
-  carried_keepalives="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["keepalives"])' \
-    "$work/pipe-stats.json" 2>/dev/null || echo 0)"
-else
-  carried_requests=0
-  carried_keepalives=0
-fi
+# THE KEEPALIVES ARE COUNTED HERE AND DELIBERATELY NOT ASSERTED HERE, which is
+# the mistake this section shipped with. `pump::keepalive` sleeps one
+# KEEPALIVE_INTERVAL — fifteen seconds — *before* it sends anything, and this
+# connection is killed about a second and a half in, deliberately, because
+# every assertion above it is about a session whose laptop has just gone. Zero
+# keepalives on a connection that short is the shipped schedule working
+# exactly as `pump/keepalive.rs` and the exec-transport design describe it, so
+# demanding one here was an assertion that could never be anything but red —
+# and "fixing" it by having the pump send a frame the moment the pipe opens
+# would be fitting the product to the test, and would turn
+# `Served::keepalives` from "the connection came up *and stayed up*" into
+# merely "it came up". The keepalive is asserted where it can actually be
+# observed: on the deaf pump at the bottom, which lives past three intervals.
+carried_requests="$(carried requests)"
 if [ "$carried_requests" -ge 5 ]; then
   pass "the clipboard traffic crossed the pipe as frames ($carried_requests of them)"
 else
   fail "only $carried_requests request frames reached the laptop; the shim answered from somewhere else"
-fi
-if [ "$carried_keepalives" -ge 1 ]; then
-  pass "the pump measured the laptop with its keepalive ($carried_keepalives answered)"
-else
-  fail "the pump never sent a keepalive, so nothing bounds how long it can outlive its laptop"
 fi
 
 echo
@@ -1007,6 +1009,39 @@ else
     fail "the pump held $remote_sock after its laptop went silent"
     cat "$work/pipe.log" >&2 || true
   fi
+
+  # And it gave the socket back because it was *measuring*, not because it
+  # happened to end. The unbind above proves the deadline fired; on its own it
+  # does not prove a single frame was ever sent, because `pump::keepalive`
+  # returns on the deadline whether or not its `try_send` ever reached the
+  # pipe. What proves the send is the laptop having received the frames — the
+  # half that had no coverage at all until this round, and the half that cost a
+  # real outage: before the pump measured its laptop, one that dropped off left
+  # the pump bound to `channel.sock` for as long as the kernel kept
+  # retransmitting, during which every paste timed out, every reconnecting pump
+  # was refused with `already serving`, and the supervisor called a server it
+  # had reached on every attempt unreachable.
+  #
+  # This costs no wall clock: the poll above has already waited the cycle out.
+  #
+  # Two, and neither one nor three. `--deaf-after 1` answers the first
+  # keepalive and ignores every one after it, so the pump sends at 15s, 30s and
+  # 45s and returns at 60s without sending a fourth — three arrive. Two is that
+  # with a whole interval of slack, and it still says the thing worth saying:
+  # the pump went on measuring after the first silence rather than sending once
+  # and stopping, which one cannot distinguish. Three would be tighter and
+  # would go red on a runner whose fifteen-second sleeps ran at twenty-three,
+  # and a flaky assertion about a timing constant is worse than a slow one.
+  # That the answered frame is what *extends* the deadline is pinned on a
+  # paused clock by `pump::tests::a_laptop_that_answers_keepalives_keeps_its_pump`,
+  # where it costs nothing and cannot be flaky.
+  answered="$(carried keepalives)"
+  if [ "$answered" -ge 2 ]; then
+    pass "the pump measured the laptop with its keepalive ($answered frames reached it)"
+  else
+    fail "only $answered keepalive frames reached the laptop, so nothing bounds how long a pump can outlive it"
+    cat "$work/pipe.log" >&2 || true
+  fi
 fi
 stop_pump
 
@@ -1032,10 +1067,11 @@ clipboard channel e2e: passed.
   riabuild-web, the environment shell and its whole environment are exactly
   what they were while the laptop was still answering.
 
-  Recovered: the frames really crossed the pipe (requests and keepalives both
-  counted), a new pump replaced the socket the killed one left behind and
-  pasted over it, and a pump whose laptop stopped answering unbound the socket
-  rather than sitting on it.
+  Recovered: the clipboard traffic really crossed the pipe as frames, a new
+  pump replaced the socket the killed one left behind and pasted over it, and a
+  pump whose laptop stopped answering went on sending keepalives into the
+  silence — counted at the laptop — and then unbound the socket rather than
+  sitting on it.
 
   Not covered here, and not by run.sh either yet: the laptop half of the
   transport (`agent::pipe::serve_pipe` and `supervisor`, stood in for by
