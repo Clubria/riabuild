@@ -14,7 +14,6 @@ use crate::shims;
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_fetch::archive;
-use riabuild_fetch::download;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
 use riabuild_version as version;
@@ -202,42 +201,42 @@ async fn ensure_node(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Res
 /// second missing and the first perfectly fine — writing the shim from the
 /// launcher already there is the whole repair, and re-extracting 50 MB over a
 /// tree a colleague is running out of is not.
+///
+/// One path for every pnpm, where there used to be two. Taking pnpm from npm
+/// removed the branch: the GitHub releases published a bare executable up to
+/// pnpm 10 and a tarball from 11 on, so the old code dropped a file straight
+/// into `bin/` for one and unpacked a tree for the other. Every npm package is
+/// a tarball, so both become a tree under the shared `tools_root()` reached
+/// through a shim — which is also the layout the co-tenant repair above needs,
+/// and pnpm 10 never had it.
 async fn ensure_pnpm(ctx: &Ctx, version: &str, downloads: &dyn Downloads) -> Result<()> {
     let bin_dir = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin_dir).await?;
-    let target = bin_dir.join("pnpm");
-    let asset = download::pnpm_asset(version)?;
 
-    if !download::pnpm_ships_a_tarball(version) {
-        // pnpm 10 and older are a single executable, and it goes straight into
-        // this developer's own bin/ — there is no shared tree to be careful
-        // with, and rewriting a file nobody else can see costs nothing.
-        ctx.ui.note(&format!("Downloading pnpm {version}…"));
-        let bytes = downloads.pnpm(version, &asset).await?;
-        return write_executable(&target, &bytes).await;
-    }
-
-    // pnpm 11 is a launcher plus the `dist/` tree it loads from beside itself,
-    // so it is installed as a tree and reached through a shim.
     let tree = ctx.paths.pnpm_dir(version);
     let launcher = tree.join("pnpm");
     if !is_current(ctx, &launcher, version).await? {
         ctx.ui.note(&format!("Downloading pnpm {version}…"));
-        let bytes = downloads.pnpm(version, &asset).await?;
-        archive::extract_pnpm_tarball(bytes, tree).await?;
+        let parts = downloads.pnpm(version).await?;
+        archive::extract_npm_tarballs(parts, tree).await?;
         if !tokio::fs::try_exists(&launcher).await.unwrap_or(false) {
             return Err(Failure::new(
                 format!("installing pnpm {version}"),
                 "Ask your team lead to check the pnpm version pinned in the repo's package.json.",
             )
             .detail(format!(
-                "{asset} unpacked without a `pnpm` launcher at its root"
+                "the npm packages for pnpm {version} unpacked without a `pnpm` launcher at their \
+                 root"
             ))
             .into());
         }
         archive::make_executable(&launcher).await?;
     }
-    write_executable(&target, shims::exec_shim(&launcher).as_bytes()).await
+    write_executable(
+        &bin_dir.join("pnpm"),
+        shims::exec_shim(&launcher).as_bytes(),
+    )
+    .await
 }
 
 /// Writes an executable via a staging file, so an interrupted run cannot leave
@@ -252,68 +251,264 @@ async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::downloads::pnpm_digest;
+    use super::downloads::{published_integrity, verified};
     use super::*;
-    use crate::testing::{ctx_with, write_file};
+    use riabuild_fetch::download;
     use riabuild_paths::Paths;
     use riabuild_runner::FakeRunner;
 
-    /// Trimmed from what `api.github.com/repos/pnpm/pnpm/releases/tags/v11.11.0`
-    /// actually answered on 2026-08-21, keeping the two fields this reads.
-    const RELEASE: &str = r#"{
-      "tag_name": "v11.11.0",
-      "assets": [
-        {
-          "name": "pnpm-linux-x64.tar.gz",
-          "digest": "sha256:df4699e897012ab14df2cc6eaa942910e830eb7fcaa420a2a1421a9461fd9108"
-        },
-        {
-          "name": "pnpm-darwin-arm64.tar.gz",
-          "digest": "sha256:ad46ad16c2376c2b78354ac488c1b166e076aa59bfcbcfd567d55957d755a690"
+    use crate::testing::{ctx_with, write_file};
+
+    /// Trimmed from what `registry.npmjs.org/@pnpm/linux-x64/11.11.0` actually
+    /// answered on 2026-08-21, keeping the field this reads.
+    const VERSION_DOCUMENT: &str = r#"{
+      "name": "@pnpm/linux-x64",
+      "version": "11.11.0",
+      "os": ["linux"],
+      "cpu": ["x64"],
+      "dist": {
+        "shasum": "4263a680b5f6e9183d34aaa283e676900949d04d",
+        "tarball": "https://registry.npmjs.org/@pnpm/linux-x64/-/linux-x64-11.11.0.tgz",
+        "integrity": "sha512-rwMbNJR+PstRu+ymWoApei1CWrAnsnW3tm+3H8qOxbp8duiaj6u7DxlMzhKbVpFwylxcJdeGwZ5tReBFOVpsdw==",
+        "attestations": {
+          "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
         }
-      ]
+      }
     }"#;
 
     #[test]
-    fn reads_the_digest_the_pnpm_release_records() {
+    fn reads_the_integrity_npm_published_for_the_version() {
+        let integrity =
+            published_integrity(VERSION_DOCUMENT, "@pnpm/linux-x64", "11.11.0").unwrap();
+        assert!(integrity.starts_with("sha512-"), "{integrity}");
         assert_eq!(
-            pnpm_digest(RELEASE, "11.11.0", "pnpm-darwin-arm64.tar.gz").unwrap(),
-            "ad46ad16c2376c2b78354ac488c1b166e076aa59bfcbcfd567d55957d755a690"
+            download::npm_integrity_digest(&integrity).map(|digest| digest.len()),
+            Some(64),
+            "the digest riabuild will compare against has to be readable here"
         );
     }
 
-    /// The state this replaced was "download it anyway". A release with no
-    /// recorded digest — pnpm 9 and older, whose assets predate GitHub
-    /// computing them — is now an error, because verifying nothing and calling
-    /// it verified is the failure `../../../../CLAUDE.md` forbids.
+    /// The state the GitHub-metadata path replaced was "download it anyway",
+    /// and this must not walk back to it by another route. A document with no
+    /// `dist.integrity` is an error, because verifying nothing and calling it
+    /// verified is the failure `../../../../CLAUDE.md` forbids.
     #[test]
-    fn a_release_that_records_no_digest_is_refused_rather_than_downloaded() {
-        let old = r#"{"assets":[{"name":"pnpm-linux-x64","digest":null}]}"#;
-        let error =
-            pnpm_digest(old, "9.15.9", "pnpm-linux-x64").expect_err("nothing to verify against");
-        assert!(format!("{error}").contains("pnpm 9.15.9"), "{error}");
-    }
-
-    #[test]
-    fn an_asset_the_release_does_not_carry_is_refused() {
-        let error = pnpm_digest(RELEASE, "11.11.0", "pnpm-linux-arm64-musl.tar.gz")
-            .expect_err("that asset is not in this release");
-        assert!(format!("{error}").contains("pnpm 11.11.0"), "{error}");
+    fn a_version_that_records_no_integrity_is_refused_rather_than_downloaded() {
+        for document in [
+            r#"{"dist":{"shasum":"4263a680b5f6e9183d34aaa283e676900949d04d"}}"#,
+            r#"{"dist":{"integrity":null}}"#,
+            r#"{"name":"@pnpm/linux-x64","version":"9.15.9"}"#,
+        ] {
+            let error = published_integrity(document, "@pnpm/linux-x64", "9.15.9")
+                .expect_err("nothing to verify against");
+            assert!(
+                format!("{error}").contains("@pnpm/linux-x64@9.15.9"),
+                "{error}"
+            );
+        }
     }
 
     /// A digest in an algorithm riabuild does not compute must not be compared
-    /// against a sha256 and reported as a mismatch: that reads as tampering and
+    /// against a sha512 and reported as a mismatch: that reads as tampering and
     /// is a format change.
     #[test]
-    fn a_digest_that_is_not_a_sha256_is_refused_as_a_format_rather_than_a_mismatch() {
-        let other = r#"{"assets":[{"name":"pnpm-linux-x64","digest":"sha512:00"}]}"#;
-        assert!(pnpm_digest(other, "12.0.0", "pnpm-linux-x64").is_err());
+    fn an_integrity_that_is_not_a_sha512_is_refused_as_a_format_rather_than_a_mismatch() {
+        let other =
+            r#"{"dist":{"integrity":"sha256-uu0Uc6dncf/8j5wcrJqCFYTfXlIH3IsgO5r9wRnaOZ0="}}"#;
+        let error = published_integrity(other, "@pnpm/linux-x64", "12.0.0")
+            .expect_err("riabuild cannot compute that");
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(failure.detail.contains("not a sha512"), "{failure:?}");
     }
 
     #[test]
-    fn an_answer_that_is_not_a_release_is_refused() {
-        assert!(pnpm_digest("not json at all", "11.11.0", "x").is_err());
-        assert!(pnpm_digest(r#"{"message":"Not Found"}"#, "11.11.0", "x").is_err());
+    fn an_answer_that_is_not_a_version_document_is_refused() {
+        // What the registry answers for a version it does not have is the
+        // string `"version not found: 11.11.0"`, which is valid JSON and has
+        // no `dist` in it.
+        assert!(published_integrity("not json at all", "@pnpm/macos-x64", "11.11.0").is_err());
+        assert!(
+            published_integrity(
+                r#""version not found: 11.11.0""#,
+                "@pnpm/macos-x64",
+                "11.11.0"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bytes_that_match_the_published_integrity_are_handed_on() {
+        let tarball = b"a tarball, for the purposes of a hash".to_vec();
+        let published = download::npm_integrity(&tarball);
+        assert_eq!(
+            verified("@pnpm/linux-x64", "11.11.0", &published, tarball.clone()).unwrap(),
+            tarball
+        );
+    }
+
+    /// The whole point of the item: an unverified download is never installed.
+    ///
+    /// This is the last gate before `extract_npm_tarballs`, and it is a
+    /// function rather than a branch inside the fetch so that it can be
+    /// asserted with no network at all.
+    #[test]
+    fn bytes_that_do_not_match_are_refused_before_anything_is_unpacked() {
+        let published = download::npm_integrity(b"what npm published");
+        let error = verified(
+            "@pnpm/linux-x64",
+            "11.11.0",
+            &published,
+            b"what a proxy handed back".to_vec(),
+        )
+        .expect_err("a mismatch is never installed");
+
+        let failure = error
+            .downcast_ref::<Failure>()
+            .expect("something the developer can act on");
+        assert!(
+            failure.attempting.contains("nothing was installed"),
+            "{failure}"
+        );
+        // Both sides are shown, in the spelling the registry page uses.
+        assert!(failure.detail.contains(&published), "{failure:?}");
+        assert!(
+            failure
+                .detail
+                .contains(&download::npm_integrity(b"what a proxy handed back")),
+            "{failure:?}"
+        );
+    }
+
+    /// One npm tarball in memory: everything under the `package/` wrapper npm
+    /// puts around every published package.
+    fn npm_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (path, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            // 0644, the mode npm actually stores the launcher with — which is
+            // why `ensure_pnpm` has to make it executable itself.
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, format!("package/{path}"), *contents)
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A pnpm whose parts are already verified, and a Node that must never be
+    /// asked for.
+    struct FixedPnpm(Vec<Vec<u8>>);
+
+    #[async_trait]
+    impl Downloads for FixedPnpm {
+        async fn node(&self, _version: &str) -> Result<Vec<u8>> {
+            panic!("must not download Node on this path");
+        }
+        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_npm_packages_land_the_launcher_where_check_looks_for_it() {
+        // The layout `tools::install` and `check()` both assume: `package/` is
+        // gone, the launcher is at the root of the shared tree with `dist/`
+        // beside it, it is executable — npm stores it 0644 — and this
+        // developer's own `bin/pnpm` starts it.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = riabuild_paths::RealPaths::rooted_at(server.path());
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        let parts = vec![
+            npm_tarball(&[
+                ("pnpm", b"This file intentionally left blank" as &[u8]),
+                ("dist/pnpm.mjs", b"the bundle"),
+            ]),
+            npm_tarball(&[("pnpm", b"#!/bin/sh\n" as &[u8])]),
+        ];
+        ensure_pnpm(&ctx, FALLBACK_PNPM, &FixedPnpm(parts))
+            .await
+            .expect("installs pnpm");
+
+        let launcher = ctx.paths.pnpm_dir(FALLBACK_PNPM).join("pnpm");
+        assert_eq!(
+            tokio::fs::read_to_string(&launcher).await.unwrap(),
+            "#!/bin/sh\n",
+            "the platform launcher has to land on top of the bundle's placeholder"
+        );
+        assert!(
+            ctx.paths
+                .pnpm_dir(FALLBACK_PNPM)
+                .join("dist/pnpm.mjs")
+                .exists(),
+            "the launcher loads dist/ from beside itself"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(&launcher)
+                .await
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "npm stores it 0644; mode was {mode:o}");
+        }
+        let shim = tokio::fs::read_to_string(ctx.paths.bin_dir().join("pnpm"))
+            .await
+            .expect("the developer's own bin/pnpm is what check() runs");
+        assert!(
+            shim.contains(&launcher.to_string_lossy().into_owned()),
+            "{shim}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pnpm_10_install_is_the_same_tree_and_the_same_shim() {
+        // pnpm 10 and older are one self-contained npm package rather than
+        // two, and that is the only difference. The old GitHub path dropped a
+        // bare executable straight into `bin/`, which is why a co-tenant on a
+        // server could never inherit one.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = riabuild_paths::RealPaths::rooted_at(server.path());
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        let parts = vec![npm_tarball(&[("pnpm", b"#!/bin/sh\n" as &[u8])])];
+        ensure_pnpm(&ctx, "10.20.0", &FixedPnpm(parts))
+            .await
+            .expect("installs pnpm");
+
+        let launcher = ctx.paths.pnpm_dir("10.20.0").join("pnpm");
+        assert_eq!(
+            tokio::fs::read_to_string(&launcher).await.unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert!(ctx.paths.bin_dir().join("pnpm").exists());
+    }
+
+    #[tokio::test]
+    async fn packages_that_unpack_without_a_launcher_are_a_failure_rather_than_an_install() {
+        // The failure mode an upstream layout change produces: everything
+        // downloads, everything verifies, and there is no `pnpm` at the root.
+        // Reported here rather than left for `check()`, which would say "pnpm
+        // is not installed yet" about a machine riabuild had just written to.
+        let server = tempfile::TempDir::new().unwrap();
+        let paths = riabuild_paths::RealPaths::rooted_at(server.path());
+        let (mut ctx, _laptop) = ctx_with(FakeRunner::new()).await;
+        ctx.paths = std::sync::Arc::new(paths);
+
+        let parts = vec![npm_tarball(&[("dist/pnpm.mjs", b"the bundle" as &[u8])])];
+        let error = ensure_pnpm(&ctx, FALLBACK_PNPM, &FixedPnpm(parts))
+            .await
+            .expect_err("half of pnpm is not pnpm");
+        assert!(format!("{error}").contains("installing pnpm"), "{error}");
+        assert!(!ctx.paths.bin_dir().join("pnpm").exists());
     }
 
     #[tokio::test]
@@ -341,33 +536,40 @@ mod tests {
         assert_eq!(desired_pnpm(Some(dir.path())).await, "10.20.0");
     }
 
-    /// Downloads the pinned pnpm and starts it through the shim riabuild
-    /// writes.
+    /// Downloads the pinned pnpm through the real registry, verifies it, and
+    /// starts it through the shim riabuild writes.
     ///
-    /// Ignored by default because it pulls ~50 MB from github.com; run it with
-    /// `cargo test -- --ignored` whenever the pinned pnpm major moves. Nothing
-    /// else catches a release-layout change: pnpm 11 renamed its macOS asset
-    /// and stopped shipping a bare executable at all, and the first symptom was
-    /// a 404 on a developer's first run.
+    /// Ignored by default because it pulls ~50 MB from registry.npmjs.org; run
+    /// it with `cargo test -- --ignored` whenever the pinned pnpm major moves.
+    /// Nothing else catches an upstream layout change, and pnpm has made two:
+    /// it renamed its macOS release asset and stopped shipping a bare
+    /// executable at 11, and it splits `dist/` out of the platform package from
+    /// 11 on. The first symptom of each was a laptop, not a test.
+    ///
+    /// It goes through `RealDownloads` rather than fetching by hand, so the
+    /// integrity check is part of what is being exercised: a registry that
+    /// stopped publishing `dist.integrity` has to fail here rather than install.
     #[tokio::test]
-    #[ignore = "downloads ~50 MB from github.com; pins pnpm's release layout"]
+    #[ignore = "downloads ~50 MB from registry.npmjs.org; pins pnpm's published layout"]
     async fn the_pinned_pnpm_downloads_and_runs() {
         use riabuild_runner::{CommandRunner, RealRunner};
 
-        let asset = download::pnpm_asset(FALLBACK_PNPM).unwrap();
-        let bytes = download::fetch_bytes(&download::pnpm_url(FALLBACK_PNPM, &asset))
-            .await
-            .unwrap();
+        let parts = RealDownloads.pnpm(FALLBACK_PNPM).await.expect("verified");
+        assert_eq!(
+            parts.len(),
+            2,
+            "pnpm 11 is the bundle plus the platform launcher"
+        );
 
         let home = tempfile::TempDir::new().unwrap();
         let tree = home.path().join(FALLBACK_PNPM);
-        archive::extract_pnpm_tarball(bytes, tree.clone())
+        archive::extract_npm_tarballs(parts, tree.clone())
             .await
             .unwrap();
         let launcher = tree.join("pnpm");
         assert!(
             tokio::fs::try_exists(&launcher).await.unwrap_or(false),
-            "{asset} has no launcher at its root"
+            "the npm packages for pnpm {FALLBACK_PNPM} have no launcher at their root"
         );
         archive::make_executable(&launcher).await.unwrap();
 
@@ -423,7 +625,7 @@ mod tests {
         async fn node(&self, _version: &str) -> Result<Vec<u8>> {
             panic!("must not download Node on this path");
         }
-        async fn pnpm(&self, _version: &str, _asset: &str) -> Result<Vec<u8>> {
+        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
             panic!("must not download pnpm on this path");
         }
     }
@@ -436,7 +638,7 @@ mod tests {
         async fn node(&self, _version: &str) -> Result<Vec<u8>> {
             Ok(self.0.clone())
         }
-        async fn pnpm(&self, _version: &str, _asset: &str) -> Result<Vec<u8>> {
+        async fn pnpm(&self, _version: &str) -> Result<Vec<Vec<u8>>> {
             panic!("must not download pnpm on this path");
         }
     }

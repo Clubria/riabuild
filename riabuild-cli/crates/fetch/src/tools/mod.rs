@@ -15,14 +15,18 @@
 //! place: distributing riabuild itself on macOS.
 
 mod install;
-mod metadata;
 
-// Re-exported so every caller keeps naming `tools::install` and
-// `tools::github_release_metadata`. Which file they live in is this module's
-// business, and a caller that had to know would have to be edited the next time
-// one moves.
+// Re-exported so every caller keeps naming `tools::install`. Which file it
+// lives in is this module's business, and a caller that had to know would have
+// to be edited the next time it moves.
+//
+// There is deliberately no route to `api.github.com` here. One existed, for
+// the per-asset digest GitHub's REST API records — the only digest pnpm's
+// releases had — and sixty unauthenticated requests an hour per address is not
+// a budget a provisioner can depend on: both e2e jobs stopped at it. pnpm now
+// comes from the npm registry, whose `dist.integrity` is a published digest
+// with no such ceiling, and nothing else here ever needed release metadata.
 pub use install::install;
-pub use metadata::github_release_metadata;
 
 use crate::archive::Kind;
 use crate::{Failure, TELL_YOUR_LEAD};

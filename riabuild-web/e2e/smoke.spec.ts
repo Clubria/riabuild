@@ -1,3 +1,4 @@
+import type { Page } from "@playwright/test";
 import { checkPage, expect, test } from "./helpers";
 
 /**
@@ -46,6 +47,55 @@ const BACKEND_REQUIRED = process.env.RIABUILD_E2E_BACKEND === "1";
  * only slow thing here when there is nothing to talk to.
  */
 let backendUp: boolean | null = null;
+
+/**
+ * A panel, located by its heading rather than by its title text.
+ *
+ * `Panel` notches the title into its top rule as an `<h2>`, and that heading's
+ * accessible name is the step index followed by the title — `04 your machines`,
+ * `lead audit log`. Naming it in full is what makes these locators pick one
+ * node and keep picking it.
+ *
+ * `getByText(title)` did not. It matches any element whose own text *contains*
+ * the string, and on the lead dashboard three of these titles are a substring
+ * of something else:
+ *
+ *   audit log          the heading; the ngrok note ("…answered by the audit log
+ *                      below and not by ngrok"); `loading audit log` while the
+ *                      query is in flight; `Could not load the audit log` when
+ *                      it fails
+ *   your machines      the heading; `Could not list your machines`
+ *   org configuration  the heading; `core dumped — org configuration`, from the
+ *                      ErrorBoundary wrapped around that panel
+ *
+ * The first CI run of this suite — its first run anywhere, because `ui:check`
+ * named only `visual.spec.ts` until this branch — died on exactly that: against
+ * a real backend the audit query had not answered yet, so `audit log` found the
+ * heading and `loading audit log` together and strict mode refused to guess.
+ *
+ * The other two are located the same way regardless. A title that is unique
+ * today is unique until somebody adds a panel, and a suite that only tightens
+ * the locator that has already failed spends a CI cycle per collision.
+ *
+ * Matched in full rather than as `/audit log/i`, which would still also find
+ * `err · core dumped — the audit log`. A panel that crashed must fail this
+ * test, and it should fail saying the panel is not there rather than saying two
+ * nodes matched.
+ */
+function panel(page: Page, name: string) {
+  return page.getByRole("heading", { name });
+}
+
+/**
+ * The dashboard's `<h1>` — what being signed in looks like, and the wait every
+ * test here starts with once the sign-in button is clicked.
+ */
+function signedIn(page: Page) {
+  return page.getByRole("heading", {
+    name: "One command builds the machine.",
+    level: 1,
+  });
+}
 
 /**
  * Tagged so this suite runs under one viewport instead of three.
@@ -97,14 +147,12 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
   }, info) => {
     await page.getByRole("button", { name: SIGN_IN }).click();
 
-    await expect(
-      page.getByText("One command builds the machine."),
-    ).toBeVisible();
-    await expect(page.getByText("confirm your profile")).toBeVisible();
-    await expect(page.getByText("your machines")).toBeVisible();
-    await expect(page.getByText("members and roles")).toBeVisible();
-    await expect(page.getByText("org configuration")).toBeVisible();
-    await expect(page.getByText("audit log")).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
+    await expect(panel(page, "01 confirm your profile")).toBeVisible();
+    await expect(panel(page, "04 your machines")).toBeVisible();
+    await expect(panel(page, "lead members and roles")).toBeVisible();
+    await expect(panel(page, "lead org configuration")).toBeVisible();
+    await expect(panel(page, "lead audit log")).toBeVisible();
 
     await checkPage(page, info, consoleErrors, { screenshot: "smoke-lead" });
   });
@@ -114,9 +162,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     consoleErrors,
   }, info) => {
     await page.getByRole("button", { name: SIGN_IN }).click();
-    await expect(
-      page.getByText("One command builds the machine."),
-    ).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
 
     await page.goto("/nope");
     await expect(page.getByText("command not found")).toBeVisible();
@@ -138,9 +184,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
    */
   test("stale sign-in state clears itself", async ({ page }) => {
     await page.getByRole("button", { name: SIGN_IN }).click();
-    await expect(
-      page.getByText("One command builds the machine."),
-    ).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
 
     const refreshTokens = () =>
       page.evaluate(() =>
@@ -170,9 +214,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
 
     // The point of all of it: signing in works without clearing site data.
     await page.getByRole("button", { name: SIGN_IN }).click();
-    await expect(
-      page.getByText("One command builds the machine."),
-    ).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
   });
 
   test("the authorize page renders for a signed-in machine", async ({
@@ -180,9 +222,7 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     consoleErrors,
   }, info) => {
     await page.getByRole("button", { name: SIGN_IN }).click();
-    await expect(
-      page.getByText("One command builds the machine."),
-    ).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
 
     // No code: against a real backend there is no pending request to find, so
     // the code box is what this proves renders and accepts input.

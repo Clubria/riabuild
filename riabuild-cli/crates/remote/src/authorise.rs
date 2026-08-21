@@ -693,6 +693,16 @@ mod tests {
         .expect("already fine");
         assert_eq!(copy_attempts(&fake), 0, "{:?}", fake.calls());
     }
+    /// The keychain CLI of both platforms, so the assertion below reads the
+    /// same on a Mac and on Linux — `copy`'s and `forget`'s tests carry this
+    /// same helper, for this same reason. Which of the two riabuild reaches
+    /// for is `keychain::select_password_store`'s decision and not this
+    /// file's, and a test naming only one of them asserts nothing on the other
+    /// host.
+    fn keychain_delete(call: &str) -> bool {
+        call.starts_with("security delete-generic-password")
+            || call.starts_with("secret-tool clear")
+    }
     #[tokio::test]
     async fn a_run_that_needs_no_password_sweeps_one_left_unconfirmed() {
         // A previous run was killed between the askpass helper writing the
@@ -701,19 +711,30 @@ mod tests {
         // `forget` both live in the copy, which this run does not perform.
         // Without the sweep it sat in the keyring indefinitely, for a server
         // that has not needed a password since.
+        //
+        // Asserted on the keychain call rather than on a file under `paths`,
+        // which is what the first spelling of this test did — green here and
+        // red on `ci.yml`'s "riabuild-cli on macOS" job. The 0600 file exists
+        // only where `select_password_store` picks it, and it never picks it
+        // on a Mac: there the sweep goes to `security(1)` and the file the
+        // test had planted was still sitting there afterwards, correctly.
+        // Registering both CLIs makes the store a keyring-backed one on either
+        // host, so one assertion watches the same sweep on both. What
+        // `discard` does to the two slots is pinned against `MemoryKeychain`
+        // in `askpass::store`, off the platform question entirely.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
-        let unconfirmed = paths.remote_password_file(&format!("{}.pending", remote().hash()));
-        tokio::fs::create_dir_all(unconfirmed.parent().expect("a directory"))
-            .await
-            .expect("mkdir");
-        tokio::fs::write(&unconfirmed, "typo").await.expect("write");
-        let fake = Arc::new(FakeRunner::new().with("ssh -o BatchMode=yes", 0, "", ""));
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("ssh -o BatchMode=yes", 0, "", "")
+                .with("security", 0, "", "")
+                .with("secret-tool", 0, "", ""),
+        );
 
         authorise(
             &remote(),
             &paths,
-            fake,
+            fake.clone(),
             &Ui::new(true),
             &api(),
             &mut Issued::preset(None),
@@ -721,10 +742,27 @@ mod tests {
         .await
         .expect("already fine");
 
+        // Named through the function that builds it rather than by pasting
+        // the suffix here: a test holding its own copy of the account shape
+        // would keep passing after the shape moved.
+        let pending = crate::askpass::pending_account(&remote().hash());
+        let deletes: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| keychain_delete(call))
+            .collect();
         assert!(
-            tokio::fs::metadata(&unconfirmed).await.is_err(),
-            "{} is still there",
-            unconfirmed.display()
+            deletes.iter().any(|call| call.contains(&pending)),
+            "the unconfirmed password was never swept: {:?}",
+            fake.calls()
+        );
+        // And only that half. The accepted slot holds a password this server
+        // has taken, so sweeping it here would throw away the one the
+        // developer typed every time riabuild's own key happened to work —
+        // and ask for it again at the first connection where it does not.
+        assert!(
+            deletes.iter().all(|call| call.contains(&pending)),
+            "a password the server accepted is not what this sweeps: {deletes:?}"
         );
     }
     /// The refusal a server that will take a password gives, used by every

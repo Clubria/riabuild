@@ -13,6 +13,11 @@
 //! Owning the tarball is a few dozen lines and removes a class of
 //! works-in-my-shell failures.
 //!
+//! pnpm comes from the **npm registry** rather than from pnpm's GitHub
+//! releases, which publish no checksum file: `dist.integrity` is a digest the
+//! publisher recorded, served with no API budget to run out of. See
+//! `NPM_REGISTRY` in `assets`.
+//!
 //! The same reasoning extends to `gh` and `infisical` — see `tools.rs`, which
 //! describes where their releases live and what the assets are called.
 //!
@@ -29,11 +34,13 @@ mod digest;
 // answer lives in is this module's business, and a caller that had to know
 // would have to be edited the next time one moves.
 pub use assets::{
-    node_platform, node_shasums_url, node_tarball_name, node_tarball_url, pnpm_asset,
-    pnpm_ships_a_tarball, pnpm_url, riabuild_asset, riabuild_asset_url, riabuild_checksums_url,
-    rust_target,
+    PNPM_BUNDLE_PACKAGE, node_platform, node_shasums_url, node_tarball_name, node_tarball_url,
+    npm_metadata_url, npm_tarball_url, pnpm_needs_the_bundle, pnpm_platform_package,
+    riabuild_asset, riabuild_asset_url, riabuild_checksums_url, rust_target,
 };
-pub use digest::{digest_for, digest_from_any, sha256_hex};
+pub use digest::{
+    digest_for, digest_from_any, npm_integrity, npm_integrity_digest, sha256_hex, sha512,
+};
 
 use crate::{CHECK_THE_NETWORK, Failure, TELL_YOUR_LEAD, UPSTREAM_MOVED};
 use anyhow::Result;

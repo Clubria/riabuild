@@ -459,6 +459,16 @@ for `Pinned` for a tool that *does* publish digests would freeze a value that mo
 every upstream release; reaching for a server-supplied digest would hand riabuild-web the
 choice of what executes.
 
+**pnpm is in neither arm and is not a row in `owned_tool` either**, because its version
+comes from the checkout at runtime rather than from a constant here — `tasks::toolchain`
+owns it. It publishes no checksum file, so it takes the third route: the **npm registry**,
+whose `dist.integrity` is a sha512 the publisher recorded over the stored tarball and is
+served with no API budget to run out of. Do not reintroduce `api.github.com` to get a
+digest, however tempting the per-asset one GitHub records looks. Sixty unauthenticated
+requests an hour *per address* is a ceiling one office behind one NAT reaches, and when it
+does, provisioning fails for all of them at once; the whole of `crates/fetch/src/tools/`
+now has no route to that host, deliberately.
+
 Grok Build's asset is the one that is **not an archive** — xAI serves a bare executable —
 so `archive::Kind::Raw` reads it straight through and `mirror.sh` renames it to `.bin`
 rather than repacking it. Repacking would make the pinned digest describe our own output

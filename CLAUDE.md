@@ -132,6 +132,25 @@ make the pinned digest describe riabuild's own output instead of the bytes xAI s
 putting an unverifiable step between what a maintainer checked and what a laptop runs. See
 `docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
+**pnpm is the tool a mirror cannot serve, and the answer is a second publisher rather than
+a lower bar.** Its version is read out of the checkout's `packageManager` at *runtime*, so
+no `Checksum::Pinned` constant in this repository can describe the bytes — pinning one to
+make a mirror possible would turn a `packageManager` bump into a fleet-wide install failure
+until a riabuild release caught up. pnpm's GitHub releases carry no checksum file at any
+spelling, so for a while riabuild read the per-asset digest GitHub's REST API records. That
+is a real digest served on a budget a provisioner cannot depend on: **sixty unauthenticated
+requests an hour per address**, which one office behind one NAT exhausts, after which
+nobody there can provision anything. Both e2e jobs stopped at exactly that.
+
+So pnpm comes from the **npm registry** instead — `@pnpm/exe` for the JavaScript bundle and
+`@pnpm/<platform>` for the launcher, each verified against the `dist.integrity` sha512 npm
+recorded over the stored tarball, the field every `npm install` already checks, with an
+SLSA provenance attestation beside it and no API ceiling. The rule is unchanged and this is
+what obeying it looked like here: a digest the *publisher* records, checked against the
+complete buffer before anything is unpacked, and a version whose integrity cannot be
+established is an error rather than an unverified download. What must never come back is
+the third option nobody proposes out loud — downloading it because the transfer completed.
+
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
 written to a developer's machine. Infisical service tokens are deprecated — use machine

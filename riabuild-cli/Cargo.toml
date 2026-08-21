@@ -100,13 +100,14 @@ strip = "symbols"
 # survive and the decisions would not.
 [workspace.dependencies]
 anyhow = "1.0"
-# The OpenSSH private key container, which stores a key's public half as a
-# base64 blob inside a base64 body — so `riabuild-api` decodes one and encodes
-# the other to derive a public key without doing any key mathematics. Nothing
-# else in this binary does base64, and hand-rolling forty lines of codec to
-# avoid one zero-dependency crate would be forty lines that are wrong in exactly
-# one direction and silently. SHA-256 for the fingerprint is already free
-# through `ring`, below.
+# Two users, both of them formats somebody else chose. `riabuild-api` reads the
+# OpenSSH private key container, which stores a key's public half as a base64
+# blob inside a base64 body, so decoding one and encoding the other derives a
+# public key without doing any key mathematics. `riabuild-fetch` reads npm's
+# `dist.integrity`, a base64 sha512 and the digest pnpm is verified against.
+# Hand-rolling forty lines of codec to avoid one zero-dependency crate would be
+# forty lines that are wrong in exactly one direction and silently. The hashes
+# either one needs are already free through `ring`, below.
 base64 = "0.22"
 # `async fn` in a trait is not dyn-compatible — it returns an anonymous future
 # with no known size, so there is no vtable layout for it. `Ctx` holds every IO

@@ -35,13 +35,26 @@ const CLEAR_THE_PATH: &str = "Check that there is free disk space and that nothi
 /// Unpacks a `node-v*.tar.gz` into `target` so that `target/bin/node` is the
 /// binary: Node wraps everything in one `node-v22.23.1-darwin-arm64/` directory.
 pub fn extract_node_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 1)
+    extract_tarball(&[bytes], target, 1)
 }
 
-/// pnpm has no wrapper directory: the `pnpm` launcher and the `dist/` tree it
-/// loads sit at the root of the archive, and must stay beside each other.
-pub fn extract_pnpm_tarball(bytes: &[u8], target: &Path) -> Result<()> {
-    extract_tarball(bytes, target, 0)
+/// Unpacks npm package tarballs into `target` as one tree, stripping the
+/// `package/` directory every one of them wraps its contents in.
+///
+/// Several, because one pnpm install is two packages: `@pnpm/exe` carries the
+/// `dist/` tree, `@pnpm/<platform>` carries the launcher that loads it from
+/// beside itself, and the two only work in one directory. They are unpacked in
+/// the order given and land as a single `rename`, so a co-tenant never sees a
+/// tree with one half of pnpm in it.
+///
+/// **Order is load-bearing.** `@pnpm/exe` ships a placeholder `pnpm` reading
+/// *"This file intentionally left blank"* — upstream's install script copies
+/// the platform binary over it — so the bundle goes first and the launcher
+/// lands on top of it. `tar`'s unpack unlinks and recreates rather than writing
+/// in place, which is what makes the later layer win cleanly.
+pub fn extract_npm_tarballs(parts: &[Vec<u8>], target: &Path) -> Result<()> {
+    let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    extract_tarball(&parts, target, 1)
 }
 
 /// Unpacks into `target` without ever clearing it where it stands.
@@ -60,7 +73,13 @@ pub fn extract_pnpm_tarball(bytes: &[u8], target: &Path) -> Result<()> {
 ///
 /// Judging whether what is already at `target` is any good is the *caller's*
 /// job (`tasks::toolchain` asks the binary its version).
-fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Result<()> {
+///
+/// `parts` is a list because a tree is not always one archive — see
+/// [`extract_npm_tarballs`]. They are unpacked into one staging directory in
+/// order, later entries overwriting earlier ones, and the whole thing lands in
+/// a single `rename`: a half-assembled tree is never something another process
+/// can reach through `target`.
+fn extract_tarball(parts: &[&[u8]], target: &Path, strip_components: usize) -> Result<()> {
     let staging = staging_beside(target, "part");
     // Only ever this call's own leftovers from an interrupted earlier run —
     // never another developer's staging directory, and never `target`.
@@ -71,9 +90,11 @@ fn extract_tarball(bytes: &[u8], target: &Path, strip_components: usize) -> Resu
         )
         .detail(format!("{error}"))
     })?;
-    if let Err(error) = unpack(bytes, &staging, strip_components) {
-        let _ = remove_tree(&staging);
-        return Err(error);
+    for bytes in parts {
+        if let Err(error) = unpack(bytes, &staging, strip_components) {
+            let _ = remove_tree(&staging);
+            return Err(error);
+        }
     }
     swap_into_place(&staging, target)
 }
@@ -434,17 +455,98 @@ mod tests {
     }
 
     #[test]
-    fn a_pnpm_archive_keeps_its_launcher_beside_the_dist_tree() {
-        // pnpm's archive has no wrapper directory. Stripping one anyway would
-        // throw the launcher away and leave a `dist/` nothing can start — and
-        // the launcher loads `dist/` from beside itself, so the two cannot be
-        // separated either.
-        let bytes = tarball(&[("pnpm", b"launcher"), ("dist/pnpm.mjs", b"module")]);
+    fn two_npm_packages_become_one_tree_with_the_later_layer_on_top() {
+        // What pnpm 11 actually is: `@pnpm/exe` carries `dist/` and a `pnpm`
+        // placeholder reading "This file intentionally left blank", and
+        // `@pnpm/<platform>` carries the real launcher. Unpacked in that
+        // order, the launcher wins; reversed, riabuild installs the
+        // placeholder as pnpm and every `pnpm -v` on the machine prints a
+        // sentence.
+        let bundle = tarball(&[
+            (
+                "package/pnpm",
+                b"This file intentionally left blank" as &[u8],
+            ),
+            ("package/dist/pnpm.mjs", b"module"),
+            ("package/package.json", b"{}"),
+        ]);
+        let platform = tarball(&[("package/pnpm", b"the launcher" as &[u8])]);
+
         let home = tempfile::TempDir::new().unwrap();
         let target = home.path().join("11.11.0");
-        extract_pnpm_tarball(&bytes, &target).unwrap();
-        assert!(target.join("pnpm").exists());
-        assert!(target.join("dist/pnpm.mjs").exists());
+        extract_npm_tarballs(&[bundle, platform], &target).unwrap();
+
+        assert_eq!(std::fs::read(target.join("pnpm")).unwrap(), b"the launcher");
+        assert!(
+            target.join("dist/pnpm.mjs").exists(),
+            "the launcher loads dist/ from beside itself, so the two cannot be separated"
+        );
+        // `package/` is npm's wrapper and no part of the tree.
+        assert!(!target.join("package").exists());
+        assert_eq!(
+            leftovers_beside(home.path(), "11.11.0"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_second_layer_replaces_the_first_rather_than_writing_over_it() {
+        // The launcher is 146 MB and a co-tenant may be executing the file it
+        // displaces. `tar`'s unpack unlinks and recreates, so the old inode —
+        // held here by a hard link, standing in for that running process —
+        // keeps its contents. Writing in place would be ETXTBSY at best.
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("11.11.0");
+        extract_npm_tarballs(
+            &[tarball(&[("package/pnpm", b"the placeholder" as &[u8])])],
+            &target,
+        )
+        .unwrap();
+        let held_open = home.path().join("still-running");
+        std::fs::hard_link(target.join("pnpm"), &held_open).unwrap();
+
+        extract_npm_tarballs(
+            &[
+                tarball(&[("package/pnpm", b"the placeholder" as &[u8])]),
+                tarball(&[("package/pnpm", b"the launcher" as &[u8])]),
+            ],
+            &target,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(target.join("pnpm")).unwrap(), b"the launcher");
+        assert_eq!(std::fs::read(&held_open).unwrap(), b"the placeholder");
+    }
+
+    #[test]
+    fn a_second_layer_that_will_not_unpack_leaves_the_installed_tree_alone() {
+        // Half of pnpm is worse than none of it: a `dist/` with no launcher
+        // reports as "pnpm is not installed" while a colleague's session dies.
+        // Both layers go into the staging directory, so a failure in the
+        // second one costs that directory and nothing else.
+        let home = tempfile::TempDir::new().unwrap();
+        let target = home.path().join("11.11.0");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("pnpm"), b"the pnpm ada is running").unwrap();
+
+        extract_npm_tarballs(
+            &[
+                tarball(&[("package/dist/pnpm.mjs", b"module" as &[u8])]),
+                b"not a gzip stream at all".to_vec(),
+            ],
+            &target,
+        )
+        .expect_err("the second layer is not an archive");
+
+        assert_eq!(
+            std::fs::read(target.join("pnpm")).unwrap(),
+            b"the pnpm ada is running"
+        );
+        assert!(!target.join("dist/pnpm.mjs").exists());
+        assert_eq!(
+            leftovers_beside(home.path(), "11.11.0"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

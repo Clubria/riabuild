@@ -1058,6 +1058,7 @@ name = "riabuild-fetch"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "flate2",
  "reqwest",
  "riabuild-ui",

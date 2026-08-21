@@ -88,7 +88,13 @@ pub fn account(remote: &Remote) -> String {
 /// slot cannot be answered by the helper. Nothing should ever want to — the
 /// pending slot is riabuild's own bookkeeping, not a place a password is read
 /// back from to hand to `ssh`.
-fn pending_account(hash: &str) -> String {
+///
+/// `pub(crate)` so the one test that watches `authorise` sweep this slot names
+/// it through the function that builds it, rather than pasting the suffix into
+/// an assertion — a test holding its own copy of the account shape would keep
+/// passing after the shape changed. `hash_of` above is the reason nothing
+/// outside the crate has any business with it.
+pub(crate) fn pending_account(hash: &str) -> String {
     format!("{ACCOUNT_PREFIX}{hash}{PENDING_SUFFIX}")
 }
 

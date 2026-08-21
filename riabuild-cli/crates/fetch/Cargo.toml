@@ -13,6 +13,12 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# npm's `dist.integrity` — the digest pnpm is verified against — is a base64
+# sha512 rather than the hex sha256 every other publisher here uses, and the
+# comparison is on the decoded digest so that a padding change at the registry
+# cannot present as tampering. The hash itself is already free through `ring`,
+# below.
+base64.workspace = true
 flate2.workspace = true
 reqwest.workspace = true
 # For `Failure`. Downloading and unpacking is the most failure-prone part of

@@ -80,10 +80,15 @@ pub async fn extract_node_tarball(bytes: Vec<u8>, target: PathBuf) -> Result<()>
     off_the_reactor(move || staging::extract_node_tarball(&bytes, &target)).await
 }
 
-/// pnpm has no wrapper directory: the `pnpm` launcher and the `dist/` tree it
-/// loads sit at the root of the archive, and must stay beside each other.
-pub async fn extract_pnpm_tarball(bytes: Vec<u8>, target: PathBuf) -> Result<()> {
-    off_the_reactor(move || staging::extract_pnpm_tarball(&bytes, &target)).await
+/// Unpacks the npm packages one tool is made of into `target` as a single
+/// tree, stripping the `package/` directory npm wraps every tarball in.
+///
+/// pnpm is the caller, and it is two packages: `@pnpm/exe` carries the `dist/`
+/// tree and `@pnpm/<platform>` the launcher that loads it from beside itself.
+/// They are unpacked in the order given — the launcher last, over the
+/// placeholder the bundle ships — and land in one `rename`.
+pub async fn extract_npm_tarballs(parts: Vec<Vec<u8>>, target: PathBuf) -> Result<()> {
+    off_the_reactor(move || staging::extract_npm_tarballs(&parts, &target)).await
 }
 
 /// Writes one file out of an archive to `destination`, executable.
@@ -286,17 +291,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pnpm_archive_keeps_its_launcher_beside_the_dist_tree() {
-        // pnpm's archive has no wrapper directory. Stripping one anyway would
-        // throw the launcher away and leave a `dist/` nothing can start — and
-        // the launcher loads `dist/` from beside itself, so the two cannot be
-        // separated either.
-        let bytes = tarball(&[("pnpm", b"launcher"), ("dist/pnpm.mjs", b"module")]);
+    async fn npm_packages_lose_their_package_wrapper_and_land_as_one_tree() {
+        // Every npm tarball wraps its contents in `package/`, and pnpm is two
+        // of them: the bundle's `dist/` and the platform package's launcher,
+        // which loads it from beside itself. The launcher goes last, over the
+        // placeholder the bundle ships in its place.
+        let bundle = tarball(&[
+            (
+                "package/pnpm",
+                b"This file intentionally left blank" as &[u8],
+            ),
+            ("package/dist/pnpm.mjs", b"module"),
+        ]);
+        let platform = tarball(&[("package/pnpm", b"the launcher" as &[u8])]);
         let home = tempfile::TempDir::new().unwrap();
         let target = home.path().join("11.11.0");
-        extract_pnpm_tarball(bytes, target.clone()).await.unwrap();
-        assert!(target.join("pnpm").exists());
+
+        extract_npm_tarballs(vec![bundle, platform], target.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(target.join("pnpm")).unwrap(), b"the launcher");
         assert!(target.join("dist/pnpm.mjs").exists());
+        assert!(!target.join("package").exists());
     }
 
     #[test]

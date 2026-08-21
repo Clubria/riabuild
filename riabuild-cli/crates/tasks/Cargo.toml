@@ -51,7 +51,7 @@ tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 
 [dev-dependencies]
-# Builds a fake node tarball for the toolchain suite.
+# Builds the fake Node and npm tarballs the toolchain suite unpacks.
 flate2.workspace = true
 riabuild-keychain = { workspace = true, features = ["testing"] }
 riabuild-paths = { workspace = true, features = ["testing"] }
