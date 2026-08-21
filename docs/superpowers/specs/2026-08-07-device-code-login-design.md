@@ -217,10 +217,19 @@ socket:
   a malformed or hostile `interval` cannot spin the CLI or park it for an hour
 - `browser_available` — takes the environment as data rather than reading it, so the
   headless decision is testable
+- `verification_link` — picks `verificationUriComplete` over `verificationUri`, falling
+  back when the server sends no complete link
 
 Browser opening becomes best-effort: skipped when `SSH_CONNECTION` is set, or on Linux
 when neither `DISPLAY` nor `WAYLAND_DISPLAY` is. The URL and the code are printed
 regardless, so the SSH path is plain text with no failed process spawn in it.
+
+**The printed URL is the one that prefills.** It is the same link the local browser is
+sent to, and the developer who most needs the code already in the box is the one over
+SSH — nothing is opened for them, so they carry the link to a browser on another machine
+themselves. Printing the bare `/cli` there made the only person copying by hand copy
+twice. The code keeps its own line regardless: it is what the terminal is checked
+against, and prefilling still stops short of approving.
 
 ### Deliberately not done
 
