@@ -46,5 +46,6 @@ tempfile.workspace = true
 # `test-util` is what lets the supervisor's suite advance a paused clock
 # instead of waiting on it: its ping interval is thirty seconds and its
 # backoff ceiling thirty more, and a suite that sat through those is a
-# suite people stop running. This is the only crate that needs it.
+# suite people stop running. `riabuild-remote` has it for the same reason,
+# for the standby interval its holder waits out.
 tokio = { workspace = true, features = ["test-util"] }

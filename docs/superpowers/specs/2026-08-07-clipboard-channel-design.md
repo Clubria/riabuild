@@ -436,13 +436,37 @@ and the side that comes and goes. The server end is entirely passive.
 
 ## Lifetime
 
-One channel per remote namespace, shared by every shell into that server. Lifetime is
-refcounted with the **same `sessions/<pid>` markers and `kill -0` sweep** the GitHub
-credential already uses — not a second mechanism. The socket lives in the namespace's
-runtime directory and inherits its `0700`, ownership, and symlink rules unchanged.
+One channel per remote namespace, shared by every shell into that server. The socket lives
+in the namespace's runtime directory and inherits its `0700`, ownership, and symlink rules
+unchanged.
 
-Two terminals into one server share one channel. The first to exit tears down nothing; the
-last tears down the tunnel.
+**Serving it is a lease, not a birthright.** Exactly one of this laptop's sessions to a
+given server serves the channel at a time — a second pump would find the first one's socket
+live and be refused — so the others *stand by*, asking every five seconds whether the lease
+has fallen free, for as long as their shells are open. When the session serving the channel
+ends, the next one takes it over and the developer's paste comes back with nothing typed.
+
+The lease is an `flock` on `~/.riabuild/channel-sessions/<hash>/owner.lock`, which is the
+whole reason the sentence above can be relied on. It is the kernel's, not a file's
+contents, so it is released when the holding process exits — cleanly, on a `SIGKILL`, or
+with a laptop's lid closed on it. There is nothing to sweep and nothing to go stale.
+
+**This replaces the `sessions/<pid>` markers and `kill -0` sweep this spec originally
+specified, and the reason is worth recording.** Markers answered one question, once: *am I
+the first?* A session that answered no started nothing and never asked again — so the
+common case of two terminals into one box became, the moment the owning session ended, a
+survivor naming a socket path that was correct and unbound, with paste, image paste and
+`xdg-open` dead and riabuild running in that very terminal. The banner said as much
+(*"it ends when that one does"*), which made it a documented failure rather than an
+unknown one, and a documented failure is still a failure. It was reported as "the clipboard
+channel is down after my laptop was disconnected for a night".
+
+The bound this does **not** move: the laptop is still the side that connects, so when the
+*last* `riabuild remote` session to a server ends there is nothing left to take the lease,
+and a new `riabuild remote` is the only thing that brings the channel back. That remains
+the remedy `riabuild channel status` names — see *The environment variable outlives the
+channel*. What changed is that it is no longer the remedy for a laptop that still has a
+session open.
 
 ## Degradation
 
@@ -505,14 +529,15 @@ Each has its own remedy, so each is detected separately.
 | Runtime directory not ours, or not 0700 | hard stop — the existing rule, unchanged |
 | Laptop has no clipboard tool (Linux laptop, no `wl-clipboard`/`xclip`) | names the install command, as `mosh-server` already does |
 | Channel down — lid closed, laptop gone | the shim exits 1, naming the channel and the one thing that brings it back; the fuller account is in `riabuild channel status` and the log |
-| Channel down — **the session that opened this shell has ended** | the same, and it is the common case rather than the exotic one (below) |
+| Channel down — **the session that was serving it has ended** | a sibling session takes the lease over within seconds and nothing is reported; with no sibling left it is the row above |
+| A laptop that cannot resolve the server's hostname yet | retried, never diagnosed. It is a laptop that has just woken up, and a diagnosis stops the supervisor for the rest of the session — the channel failing to return from exactly the event it exists to survive |
 | Clipboard genuinely empty | identical exit 1 — deliberately indistinguishable to the caller |
 | Payload over 32 MB | the cap and the type that exceeded it |
 | Type vanished between `TARGETS` and read | served from the snapshot; a genuine miss is exit 1 |
 | Server-side `xclip` invoked for a write or an odd flag | `exec`s the real binary; if absent, reproduces xclip's own usage error |
 
-The two middle rows are a decision, not an oversight. The caller's contract is xclip's
-contract, and xclip has no way to say "your laptop is asleep" — Claude Code additionally
+The two `Channel down` rows are a decision, not an oversight. The caller's contract is
+xclip's contract, and xclip has no way to say "your laptop is asleep" — Claude Code additionally
 runs its probe with `2>/dev/null`, so the shim's stderr is discarded. **All diagnostic
 value must live outside the paste path.**
 
@@ -520,10 +545,15 @@ value must live outside the paste path.**
 
 `RIABUILD_CHANNEL_SOCKET` is a **promise written once** into the shell's environment when
 the session opens. The channel behind it is a **live resource** owned by a laptop-side
-process, and it can end at any moment: the terminal that owned it exited first while a
-second one is still open, a tmux window is still there tomorrow, a laptop slept and never
-came back. Nothing reconciles the two, and nothing can — the laptop is the side that must
-connect, so a shell on the server can neither restart the channel nor be told by it.
+process, and it can end at any moment: a tmux window is still there tomorrow, a laptop
+slept and never came back. Nothing on the server reconciles the two, and nothing can — the
+laptop is the side that must connect, so a shell on the server can neither restart the
+channel nor be told by it.
+
+One entry on that list is gone, and it was the common one: *the terminal that owned it
+exited first while a second one is still open*. A session standing by takes the lease over
+within seconds now, so the variable outlives the channel only when **every** session on the
+laptop has ended. See *Lifetime*.
 
 What that leaves is a shell naming a path that is entirely correct and completely unbound,
 and the first version of this reported it as `No such file or directory (os error 2)` — a
@@ -543,8 +573,8 @@ and `riabuild channel status` tells apart:
 | State | What it means |
 |---|---|
 | no `RIABUILD_CHANNEL_SOCKET` | not a remote session at all; the clipboard here is already the developer's own |
-| set, nothing bound | the session that opened this shell has ended |
-| set, socket present, nobody accepting | that session ended without removing its socket |
+| set, nothing bound | **every** session this laptop had to this server has ended — while one is open it takes the channel over on its own |
+| set, socket present, nobody accepting | a session ended without removing its socket |
 
 The remedy is the same for the last two and is a real one rather than a shrug: the socket
 path is per developer and per server, so **a new `riabuild remote` binds that very path
@@ -552,9 +582,11 @@ again and the shells already open start working — nothing needs restarting.** 
 worth stating out loud, because the obvious guess is that a stale shell has to be thrown
 away.
 
-A second terminal's banner says so too. It starts nothing, so it may not claim
-`connected`: it reports that it is sharing the first session's channel and that the
-channel ends when that session does.
+A second terminal's banner says so too. It starts no connection, so it may not claim
+`connected`: it reports that the laptop's other session is serving the channel, and that
+this one takes it over if that session ends. The first half is why it cannot say
+`connected`; the second is the thing worth telling a developer, since it is the difference
+between a channel that comes back on its own and one they have to notice.
 
 ---
 
@@ -618,7 +650,7 @@ a PNG at all, so an image write through it would not be lossy but unconstructibl
 | Ping timeout | an agent that stops answering `channel.ping` is torn down and rebuilt |
 | Forward refused | a canned sshd refusal produces the `AllowStreamLocalForwarding` message, not a generic connect error |
 | Stale socket safety | a pre-existing socket owned by another uid is refused, never unlinked |
-| Refcounting | two shells share one channel; the first to exit tears down nothing, the second tears down |
+| Leasing | two shells share one channel; the second starts no connection of its own, and **takes the lease over when the one serving it ends** — the case a refcount could not express |
 | **Degradation** | container test: the tunnel is killed mid-session; setup re-runs, secrets re-pull, the shell works, and only clipboard fails |
 | End to end | the `e2e/remote` sshd container plus a laptop-side agent: a PNG and a UTF-8 string paste through a real shim |
 

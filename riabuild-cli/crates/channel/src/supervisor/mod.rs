@@ -162,7 +162,7 @@ pub fn backoff(attempt: u32) -> Duration {
 /// more than no instruction. Nothing below claims a cause the text does not
 /// state.
 pub fn diagnose(stderr: &str) -> Option<Failure> {
-    let lower = stderr.to_ascii_lowercase();
+    let lower = decisive(stderr);
 
     // The server's riabuild is missing or too old to have a pump. Worth
     // naming, because retrying cannot fix it: every attempt fails identically
@@ -207,6 +207,48 @@ pub fn diagnose(stderr: &str) -> Option<Failure> {
     }
 
     None
+}
+
+/// What ssh said about why it gave up, with what it said on the way there taken
+/// out first.
+///
+/// Every pattern above is a `contains` over the whole of stderr, and a match
+/// **stops the supervisor for the rest of the session**. That is the right
+/// answer for a wall and the worst possible one for a blip, so what the
+/// patterns are matched against has to be the reason ssh stopped rather than
+/// everything ssh happened to write. Two kinds of line come out, and both carry
+/// words that read as decisive while being nothing of the sort:
+///
+/// - **`Warning: Identity file … not accessible: No such file or directory.`**
+///   is ssh saying it will offer one key fewer and then carrying on. Left in,
+///   it turns every ordinary disconnect underneath it into "the server has no
+///   `riabuild channel pump` to run" — a wall, permanent, on a server that has
+///   one.
+/// - **a hostname that will not resolve** is a laptop whose network has not
+///   come back yet. That is the single most common way this connection fails
+///   and the one case that must always be retried, since retrying is the whole
+///   of how the channel survives a closed lid. Resolvers disagree about the
+///   words (`Name or service not known`, `Temporary failure in name
+///   resolution`, `nodename nor servname provided`, and `Host not found`, which
+///   really does contain one of the patterns above), so the line is dropped by
+///   what it is about rather than by which spelling it used.
+///
+/// Only the *matching* is narrowed. `Failure::detail` still carries the whole
+/// of stderr, because a developer reading a wall wants everything ssh said.
+fn decisive(stderr: &str) -> String {
+    stderr
+        .to_ascii_lowercase()
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("warning:")
+                && !line.contains("could not resolve")
+                && !line.contains("name or service not known")
+                && !line.contains("temporary failure in name resolution")
+                && !line.contains("nodename nor servname")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -420,6 +462,60 @@ mod tests {
                 "a cause that cannot be established from `{stderr}` must not be asserted"
             );
         }
+    }
+
+    /// The laptop this whole design exists to survive: one that has just woken
+    /// up, whose network is a second or two behind it.
+    ///
+    /// A wall stops the supervisor for the rest of the session, so diagnosing
+    /// this one is the channel failing to come back from precisely the event it
+    /// is built to come back from — and the developer is told their server has
+    /// no riabuild on it, which is a confident answer about the wrong machine.
+    /// `Host not found` is the spelling that made this reachable rather than
+    /// theoretical: it contains `not found`.
+    #[test]
+    fn a_hostname_that_will_not_resolve_is_retried_rather_than_named_as_a_wall() {
+        for stderr in [
+            "ssh: Could not resolve hostname build-01.clubria.dev: Host not found",
+            "ssh: Could not resolve hostname build-01.clubria.dev: Name or service not known",
+            "ssh: Could not resolve hostname build-01: Temporary failure in name resolution",
+            "ssh: Could not resolve hostname build-01: nodename nor servname provided, or not known",
+        ] {
+            assert!(
+                diagnose(stderr).is_none(),
+                "a laptop with no DNS yet must be retried, not walled off: {stderr}"
+            );
+        }
+    }
+
+    /// ssh warns about a key it cannot read and then carries on without it, so
+    /// that line is not the reason it stopped. Read as one, it makes every
+    /// ordinary disconnect underneath it permanent.
+    #[test]
+    fn a_warning_ssh_carried_on_from_is_not_read_as_the_reason_it_stopped() {
+        let stderr = "Warning: Identity file /home/ada/.riabuild/ssh/id_ed25519 not accessible: \
+                      No such file or directory.\r\n\
+                      Connection closed by 10.0.0.4 port 22";
+        assert!(
+            diagnose(stderr).is_none(),
+            "a warning is not a wall: {stderr}"
+        );
+    }
+
+    /// …and narrowing what is matched must not stop a real wall being named.
+    /// The warning above arrives beside genuine walls too, and a server with no
+    /// pump is still a server with no pump.
+    #[test]
+    fn a_real_wall_is_still_named_when_a_warning_arrives_with_it() {
+        let stderr = "Warning: Identity file /home/ada/.riabuild/ssh/id_ed25519 not accessible: \
+                      No such file or directory.\r\n\
+                      bash: riabuild: command not found";
+        assert!(
+            diagnose(stderr)
+                .expect("a wall")
+                .to_string()
+                .contains("pump")
+        );
     }
 
     /// An ordinary disconnect is retried silently rather than turned into a

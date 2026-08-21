@@ -3,22 +3,25 @@
 //! `riabuild_channel` builds the parts — the laptop's agent, the rules about
 //! which socket is ours, the supervisor that keeps the exec session up. This is
 //! where remote mode puts them together: the paths that are remote mode's to
-//! choose, the refcount that stops two terminals into one box from fighting
-//! over the channel, and the rule that outranks everything else here — a
-//! channel that will not start costs a warning, never the shell.
+//! choose, the lease that decides which of two terminals into one box serves
+//! the channel — and hands it to the other when that one ends — and the rule
+//! that outranks everything else here: a channel that will not start costs a
+//! warning, never the shell.
 //!
 //! Inside `remote`, `channel::` is this module and the parts it drives are
 //! spelled `riabuild_channel::` throughout. The two are one word apart and only
 //! one of them is optional, so the longer spelling is worth the noise.
 
-mod claim;
+mod hold;
+mod lease;
 mod sockets;
 
 pub use sockets::remote_socket;
 
 use super::{Remote, askpass, identity, shell};
 use anyhow::Result;
-use riabuild_channel::supervisor::{StatusLine, Stop, Tunnel, supervise};
+use hold::{Holder, hold};
+use riabuild_channel::supervisor::{StatusLine, Stop, Tunnel};
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
 use riabuild_ui::{Failure, Ui};
@@ -43,17 +46,20 @@ const BANNER: &str = "Clipboard channel — connected";
 
 /// What a second terminal into the same server says instead.
 ///
-/// It starts nothing — the first session owns the connection — so it cannot
-/// claim one. The wording carries the limit with it, because this is the shape
-/// the failure actually takes: the supervisor is a task inside the *owner's*
-/// process, so whichever terminal exits first takes the channel with it, and
-/// the survivor is left naming a socket path that is correct and unbound. Its
-/// paste, image paste and `xdg-open` stop; its copying appears to carry on,
-/// because Claude Code's OSC 52 escape needs no channel. `riabuild channel
-/// status` is the thing that says so, which is why it is named here rather than
-/// left to be found.
-const SHARED_BANNER: &str = "Clipboard channel — shared with this laptop's other session on this server \
-     (it ends when that one does; `riabuild channel status` reports it)";
+/// It starts no connection of its own — a second pump would find the first
+/// one's socket live and be refused — but it is not a bystander either: it
+/// holds a place in the queue for the channel's lease and takes the channel
+/// over if the session serving it ends. That is the half worth putting in the
+/// banner, because it is the half a developer would otherwise have to discover
+/// by watching paste come back.
+///
+/// This used to carry a limit instead of a promise: *it ends when that one
+/// does*. It really did, and the sentence was honest, but a documented failure
+/// is still a failure — the survivor sat there naming a socket path that was
+/// correct and unbound, with paste, image paste and `xdg-open` dead, while
+/// riabuild ran in that very terminal. See `hold`.
+const STANDBY_BANNER: &str = "Clipboard channel — served by this laptop's other session on this server, and taken over \
+     by this one if that session ends";
 
 /// Everything remote mode has to tell the channel about this session.
 ///
@@ -115,14 +121,18 @@ pub async fn open_shell(plan: Plan<'_>) -> Result<i32> {
 
 /// What this session is holding open, and has to give back.
 struct Channel {
-    claim: Option<claim::Claim>,
     started: Option<Started>,
 }
 
-/// The two background tasks the first session into a server owns.
+/// The two background tasks every session into a server owns.
+///
+/// *Every* session, including one that found a sibling already serving. The
+/// holder is what makes that session more than a bystander: it is standing by
+/// for the channel's lease, and there is no longer such a thing as a remote
+/// session with nothing running behind it but a banner.
 struct Started {
     stop: Stop,
-    tunnel: tokio::task::JoinHandle<Option<Failure>>,
+    holder: tokio::task::JoinHandle<()>,
     /// The one line the channel is allowed to say anything on while the
     /// developer's shell owns the screen.
     ///
@@ -142,92 +152,53 @@ impl Channel {
     /// the whole contract. A channel that could not start is a `Channel` with
     /// nothing in it.
     async fn start(plan: &Plan<'_>) -> Channel {
-        let dir = claim::dir(plan.paths, plan.remote);
-        let claim = match claim::Claim::open(&dir, std::process::id(), plan.runner.clone()).await {
-            Ok(claim) => claim,
-            Err(error) => {
-                warn(plan.ui, &error);
-                return Channel {
-                    claim: None,
-                    started: None,
-                };
-            }
-        };
-
-        if !claim.owner {
-            // A sibling terminal into this same server already has one. Set the
-            // environment, say so, and start nothing: a second pump would find
-            // the first one's socket live and refuse it.
-            //
-            // The honest limit, since it is not the one the markers imply: the
-            // supervisor is a task inside the *owner's* process, so a first
-            // terminal that exits first takes the channel with it and this
-            // session's paste stops. That is the channel's documented failure
-            // rather than a new one, and the alternative is a daemon outliving
-            // the shell — which remote mode does not have and should not grow
-            // for paste.
-            //
-            // Said in its own words rather than with `BANNER`, which asserts a
-            // connection this branch has neither made nor checked. All it knows
-            // is that a sibling *process* is alive — not that the channel it
-            // owns ever came up, and not that it still has one. Claiming
-            // "connected" there is how a developer ends up reporting paste as
-            // broken while riabuild's own banner told them it was fine.
-            plan.ui.satisfied(SHARED_BANNER);
-            return Channel {
-                claim: Some(claim),
-                started: None,
-            };
-        }
-
         match try_start(plan).await {
-            Ok(started) => {
-                // Honest as far as it goes: the agent is serving and the
-                // supervisor holds the forward. A tunnel that then fails to
-                // come up reports itself, in the supervisor's own voice, rather
-                // than being promised away here.
-                plan.ui.satisfied(BANNER);
+            Ok((started, serving)) => {
+                // Which of the two sentences is the *first* ask for the lease,
+                // and nothing else. Both are honest as far as they go: the
+                // agent is serving and this session either holds the channel or
+                // is standing by for it. A connection that then fails to come up
+                // reports itself, in the supervisor's own voice, rather than
+                // being promised away here.
+                plan.ui
+                    .satisfied(if serving { BANNER } else { STANDBY_BANNER });
                 Channel {
-                    claim: Some(claim),
                     started: Some(started),
                 }
             }
             Err(error) => {
                 warn(plan.ui, &error);
-                // Released rather than held: a marker with no channel behind it
-                // would tell the next terminal a channel exists, and it would
-                // start nothing either.
-                claim.close().await;
-                Channel {
-                    claim: None,
-                    started: None,
-                }
+                Channel { started: None }
             }
         }
     }
 
     async fn stop(self) {
         if let Some(started) = self.started {
-            // Before the supervisor is even asked to stop: the shell has
-            // already exited, so riabuild is about to print its own output to
-            // a terminal that must not have a stale warning pinned to row two.
+            // Before the holder is even asked to stop: the shell has already
+            // exited, so riabuild is about to print its own output to a
+            // terminal that must not have a stale warning pinned to row two.
             started.line.stop();
             started.stop.stop();
-            // Awaited, not detached: the supervisor kills its `ssh` on the way
-            // out, which ends the pump, which frees the server's socket before
-            // the next session tries to bind it. There is no laptop socket to
-            // clean up any more — the agent is served on the child's stdio.
-            let _ = started.tunnel.await;
-        }
-        if let Some(claim) = self.claim {
-            claim.close().await;
+            // Awaited, not detached, for two things that both have to have
+            // happened before this function returns. The supervisor kills its
+            // `ssh` on the way out, which ends the pump, which frees the
+            // server's socket before the next session tries to bind it. And the
+            // holder drops the lease, which is what lets a sibling terminal
+            // take the channel over rather than waiting on this process to
+            // exit.
+            let _ = started.holder.await;
         }
     }
 }
 
 /// Everything that can go wrong, in one place, so the caller above can turn all
 /// of it into a warning.
-async fn try_start(plan: &Plan<'_>) -> Result<Started> {
+///
+/// Answers whether this session is *serving* the channel as well as what it
+/// started, because that is the one thing the banner cannot work out for itself
+/// and the one thing that stops being true five seconds later.
+async fn try_start(plan: &Plan<'_>) -> Result<(Started, bool)> {
     // Still checked, and still the server's path: the pump binds it there, and
     // a `sockaddr_un` that cannot hold it fails inside `bind()` with
     // `ENAMETOOLONG` at best and a silent truncation at worst. What no longer
@@ -236,14 +207,24 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
 
     let agent = riabuild_channel::laptop_agent(plan.runner.clone(), &plan.paths.bin_dir())?;
 
+    // Asked once here, and again every few seconds in `hold` for as long as the
+    // answer is no. The first ask is what the banner reports; every ask after it
+    // is what makes the channel come back on its own when the session serving it
+    // goes away.
+    let dir = lease::dir(plan.paths, plan.remote);
+    let lease = lease::try_take(&dir).await?;
+    let serving = lease.is_some();
+
     let stop = Stop::new();
     // After everything that can fail, and before the one thing that outlives
     // this call: an early return past this point would leave a task repainting
     // a line for a channel that never started.
     let line = StatusLine::start(plan.quiet);
-    let tunnel = tokio::spawn(supervise(
-        plan.runner.clone(),
-        Tunnel {
+    let holder = tokio::spawn(hold(Holder {
+        dir,
+        lease,
+        runner: plan.runner.clone(),
+        tunnel: Tunnel {
             host: plan.remote.host.clone(),
             user: plan.remote.user.clone(),
             // The same options every other ssh in this flow is built from —
@@ -260,12 +241,12 @@ async fn try_start(plan: &Plan<'_>) -> Result<Started> {
             env: askpass::ssh_env(plan.remote, plan.paths),
         },
         agent,
-        Ui::new(plan.quiet),
-        stop.clone(),
-        line.bar(),
-    ));
+        ui: Ui::new(plan.quiet),
+        stop: stop.clone(),
+        bar: line.bar(),
+    }));
 
-    Ok(Started { stop, tunnel, line })
+    Ok((Started { stop, holder, line }, serving))
 }
 
 /// The channel's own failure voice.
@@ -309,8 +290,18 @@ mod tests {
 
     /// The shell, and nothing but the shell: no mosh anywhere, so `open` takes
     /// its ssh fallback and one scripted stub covers the run.
+    ///
+    /// `xclip` is here so the laptop has a clipboard tool for `laptop_agent` to
+    /// find. Without it these tests would pass on a Mac — where `detect`
+    /// answers `macos` before it looks for anything — and on Linux would take
+    /// the "this laptop has no clipboard tool" branch, starting no channel and
+    /// asserting nothing they were written to assert.
     fn shell_runner() -> Arc<FakeRunner> {
-        Arc::new(FakeRunner::new().with("ssh", 0, "", ""))
+        Arc::new(
+            FakeRunner::new()
+                .with("ssh", 0, "", "")
+                .with("xclip", 0, "", ""),
+        )
     }
 
     fn plan<'a>(
@@ -375,17 +366,12 @@ mod tests {
     async fn a_second_session_to_one_server_joins_the_channel_rather_than_rebuilding_it() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "", "")
-                // The sibling terminal's process, still running.
-                .with("kill -0", 0, "", ""),
-        );
-        let dir = claim::dir(&paths, &remote());
-        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
-        tokio::fs::write(dir.join("4242"), "0")
+        let fake = shell_runner();
+        // The sibling terminal, serving the channel.
+        let held = lease::try_take(&lease::dir(&paths, &remote()))
             .await
-            .expect("write");
+            .expect("take")
+            .expect("owns");
         let ui = Ui::new(true);
 
         open_shell(plan(
@@ -400,7 +386,7 @@ mod tests {
 
         assert!(
             fake.spawns().is_empty(),
-            "the second session must start no agent and no tunnel: {:?}",
+            "the second session must start no connection of its own: {:?}",
             fake.spawns()
         );
         assert!(
@@ -410,9 +396,74 @@ mod tests {
             "{:?}",
             fake.calls()
         );
+        drop(held);
+    }
+
+    /// Virtual time from now until the fake has started `count` children.
+    ///
+    /// Polling rather than a channel, because under a paused clock the polling
+    /// *is* the mechanism: time only moves when the runtime has nothing left to
+    /// run, so this sleep is what lets the holder's standby interval elapse.
+    async fn until_spawns(fake: &FakeRunner, count: usize) {
+        for _ in 0..2_000 {
+            if fake.spawns().len() >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("only {} of {count} spawns happened", fake.spawns().len());
+    }
+
+    /// The bug this change exists to fix, end to end.
+    ///
+    /// A developer with two terminals into one server closes the laptop for the
+    /// night. The session that was serving the channel ends; the other one is
+    /// still there in the morning. It used to be a bystander — ownership was
+    /// decided once, at startup, so it started nothing and never asked again,
+    /// and paste, image paste and `xdg-open` stayed dead in a terminal with
+    /// riabuild running in it. Copying went on working, because Claude Code's
+    /// OSC 52 escape needs no channel, which is what made it read as two
+    /// unrelated bugs rather than one dead channel.
+    ///
+    /// Now the survivor takes the channel over and paste comes back with
+    /// nothing typed anywhere.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_standing_by_takes_the_channel_over_when_the_one_serving_it_ends() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = shell_runner();
+        let ui = Ui::new(true);
+        let remote = remote();
+
+        let serving = lease::try_take(&lease::dir(&paths, &remote))
+            .await
+            .expect("take")
+            .expect("the other terminal is serving the channel");
+
+        let channel = Channel::start(&plan(
+            &remote,
+            &paths,
+            fake.clone(),
+            &ui,
+            "/home/dev/.riabuild-remote/abc/channel.sock".into(),
+        ))
+        .await;
         assert!(
-            !dir.join(std::process::id().to_string()).exists(),
-            "a session that has returned must not leave its marker behind"
+            fake.spawns().is_empty(),
+            "a session standing by must start no second connection: {:?}",
+            fake.spawns()
         );
+
+        // The laptop's other session ends.
+        drop(serving);
+
+        until_spawns(&fake, 1).await;
+        let spawned = fake.spawns().join(" ");
+        assert!(
+            spawned.contains("channel pump"),
+            "the survivor has to open the channel itself: {spawned}"
+        );
+
+        channel.stop().await;
     }
 }

@@ -85,6 +85,28 @@ impl Stop {
         self.0.send_replace(true);
     }
 
+    /// Whether a stop has already been asked for.
+    ///
+    /// For a caller that has work of its own to skip — `remote::channel`'s
+    /// holder loop asks before it goes back to waiting for the channel's lease,
+    /// so a session whose shell has just exited does not take a lease it is
+    /// about to give back.
+    pub fn asked(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once a stop has been asked for — immediately if it already has.
+    ///
+    /// The same guarantee [`stopped`] gives this file's own loop, offered to the
+    /// caller that waits *between* supervised connections. Without it a session
+    /// standing by would have to poll `asked` and could sleep through its own
+    /// shell exiting, which is a task left running against a terminal riabuild
+    /// has finished with.
+    pub async fn stopped(&self) {
+        let mut signal = self.signal();
+        stopped(&mut signal).await;
+    }
+
     fn signal(&self) -> watch::Receiver<bool> {
         self.0.subscribe()
     }
