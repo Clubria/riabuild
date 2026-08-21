@@ -57,7 +57,7 @@ pub async fn ctx_with_tools(runner: FakeRunner) -> (Ctx, TempDir) {
 }
 
 pub async fn install_owned_tools(ctx: &Ctx) {
-    for binary in [ctx.gh(), ctx.infisical(), ctx.ngrok()] {
+    for binary in [ctx.gh(), ctx.infisical(), ctx.ngrok(), ctx.grok()] {
         write_file(std::path::Path::new(&binary), "#!/bin/sh\n").await;
     }
 }

@@ -606,7 +606,7 @@ step "The machine riabuild built"
 
 STATE="$(cat "$RIA_HOME/state.json" 2>/dev/null || echo '{}')"
 for task in login github_cli git_credentials infisical_cli ngrok toolchain project \
-            repo_status codex_cli org_settings env_local claude_statusline; do
+            repo_status codex_cli grok_cli org_settings env_local claude_statusline; do
   check_contains "task recorded: $task" "$STATE" "\"$task\""
 done
 
@@ -672,6 +672,60 @@ if cmp -s "$RIA_HOME/bin/codex" "$RIA_HOME/bin/codex-1"; then
   pass "the bare codex launcher is the first profile"
 else
   fail "the bare codex launcher is not codex-1"
+fi
+
+# Grok Build sits beside Codex for the same reason and is asserted on both paths:
+# it depends on nothing the Claude sign-in provides, so a developer who walked
+# away from the browser still has a working `grok`. Unlike Codex it waits on the
+# toolchain too — it is a static binary, so it has no `depends_on` at all.
+check "the grok launcher is there" test -x "$RIA_HOME/bin/grok"
+
+# The whole point of the wrapper. `bypassPermissions` and not `dontAsk`, which
+# reads like the same thing and silently *denies* every tool that is not
+# pre-approved — a session that looks permissive and does nothing.
+check_contains "the grok launcher bypasses permissions" \
+  "$(cat "$RIA_HOME/bin/grok" 2>/dev/null || echo '')" \
+  "--permission-mode bypassPermissions"
+
+# riabuild downloads the binary itself and never runs xAI's installer, which is a
+# competing provisioner: it writes ~/.grok/bin, symlinks into /usr/local/bin, and
+# appends a PATH block to the developer's rcfile — the one thing that would
+# demote ~/.riabuild/bin and quietly break the claude launcher and the clipboard
+# shims beside it. Asserted as an absence, like the ngrok config above.
+check "riabuild wrote no grok bin directory of xAI's" test ! -d "$HOME/.grok/bin"
+check "riabuild left the developer's own ~/.grok alone" test ! -f "$HOME/.grok/config.toml"
+
+# All nine, each with its own directory and its own GROK_HOME. Grok Build keeps
+# sign-ins apart per GROK_HOME and by nothing else, so nine launchers sharing one
+# would be nine names for a single account — and every other assertion here would
+# still pass.
+GROK_HOMES=""
+for n in 1 2 3 4 5 6 7 8 9; do
+  check "grok profile $n has a config directory" test -d "$RIA_HOME/grok/$n"
+  check "the grok-$n launcher is there" test -x "$RIA_HOME/bin/grok-$n"
+  check_contains "grok-$n pins its own GROK_HOME" \
+    "$(cat "$RIA_HOME/bin/grok-$n" 2>/dev/null || echo '')" \
+    "GROK_HOME=\"$RIA_HOME/grok/$n\""
+  check_contains "grok-$n bypasses permissions" \
+    "$(cat "$RIA_HOME/bin/grok-$n" 2>/dev/null || echo '')" \
+    "--permission-mode bypassPermissions"
+  GROK_HOMES="$GROK_HOMES$(sed -n 's/^GROK_HOME="\(.*\)"$/\1/p' \
+    "$RIA_HOME/bin/grok-$n" 2>/dev/null | head -1)
+"
+done
+GROK_DISTINCT="$(printf '%s' "$GROK_HOMES" | sort -u | grep -c . || true)"
+if [ "$GROK_DISTINCT" = "9" ]; then
+  pass "the nine grok launchers open nine different accounts"
+else
+  fail "the grok launchers share a GROK_HOME — $GROK_DISTINCT distinct, expected 9"
+fi
+
+# `grok` and `grok-1` are one account under two names, the shape `claude` and
+# `codex` already have.
+if cmp -s "$RIA_HOME/bin/grok" "$RIA_HOME/bin/grok-1"; then
+  pass "the bare grok launcher is the first profile"
+else
+  fail "the bare grok launcher is not grok-1"
 fi
 
 # The four tasks the sign-in gates. `claude_accounts` is only recorded once

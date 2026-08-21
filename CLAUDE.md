@@ -82,11 +82,22 @@ Editing that string in the dashboard cannot change what runs on a laptop — onl
 upgrade can. A settings key whose value the server chose the *contents* of would
 be the manifest again under another name.
 
-**riabuild owns every tool it installs.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
-`infisical` and `ngrok` are downloaded by riabuild and verified against a digest. No task
+**riabuild owns every tool it installs.** Node, pnpm, Claude Code, the Codex CLI, Grok
+Build, `gh`, `infisical` and `ngrok` are downloaded by riabuild and verified against a
+digest. No task
 shells out to Homebrew, apt, or dnf to install a dependency — those exist to distribute
 riabuild itself, nothing else. A provisioner that needs a package manager already set up cannot be the
 first thing a developer runs.
+
+Nor does riabuild run **another project's install script**, which is the same rule seen
+from the other side. `x.ai/cli/install.sh` is the case that forces it into words: it is a
+provisioner in its own right, and it downloads an unverified floating build, symlinks into
+`/usr/local/bin`, and appends a `PATH` line to the developer's `.bashrc`, `.zshrc` or
+`config.fish`. That last one silently demotes `~/.riabuild/bin` from the front of `PATH`,
+which is where the `claude` launcher, the clipboard shims and the `xdg-open` that carries
+links to the laptop all live. Nothing errors; the developer's own `claude` simply starts
+instead of riabuild's. A one-line `curl | bash` in a task is a second provisioner fighting
+this one.
 
 **Where a project publishes no digest, riabuild republishes the artifact rather than
 lowering the bar.** ngrok is the one that forces this: Equinox serves a single floating
@@ -98,6 +109,23 @@ release and `tools.rs` pins the URL beside a `Checksum::Pinned` digest, which is
 become are a floating download nobody verifies, and a digest the *server* supplies —
 which would let riabuild-web choose which bytes execute on a laptop, and is the task
 manifest under another name.
+
+**Grok Build is the second, and it fails a different half of the same rule.** xAI's URLs
+are honest — `x.ai/cli/grok-1.0.5-linux-x86_64` names a real version and one nobody
+published is a 404 — so the *pin* is not the problem. The digest is: no checksum file
+exists at any spelling beside the artifact, and `install.sh`'s entire integrity check is
+that the download runs. "It runs" is not "it is the right bytes", so
+`packaging/grok/mirror.sh` republishes the four builds the same way. Mirroring rather than
+pinning a digest against xAI's own URL is the conservative choice, not the paranoid one: a
+version re-cut under the same name would become a checksum mismatch and a hard install
+failure on every laptop at once, for bytes nobody can fetch any more.
+
+That artifact is also the first riabuild owns that arrives in **no container at all** — an
+uncompressed executable — which is what `archive::Kind::Raw` is for. It is mirrored
+byte-for-byte and renamed to `.bin` rather than repacked into a tarball: a repack would
+make the pinned digest describe riabuild's own output instead of the bytes xAI served,
+putting an unverifiable step between what a maintainer checked and what a laptop runs. See
+`docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever

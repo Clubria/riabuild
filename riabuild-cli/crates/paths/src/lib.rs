@@ -165,6 +165,33 @@ pub trait Paths: Send + Sync {
     fn codex_profile_dir(&self, profile: usize) -> PathBuf {
         self.codex_dir().join(profile.to_string())
     }
+    /// The nine Grok Build profiles, one directory each.
+    ///
+    /// The same shape as `codex_dir`, and for the same verified reason: Grok
+    /// Build keeps its credentials in `$GROK_HOME/auth.json` and nowhere else —
+    /// no OS keychain — so two homes really are two independent sign-ins.
+    /// `GROK_HOME` also carries the rest of that account's local state:
+    /// `config.toml`, sessions, MCP registrations, hooks and plugins. Verified
+    /// against Grok Build 1.0.5.
+    fn grok_dir(&self) -> PathBuf {
+        self.root().join("grok")
+    }
+    /// One Grok Build profile — what `GROK_HOME` points at.
+    ///
+    /// Numbered `1`..=`9` for the reason `codex_profile_dir` is: the set is
+    /// fixed, nothing is ever created or renumbered, so `grok-3` and
+    /// `~/.riabuild/grok/3` are obviously the same thing to anyone reading
+    /// their own disk. Claude Code's uuids exist because its accounts *can* be
+    /// deleted and renumbered, and position is then the account number.
+    ///
+    /// Unlike a `CODEX_HOME`, this one does **not** have to exist first: Grok
+    /// Build creates a `GROK_HOME` that is not there rather than refusing to
+    /// start, verified against 1.0.5. riabuild creates all nine anyway, so that
+    /// "nine accounts" is a state of the machine `check()` can assert rather
+    /// than a promise that comes true the first time each launcher is run.
+    fn grok_profile_dir(&self, profile: usize) -> PathBuf {
+        self.grok_dir().join(profile.to_string())
+    }
     fn shell_dir(&self, shell: &str) -> PathBuf {
         self.root().join("shell").join(shell)
     }

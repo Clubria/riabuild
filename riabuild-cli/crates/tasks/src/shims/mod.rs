@@ -92,6 +92,7 @@
 pub mod browser;
 pub mod clipboard;
 pub mod codex;
+pub mod grok;
 
 use crate::Ctx;
 use anyhow::{Context, Result};
