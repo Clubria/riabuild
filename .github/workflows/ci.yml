@@ -519,24 +519,57 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
 
+      # Three packages, and each earns its place. `xvfb` and `xclip` give
+      # `channel.sh`'s laptop side a real clipboard to serve rather than a
+      # scripted stand-in (that script's header explains the trade);
+      # `musl-tools` is for the *server* binary both scripts now copy into
+      # their container, because the container's glibc is older than this
+      # runner's and musl is what release.yml ships for Linux anyway.
+      - name: Install what the container tests drive
+        run: sudo apt-get update && sudo apt-get install -y xvfb xclip musl-tools
+
       - run: cargo build --release --locked
         working-directory: riabuild-cli
 
-      # `run.sh` distinguishes a real regression (SSH, identity, host-key
-      # trust, authorising the key, riabuild-web) from the one known, tracked
-      # gap: the stand-in riabuild-web does not implement every route a full
-      # server-side provisioning run needs. That gap exits 0 with a banner
-      # naming the routes the run actually asked for and did not get — but
-      # only after asserting, against the container, that the earlier stages
-      # really ran. Anything else, including a hang, fails this step for real.
+      # Built BEFORE `run.sh` rather than after it, which is the change that
+      # gave this job something to gate.
       #
-      # The musl checksum this comment used to name has been published since
-      # v2026.08.10; `release.yml` assembles checksums for all four targets.
+      # `run.sh`'s act one installs a real published release on the container —
+      # that is the only thing `install::ensure_riabuild` can do, and it is
+      # real coverage of the download-and-verify path. But it also means the
+      # binary that runs the task DAG is the *last release*, so a server-side
+      # regression this pull request introduces could not turn this job red and
+      # a server-side bug it fixes could not turn it green. Act two copies this
+      # musl build onto the same container and drives the server side with it,
+      # and that is the half that gates the change. `channel.sh` takes the same
+      # binary afterwards, so nothing is built twice.
+      #
+      # `ring` builds C, and cc-rs looks for a compiler named after the target;
+      # Ubuntu's musl-tools ships `musl-gcc` under that one name. release.yml
+      # sets the same two variables for the same reason.
+      - name: Build the server's riabuild
+        working-directory: riabuild-cli
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc \
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      # `run.sh` distinguishes a real regression (SSH, identity, host-key
+      # trust, authorising the key, installing and verifying the release,
+      # riabuild-web) from the one known, tracked gap: the stand-in
+      # riabuild-web does not implement every route a full server-side
+      # provisioning run needs. That gap exits 0 with a banner naming the
+      # routes the run actually asked for and did not get — but only after
+      # asserting, against the container, that the earlier stages really ran.
+      # Anything else, including a hang, fails this step for real, and so does
+      # act two: that half runs the binary built above and is judged outright.
       - run: bash e2e/remote/run.sh
         if: env.RIABUILD_E2E_GH_TOKEN != ''
-        timeout-minutes: 20
+        timeout-minutes: 25
         env:
           RIABUILD_BIN: ${{ github.workspace }}/riabuild-cli/target/release/riabuild
+          RIABUILD_SERVER_BIN: ${{ github.workspace }}/riabuild-cli/target/x86_64-unknown-linux-musl/release/riabuild
 
       - name: Report that the container test was skipped
         if: env.RIABUILD_E2E_GH_TOKEN == ''
@@ -549,26 +582,6 @@ jobs:
       # `channel.sh` needs no GitHub token: it never runs `riabuild remote`, so
       # nothing re-verifies org membership. It is therefore ungated — this job
       # does real work on a fork's pull request instead of only warning.
-      #
-      # Three packages, and each earns its place. `xvfb` and `xclip` give the
-      # laptop side a real clipboard to serve rather than a scripted stand-in
-      # (the header explains that trade); `musl-tools` is for the *server*
-      # binary, because the container's glibc is older than this runner's and
-      # musl is what release.yml ships for Linux anyway.
-      - name: Install what the clipboard channel test drives
-        run: sudo apt-get update && sudo apt-get install -y xvfb xclip musl-tools
-
-      # `ring` builds C, and cc-rs looks for a compiler named after the target;
-      # Ubuntu's musl-tools ships `musl-gcc` under that one name. release.yml
-      # sets the same two variables for the same reason.
-      - name: Build the server's riabuild
-        working-directory: riabuild-cli
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          CC_x86_64_unknown_linux_musl=musl-gcc \
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-            cargo build --release --locked --target x86_64-unknown-linux-musl
-
       - run: bash e2e/remote/channel.sh
         timeout-minutes: 20
         env:

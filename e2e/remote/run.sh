@@ -10,8 +10,67 @@
 # reads — `/api/v1/me`, `/api/v1/org/config` and `/api/v1/org/claude-settings`
 # (through a small stand-in — see `stub_web.py`).
 #
-# TWO PREREQUISITES, both outside this script's control. Neither is hidden,
-# and neither is allowed to look like a pass.
+# TWO ACTS, AND THE THING THAT MAKES THEM TWO. `riabuild remote` puts riabuild
+# on a server by downloading a *published release* and verifying its digest.
+# There is no flag, no environment variable and no seam that points that at a
+# local build, and there must not be one: a server binary chosen by anything
+# other than a signed release is the server-supplied task manifest the root
+# `CLAUDE.md` forbids, wearing a different hat. So in a run of this script the
+# laptop half is the code under review and the server half is whatever shipped
+# last.
+#
+# That is only a curiosity until the job is asked to *gate a pull request*, at
+# which point it is the same defect as a test that cannot fail: a server-side
+# regression this branch introduces cannot turn the job red, and a server-side
+# bug this branch fixes cannot turn it green. It was found the second way
+# round. v2026.08.21.1's pnpm is linked against `libatomic.so.1`, which no
+# stock Linux ships, so the released server stopped on `Node and pnpm (it did
+# not take effect)` for three rounds running — while the fix for exactly that
+# sat in the branch the job was supposedly gating.
+#
+# So this script runs twice against the one container, and says which half
+# proves what.
+#
+#   ACT ONE — THE LAPTOP, AND THE INSTALL. `riabuild remote` end to end: SSH,
+#     host-key trust held to a named fingerprint, authorising a fresh key,
+#     asking the server its home directory, `install::ensure_riabuild` fetching
+#     `riabuild-<version>-checksums.txt` and then the tarball from real GitHub
+#     and refusing without a digest, signing the server in, and lending it this
+#     laptop's GitHub sign-in. All of that is this branch's code and act one
+#     judges it.
+#
+#     What act one cannot judge is what the released binary then does with the
+#     task DAG. That is last month's code; nothing in this checkout can move it,
+#     and a red tick for it teaches a reader the wrong thing. The boundary is
+#     not a paragraph — it is `assert_installed_the_published_release` below,
+#     which proves the download-and-verify path ran and put the published bytes
+#     on the server. A run that fell over anywhere before that is still fatal,
+#     and a run that stopped *after* it is handed to act two rather than
+#     forgiven: `known_gap` is untouched and no branch was added to it.
+#
+#   ACT TWO — THE SERVER, RUNNING THIS BRANCH. The musl build named by
+#     `RIABUILD_SERVER_BIN` is copied in — `channel.sh` has done exactly this
+#     since it was written, for exactly this reason, and says so as plainly —
+#     and the three invocations `flow::connect` composes are then made against
+#     it over the same SSH, in the same order: `internal gh-sweep`, `internal
+#     seed-github` with the token on stdin, and the `env 'K=V' …
+#     '/abs/riabuild' --no-shell` setup run. Each of those is riabuild's own
+#     subcommand, not a re-implementation of one.
+#
+#     Its assertions are the ones a released server cannot satisfy: the log
+#     line the run wrote has to name *this* build, pnpm has to answer `-v`
+#     through the shim on a container that has no `libatomic.so.1`, and
+#     `toolchain` must not appear among the tasks riabuild recorded as failed.
+#     Those three fail against v2026.08.21.1 and pass with the change, which is
+#     what makes this job a gate rather than a report.
+#
+#     What act two does not prove is the laptop-to-server handoff — it composes
+#     the prefix itself rather than watching remote mode compose it. Act one is
+#     what proves that, which is why neither act is a substitute for the other
+#     and why both run on every invocation.
+#
+# THREE PREREQUISITES, all outside this script's control. None is hidden,
+# and none is allowed to look like a pass.
 #
 # 1. A GitHub token belonging to an *active Clubria org member*. Before it
 #    touches a server, `riabuild remote` runs `GithubCli` on the laptop
@@ -54,6 +113,18 @@
 #         unit tests scripted the server's `sha256sum` to answer with the value
 #         the assertion was about to compare against, so they agreed with
 #         themselves.
+#
+# 3. A musl build of *this* checkout, for act two — `RIABUILD_SERVER_BIN`,
+#    the same variable and the same target `channel.sh` takes. Checked up
+#    front and named with the `cargo` line that produces it, because the
+#    alternative is discovering it after act one has already spent a minute
+#    building a container and downloading a release.
+#
+#    x86_64-unknown-linux-musl and not the host build: the container's glibc
+#    is older than a GitHub runner's, so the ordinary `target/release/riabuild`
+#    starts and dies. musl is also what `release.yml` ships for Linux, so the
+#    binary act two runs is the same *kind* of artifact act one installs, built
+#    from the branch instead of from the tag.
 #
 # This script does not paper over a run that stopped early. It asserts
 # positively, against the container and this laptop's own filesystem, that the
@@ -118,6 +189,11 @@
 #      the missing piece is *named* in the banner instead of guessed at.
 #      Adding those routes, and an Infisical stand-in the container can reach,
 #      is the work that finally makes the block at the bottom run.
+#
+#      Act two runs into the same wall and is bounded accordingly: it asserts
+#      the toolchain, which is upstream of the secrets pull, and prints what
+#      the run failed on and never reached rather than pretending to a verdict
+#      on either. What act two changes is *whose* code is behind that wall.
 #   f. CLOSED, and it is the one that was hiding directly behind (b). The
 #      first run to get past the sign-in stopped three tasks in, on
 #      `git_credentials`: `gh auth setup-git` reported "unable to find git
@@ -144,7 +220,10 @@
 #
 # THE CLIPBOARD CHANNEL IS NOT TESTED HERE. `channel.sh`, beside this file,
 # covers it — and runs to the end, because it copies a musl binary onto the
-# container instead of installing one and so begins where this script stops.
+# container instead of installing one. Act two now borrows that trick, so the
+# two scripts differ in what they point it at rather than in whether they use
+# it: `channel.sh` drives the clipboard transport with it, act two drives the
+# provisioning DAG.
 # What neither script *observes* is remote mode's own channel wiring
 # (`src/remote/channel.rs`): the supervisor holding the tunnel up,
 # `RIABUILD_CHANNEL_SOCKET` in the `env 'K=V' … '/abs/riabuild'` prefix, and
@@ -157,6 +236,11 @@ repo_root="$(cd "$here/../.." && pwd)"
 work="$(mktemp -d)"
 
 RIABUILD_BIN="${RIABUILD_BIN:-$repo_root/riabuild-cli/target/release/riabuild}"
+# Act two's binary. The laptop's build runs here, on the runner; the server's
+# runs inside a Debian container whose glibc is older, so it cannot be the same
+# file. Same variable, same default and same target as `channel.sh`, so a
+# developer who has built one script's server binary has built the other's.
+SERVER_BIN="${RIABUILD_SERVER_BIN:-$repo_root/riabuild-cli/target/x86_64-unknown-linux-musl/release/riabuild}"
 MEMBER_A="11111111-1111-4111-8111-111111111111"
 MEMBER_B="22222222-2222-4222-8222-222222222222"
 
@@ -218,6 +302,20 @@ echo "== riabuild remote e2e =="
 if [ ! -x "$RIABUILD_BIN" ]; then
   echo "RIABUILD_BIN ($RIABUILD_BIN) is not an executable. Build it first:" >&2
   echo "  cd riabuild-cli && cargo build --release --locked" >&2
+  exit 1
+fi
+
+# Checked here, beside the laptop's binary and before a container is built, for
+# the reason prerequisite 3 gives: act two is four minutes into the run, and a
+# missing file discovered there costs the whole of act one to find out.
+if [ ! -x "$SERVER_BIN" ]; then
+  echo "RIABUILD_SERVER_BIN ($SERVER_BIN) is not an executable." >&2
+  echo "Act two runs this branch's riabuild on the server, and the server is a" >&2
+  echo "Debian container — so it needs a static musl build:" >&2
+  echo "  rustup target add x86_64-unknown-linux-musl" >&2
+  echo "  cd riabuild-cli && CC_x86_64_unknown_linux_musl=musl-gcc \\" >&2
+  echo "    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \\" >&2
+  echo "    cargo build --release --locked --target x86_64-unknown-linux-musl" >&2
   exit 1
 fi
 
@@ -659,8 +757,340 @@ assert_reached_the_server() {
   fi
 }
 
-if [ "$ada_status" -ne 0 ] && known_gap; then
-  assert_reached_the_server
+# Where `install::ensure_riabuild` puts a server's riabuild:
+# `RealPaths::with_root(home, home).riabuild_dir(version)` is
+# `tools_root()/riabuild/<version>`, and `tools_root()` is `$HOME/.riabuild`
+# whatever `RIABUILD_ROOT` says — toolchains are shared, state is per-developer.
+# Spelled out rather than globbed: the version is the one this script resolved
+# and handed the stand-in, so a binary appearing under some *other* version is a
+# disagreement worth failing on rather than one to glob past.
+published_binary="/home/shared/.riabuild/riabuild/$version/riabuild"
+
+# The boundary act one stops judging at, and the whole reason it can stop there
+# honestly.
+#
+# `ensure_riabuild` fetches the checksums file, refuses a platform with no
+# digest in it, downloads the tarball, refuses bytes that do not hash to that
+# digest, extracts, streams the binary over SSH and re-reads its digest on the
+# far side. None of that is faked here and none of it is skipped: this asserts
+# the *outcome* of all of it, against the container, in the two ways a black box
+# has — the file is at the path riabuild computes, and the thing at that path is
+# the release, which it proves by running it and reading back the version this
+# script asked for.
+#
+# `--version` and not `test -x`: an executable bit says a file was chmod'd, and
+# what this is here to catch is a binary that landed truncated, or built for the
+# wrong platform, or is a *previous* version left over from an install that
+# silently did nothing.
+assert_installed_the_published_release() {
+  local reported
+  reported="$(in_container "'$published_binary' --version 2>/dev/null" || true)"
+  case "$reported" in
+    *"$version"*)
+      echo "-- the published riabuild v$version installed, and runs on the server"
+      ;;
+    *)
+      echo "riabuild remote did not install the published release." >&2
+      echo "  expected $published_binary to report $version" >&2
+      echo "  it said: '$reported'" >&2
+      echo >&2
+      echo "That is the download-and-verify path failing, which is this" >&2
+      echo "branch's code and is act one's to judge. Nothing below runs." >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The server's own riabuild writes one line per run to
+# `<namespace>/logs/riabuild.log` — `provision::report::log_run`, after the
+# tasks, whatever the tasks did. Its presence is the fact that separates "the
+# laptop handed off and the DAG ran" from "the run died before the server ever
+# got going", and both acts read it: act one to decide whether a failure is
+# still its own, act two to assert on what its own run recorded.
+namespace="/home/shared/.riabuild-remote/$MEMBER_A"
+server_run_log() {                # server_run_log — the last line, or nothing
+  in_container "tail -n 1 '$namespace/logs/riabuild.log' 2>/dev/null" || true
+}
+
+# One field out of that line, by name. The fields are printed in a fixed order,
+# but reading them positionally is how a field added in front of them turns
+# every assertion here into a silent pass.
+log_field() {                     # log_field <line> <field-name>
+  local rest="$1"
+  case "$rest" in
+    *"$2=["*) ;;
+    *) return 1 ;;
+  esac
+  rest="${rest#*"$2"=[}"
+  printf '%s' "${rest%%]*}"
+}
+
+# Act one's assertions, run on every path rather than only on the forgiving
+# one. They used to sit inside the `known_gap` branch, which meant a run that
+# ended some *other* way was never asked whether it had reached the server at
+# all — and act two below is about to spend real time on this container, so
+# "did act one actually happen" has to be answered before it does.
+assert_reached_the_server
+assert_installed_the_published_release
+
+# How act one ended, decided once and acted on after act two. Three outcomes,
+# and none of them is "carry on regardless":
+#
+#   gap      — a route `stub_web.py` does not implement, on the evidence of the
+#              stand-in's own log plus riabuild relaying its sentence. Exactly
+#              as before; `known_gap` is unchanged.
+#   deferred — the laptop handed off and the *server's* riabuild ran the DAG
+#              and recorded it. That server is the published release, so the
+#              outcome is last month's code and act one is not the thing that
+#              can judge it. Handed to act two, which runs the same DAG with
+#              this branch's binary and does judge it. A deferral to a named,
+#              executing assertion, not an exemption: act two failing fails
+#              the job.
+#   neither  — fatal, exactly as before. A failure with no server-side run log
+#              behind it is one the laptop owns, and the laptop is this branch.
+act_one_gap=""
+act_one_deferred=""
+act_one_line=""
+if [ "$ada_status" -ne 0 ]; then
+  if known_gap; then
+    act_one_gap=1
+  else
+    act_one_line="$(server_run_log)"
+    if log_field "$act_one_line" failed >/dev/null 2>&1; then
+      act_one_deferred=1
+      echo
+      echo "-- act one stopped past the install, inside the released server's"
+      echo "   task DAG. Its run log: $act_one_line"
+      echo "   That is v$version's code, not this checkout's. Act two runs the"
+      echo "   same DAG with this branch's binary and asserts the outcome."
+    else
+      echo "riabuild remote failed for a reason that is not the known gap," >&2
+      echo "and the server's own riabuild recorded no run — so this is not" >&2
+      echo "something act two can be asked about:" >&2
+      # The stub's own log, which is no longer on stdout. Without it an HTTP
+      # failure here shows riabuild's side of the exchange and not what the
+      # stub was asked for, and those two together are what say whether this
+      # is a harness limitation or a real regression.
+      echo "--- stub_web ---" >&2
+      tail -20 "$work/stub_web.log" >&2 2>/dev/null || true
+      exit 1
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# ACT TWO — this branch's riabuild, on the server
+# ---------------------------------------------------------------------------
+#
+# See the header. Everything above ran the released binary on the far side and
+# could not have done otherwise; everything below runs the binary built from
+# this checkout, and is therefore the half of this job that gates the change.
+
+echo
+echo "== act two: this branch's riabuild, running the server side =="
+
+# The same option list `remote::identity::ssh_options` stands for, and the same
+# one the API tunnel above was opened with. Deliberately the seed key rather
+# than riabuild's own: act one has already proven riabuild authorised its key,
+# and reusing it here would make act two's first failure a second reading of
+# act one's last assertion.
+server_ssh=(
+  -F /dev/null
+  -p "$CONTAINER_PORT"
+  -i "$work/seed"
+  -o UserKnownHostsFile="$work/known_hosts"
+  -o StrictHostKeyChecking=yes
+  -o IdentitiesOnly=yes
+  -o BatchMode=yes
+)
+
+# Over SSH rather than `docker exec`, which is not fussiness: `~/.ssh/environment`
+# — the file that tells the server's riabuild where riabuild-web is — is applied
+# by *sshd*, to sshd's own sessions. A `docker exec` inherits none of it and
+# would talk to the real deployment holding a token this stand-in minted.
+# `timeout` for the reason `run_as` has one: a silent wait is the single failure
+# a CI log cannot diagnose.
+on_server() {                     # on_server <shell command>
+  timeout 600 ssh "${server_ssh[@]}" shared@localhost "$1"
+}
+
+# Act two runs under the session act one minted, not under a `RIABUILD_TOKEN`
+# of its own. `session::ensure` wrote it to `<namespace>/session.token` — a
+# server keeps its session in a file, never in the keychain — and reusing it is
+# what makes act two's requests authenticate the way a real server's do:
+# delegated, one hop, checked for expiry and revocation on every call.
+#
+# Checked, not assumed, and fatal when it is missing. `RIABUILD_TOKEN` would
+# win over the file if it were set (`keychain::selection::select` puts it
+# first), and setting it here would quietly paper over exactly the case this
+# guard is for: act one not reaching the sign-in at all. Act two is the half of
+# this job that gates the change, so a run where it *cannot* execute has to be
+# red — a gate that skips itself is the pathology this whole file is about.
+# Today it cannot happen: item (b) is closed and act one signs the server in.
+if ! in_container "test -s '$namespace/session.token'" >/dev/null 2>&1; then
+  echo "Act one minted no server session — there is no $namespace/session.token." >&2
+  echo "Act two has nothing to authenticate as, so the half of this job that" >&2
+  echo "tests this branch's server code cannot run. That is a regression in" >&2
+  echo "the sign-in path (header item (b), closed), not a harness gap." >&2
+  exit 1
+fi
+
+# `/home/shared/riabuild`, never over the versioned path act one installed to.
+# `published_binary` is the evidence for act one's assertion, and overwriting it
+# would erase what this script has just proved — and a later `riabuild remote`
+# against this container would find a digest that is not the release's and
+# reinstall, which reads as flakiness rather than as this script having moved
+# the file.
+branch_binary="/home/shared/riabuild"
+echo "-- copying this branch's musl build onto the container"
+docker cp "$SERVER_BIN" "$CONTAINER:$branch_binary" >/dev/null
+docker exec "$CONTAINER" chown shared:shared "$branch_binary"
+docker exec "$CONTAINER" chmod 755 "$branch_binary"
+
+# The prefix `remote::env_prefix` builds, composed here because act two has no
+# `riabuild remote` to build it. Three of its four variables: `RIABUILD_ROOT`
+# and `RIABUILD_REMOTE` are set *together* or `scope::detect` refuses the run
+# outright — deliberately, because one without the other is how a bearer token
+# once reached a laptop's shared path — and `CLOUDCLI_NO_TMUX` rides along
+# exactly as it does on the wire.
+#
+# `RIABUILD_CHANNEL_SOCKET` is the one left out, and left out rather than
+# forgotten: nothing here serves a pump, `--no-shell` starts none, and naming a
+# socket nobody is listening on would have the shims fail for a reason act two
+# has nothing to say about. `channel.sh` is where that variable is under test.
+#
+# The name is `localhost`, which is what act one's run allocated: `ask_name`
+# defaults to the first label of the hostname and an unattended run takes the
+# default. Only its non-emptiness is load-bearing for `scope::detect`, but using
+# the same one keeps act two inside act one's namespace rather than beside it.
+branch_prefix="env 'RIABUILD_ROOT=$namespace' 'RIABUILD_REMOTE=localhost' 'CLOUDCLI_NO_TMUX=1' '$branch_binary'"
+
+# The two hops `flow::connect` makes before the setup run, in its order and for
+# its reasons. Sweeping first can only ever clear a session that already ended;
+# sweeping after seeding would let this run's own exit wipe the credential it
+# had just written. Both are riabuild's own `internal` subcommands — act two
+# composes the call, never the behaviour.
+#
+# Non-fatal, both, because `seed_github` itself is: a laptop with no sign-in to
+# lend prints a note and carries on. What a failed seed costs shows up in the
+# run log's `failed=` field, which is printed either way.
+echo "-- sweeping, and lending this laptop's GitHub sign-in"
+on_server "$branch_prefix internal gh-sweep" >"$work/act2-sweep.log" 2>&1 || true
+# On stdin, never in argv, for the reason `seed.rs` gives: `ps` is readable by
+# every other developer sharing this account.
+printf '%s' "$token" \
+  | on_server "$branch_prefix internal seed-github" >"$work/act2-seed.log" 2>&1 || true
+
+echo "-- running the setup flow on the server"
+set +e
+on_server "$branch_prefix --no-shell --quiet" >"$work/act2.log" 2>&1
+act2_status=$?
+set -e
+cat "$work/act2.log"
+
+if [ "$act2_status" -eq 124 ]; then
+  echo "the server-side setup run hung and was killed at 600s. A hang is a" >&2
+  echo "failure: something is waiting on input that cannot arrive." >&2
+  exit 1
+fi
+
+# What act two asserts, and why it is these three.
+#
+# The exit status is NOT one of them, and that is act one's boundary drawn
+# again rather than a second helping of forgiveness. Past the toolchain the DAG
+# wants an Infisical the container cannot reach — item (e) in the header, still
+# open, and a piece of work rather than a fix. So act two asserts what it can
+# observe, names what it could not reach, and claims nothing about it.
+act2_failures=""
+note_failure() { act2_failures="$act2_failures\n  - $1"; }
+
+act2_line="$(server_run_log)"
+act2_failed=""
+act2_skipped=""
+if ! log_field "$act2_line" failed >/dev/null 2>&1; then
+  note_failure "the server wrote no usable run log (last line: '$act2_line')"
+else
+  # (1) The run log has to have been written by *this* build. A local `cargo
+  # build` gets `9999.0.0-dev` from `version::VERSION` — the sentinel for "no
+  # release tag injected one" — and the release act one installed reports a
+  # date. Without this, everything below could be satisfied by act one's
+  # leftovers on a server act two never actually ran on.
+  case "$act2_line" in
+    *"riabuild 9999.0.0-dev "*) ;;
+    *) note_failure "the last run log line is not from a local build: '$act2_line'" ;;
+  esac
+
+  act2_failed="$(log_field "$act2_line" failed)"
+  act2_skipped="$(log_field "$act2_line" skipped)"
+
+  # Failed and skipped are told apart rather than lumped together, because they
+  # say opposite things about this branch. `toolchain` in `failed` is the bug
+  # this act exists for; `toolchain` in `skipped` means something upstream of it
+  # went down and act two never reached the assertion at all.
+  toolchain_state=ran
+  case ",$act2_failed," in
+    *,toolchain,*) toolchain_state=failed ;;
+    *)
+      case ",$act2_skipped," in
+        *,toolchain,*) toolchain_state=skipped ;;
+      esac
+      ;;
+  esac
+
+  case "$toolchain_state" in
+    failed)
+      # (2) riabuild's own verdict on the task this branch changed. This is the
+      # "it did not take effect" hard error — apply ran and the re-check
+      # disagreed — which is exactly what v2026.08.21.1 does on this container
+      # and exactly what the change is for.
+      note_failure "riabuild recorded the toolchain task as failed"
+      ;;
+    skipped)
+      # Still red, because a gate that could not execute is not a pass — but
+      # named for what it is, so nobody reads it as a pnpm bug.
+      note_failure "the toolchain task was skipped behind failed=[$act2_failed]"
+      ;;
+    *)
+      # (3) The property behind (2), asserted from outside riabuild so that a
+      # task reporting satisfied on a broken machine cannot pass it. pnpm's own
+      # `-v`, through the shim `toolchain::ensure_pnpm` writes, on a container
+      # that has no `libatomic.so.1` and never will: the released build puts
+      # pnpm's platform executable at this path, and it exits 127.
+      pnpm_reported="$(in_container "'$namespace/bin/pnpm' -v 2>/dev/null" || true)"
+      case "$pnpm_reported" in
+        [0-9]*) echo "-- pnpm answers $pnpm_reported on the server" ;;
+        *)
+          note_failure \
+            "pnpm does not run on the server ($namespace/bin/pnpm -v said '$pnpm_reported')"
+          ;;
+      esac
+      ;;
+  esac
+fi
+
+if [ -n "$act2_failures" ]; then
+  echo >&2
+  echo "Act two failed. This is the half of the job that runs THIS branch on" >&2
+  echo "the server, so these are regressions rather than harness gaps:" >&2
+  printf "%b\n" "$act2_failures" >&2
+  echo >&2
+  echo "--- the server's run log ---" >&2
+  echo "$act2_line" >&2
+  exit 1
+fi
+
+echo
+echo "-- act two passed: $act2_line"
+# Named rather than implied. `failed` and `skipped` here are the part of the DAG
+# this container cannot finish, and printing them is the bargain
+# `unimplemented_routes` makes — a gap that is named is a gap somebody can
+# close, and one that is merely tolerated is one nobody will.
+echo "   still out of this container's reach —"
+echo "     failed:  $(log_field "$act2_line" failed)"
+echo "     skipped: $(log_field "$act2_line" skipped)"
+echo "   see item (e) in this file's header."
+
+if [ -n "$act_one_gap" ]; then
   echo
   # Which gap, in the run's own words rather than a fixed paragraph. Two
   # earlier versions of this banner named a cause from a constant here: one
@@ -682,12 +1112,19 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   echo "# when none are left."
   echo "#"
   echo "# Asserted just now, not assumed: a key pair was generated,"
-  echo "# the container's host key was pinned, and riabuild's key was"
-  echo "# authorised on the container. Those stages ran for real."
+  echo "# the container's host key was pinned, riabuild's key was"
+  echo "# authorised on the container, and the published v$version was"
+  echo "# downloaded, verified, installed and run there. Those stages"
+  echo "# ran for real."
   echo "#"
-  echo "# The assertions this test names were NOT run."
-  echo "# They need a fully provisioned server. Nothing in CI has yet"
-  echo "# proved the namespace isolation remote mode rests on."
+  echo "# The two-developer assertions this test names were NOT run."
+  echo "# They need a fully provisioned server, and act one is what"
+  echo "# would have to reach one. Nothing here has yet proved the"
+  echo "# namespace isolation remote mode rests on."
+  echo "#"
+  echo "# Act two DID run, and passed: this branch's riabuild drove"
+  echo "# the server's own task DAG. What act one lost above is the"
+  echo "# laptop half of the handoff, not the server half."
   echo "#"
   echo "# The clipboard channel is NOT among what went untested here:"
   echo "# channel.sh covers it against this same container and runs to"
@@ -696,31 +1133,55 @@ if [ "$ada_status" -ne 0 ] && known_gap; then
   exit 0
 fi
 
-if [ "$ada_status" -ne 0 ]; then
-  echo "riabuild remote failed for a reason that is not the known gap:" >&2
-  # The stub's own log, which is no longer on stdout. Without it an HTTP
-  # failure here shows riabuild's side of the exchange and not what the stub
-  # was asked for, and those two together are what say whether this is a
-  # harness limitation or a real regression.
-  echo "--- stub_web ---" >&2
-  tail -20 "$work/stub_web.log" >&2 2>/dev/null || true
-  exit 1
+if [ -n "$act_one_deferred" ]; then
+  echo
+  echo "############################################################"
+  echo "# Act one stopped inside the RELEASED server's task DAG, and"
+  echo "# act two passed."
+  echo "#"
+  echo "# What act one proved, asserted just now and not assumed: a"
+  echo "# key pair was generated, the container's host key was pinned,"
+  echo "# riabuild's key was authorised, and riabuild downloaded,"
+  echo "# verified and installed the published v$version — which runs"
+  echo "# on the server."
+  echo "#"
+  echo "# What it then stopped on belongs to v$version and cannot be"
+  echo "# changed from this checkout:"
+  echo "#   $act_one_line"
+  echo "#"
+  echo "# That same DAG, driven by THIS branch's binary, is what act"
+  echo "# two just asserted. A server-side regression this branch"
+  echo "# introduces makes act two red; it does not reach this banner."
+  echo "#"
+  echo "# The two-developer assertions still did NOT run: they need a"
+  echo "# riabuild remote that reaches the end, which needs the routes"
+  echo "# and the Infisical stand-in item (e) names."
+  echo "############################################################"
+  exit 0
 fi
 
 # EVERYTHING BELOW THIS LINE IS GATED, AND HAS NEVER RUN.
 #
-# Not gated by a flag and not skipped: the `exit 0` above is reached first,
-# every time, because the run stops short of a provisioned server. What stops
-# it is `stub_web.py` — three GET routes and one POST against a server that
-# runs riabuild's whole task DAG — and the banner above names the exact routes
-# the last run wanted. Item (e) in this file's header is the same fact stated
-# once, up there, for a reader who starts at the top.
+# Not gated by a flag and not skipped: one of the two `exit 0`s above is
+# reached first, every time, because act one stops short of a provisioned
+# server. What stops it is `stub_web.py` — three GET routes and one POST
+# against a server that runs riabuild's whole task DAG — plus the Infisical
+# stand-in the container cannot reach, and the banner above names whichever of
+# those the last run actually wanted. Item (e) in this file's header is the
+# same fact stated once, up there, for a reader who starts at the top.
+#
+# ACT TWO IS NOT A SUBSTITUTE FOR THIS BLOCK, and reading it as one is the
+# mistake this paragraph exists to prevent. Act two drives the server's own
+# riabuild for a single developer, with the prefix composed by hand; what is
+# written below is *two* developers, each arriving through a whole
+# `riabuild remote`, and the isolation between them. The half act two cannot
+# reach is exactly the half these lines are about.
 #
 # It is written down here rather than in the header alone because this is
 # where somebody stands when they wonder why an assertion they can read is not
-# protecting them. Until `known_gap` stops matching, none of these lines has
-# ever executed — including the two below that were added specifically to
-# catch a bug that had already shipped.
+# protecting them. Until act one reaches the end, none of these lines has ever
+# executed — including the two below that were added specifically to catch a
+# bug that had already shipped.
 echo "-- ada's run reached the end. Running the real assertions."
 
 echo "-- running as bob (member $MEMBER_B)"
