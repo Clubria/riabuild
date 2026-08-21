@@ -407,21 +407,32 @@ one *moves* the untested branch into the wrapper rather than removing it, and a 
 hardcoding `false` would send every Mac to `secret-tool` while the suite stayed green on
 both hosts.
 
-**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, the Codex CLI, `gh`,
-`infisical` and `ngrok` are downloaded, verified against a digest, and kept under
+**riabuild owns every tool it depends on.** Node, pnpm, Claude Code, the Codex CLI, Grok
+Build, `gh`, `infisical` and `ngrok` are downloaded, verified against a digest, and kept
+under
 `~/.riabuild/`. Nothing on the developer's `PATH` is trusted, and no task shells out to a
-package manager to install a dependency. Run them through `ctx.gh()`, `ctx.infisical()`
-and `ctx.ngrok()` rather than by name: during provisioning `~/.riabuild/bin` is not on
+package manager to install a dependency. Run them through `ctx.gh()`, `ctx.infisical()`,
+`ctx.ngrok()` and `ctx.grok()` rather than by name: during provisioning `~/.riabuild/bin`
+is not on
 `PATH`, so the bare name finds a binary no `check()` verified, or nothing at all.
 
-ngrok is the one whose digest is **not** published by its own project, and
-`tools::Checksum` is where that shows up. `Published(urls)` is the normal case — gh and
-infisical fetch the checksum files their releases carry. `Pinned(digest)` is ngrok alone:
-Equinox serves one floating build per platform with no checksum anywhere, so
-`packaging/ngrok/mirror.sh` republishes the bytes we verified as a `Clubria/riabuild`
-release and the digest is a constant in this repository. Reaching for `Pinned` for a tool
-that *does* publish digests would freeze a value that moves with every upstream release;
-reaching for a server-supplied digest would hand riabuild-web the choice of what executes.
+ngrok and Grok Build are the two whose digests are **not** published by their own
+projects, and `tools::Checksum` is where that shows up. `Published(urls)` is the normal
+case — gh and infisical fetch the checksum files their releases carry. `Pinned(digest)` is
+those two: Equinox serves one floating ngrok per platform with no checksum anywhere, and
+xAI serves an honestly-versioned Grok Build with no checksum anywhere, so
+`packaging/ngrok/mirror.sh` and `packaging/grok/mirror.sh` republish the bytes we verified
+as `Clubria/riabuild` releases and the digests are constants in this repository. Reaching
+for `Pinned` for a tool that *does* publish digests would freeze a value that moves with
+every upstream release; reaching for a server-supplied digest would hand riabuild-web the
+choice of what executes.
+
+Grok Build's asset is the one that is **not an archive** — xAI serves a bare executable —
+so `archive::Kind::Raw` reads it straight through and `mirror.sh` renames it to `.bin`
+rather than repacking it. Repacking would make the pinned digest describe our own output
+rather than upstream's. `Kind::Raw` is spelled as an explicit suffix and never inferred
+from "an extension I do not recognise", which would install a `.pkg` or a `.deb` as though
+it were a binary and fail when the developer ran it.
 
 Pinned versions live in `riabuild-fetch`'s `tools` as constants, never a `releases/latest` lookup —
 what riabuild puts on a laptop should be versioned, auditable, and shipped in a signed
@@ -499,7 +510,7 @@ crates form a straight line, each depending only on those above it:
 |---|---|---|
 | `theme` | the Clubria palette, by role, and the depth ladder under it | — |
 | `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
-| `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh and infisical releases riabuild owns) | — |
+| `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | — |
 | `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
 | `runner` | `CommandRunner` — all subprocesses. `subdue` is the line filter a subdued child's output goes through; `pty` is the terminal it gets instead of riabuild's own | theme |
 | `paths` | path resolution (trait), `config` (`~/.riabuild` and state), `filelock` (the lock both are read and written under) | ui |
@@ -927,6 +938,65 @@ The Claude launcher's `unset SSH_CONNECTION SSH_CLIENT SSH_TTY` and its `WAYLAND
 claim are deliberately **not** copied into it. Both are workarounds for behaviour read out
 of the Claude Code binary; neither is a fact about Codex, and asserting them here would be
 inventing an upstream behaviour rather than accommodating one.
+
+## Grok Build
+
+`grok_cli` downloads xAI's coding agent from riabuild's own mirror and writes ten
+launchers: `grok-1` … `grok-9`, each pinning `GROK_HOME` to its own `~/.riabuild/grok/<n>`,
+and `grok` for the first. Every one adds `--permission-mode bypassPermissions`. riabuild
+does **not** sign anyone in: a Grok sign-in is the developer's own xAI account.
+
+Read as a diff against the Codex section above — the shape is deliberately the same, and
+the four places it differs are the interesting ones.
+
+**It is a static binary, not a Node script.** The Linux build is a `static-pie` ELF, so
+neither the `--version` probe nor the generated launcher needs riabuild's Node on `PATH`,
+and `depends_on()` is empty rather than naming `toolchain`. Do not copy Codex's
+`PATH="$codex_node_bin:$PATH"` here on the grounds that it looks symmetrical: it would be
+carrying a Node for nobody. This is also why `Ctx::grok()` is an `owned_tool` like
+`ctx.gh()` — always an absolute versioned path — rather than the Node-relative path with a
+bare-name fallback that `Ctx::claude()` and `Ctx::codex()` return.
+
+**`GROK_HOME` does not have to exist first, and the nine are created anyway.** Codex
+hard-fails on a missing `CODEX_HOME` (`Error finding codex home`), so creating all nine
+repairs a machine that would otherwise be broken. Grok Build creates one that is not there.
+riabuild still creates the nine, so that "nine accounts" is a state `check()` can assert
+rather than a promise that comes true the first time each launcher happens to be run. The
+same upstream behaviour is why the version probe **names** a `GROK_HOME` rather than
+leaving it unset: an unset one does not merely read the developer's `~/.grok`, it brings
+that directory into existence.
+
+**The bypass is a flag, and it has to be.** Grok Build resolves the launch mode as *CLI
+beats `[ui] permission_mode` beats remote*, so the command line is the only spelling that
+cannot be silently overridden by a value already on disk — and `config.toml` is a file the
+developer owns and Grok Build's own `/settings` writes to, which riabuild would then be
+rewriting under them on every run. `bypassPermissions` and not `dontAsk`, which reads like
+the same thing and silently *denies* everything not pre-approved. Like Codex's `--yolo` it
+is a **default rather than an imposition**: Grok Build rejects `--permission-mode` twice
+in both the spaced and `=` spellings, so the launcher scans its own arguments and stands
+aside wherever the developer named a policy. It does *not* stand aside for
+`--always-approve`/`--yolo`, which Grok Build accepts happily alongside the flag and which
+means the same thing. And the flag goes **ahead of** `"$@"`, because it is a root option
+only — after a subcommand it is `unexpected argument`, so `grok mcp list` has to become
+`grok --permission-mode … mcp list`.
+
+A managed-policy pin (`~/.grok/managed_config.toml`, `/etc/grok/managed_config.toml`)
+force-disables the bypass regardless of the flag. riabuild does not fight that and should
+not — an enterprise deployment pinning approvals on is a decision made above riabuild's
+head. Note too that this is an approval policy and **not a sandbox**: `GROK_SANDBOX`
+defaults to `off` and riabuild sets neither it nor `GROK_SANDBOX_AUTO_ALLOW_BASH`.
+
+**Never run `x.ai/cli/install.sh`.** It is a competing provisioner — unverified floating
+download, `~/.grok/bin`, symlinks into `~/.local/bin` and `/usr/local/bin`, and a `PATH`
+block appended to the developer's rcfile, which is exactly what demotes `~/.riabuild/bin`
+and quietly breaks the `claude` launcher and the clipboard shims beside it.
+`nothing_runs_xais_install_script` is the gate.
+
+All of the above is undocumented, read out of Grok Build 1.0.5 — the shipped binary and the
+Apache-2.0 source at `xai-org/grok-build` — which is why the `#[ignore]`d smoke tests in
+`shims::grok` run the generated launcher itself rather than asserting on the text of a
+shell script. Run `cargo test -- --ignored` when the pin moves. Design:
+`../docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
 ## Colour
 

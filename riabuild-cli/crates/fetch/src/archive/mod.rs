@@ -11,6 +11,8 @@
 //! - **whole archive**, for Node and pnpm, which ship a tree riabuild keeps
 //! - **one member**, for `gh` and `infisical`, which ship a binary alongside
 //!   manpages, completions, and a licence riabuild has no use for
+//!
+//! And one project ships no container at all — see [`Kind::Raw`].
 
 use anyhow::{Context, Result, anyhow};
 use std::io::Read;
@@ -26,16 +28,43 @@ use std::path::{Component, Path, PathBuf};
 pub enum Kind {
     TarGz,
     Zip,
+    /// No container: the download *is* the binary.
+    ///
+    /// Grok Build is the one that forces this. xAI serves an uncompressed
+    /// executable straight from `https://x.ai/cli/grok-<version>-<platform>`,
+    /// with no tarball, no zip, and nothing beside it. The two ways to avoid a
+    /// third variant were both worse. Repacking it into a tarball in
+    /// `packaging/grok/mirror.sh` would mean the digest pinned in `tools.rs` is
+    /// the digest of *riabuild's repack* rather than of the bytes xAI served,
+    /// which puts an unverifiable transformation between what a maintainer
+    /// checked and what a laptop runs — the opposite of what pinning is for.
+    /// Downloading it outside `tools::install` would put a second, unverified
+    /// fetch path in the codebase.
+    ///
+    /// So the bytes are mirrored byte-for-byte and this reads them straight
+    /// through. `member` is not consulted for a `Raw` asset, because there is
+    /// no archive to look inside.
+    Raw,
 }
 
 impl Kind {
     /// Picked from the asset name, so it stays wrong-proof when a new asset is
     /// added: the name and the container cannot drift apart.
+    ///
+    /// `Raw` is spelled `.bin` rather than inferred from "no extension I
+    /// recognise". Inferring it would make every future typo and every asset in
+    /// a container riabuild has not learned yet — a `.pkg`, a `.deb`, an
+    /// `.xz` — install as though it were an executable, which fails at the
+    /// moment the developer runs it rather than here. Renaming a file does not
+    /// change its bytes, so the mirrored `.bin` still hashes to exactly what
+    /// upstream served.
     pub fn of(asset: &str) -> Result<Self> {
         if asset.ends_with(".tar.gz") || asset.ends_with(".tgz") {
             Ok(Kind::TarGz)
         } else if asset.ends_with(".zip") {
             Ok(Kind::Zip)
+        } else if asset.ends_with(".bin") {
+            Ok(Kind::Raw)
         } else {
             Err(anyhow!("riabuild does not know how to unpack {asset}"))
         }
@@ -68,6 +97,10 @@ pub fn extract_member(bytes: &[u8], kind: Kind, member: &str, destination: &Path
     let found = match kind {
         Kind::TarGz => tar_member(bytes, member)?,
         Kind::Zip => zip_member(bytes, member)?,
+        // Nothing to look inside, and nothing to look for: `member` names where
+        // the binary lands under `~/.riabuild/<tool>/<version>/`, which is the
+        // caller's business rather than this function's.
+        Kind::Raw => Some(bytes.to_vec()),
     };
     let found = found.ok_or_else(|| {
         anyhow!(
@@ -392,5 +425,51 @@ mod tests {
             .to_string();
         assert!(error.contains("bin/gh"), "{error}");
         assert!(error.contains("nothing was installed"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_binary_is_recognised_by_its_name_and_nothing_else() {
+        // The whole point of spelling `Raw` as `.bin`: a container riabuild has
+        // not learned yet must fail here, not install as an executable and fail
+        // when the developer runs it.
+        assert_eq!(Kind::of("grok-1.0.5-linux-x86_64.bin").unwrap(), Kind::Raw);
+        assert_eq!(
+            Kind::of("ngrok-3.39.11-linux-amd64.tgz").unwrap(),
+            Kind::TarGz
+        );
+        assert!(Kind::of("grok-1.0.5-linux-x86_64").is_err());
+        assert!(Kind::of("grok.pkg").is_err());
+        assert!(Kind::of("grok.deb").is_err());
+    }
+
+    #[test]
+    fn a_raw_download_is_written_through_byte_for_byte() {
+        // xAI serves an uncompressed executable, so what riabuild verified and
+        // what it writes have to be the same bytes — a repack in between would
+        // make the pinned digest describe riabuild's own output rather than
+        // upstream's.
+        let payload = b"\x7fELF not really a binary, but the bytes are the point";
+        let home = tempfile::TempDir::new().unwrap();
+        let destination = home.path().join("grok").join("1.0.5").join("grok");
+
+        extract_member(payload, Kind::Raw, "grok", &destination).expect("extract");
+
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode();
+            // A download that is not executable reads as "grok is not
+            // installed" on a laptop, not as a test failure here.
+            assert_eq!(mode & 0o111, 0o111, "mode was {mode:o}");
+        }
     }
 }

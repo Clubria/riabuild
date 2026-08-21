@@ -20,6 +20,7 @@ pub mod engine;
 pub mod env_local;
 pub mod git_credentials;
 pub mod github_cli;
+pub mod grok_cli;
 pub mod infisical_cli;
 pub mod login;
 pub mod ngrok;
@@ -416,6 +417,22 @@ impl Ctx {
         )
     }
 
+    /// The Grok Build riabuild owns. Same reasoning as `gh`.
+    ///
+    /// Note what this is *not*: `Ctx::claude()` and `Ctx::codex()` both build a
+    /// path under the pinned Node, because those two are npm packages, and both
+    /// fall back to a bare name before a Node is pinned. Grok Build is a static
+    /// binary riabuild downloads whole, so it is an owned tool like `gh` and
+    /// `ngrok` — always an absolute path, with no Node in the picture and no
+    /// bare-name fallback for a launcher to defend against.
+    pub fn grok(&self) -> String {
+        self.owned_tool(
+            "grok",
+            riabuild_fetch::tools::GROK_VERSION,
+            riabuild_fetch::tools::GROK_MEMBER,
+        )
+    }
+
     /// The Claude Code riabuild installed, by absolute path.
     ///
     /// Same reasoning as `gh()`, with one addition: `which("claude")` reads the
@@ -488,6 +505,10 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         // Nothing about Codex depends on that sign-in, so nothing about it
         // should wait behind it.
         Box::new(codex_cli::CodexCli),
+        // Beside Codex and ahead of `claude_accounts` for the same reason: it
+        // depends on nothing the Claude sign-in provides, so it has no business
+        // waiting behind a task that waits on a browser.
+        Box::new(grok_cli::GrokCli),
         Box::new(claude_accounts::ClaudeAccounts),
         Box::new(org_settings::OrgSettings),
         Box::new(claude_trust::ClaudeTrust),
