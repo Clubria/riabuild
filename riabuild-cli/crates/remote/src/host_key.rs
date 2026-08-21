@@ -146,13 +146,15 @@ fn mismatch(remote: &Remote, paths: &dyn Paths, detail: String) -> anyhow::Error
     .into()
 }
 
-/// Shows the server's host key and pins it once the developer agrees.
+/// Shows the server's host key and pins it.
 ///
 /// `accept` is the value of `--accept-host-key`, already checked at the CLI
 /// layer to start with `SHA256:` (a typo can never masquerade as a match).
-/// When `Some`, it answers the trust question non-interactively: it must
-/// match the scanned key exactly, or this fails rather than falling back to
-/// a prompt with no terminal to show on. When `None`, a developer is asked.
+/// When `Some`, the scanned key must match it exactly or this fails and pins
+/// nothing. When `None`, the key riabuild scanned is pinned on sight: the
+/// fingerprint is printed and the run carries on, rather than stopping on a
+/// `[y/N]` that an unattended run cannot answer and an attended one answers
+/// without checking.
 pub async fn trust_host(
     remote: &Remote,
     paths: &dyn Paths,
@@ -263,17 +265,17 @@ pub async fn trust_host(
         return Ok(());
     }
 
-    ui.note(&format!("fingerprint {fingerprint}"));
-    if !ui.confirm_required("is that the server you expected?")? {
-        // Declined, not mismatched: no expected value was ever supplied to
-        // compare against — worded as a next step, not an alarm.
-        return Err(Failure::new(
-            format!("trusting {}", remote.host),
-            "Check the fingerprint with whoever runs that server, then run `riabuild remote` again.",
-        )
-        .into());
-    }
-
+    // Trust on first sight, with no question asked — the shape of
+    // `StrictHostKeyChecking=accept-new`. The fingerprint is still printed, so
+    // it is in the transcript for a developer who has one to compare against,
+    // but riabuild does not stop the run to collect an answer nobody was going
+    // to check. What this gives up is only the *first* connection: the key is
+    // pinned here, `identity::ssh_options` passes `StrictHostKeyChecking=yes`
+    // against riabuild's own `known_hosts`, and every later run — including the
+    // one where a server is impersonated — still fails hard on a key that
+    // disagrees with the pin. `--accept-host-key` is unchanged above and is
+    // still compared exactly.
+    ui.note(&format!("fingerprint {fingerprint} — trusting it"));
     pin(paths, &known_hosts, &keys).await?;
     Ok(())
 }
@@ -747,11 +749,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_accepted_fingerprint_that_matches_pins_without_a_prompt() {
+    async fn an_accepted_fingerprint_that_matches_pins_the_key_it_names() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = RealPaths::rooted_at(home.path());
-        // A non-interactive Ui would refuse `confirm` outright — proving this
-        // path never reaches it.
         let ui = Ui::new(true);
         let remote = remote();
         let fake = Arc::new(scan_stub(&remote, GOOD_FINGERPRINT_LINE));
@@ -774,6 +774,30 @@ mod tests {
                 .mode()
         };
         assert_eq!(dir_mode & 0o777, 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_host_nobody_has_pinned_yet_is_trusted_without_being_asked_about() {
+        // The `[y/N]` is gone: a scanned key is pinned on sight. `Ui::new(true)`
+        // has no terminal under `cargo test`, so `confirm_required` would refuse
+        // outright — reaching one is what this test fails on, and `accept` is
+        // `None` so nothing else could be answering the question either.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let remote = remote();
+        let fake = Arc::new(scan_stub(&remote, GOOD_FINGERPRINT_LINE));
+
+        trust_host(&remote, &paths, fake, &Ui::new(true), None)
+            .await
+            .expect("a new host is trusted on sight, with no question to answer");
+
+        let contents = tokio::fs::read_to_string(paths.known_hosts_file())
+            .await
+            .expect("known_hosts written");
+        assert!(
+            contents.contains("ssh-ed25519 AAAAstubkeydata"),
+            "{contents}"
+        );
     }
 
     #[tokio::test]

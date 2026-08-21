@@ -82,7 +82,7 @@ Adding a server
 
 Connecting to ada@build-01.fly.dev
   ● SSH key — generated for this server
-    fingerprint SHA256:qKqvB…3s  ·  is that the server you expected? [y/N] y
+    fingerprint SHA256:qKqvB…3s — trusting it
   ● Authorised — ssh-copy-id installed the key
     ada@build-01.fly.dev's password:
   ● Reachable — key-only sign-in works
@@ -283,16 +283,24 @@ predictable, which beats being clever about it.
 ## Host keys
 
 Before anything is sent to the server, `ssh-keyscan -t ed25519,ecdsa,rsa` fetches its host
-keys, riabuild shows one fingerprint, and the developer confirms once. That one key is then
-pinned in riabuild's own `known_hosts`, and every later connection runs with
-`StrictHostKeyChecking=yes` against that file.
+keys and riabuild shows one fingerprint and pins it on sight — trust on first use, the shape
+of `StrictHostKeyChecking=accept-new`. That one key goes into riabuild's own `known_hosts`,
+and every later connection runs with `StrictHostKeyChecking=yes` against that file.
+
+**There is no `[y/N]`.** There was, and what it bought was not verification: a developer with
+no fingerprint to compare against can only answer yes, and an unattended run — CI, a
+container, anything with no TTY — could not answer at all. The fingerprint is still printed,
+so it is in the transcript for whoever does have one to check against, and
+`--accept-host-key` is still compared exactly and still fails the run on a mismatch. What is
+given up is the *first* connection to a server nobody named a fingerprint for; every
+connection after it is verified against the pin.
 
 **Every type is asked for, exactly one is pinned.** Displaying the first fingerprint and
 pinning them all would have the developer approve, typically, the RSA key while the ed25519
 and ecdsa keys they never saw were pinned alongside it — and the fingerprint a cloud console
 gives them to compare against is usually the ed25519 one. So riabuild picks one key from the
-answer, best type first (ed25519, then ecdsa, then RSA), and shows and pins that one. This
-prompt is the trust anchor for everything after it: the next thing that happens is a GitHub
+answer, best type first (ed25519, then ecdsa, then RSA), and shows and pins that one. That
+pin is the trust anchor for everything after it: the next thing that happens is a GitHub
 token and a riabuild session going to whatever answered.
 
 Asking for one type was the earlier design, and it was wrong in a way no test on a normal
@@ -1091,7 +1099,7 @@ Each one has its own remedy, so each one is detected separately.
 src/remote/
   mod.rs        the Remote type, the hash, the flow
   store.rs      remotes.json, name allocation
-  identity.rs   keypair, ssh-keyscan and the fingerprint prompt, ssh-copy-id
+  identity.rs   keypair, ssh-keyscan and the host-key pin, ssh-copy-id
   session.rs    minting the server's session and writing it down
   install.rs    uname, version comparison, streaming the binary
   shell.rs      mosh, with the ssh fallback

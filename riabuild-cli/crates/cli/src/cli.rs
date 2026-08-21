@@ -68,15 +68,14 @@ pub enum Command {
         #[arg(value_name = "SERVER")]
         target: Option<String>,
 
-        /// The SSH host key fingerprint to trust without prompting, e.g.
-        /// `SHA256:qKqv...`. Compared verbatim against what the server
-        /// offers, and fails on a mismatch rather than prompting — it does
-        /// not weaken the check, it just answers it non-interactively. This
-        /// is how an unattended run (CI, a container test) gets past a
-        /// prompt that has no terminal to show on. Only `riabuild remote`
-        /// ever reads a host key, so this flag lives here rather than as a
-        /// global: nothing about `status`, `login`, or the default flow can
-        /// use it.
+        /// The SSH host key fingerprint the server must offer, e.g.
+        /// `SHA256:qKqv...`. Compared verbatim against what it answers with,
+        /// and fails the run on a mismatch. Without it riabuild trusts the key
+        /// it scanned on first sight, so this flag is what turns that into a
+        /// verified connection — it strengthens the check rather than skipping
+        /// one. Only `riabuild remote` ever reads a host key, so this flag
+        /// lives here rather than as a global: nothing about `status`,
+        /// `login`, or the default flow can use it.
         #[arg(long, value_name = "FINGERPRINT", value_parser = accept_host_key_shape)]
         accept_host_key: Option<String>,
 

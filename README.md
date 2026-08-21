@@ -132,8 +132,11 @@ riabuild remote forget build-01     # undo everything below
 ```
 
 The first connection generates an SSH key just for that server, shows you its host
-key fingerprint once, and asks you to confirm it — same as `ssh` would the first time,
-except riabuild remembers the answer in its own `known_hosts` rather than yours. From
+key fingerprint once, and trusts it — the same trust-on-first-use `ssh
+-o StrictHostKeyChecking=accept-new` does, except riabuild pins it in its own
+`known_hosts` rather than yours, and checks every later connection against it.
+Pass `--accept-host-key SHA256:…` when you have a fingerprint to hold it to: it has
+to match exactly, or the run stops. From
 there it authorises the key, installs its own binary on the server, mints the server a
 session of its own (separate from your laptop's), lends it your GitHub sign-in for the
 one setup run that needs it, and runs the same nine tasks against a namespace of its

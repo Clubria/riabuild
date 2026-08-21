@@ -119,9 +119,10 @@ pub(super) async fn connect_and_setup(
     )
     .await?;
     // R12: the flag threaded here, not `None` — a `None` compiles, passes
-    // every test that does not check for it, and silently reduces
-    // `trust_host` to the interactive prompt, which errors out with no TTY
-    // to show one on (an unattended CI or container run, in particular).
+    // every test that does not check for it, and silently discards the one
+    // fingerprint the developer named, leaving `trust_host` to pin whatever
+    // answered. That is the right default for a server nobody stated a
+    // fingerprint for; it is precisely wrong for one where they did.
     host_key::trust_host(
         &remote,
         ctx.paths.as_ref(),
@@ -504,9 +505,9 @@ mod tests {
     /// scenario that a `None` passed to `trust_host` instead of the real flag
     /// would get *wrong*. A mismatch fails with `trust_host`'s "verifying …"
     /// wording, which only exists on the `Some(expected)` branch — with
-    /// `None`, this same setup would instead hit `Ui::confirm` and fail with
-    /// its own "asking you to confirm" wording (no TTY in a test process),
-    /// never reaching a fingerprint comparison at all.
+    /// `None`, this same setup would pin the key it scanned and carry on,
+    /// reporting success for a server whose fingerprint disagrees with the one
+    /// the developer typed.
     #[tokio::test]
     async fn the_accept_host_key_flag_reaches_trust_host() {
         let fake = FakeRunner::new()
@@ -538,8 +539,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("verifying"),
-            "a `None` reaching trust_host would fail on the confirm prompt instead, \
-             with different wording entirely: {message}"
+            "a `None` reaching trust_host would pin this key and succeed instead: {message}"
         );
         let failure = error
             .downcast_ref::<Failure>()
@@ -551,15 +551,14 @@ mod tests {
         );
     }
 
-    /// The other half of R12's proof: a fingerprint that *does* match pins
-    /// without ever reaching `Ui::confirm` (which would error out — no TTY in
-    /// a test process). Stops at `trust_host` deliberately: everything past
+    /// The other half of R12's proof: a fingerprint that *does* match pins,
+    /// and pins the key it was held to. Stops at `trust_host` deliberately: everything past
     /// it (`authorise`, `install::ensure_riabuild`) either needs real
     /// checksums over the network or a real riabuild-web, neither of which
     /// this crate's test scaffolding stands up (see `session.rs`'s own note
     /// on `auth::login`).
     #[tokio::test]
-    async fn a_matching_accept_host_key_pins_without_ever_touching_a_prompt() {
+    async fn a_matching_accept_host_key_pins_the_key_it_was_held_to() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
         let fake = Arc::new(
@@ -586,7 +585,7 @@ mod tests {
             Some(GOOD_FINGERPRINT),
         )
         .await
-        .expect("a matching fingerprint must not hit a prompt");
+        .expect("a matching fingerprint pins");
     }
 
     /// The ordering inside `connect_and_setup` that every *other* test in
