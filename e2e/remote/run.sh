@@ -48,6 +48,19 @@
 #     and a run that stopped *after* it is handed to act two rather than
 #     forgiven: `known_gap` is untouched and no branch was added to it.
 #
+#     THE EVIDENCE FOR THAT HAND-OFF IS THE SERVER'S OWN `state.json`, and the
+#     first version of this split got it wrong in a way worth keeping written
+#     down. It asked for the server's *run log* — and v2026.08.21.1's
+#     `provision` is `engine::run_all(&registry, ctx).await?`, so a failed task
+#     short-circuits past `log_run` and a released server that fails writes no
+#     run log at all. Act one therefore saw no evidence, fell into the fatal
+#     branch, and **act two never ran**: the job stayed red for a third reason
+#     that was again not the branch's. `state.json` is written by the engine one
+#     `update_state` at a time as the DAG walks, so it survives that
+#     short-circuit; nothing on the laptop writes it (`session::ensure` puts
+#     `session.token`, `gitconfig` and `owner.json` there and nothing else), so
+#     it cannot be act one's own handiwork read back as the server's.
+#
 #   ACT TWO — THE SERVER, RUNNING THIS BRANCH. The musl build named by
 #     `RIABUILD_SERVER_BIN` is copied in — `channel.sh` has done exactly this
 #     since it was written, for exactly this reason, and says so as plainly —
@@ -68,6 +81,15 @@
 #     the prefix itself rather than watching remote mode compose it. Act one is
 #     what proves that, which is why neither act is a substitute for the other
 #     and why both run on every invocation.
+#
+#     AND "BOTH RUN" IS ENFORCED RATHER THAN INTENDED. Act two brackets itself
+#     with `=== ACT TWO: START ===` and `=== ACT TWO: PASSED ===` / `FAILED`, so
+#     one grep answers which act judged a run; and the `cleanup` trap refuses to
+#     let this script exit 0 unless act two actually ran. The two ways of losing
+#     the gate are the same bug seen from either side — the deferral falling
+#     into the fatal branch, which happened, and the deferral falling through to
+#     a quiet `exit 0`, which had not yet — and the trap closes the second the
+#     way the evidence above closes the first.
 #
 # THREE PREREQUISITES, all outside this script's control. None is hidden,
 # and none is allowed to look like a pass.
@@ -284,7 +306,29 @@ CONTAINER_PORT="${CONTAINER_PORT:-}"
 stub_pid=""
 agent_pid=""
 api_tunnel_pid=""
+
+# ACT TWO CANNOT BE SKIPPED, AND THIS IS WHERE THAT IS ENFORCED.
+#
+# Declared up here, before the trap that reads them, because the first version
+# of this split had exactly the bug the enforcement is for: act one deferred its
+# verdict to act two, act two never executed, and the script ended — on that
+# occasion loudly, by falling into the fatal branch, but the *other* direction
+# is the dangerous one. A path that deferred and then reached the end quietly
+# would exit 0 having judged nothing at all, which is precisely the "test that
+# cannot fail" this whole file is written against.
+#
+# So the rule is one sentence with no exceptions to remember: **this script may
+# not exit 0 unless act two ran.** Every early `exit 0` is a path that got past
+# act one, and every one of them is behind act two in the flow below; a new one
+# added in front of it trips this instead of quietly becoming the third bug of
+# the same shape. Failures are left alone — they are already red, and act two
+# not running is the *consequence* of them rather than a second finding.
+act_two_ran=""
+
 cleanup() {
+  # First line of the trap, before anything below can clobber it: `$?` here is
+  # the status the script is exiting with.
+  local status=$?
   [ -n "$stub_pid" ] && kill "$stub_pid" >/dev/null 2>&1 || true
   [ -n "$agent_pid" ] && kill "$agent_pid" >/dev/null 2>&1 || true
   [ -n "$api_tunnel_pid" ] && kill "$api_tunnel_pid" >/dev/null 2>&1 || true
@@ -294,6 +338,24 @@ cleanup() {
   # layer set per invocation on whatever machine this is.
   docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$work"
+
+  if [ "$status" -eq 0 ] && [ -z "$act_two_ran" ]; then
+    echo >&2
+    echo "############################################################" >&2
+    echo "# THIS RUN JUDGED NOTHING. Act two — the half that puts this" >&2
+    echo "# branch's binary on the server — never executed, and the" >&2
+    echo "# script was about to exit 0 anyway." >&2
+    echo "#" >&2
+    echo "# Act one can only ever run the last published release on the" >&2
+    echo "# far side, so a green tick without act two says nothing at" >&2
+    echo "# all about the change under review. Failing instead." >&2
+    echo "#" >&2
+    echo "# Look for the '=== ACT TWO: START ===' line above. If it is" >&2
+    echo "# not there, something returned or exited before it." >&2
+    echo "############################################################" >&2
+    exit 1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -801,15 +863,73 @@ assert_installed_the_published_release() {
   esac
 }
 
-# The server's own riabuild writes one line per run to
-# `<namespace>/logs/riabuild.log` — `provision::report::log_run`, after the
-# tasks, whatever the tasks did. Its presence is the fact that separates "the
-# laptop handed off and the DAG ran" from "the run died before the server ever
-# got going", and both acts read it: act one to decide whether a failure is
-# still its own, act two to assert on what its own run recorded.
 namespace="/home/shared/.riabuild-remote/$MEMBER_A"
+
+# The server's own riabuild writes one line per run to
+# `<namespace>/logs/riabuild.log` — `provision::report::log_run`. **Only when
+# it gets there**, and that qualification is the whole reason this function is
+# not what act one deferred on.
+#
+# `provision` on this branch runs `engine::run_all_with_outcome` and then
+# `after_the_tasks`, which reaches `log_run` whatever the tasks did. The
+# *released* v2026.08.21.1 runs `engine::run_all(&registry, ctx).await?` — the
+# `?` short-circuits on the first failed task and `log_run` is fifteen lines
+# below it, unreached. So a released server that fails in the DAG writes no run
+# log at all, which is exactly the server act one is deferring about.
+#
+# The first version of this split asked for a run log as its deferral evidence
+# and got none, so act one fell into the fatal branch and act two never ran.
+# The evidence moved (see `server_ran_the_dag`); this stayed, because act two
+# runs *this branch's* binary, where `after_the_tasks` does reach `log_run` —
+# so act two reading a run log is also a small, free proof of that fix.
 server_run_log() {                # server_run_log — the last line, or nothing
   in_container "tail -n 1 '$namespace/logs/riabuild.log' 2>/dev/null" || true
+}
+
+# What act one defers on instead: the server's own `state.json`, in the
+# namespace, naming at least one task record.
+#
+# It is the right fact for three reasons. It is written by the *engine*, one
+# `ctx.update_state` at a time as the DAG walks, so it survives the released
+# binary's short-circuit — the tasks that ran before the failure are recorded
+# whether or not the run reached its own summary. Nothing on the laptop writes
+# it: `session::ensure` puts exactly `session.token`, `gitconfig` and
+# `owner.json` into the namespace, so its presence cannot be act one's own
+# handiwork mistaken for the server's. And it is the same file the two-developer
+# block at the bottom asserts on for the same reason.
+#
+# `"last_reason"` rather than merely a non-empty file: `{"tasks":{}}` is a
+# state.json that parses and proves nothing, and one task record is the
+# difference between "the engine ran" and "a file exists".
+#
+# Either fact will do, and the `||` is not belt-and-braces. The whole failure
+# this function was rewritten after was one piece of evidence going missing
+# because the *released* binary behaved differently from this one. A release
+# that starts writing a run log on a failed run — this branch's
+# `after_the_tasks`, once it ships — must go on deferring rather than falling
+# into the fatal branch and taking act two down with it.
+server_ran_the_dag() {
+  in_container "grep -q '\"last_reason\"' '$namespace/state.json' 2>/dev/null" && return 0
+  log_field "$(server_run_log)" failed >/dev/null 2>&1
+}
+
+# For the banner, and for a reader who wants to know how far the released
+# server got: the task ids `state.json` holds, on one line.
+#
+# Parsed on this side with the python3 the prerequisites already check for,
+# rather than with a `sed` inside the container. `config::atomic` writes with
+# `serde_json::to_string_pretty`, so the file is multi-line and every
+# line-oriented pattern for it is a guess about indentation — the first draft
+# of this function guessed wrong and would have printed an empty list under a
+# banner claiming to name what ran. `json.load` cannot be wrong about it, and a
+# file that will not parse yields nothing rather than a lie.
+server_state_tasks() {
+  in_container "cat '$namespace/state.json' 2>/dev/null" 2>/dev/null \
+    | python3 -c 'import json, sys
+try:
+    print(" ".join(sorted(json.load(sys.stdin).get("tasks", {}))))
+except Exception:
+    pass' 2>/dev/null || true
 }
 
 # One field out of that line, by name. The fields are printed in a fixed order,
@@ -839,42 +959,47 @@ assert_installed_the_published_release
 #   gap      — a route `stub_web.py` does not implement, on the evidence of the
 #              stand-in's own log plus riabuild relaying its sentence. Exactly
 #              as before; `known_gap` is unchanged.
-#   deferred — the laptop handed off and the *server's* riabuild ran the DAG
-#              and recorded it. That server is the published release, so the
-#              outcome is last month's code and act one is not the thing that
-#              can judge it. Handed to act two, which runs the same DAG with
-#              this branch's binary and does judge it. A deferral to a named,
-#              executing assertion, not an exemption: act two failing fails
-#              the job.
-#   neither  — fatal, exactly as before. A failure with no server-side run log
-#              behind it is one the laptop owns, and the laptop is this branch.
+#   deferred — the laptop handed off and the *server's* engine walked the DAG,
+#              on the evidence of a `state.json` it wrote in the namespace.
+#              That server is the published release, so the outcome is last
+#              month's code and act one is not the thing that can judge it.
+#              Handed to act two, which runs the same DAG with this branch's
+#              binary and does judge it. A deferral to a named, executing
+#              assertion, not an exemption: act two failing fails the job, and
+#              act two not running at all fails it too (see the trap).
+#   neither  — fatal, exactly as before. A failure with nothing recorded in the
+#              namespace behind it is one the laptop owns, and the laptop is
+#              this branch.
 act_one_gap=""
 act_one_deferred=""
-act_one_line=""
+act_one_tasks=""
 if [ "$ada_status" -ne 0 ]; then
   if known_gap; then
     act_one_gap=1
+  elif server_ran_the_dag; then
+    act_one_deferred=1
+    act_one_tasks="$(server_state_tasks)"
+    echo
+    echo "-- act one stopped past the install, inside the released server's"
+    echo "   task DAG. The server recorded these tasks in its own state.json:"
+    echo "     $act_one_tasks"
+    echo "   That is v$version's code, not this checkout's. Act two runs the"
+    echo "   same DAG with this branch's binary and asserts the outcome."
   else
-    act_one_line="$(server_run_log)"
-    if log_field "$act_one_line" failed >/dev/null 2>&1; then
-      act_one_deferred=1
-      echo
-      echo "-- act one stopped past the install, inside the released server's"
-      echo "   task DAG. Its run log: $act_one_line"
-      echo "   That is v$version's code, not this checkout's. Act two runs the"
-      echo "   same DAG with this branch's binary and asserts the outcome."
-    else
-      echo "riabuild remote failed for a reason that is not the known gap," >&2
-      echo "and the server's own riabuild recorded no run — so this is not" >&2
-      echo "something act two can be asked about:" >&2
-      # The stub's own log, which is no longer on stdout. Without it an HTTP
-      # failure here shows riabuild's side of the exchange and not what the
-      # stub was asked for, and those two together are what say whether this
-      # is a harness limitation or a real regression.
-      echo "--- stub_web ---" >&2
-      tail -20 "$work/stub_web.log" >&2 2>/dev/null || true
-      exit 1
-    fi
+    echo "riabuild remote failed for a reason that is not the known gap," >&2
+    echo "and the server's own riabuild recorded neither a task in" >&2
+    echo "$namespace/state.json nor a run log — so the DAG never ran out" >&2
+    echo "there, and this is not something act two can be asked about." >&2
+    echo >&2
+    echo "ACT TWO DID NOT RUN. Nothing here has tested this branch's server" >&2
+    echo "code; what follows is act one's failure, in full:" >&2
+    # The stub's own log, which is no longer on stdout. Without it an HTTP
+    # failure here shows riabuild's side of the exchange and not what the
+    # stub was asked for, and those two together are what say whether this
+    # is a harness limitation or a real regression.
+    echo "--- stub_web ---" >&2
+    tail -20 "$work/stub_web.log" >&2 2>/dev/null || true
+    exit 1
   fi
 fi
 
@@ -886,8 +1011,12 @@ fi
 # could not have done otherwise; everything below runs the binary built from
 # this checkout, and is therefore the half of this job that gates the change.
 
+# One greppable line, and the counterpart at the end of the act. Between them
+# is the only part of this job that can see the code under review running on a
+# server, so "did act two run, and what did it decide" has to be answerable
+# from the log by eye rather than by reconstructing the control flow.
 echo
-echo "== act two: this branch's riabuild, running the server side =="
+echo "=== ACT TWO: START === this branch's riabuild, running the server side"
 
 # The same option list `remote::identity::ssh_options` stands for, and the same
 # one the API tunnel above was opened with. Deliberately the seed key rather
@@ -1070,8 +1199,9 @@ fi
 
 if [ -n "$act2_failures" ]; then
   echo >&2
-  echo "Act two failed. This is the half of the job that runs THIS branch on" >&2
-  echo "the server, so these are regressions rather than harness gaps:" >&2
+  echo "=== ACT TWO: FAILED ===" >&2
+  echo "This is the half of the job that runs THIS branch on the server, so" >&2
+  echo "these are regressions rather than harness gaps:" >&2
   printf "%b\n" "$act2_failures" >&2
   echo >&2
   echo "--- the server's run log ---" >&2
@@ -1079,8 +1209,13 @@ if [ -n "$act2_failures" ]; then
   exit 1
 fi
 
+# Set here and nowhere else: after every assertion above has been made, and
+# before any of the `exit 0`s below. The trap turns a missing one into a
+# failure, so this line is what a green tick means.
+act_two_ran=1
+
 echo
-echo "-- act two passed: $act2_line"
+echo "=== ACT TWO: PASSED === $act2_line"
 # Named rather than implied. `failed` and `skipped` here are the part of the DAG
 # this container cannot finish, and printing them is the bargain
 # `unimplemented_routes` makes — a gap that is named is a gap somebody can
@@ -1145,9 +1280,17 @@ if [ -n "$act_one_deferred" ]; then
   echo "# verified and installed the published v$version — which runs"
   echo "# on the server."
   echo "#"
-  echo "# What it then stopped on belongs to v$version and cannot be"
-  echo "# changed from this checkout:"
-  echo "#   $act_one_line"
+  echo "# Where it then stopped belongs to v$version and cannot be"
+  echo "# changed from this checkout. The tasks that server recorded"
+  echo "# before it gave up:"
+  echo "#   $act_one_tasks"
+  echo "#"
+  echo "# It wrote no run log of its own, and that is not a harness"
+  echo "# gap either: v$version's provision.rs is"
+  echo "# \`engine::run_all(&registry, ctx).await?\`, so a failed task"
+  echo "# short-circuits past \`log_run\`. This branch's"
+  echo "# \`after_the_tasks\` is the fix, and act two's run log below"
+  echo "# is that fix observed from outside the binary."
   echo "#"
   echo "# That same DAG, driven by THIS branch's binary, is what act"
   echo "# two just asserted. A server-side regression this branch"

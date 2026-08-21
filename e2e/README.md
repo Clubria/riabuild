@@ -242,6 +242,15 @@ executing a released binary. A run that falls over before the install is still
 fatal; a run that stops after it is handed to act two rather than forgiven.
 `known_gap` is unchanged and no branch was added to it.
 
+The hand-off is decided on the server's own `state.json`, and the first version
+of this split decided it on the server's *run log* instead — which a released
+server that fails does not write, because v2026.08.21.1's `provision` is
+`engine::run_all(&registry, ctx).await?` and the `?` short-circuits past
+`log_run`. Act one saw no evidence, took the fatal branch, and act two never
+ran. `state.json` is written by the engine as the DAG walks, so it survives that
+short-circuit, and nothing on the laptop writes it — `session::ensure` puts
+`session.token`, `gitconfig` and `owner.json` in the namespace and nothing else.
+
 **Act two — the server, running the branch.** The musl build named by
 `RIABUILD_SERVER_BIN` is copied in, and the three invocations `flow::connect`
 composes are made against it over the same SSH, in the same order: `internal
@@ -255,6 +264,13 @@ no release tag injected one), `toolchain` must not appear among the tasks
 riabuild recorded as failed, and pnpm has to answer `-v` through its shim on a
 container with no `libatomic.so.1`. Those fail against v2026.08.21.1 and pass
 with the fix, which is what makes this job a gate rather than a report.
+
+Act two brackets itself with `=== ACT TWO: START ===` and
+`=== ACT TWO: PASSED ===` (or `FAILED`), so one grep over a CI log answers which
+act judged the run — and the `cleanup` trap refuses to let the script exit 0
+unless act two actually ran. Losing the gate by falling into the fatal branch
+and losing it by falling through to a quiet `exit 0` are the same bug from
+either side; the evidence above closes the first and the trap closes the second.
 
 Act two is **not** a substitute for the gated block at the bottom of the script.
 It drives the server for one developer with a prefix it composed itself; that
