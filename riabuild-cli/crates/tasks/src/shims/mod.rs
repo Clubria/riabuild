@@ -6,10 +6,17 @@
 //! layered over it.
 //!
 //! ```sh
+//! # a bare, interactive `claude` — opens on the agents view
+//! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
+//!   --settings ~/.riabuild/org-settings.json \
+//!   --allow-dangerously-skip-permissions \
+//!   agents
+//!
+//! # anything else: `claude -p`, `claude --resume`, `claude-2 auth login`
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
 //!   --settings ~/.riabuild/org-settings.json \
 //!   --exclude-dynamic-system-prompt-sections \
-//!   --allow-dangerously-skip-permissions
+//!   --allow-dangerously-skip-permissions "$@"
 //! ```
 //!
 //! `--settings` layers over the account's own settings, so org policy is always
@@ -30,10 +37,38 @@
 //! `--settings` because the org settings have never been fetched. See
 //! `ALLOW_BYPASS`.
 //!
+//! **The two lines are two lines because they cannot be one.** The agents view
+//! is reached by the bare `agents` positional, and Claude Code only honours it
+//! when everything else on the line has been stripped off. Which flags are
+//! stripped is not a matter of taste and not guessable from the names:
+//! `--settings` and `--allow-dangerously-skip-permissions` both are — the first
+//! is taken off with its value, the second is folded into the dispatch defaults
+//! the view hands to the sessions it starts — and
+//! `--exclude-dynamic-system-prompt-sections` is not. So the first two ride
+//! along and the third cannot.
+//!
+//! Passing it anyway does not degrade to a view with one feature missing:
+//! `agents` falls through to the ordinary parser as the *background-agents*
+//! subcommand, and `claude` prints a list and exits. So a bare launch takes the
+//! view and gives up the shared prompt prefix, and every launch that carries
+//! arguments keeps the prefix and never wanted the view. Giving it up costs
+//! nothing that was not already gone: that flag is not among the ones Claude
+//! Code carries into a session started *from* the agents view either, so no bare
+//! launch could have kept it whichever way this was written. `ALLOW_BYPASS` is
+//! the opposite case and is carried, which is why it stays on both lines.
+//!
+//! Which also means `defaultToAgentsView` — the global-config key
+//! `claude_agents_view` writes — has never decided anything here, and cannot:
+//! Claude Code reads it only when the raw argv holds nothing but debug flags,
+//! and every launcher riabuild has ever written passed `--settings`. The task
+//! still writes it, for a developer who runs Claude Code from outside
+//! `~/.riabuild/bin`; the launcher is what makes the view happen for everyone
+//! else, and it does so unconditionally. See `claude_agents_view`.
+//!
 //! `CLAUDE_CONFIG_DIR` is present in the Claude Code binary (verified against
 //! 2.1.221) but is **not** in the public settings documentation. Undocumented
-//! means unpromised, so the four `#[ignore]`d smoke tests at the end of this
-//! file pin it and the three behaviours built on it: an upstream change should
+//! means unpromised, so the `#[ignore]`d smoke tests at the end of this
+//! file pin it and the behaviours built on it: an upstream change should
 //! surface as a test failure, not as broken laptops. They need a real Claude Code
 //! install, so run them with `cargo test -- --ignored` before every version bump.
 //!
@@ -78,11 +113,18 @@ use std::path::Path;
 /// from the settings schema, so `org-settings.json` could carry the name and
 /// change nothing. Verified against 2.1.231.
 ///
-/// Passed unconditionally, which is safe on two counts. It arrived in Claude
-/// Code 2.1.98, well below the 2.1.223 floor `claude_accounts` already enforces
-/// and repairs, so no launcher will meet a binary that rejects it — and it is a
-/// global option, accepted ahead of a subcommand exactly as `--settings` is, so
-/// `claude-2 auth login` still works.
+/// Passed on every launch that carries arguments, which is safe on two counts.
+/// It arrived in Claude Code 2.1.98, well below the 2.1.223 floor
+/// `claude_accounts` already enforces and repairs, so no launcher will meet a
+/// binary that rejects it — and it is a global option, accepted ahead of a
+/// subcommand exactly as `--settings` is, so `claude-2 auth login` still works.
+///
+/// Withheld from exactly one launch: a bare interactive `claude`, which takes
+/// the agents view instead. That is not a preference between the two. The
+/// `agents` positional is honoured only when the rest of the line is empty
+/// after Claude Code strips the options it recognises, and this flag is not one
+/// of them — so the pair does not open a view with a longer prompt, it opens
+/// the background-agents subcommand and exits. See the module header.
 const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 
 /// Keeps bypass-permissions in the Shift+Tab cycle, without making it the mode.
@@ -197,15 +239,66 @@ if [ ! -x "$claude_binary" ]; then
   export PATH
   claude_binary=claude
 fi
-if [ -f "{settings}" ]; then
-  exec "$claude_binary" --settings "{settings}" {flags} "$@"
+# Which view Claude Code opens on. Clubria's answer is the agents view, and the
+# bare `agents` positional is the only route to it that a launcher can take.
+#
+# The obvious route is the `defaultToAgentsView` key in the account's
+# `.claude.json`, which `claude_agents_view` writes. It cannot work from here.
+# Claude Code consults that key only when *every* token on the command line is a
+# debug flag — it tests the raw argv, before its own option parsing — so the
+# `--settings` two lines below is on its own enough to rule the agents view out.
+# Every launcher riabuild has ever written passed `--settings`, so that key has
+# never once decided what a Clubria developer's `claude` opened on.
+#
+# The positional is checked differently: `--settings` and its value are taken
+# off the line first, and only what remains has to be empty. So this is the one
+# spelling that carries org policy *and* opens the view. It also ignores
+# `defaultToAgentsView` entirely, which is what "always" means here.
+#
+# {flag} has to come off the line to do it, and {bypass} does not. Which flags
+# are stripped is not guessable from the names: --settings goes with its value,
+# {bypass} is folded into the dispatch defaults the view hands to the sessions it
+# starts, and {flag} is left where it lies. Leaving {flag} on makes the remainder
+# non-empty and the view is refused; worse, `agents` then reaches the ordinary
+# parser, where it is the *background-agents* subcommand, and `claude` would
+# print a list of background agents and exit instead of opening a session.
+#
+# Nothing is lost by dropping it on this path that was not lost already: {flag}
+# is not among the ones Claude Code carries into a session dispatched from the
+# agents view either, so a bare launch could not have kept it whichever way this
+# was written. Every other launch — `claude -p`, `claude --resume`, `claude
+# "some prompt"`, `claude-2 auth login` — still gets it, unchanged.
+#
+# Read out of Claude Code 2.1.235; re-read it when the pinned version moves.
+#
+# Three guards, each load-bearing:
+#
+#   $# -eq 0   a developer who typed arguments asked for something other than
+#              the view, and `agents` would collide with their own first word.
+#   -t 0 -t 1  `echo "fix the build" | claude` is a session with a prompt on
+#              stdin. The positional route does not test the terminal itself,
+#              so without this the prompt is swallowed and the view opens over
+#              it. Claude Code applies the same pair on its own route.
+#   the env var  Claude Code's documented off switch. With the view disabled,
+#              `claude agents` does not fall back to a session — it prints
+#              "'claude agents' is disabled …" and exits 1. Honouring the
+#              switch here is the difference between a developer turning the
+#              view off and a developer losing the `claude` command.
+if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]; then
+  set -- {bypass} agents
+else
+  set -- {flag} {bypass} "$@"
 fi
-exec "$claude_binary" {flags} "$@"
+if [ -f "{settings}" ]; then
+  exec "$claude_binary" --settings "{settings}" "$@"
+fi
+exec "$claude_binary" "$@"
 "#,
         config_dir = config_dir.display(),
         bin_dir = bin_dir.display(),
         settings = org_settings.display(),
-        flags = format!("{STATIC_SYSTEM_PROMPT} {ALLOW_BYPASS}"),
+        flag = STATIC_SYSTEM_PROMPT,
+        bypass = ALLOW_BYPASS,
     )
 }
 
@@ -636,50 +729,218 @@ mod tests {
         // that has not fetched settings yet. Losing it would still satisfy
         // `the_launcher_can_never_exec_itself` (which only checks the exec
         // inside the `if`) while the launcher silently exited 0 doing nothing.
+        assert!(script.contains(r#"exec "$claude_binary" "$@""#), "{script}");
+    }
+
+    /// A bare, interactive `claude` opens on the agents view — always, and
+    /// without consulting `defaultToAgentsView`.
+    ///
+    /// The positional is the only spelling that reaches the view from a
+    /// launcher. Claude Code's other route reads the *raw* argv and requires
+    /// every token on it to be a debug flag, which `--settings` alone defeats;
+    /// this one is tested after the options it recognises have been taken off.
+    #[test]
+    fn a_bare_interactive_launch_opens_the_agents_view() {
+        let script = script();
+        // `ALLOW_BYPASS` rides along, and that is not decoration. Claude Code
+        // folds it into the dispatch defaults the view hands to every session
+        // it starts, so dropping it here would take bypass-permissions out of
+        // the Shift+Tab cycle for exactly the launch most developers make —
+        // the one thing `every_exec_keeps_bypass_permissions_reachable_from_
+        // the_cycle` was written to prevent, reintroduced one branch over.
         assert!(
-            script.contains(&format!(
-                r#"exec "$claude_binary" {STATIC_SYSTEM_PROMPT} {ALLOW_BYPASS} "$@""#
-            )),
+            script.contains(&format!("set -- {ALLOW_BYPASS} agents")),
+            "{script}"
+        );
+
+        // Ahead of every exec, or it decides nothing. Matched on whole lines
+        // rather than with `find`, because the comments above the PATH strip
+        // talk about exec'ing a bare name and a substring search finds those
+        // first — which would make this pass on a script that never runs the
+        // branch at all.
+        let line_of = |wanted: &str| {
+            script
+                .lines()
+                .position(|line| line.trim_start().starts_with(wanted))
+                .unwrap_or_else(|| panic!("no line starts with {wanted:?}:\n{script}"))
+        };
+        assert!(line_of("set -- ") < line_of("exec "), "{script}");
+    }
+
+    /// Each guard on the agents-view branch, and what dropping it would cost.
+    #[test]
+    fn the_agents_view_is_guarded_three_ways() {
+        let script = script();
+
+        // A developer who typed something asked for that, not for the view —
+        // and `agents` would land in front of their own first word.
+        assert!(script.contains("[ $# -eq 0 ]"), "{script}");
+
+        // `echo "fix the build" | claude` is a session with a prompt on stdin.
+        // Claude Code's positional route does not test the terminal itself, so
+        // without these two the prompt is swallowed and the view opens over it.
+        assert!(script.contains("[ -t 0 ]"), "{script}");
+        assert!(script.contains("[ -t 1 ]"), "{script}");
+
+        // Claude Code's own off switch. With the view disabled, `claude agents`
+        // does not fall back to a session — it writes "'claude agents' is
+        // disabled …" to stderr and exits 1. Ignoring it here would turn a
+        // developer who turned the view off into a developer with no working
+        // `claude` at all.
+        assert!(
+            script.contains(r#"[ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]"#),
             "{script}"
         );
     }
 
+    /// The guards, run as shell rather than read as text.
+    ///
+    /// `cargo test` gives a child no terminal, so this is a real
+    /// non-interactive launch — the shape `echo "fix the build" | claude`, a CI
+    /// job and `claude -p` all arrive in. None of them may pick up `agents`:
+    /// the positional would swallow a prompt waiting on stdin, and Claude
+    /// Code's own route does not test the terminal, so this script is the only
+    /// thing standing between a piped prompt and a view opening over it.
+    ///
+    /// Executed instead of asserted on, because every way of getting this wrong
+    /// reads identically in the source: a `set --` that drops `"$@"`, a guard
+    /// that is true when it should be false, an `-eq` that should be `-gt`.
+    /// The interactive half cannot be reached from here — it needs a terminal
+    /// on both descriptors — which is what
+    /// `the_agents_token_is_still_the_agents_entry_point` and a bare `claude`
+    /// on a laptop are for.
+    #[tokio::test]
+    async fn a_launch_with_no_terminal_never_picks_up_the_agents_view() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+
+        let home = tempfile::TempDir::new().unwrap();
+        // A stand-in for Claude Code that reports the line it was given.
+        let claude = home.path().join("claude");
+        tokio::fs::write(
+            &claude,
+            "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done\n",
+        )
+        .await
+        .unwrap();
+        make_executable(&claude).await.unwrap();
+
+        let settings = home.path().join("org-settings.json");
+        tokio::fs::write(&settings, "{}").await.unwrap();
+
+        let launcher = home.path().join("launcher");
+        let script = launcher_script(
+            &home.path().join("profile"),
+            &claude.to_string_lossy(),
+            &settings,
+            &home.path().join("bin"),
+        );
+        tokio::fs::write(&launcher, &script).await.unwrap();
+        make_executable(&launcher).await.unwrap();
+
+        let runner = RealRunner;
+        let run = |args: Vec<String>| {
+            let launcher = launcher.to_string_lossy().into_owned();
+            let runner = &runner;
+            async move {
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                let output = runner
+                    .run(&launcher, &borrowed, &RunOptions::default())
+                    .await
+                    .expect("the launcher ran");
+                assert!(output.ok(), "{output:?}");
+                output
+                    .stdout
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        // No arguments, no terminal. This is the case the guards exist for:
+        // without `-t 0`/`-t 1` it would take the agents branch.
+        let bare = run(Vec::new()).await;
+        assert!(!bare.iter().any(|arg| arg == "agents"), "{bare:?}");
+        assert!(
+            bare.iter().any(|arg| arg == STATIC_SYSTEM_PROMPT),
+            "{bare:?}"
+        );
+        assert_eq!(
+            bare.first().map(String::as_str),
+            Some("--settings"),
+            "{bare:?}"
+        );
+
+        // And a launch that carries arguments keeps every one of them, in
+        // order, after the flag — `claude-2 auth login` and `claude --resume`
+        // both depend on it.
+        let carried = run(vec!["-p".into(), "fix the build".into()]).await;
+        assert!(!carried.iter().any(|arg| arg == "agents"), "{carried:?}");
+        assert_eq!(
+            carried.last().map(String::as_str),
+            Some("fix the build"),
+            "{carried:?}"
+        );
+        let flag = carried
+            .iter()
+            .position(|arg| arg == STATIC_SYSTEM_PROMPT)
+            .unwrap_or_else(|| panic!("{carried:?}"));
+        let prompt = carried.iter().position(|arg| arg == "-p").unwrap();
+        assert!(flag < prompt, "{carried:?}");
+    }
+
+    /// The pair that must never share a line.
+    ///
+    /// `--exclude-dynamic-system-prompt-sections` is not among the options
+    /// Claude Code strips before testing whether the `agents` positional stands
+    /// alone, so a line carrying both does not open the view with a longer
+    /// system prompt. It falls through to the ordinary parser, where `agents`
+    /// is the *background-agents* subcommand — `claude` would print a list of
+    /// background agents and exit instead of opening a session.
     #[test]
-    fn every_exec_moves_the_per_machine_prompt_sections_out_of_the_cache() {
-        // Asserted on *every* exec rather than on the script text, because the
-        // two are reached under opposite conditions: the first runs on a
-        // machine that has fetched the org settings, the second on one that has
-        // not. A flag on only one of them is a cache that half the team shares
-        // and the other half does not, with nothing to see in either terminal.
+    fn the_agents_view_and_the_static_prompt_flag_never_share_a_line() {
         let script = script();
-        let execs: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("exec "))
-            .collect();
-        assert_eq!(execs.len(), 2, "{script}");
-        for exec in execs {
-            assert!(exec.contains(STATIC_SYSTEM_PROMPT), "{exec}");
-            // Ahead of `"$@"`, so a developer's own trailing arguments still
-            // reach Claude Code as arguments rather than landing after a flag
-            // that has already consumed the line.
+        for line in script.lines().map(str::trim) {
+            if !line.starts_with("exec ") && !line.starts_with("set -- ") {
+                continue;
+            }
             assert!(
-                exec.find(STATIC_SYSTEM_PROMPT) < exec.find(r#""$@""#),
-                "{exec}"
+                !(line.contains(" agents") && line.contains(STATIC_SYSTEM_PROMPT)),
+                "the agents view and the static-prompt flag share a line:\n{line}"
             );
         }
     }
 
     #[test]
-    fn every_exec_keeps_bypass_permissions_reachable_from_the_cycle() {
-        // The exec that matters most here is the *second* one, and it is the one
-        // an assertion on the script text would not distinguish. A machine that
-        // has not fetched `org-settings.json` execs with no `--settings` at all,
-        // so `permissions.defaultMode` reaches it by no route whatsoever and this
-        // flag is the only thing keeping the mode in its Shift+Tab cycle. Losing
-        // it there is invisible: the launcher starts, Claude Code starts, and the
-        // cycle silently has one fewer stop on it.
+    fn every_launch_that_carries_arguments_moves_the_per_machine_sections_out() {
+        // Asserted in two halves, because the argument line is now decided in
+        // one place and forwarded by two execs that are reached under opposite
+        // conditions — the first on a machine that has fetched the org
+        // settings, the second on one that has not. A flag reaching only one of
+        // them would be a cache that half the team shares and the other half
+        // does not, with nothing to see in either terminal.
         let script = script();
+
+        // Half one: exactly two branches build a line, and the one that is not
+        // the agents view carries the flag ahead of `"$@"` — so a developer's
+        // own trailing arguments still reach Claude Code as arguments, rather
+        // than landing after a flag that has already consumed the line.
+        let built: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("set -- "))
+            .collect();
+        assert_eq!(built.len(), 2, "{script}");
+        let carried = built
+            .iter()
+            .find(|line| line.contains(STATIC_SYSTEM_PROMPT))
+            .unwrap_or_else(|| panic!("no branch carries the flag:\n{script}"));
+        assert!(
+            carried.find(STATIC_SYSTEM_PROMPT) < carried.find(r#""$@""#),
+            "{carried}"
+        );
+
+        // Half two: both execs forward whatever that branch built, so neither
+        // drops the line it was handed.
         let execs: Vec<&str> = script
             .lines()
             .map(str::trim)
@@ -687,9 +948,48 @@ mod tests {
             .collect();
         assert_eq!(execs.len(), 2, "{script}");
         for exec in execs {
-            assert!(exec.contains(ALLOW_BYPASS), "{exec}");
-            assert!(exec.find(ALLOW_BYPASS) < exec.find(r#""$@""#), "{exec}");
+            assert!(exec.ends_with(r#""$@""#), "{exec}");
         }
+    }
+
+    #[test]
+    fn every_branch_keeps_bypass_permissions_reachable_from_the_cycle() {
+        // Asserted on *every* branch that builds an argument line, because the
+        // machine that matters most is the one an assertion on the script text
+        // would not distinguish: a laptop that has not fetched
+        // `org-settings.json` execs with no `--settings` at all, so
+        // `permissions.defaultMode` reaches it by no route whatsoever and this
+        // flag is the only thing keeping the mode in its Shift+Tab cycle.
+        // Losing it is invisible — the launcher starts, Claude Code starts, and
+        // the cycle silently has one fewer stop on it.
+        //
+        // The agents branch is included on purpose. Unlike the static-prompt
+        // flag, this one is stripped before the `agents` positional is tested
+        // *and* carried into the sessions the view dispatches, so it belongs on
+        // both lines and there is no reason to drop it from either.
+        let script = script();
+        let built: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("set -- "))
+            .collect();
+        assert_eq!(built.len(), 2, "{script}");
+        for line in built {
+            assert!(line.contains(ALLOW_BYPASS), "{line}");
+        }
+
+        // And on the branch that forwards a developer's own arguments, ahead of
+        // `"$@"` — behind it the flag would land after a line that has already
+        // been consumed.
+        let carried = script
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("set -- ") && line.contains(r#""$@""#))
+            .unwrap_or_else(|| panic!("{script}"));
+        assert!(
+            carried.find(ALLOW_BYPASS) < carried.find(r#""$@""#),
+            "{carried}"
+        );
     }
 
     #[test]
@@ -1144,11 +1444,11 @@ mod tests {
         );
     }
 
-    /// Every launcher passes `--settings`,
+    /// Every launch that carries arguments passes `--settings`,
     /// `--exclude-dynamic-system-prompt-sections` and
-    /// `--allow-dangerously-skip-permissions` unconditionally, so `claude-2 auth
-    /// login` — which the account box tells developers to run — depends on all
-    /// three being accepted ahead of a subcommand.
+    /// `--allow-dangerously-skip-permissions`, so `claude-2 auth login` — which
+    /// the account box tells developers to run — depends on all three being
+    /// accepted ahead of a subcommand.
     ///
     /// All three are asserted in one invocation because that is the argument line
     /// a launcher actually builds; a test that passed them separately would not
@@ -1188,5 +1488,63 @@ mod tests {
             .await
             .expect("claude --settings auth status");
         assert!(output.stdout.contains("loggedIn"), "{output:?}");
+    }
+
+    /// Records that `agents` is still Claude Code's agents entry point, and
+    /// still reachable with `--settings` in front of it.
+    ///
+    /// A bare interactive `claude` is `claude --settings <org> agents`, and the
+    /// whole of that spelling is undocumented: the positional is honoured only
+    /// when everything Claude Code recognises has been stripped off the line
+    /// and nothing remains, `--settings` is one of the things stripped, and
+    /// none of it is promised anywhere. If upstream renames the token, the
+    /// parser stops recognising it and every developer's `claude` starts
+    /// failing as an unknown command.
+    ///
+    /// **What this can and cannot prove.** Opening the view needs a terminal on
+    /// both stdin and stdout, so no test here can watch it happen; what
+    /// `--json` reaches is the same token's non-interactive branch. So this
+    /// pins that the token is still live and still composes with `--settings`,
+    /// which is the half that breaks silently. It does **not** pin that the
+    /// interactive branch still opens the view — that is a real gap, and the
+    /// way to close it is to run a bare `claude` on a laptop and look.
+    ///
+    /// Deliberately `#[ignore]`d: only a real `claude` can answer, and it needs
+    /// no sign-in — a signed-out install still lists its own sessions.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code install; records that the `agents` token the launcher builds is still recognised"]
+    async fn the_agents_token_is_still_the_agents_entry_point() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        tokio::fs::write(&settings, "{}").await.unwrap();
+
+        // The launcher's own order: --settings, then the positional.
+        let output = runner
+            .run(
+                "claude",
+                &[
+                    "--settings",
+                    &settings.to_string_lossy(),
+                    "agents",
+                    "--json",
+                ],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude --settings agents --json");
+
+        assert!(output.ok(), "claude rejected the agents token: {output:?}");
+        // Parsed rather than substring-matched: an unknown-command error could
+        // contain the word "agents" too, and a JSON array is the one answer
+        // only the real subcommand gives.
+        let sessions: serde_json::Value =
+            serde_json::from_str(output.trimmed()).expect("claude agents --json must print JSON");
+        assert!(sessions.is_array(), "{sessions:?}");
     }
 }

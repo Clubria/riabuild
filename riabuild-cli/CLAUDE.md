@@ -784,7 +784,8 @@ the first.
 `.claude.json` state that `--settings` cannot express, so `claude_trust`,
 `claude_onboarding` and `claude_agents_view` write them per account — and
 `--exclude-dynamic-system-prompt-sections` has no key of any kind, so the launcher passes
-it on the command line. Before adding anything to the dashboard's settings JSON, check it
+it on the command line, on every launch but the bare interactive one that takes the
+agents view instead. Before adding anything to the dashboard's settings JSON, check it
 is a settings key at all: one that is not gets served to every laptop and read by nobody.
 
 **A settings value that names a path names it on every machine, so what it names goes in
@@ -819,6 +820,20 @@ comments exist to prevent.
 the key only where the account has no answer, because `/config` persists a developer's
 `false` and a task that asserted `true` every run would silently overrule them on every
 `riabuild`. Trust and onboarding are facts nobody wants undone; a view is not.
+
+**The key is not what opens the view, though, and never was.** Claude Code reads
+`defaultToAgentsView` only when the raw command line holds nothing but debug flags, and
+every launcher passes `--settings` — so on a Clubria laptop that key has never decided
+what `claude` opened on. The launcher reaches the view by the bare `agents` positional,
+which is tested after the recognised options are stripped and which ignores the key. Two
+consequences worth holding on to. `--exclude-dynamic-system-prompt-sections` cannot ride
+along: it is not stripped, so the pair drops through to the *background-agents
+subcommand* and `claude` prints a list instead of opening a session — which is why a bare
+launch gives the flag up, and why it loses nothing by doing so (Claude Code does not
+carry it into sessions dispatched from the view either). And the developer's `/config`
+answer no longer applies through the launcher, so `CLAUDE_CODE_DISABLE_AGENT_VIEW` is
+their way out and the launcher honours it — without that guard a disabled view would not
+degrade to a session, it would exit 1 and take the `claude` command with it.
 
 **Trust is the only gate Claude Code puts in front of a checkout's settings, and the
 plugins ride on it.** `hasTrustDialogAccepted` — keyed by the checkout's *git root*, which
