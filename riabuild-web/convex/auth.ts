@@ -6,6 +6,13 @@ import { Id } from "./_generated/dataModel";
 import { claimOrCreateMember } from "./members";
 
 /**
+ * The issuer identifier GitHub puts in the `iss` authorization-response
+ * parameter. Not a URL we ever fetch — it is compared, byte for byte, against
+ * what GitHub sends back, so it is written out rather than derived.
+ */
+export const GITHUB_ISSUER = "https://github.com/login/oauth";
+
+/**
  * GitHub only. There is no password provider and there never should be — the
  * whole authorization model assumes the identity is a GitHub account whose org
  * membership can be re-checked later.
@@ -13,7 +20,33 @@ import { claimOrCreateMember } from "./members";
  * `read:org` is required: without it the token cannot answer membership
  * questions and every secret-brokering request fails closed.
  */
-const GitHubProvider = GitHub({
+export const GitHubProvider = GitHub({
+  // GitHub implements RFC 9207: its authorization response carries an `iss`
+  // parameter, and `oauth4webapi` rejects any `iss` that does not equal the
+  // issuer the provider was configured with. `@convex-dev/auth` has no issuer
+  // for GitHub to fall back on, so it substitutes the literal placeholder
+  // `theremustbeastringhere.dev` — which `iss` can never match. Naming the real
+  // issuer here is the whole fix.
+  //
+  // It is hard to find because of *how* it fails. The library's OAuth
+  // callback catches every error and answers `Response.redirect(SITE_URL)`
+  // with no `code` on it, so a developer authorises on GitHub, lands back on
+  // the dashboard, and is shown the sign-in screen again with nothing on the
+  // page, in the console or in the URL saying why. It looked like a browser
+  // that had gone bad — clearing storage appeared not to help, and a second
+  // browser profile appeared to work. Neither was true: clearing storage is
+  // what *forces* a real sign-in, and the profile that worked was still
+  // holding a session minted before GitHub's rollout reached this app.
+  //
+  // Setting the issuer does not turn this into an OIDC provider. Discovery
+  // runs only for a config missing `authorization`, `token` or `userinfo`, and
+  // the GitHub provider names all three; `isOIDCProvider` keys off
+  // `type: "oauth"`, which is unchanged. The companion flag
+  // `authorization_response_iss_parameter_supported` is deliberately left
+  // unset, so an authorization server that sends no `iss` — GitHub Enterprise
+  // Server, or a deployment GitHub's rollout has not reached — still signs a
+  // developer in rather than starting to require one.
+  issuer: GITHUB_ISSUER,
   authorization: {
     params: { scope: "read:user user:email read:org" },
   },
