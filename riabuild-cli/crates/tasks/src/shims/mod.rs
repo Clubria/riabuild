@@ -8,7 +8,8 @@
 //! ```sh
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
 //!   --settings ~/.riabuild/org-settings.json \
-//!   --exclude-dynamic-system-prompt-sections
+//!   --exclude-dynamic-system-prompt-sections \
+//!   --allow-dangerously-skip-permissions
 //! ```
 //!
 //! `--settings` layers over the account's own settings, so org policy is always
@@ -19,6 +20,15 @@
 //! because Claude Code offers no settings key for it: it is read off argv
 //! (`excludeDynamicSections`) and appears nowhere in the settings schema, so the
 //! launcher is the only place riabuild can turn it on for the whole team.
+//!
+//! `--allow-dangerously-skip-permissions` is a flag for a related reason. The
+//! org settings already carry `permissions.defaultMode: "bypassPermissions"`,
+//! and that key decides which mode a session *starts* in; whether the mode stays
+//! *reachable* from the Shift+Tab cycle is a second question with no settings key
+//! at all. The flag is what riabuild can say about it, and it covers the machines
+//! the settings key cannot reach — including one whose launcher execs without
+//! `--settings` because the org settings have never been fetched. See
+//! `ALLOW_BYPASS`.
 //!
 //! `CLAUDE_CONFIG_DIR` is present in the Claude Code binary (verified against
 //! 2.1.221) but is **not** in the public settings documentation. Undocumented
@@ -74,6 +84,47 @@ use std::path::Path;
 /// global option, accepted ahead of a subcommand exactly as `--settings` is, so
 /// `claude-2 auth login` still works.
 const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
+
+/// Keeps bypass-permissions in the Shift+Tab cycle, without making it the mode.
+///
+/// Claude Code answers two separate questions about that mode. Which mode a
+/// session *starts* in comes from `permissions.defaultMode`, which
+/// `org-settings.json` already carries. Whether the mode is *offered* by the
+/// cycle is decided once, at startup, and never revisited:
+///
+/// ```text
+/// isBypassPermissionsModeAvailable =
+///     (resolvedMode === "bypassPermissions" || allowDangerouslySkipPermissions)
+///     && permissions.disableBypassPermissionsMode !== "disable"
+/// ```
+///
+/// There is no settings key for the left-hand disjunct's second half — only this
+/// flag — and no way to switch a running session into a mode that startup did not
+/// make available. So on every machine where the settings key does not arrive or
+/// is refused, the mode is not merely off: it is unreachable for the whole
+/// session, and the developer's Shift+Tab silently has one fewer stop on it.
+///
+/// Three such machines are ordinary rather than hypothetical. A launcher whose
+/// `if [ -f ]` finds no `org-settings.json` execs with **no `--settings` at all**,
+/// which is every laptop before its first successful fetch. A laptop holding a
+/// cached copy written before the key existed serves settings with no permission
+/// mode in them — the failure `org.backfillClaudeDefaults` was written for, which
+/// repairs the *server's* row and can do nothing about a file already on disk. And
+/// under `CLAUDE_CODE_REMOTE` Claude Code rejects `bypassPermissions` from settings
+/// outright, allowing only `acceptEdits`, `plan`, `default` and `auto`.
+///
+/// Strictly weaker than the settings key beside it, which is why it is safe to
+/// pass on all three: it makes the mode selectable and changes no default, so a
+/// machine that never fetched org policy gets a cycle stop rather than a session
+/// with its permission prompts already off. `disableBypassPermissionsMode` in
+/// settings still overrides it — that stays the way to take the mode away.
+///
+/// Passed unconditionally on the same two counts as `STATIC_SYSTEM_PROMPT`. It is
+/// in Claude Code by 2.1.143, below the 2.1.223 floor `claude_accounts` enforces
+/// and repairs, so no launcher will meet a binary that rejects it; and it is a
+/// global option accepted ahead of a subcommand, which `settings_flag_survives_a_subcommand`
+/// pins beside the other two. Verified against 2.1.235.
+const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 
 /// One account's launcher: `claude`, or `claude-<n>`.
 pub fn launcher_script(
@@ -147,14 +198,14 @@ if [ ! -x "$claude_binary" ]; then
   claude_binary=claude
 fi
 if [ -f "{settings}" ]; then
-  exec "$claude_binary" --settings "{settings}" {flag} "$@"
+  exec "$claude_binary" --settings "{settings}" {flags} "$@"
 fi
-exec "$claude_binary" {flag} "$@"
+exec "$claude_binary" {flags} "$@"
 "#,
         config_dir = config_dir.display(),
         bin_dir = bin_dir.display(),
         settings = org_settings.display(),
-        flag = STATIC_SYSTEM_PROMPT,
+        flags = format!("{STATIC_SYSTEM_PROMPT} {ALLOW_BYPASS}"),
     )
 }
 
@@ -587,7 +638,7 @@ mod tests {
         // inside the `if`) while the launcher silently exited 0 doing nothing.
         assert!(
             script.contains(&format!(
-                r#"exec "$claude_binary" {STATIC_SYSTEM_PROMPT} "$@""#
+                r#"exec "$claude_binary" {STATIC_SYSTEM_PROMPT} {ALLOW_BYPASS} "$@""#
             )),
             "{script}"
         );
@@ -616,6 +667,28 @@ mod tests {
                 exec.find(STATIC_SYSTEM_PROMPT) < exec.find(r#""$@""#),
                 "{exec}"
             );
+        }
+    }
+
+    #[test]
+    fn every_exec_keeps_bypass_permissions_reachable_from_the_cycle() {
+        // The exec that matters most here is the *second* one, and it is the one
+        // an assertion on the script text would not distinguish. A machine that
+        // has not fetched `org-settings.json` execs with no `--settings` at all,
+        // so `permissions.defaultMode` reaches it by no route whatsoever and this
+        // flag is the only thing keeping the mode in its Shift+Tab cycle. Losing
+        // it there is invisible: the launcher starts, Claude Code starts, and the
+        // cycle silently has one fewer stop on it.
+        let script = script();
+        let execs: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("exec "))
+            .collect();
+        assert_eq!(execs.len(), 2, "{script}");
+        for exec in execs {
+            assert!(exec.contains(ALLOW_BYPASS), "{exec}");
+            assert!(exec.find(ALLOW_BYPASS) < exec.find(r#""$@""#), "{exec}");
         }
     }
 
@@ -1071,14 +1144,15 @@ mod tests {
         );
     }
 
-    /// Every launcher passes `--settings` and
-    /// `--exclude-dynamic-system-prompt-sections` unconditionally, so `claude-2
-    /// auth login` — which the account box tells developers to run — depends on
-    /// both being accepted ahead of a subcommand.
+    /// Every launcher passes `--settings`,
+    /// `--exclude-dynamic-system-prompt-sections` and
+    /// `--allow-dangerously-skip-permissions` unconditionally, so `claude-2 auth
+    /// login` — which the account box tells developers to run — depends on all
+    /// three being accepted ahead of a subcommand.
     ///
-    /// Both are asserted in one invocation because that is the argument line a
-    /// launcher actually builds; a test that passed them separately would not
-    /// cover the pair. If this ever fails, the launcher — not the developer's
+    /// All three are asserted in one invocation because that is the argument line
+    /// a launcher actually builds; a test that passed them separately would not
+    /// cover the set. If this ever fails, the launcher — not the developer's
     /// command — is what broke.
     ///
     /// Deliberately `#[ignore]`d: only a real `claude` can say whether its
@@ -1104,6 +1178,7 @@ mod tests {
                     "--settings",
                     &settings.to_string_lossy(),
                     STATIC_SYSTEM_PROMPT,
+                    ALLOW_BYPASS,
                     "auth",
                     "status",
                     "--json",
