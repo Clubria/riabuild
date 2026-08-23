@@ -1,11 +1,12 @@
 //! What one Claude Code launcher says.
 //!
 //! ```sh
-//! # a bare, interactive `claude` — opens on the agents view
+//! # a bare, interactive `claude` — opens on the agents view, scoped to the
+//! # checkout this machine was set up for
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
 //!   --settings ~/.riabuild/org-settings.json \
 //!   --allow-dangerously-skip-permissions \
-//!   agents
+//!   agents --cwd ~/Clubria/ai-builders-hub
 //!
 //! # anything else: `claude -p`, `claude --resume`, `claude-2 auth login`
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
@@ -51,6 +52,15 @@
 //! Code carries into a session started *from* the agents view either, so no bare
 //! launch could have kept it whichever way this was written. `ALLOW_BYPASS` is
 //! the opposite case and is carried, which is why it stays on both lines.
+//!
+//! `--cwd` is a third case again, and it is why "stripped or not" is the wrong
+//! question to ask of it. It belongs to the `agents` subcommand rather than to
+//! `claude` — `claude --cwd <path> mcp list` is "unknown option" — so it goes
+//! *after* the positional instead of ahead of it, and an option in that position
+//! costs the view nothing: the launch still opens on it, still with
+//! `ALLOW_BYPASS` in force. Which makes it the one thing here that only the bare
+//! line can have, where `STATIC_SYSTEM_PROMPT` is the one thing only the other
+//! line can have. See `VIEW_CWD`.
 //!
 //! Which also means `defaultToAgentsView` — the global-config key
 //! `claude_agents_view` writes — has never decided anything here, and cannot:
@@ -147,13 +157,74 @@ const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 /// pins beside the other two. Verified against 2.1.235.
 const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 
+/// Scopes the agents view to the checkout this machine was set up for.
+///
+/// A **subcommand** option of `agents`, and only of `agents`: `claude --cwd
+/// <path> mcp list` is "error: unknown option '--cwd'". So it cannot join
+/// `STATIC_SYSTEM_PROMPT` and `ALLOW_BYPASS` ahead of the line — it goes after
+/// the positional, on the one launch that reaches the view, and every other
+/// launch is left exactly as it was.
+///
+/// What it does is two things at once, and the second is the one worth having.
+/// It filters the session list to the sessions started under that path — which
+/// is what the `--help` line says and all it says — *and* it becomes the
+/// working directory the view reports and dispatches from. A developer who runs
+/// `claude` from their home directory used to get a view listing every session
+/// on the machine, from every checkout; now they get the repository riabuild
+/// set this machine up for, wherever they were standing.
+///
+/// It does **not** override a developer who is already somewhere more specific.
+/// Claude Code keeps the process's own working directory when that directory is
+/// inside the path passed here, and takes this one when it is not — so `claude`
+/// from `<checkout>/riabuild-cli`, or from a `.claude/worktrees/` worktree under
+/// it, still opens on where they are. "Always" is therefore always *at least*
+/// the repository, which is the useful reading of it: the flag pulls a
+/// developer who is nowhere near their work back to it, and leaves one who is
+/// standing in it alone.
+///
+/// Passed only where the checkout is on disk. A path that is not there does not
+/// fail — the view opens on an empty list naming a directory nobody has — and
+/// that is precisely the failure worth not shipping: a `claude` whose view is
+/// pinned to a ghost is worse than one that behaves like it did last week.
+///
+/// Verified against Claude Code 2.1.235, including the thing that would have
+/// sunk it: an option after the `agents` positional does not push the launch
+/// off the view and into the background-agents listing, the way
+/// `STATIC_SYSTEM_PROMPT` ahead of it does. `ALLOW_BYPASS` still lands, too —
+/// the view comes up with bypass on its footer. Re-read it when the pinned
+/// version moves.
+const VIEW_CWD: &str = "--cwd";
+
 /// One account's launcher: `claude`, or `claude-<n>`.
+///
+/// `project` is the checkout of the repository this run is about, or `None` on
+/// a machine that has not got one yet — which is every machine before its first
+/// clone, and the reason this is an `Option` rather than a path with a
+/// convention for "nowhere".
 pub fn launcher_script(
     config_dir: &Path,
     claude: &str,
     org_settings: &Path,
     bin_dir: &Path,
+    project: Option<&Path>,
 ) -> String {
+    // Two spellings of one branch rather than one spelling with an interpolated
+    // argument: `${{x:+--cwd "$x"}}` would split a path containing a space back
+    // into two arguments, and `/Users/Ada Smith/Clubria/...` is an ordinary
+    // macOS home rather than a hypothetical one.
+    let agents_view = match project {
+        Some(project) => format!(
+            r#"  if [ -d "{project}" ]; then
+    set -- {bypass} agents {cwd} "{project}"
+  else
+    set -- {bypass} agents
+  fi"#,
+            project = project.display(),
+            bypass = ALLOW_BYPASS,
+            cwd = VIEW_CWD,
+        ),
+        None => format!("  set -- {ALLOW_BYPASS} agents"),
+    };
     format!(
         r#"#!/bin/sh
 # Generated by riabuild. Edits here are overwritten.
@@ -263,8 +334,26 @@ fi
 #              "'claude agents' is disabled …" and exits 1. Honouring the
 #              switch here is the difference between a developer turning the
 #              view off and a developer losing the `claude` command.
+#
+# The view opens on the checkout this machine was set up for, which is what
+# `--cwd` is doing below. It is an option of the `agents` subcommand and of
+# nothing else — `claude --cwd <path> mcp list` is "unknown option" — so it sits
+# after the positional, and the other branch cannot have it. Unlike {flag}, an
+# option in that position does not cost the view: the launch still opens on it,
+# still with {bypass} in force. Verified against Claude Code 2.1.235.
+#
+# It is a floor rather than a move. Claude Code keeps the working directory the
+# process already has when that directory is *inside* the one named here, so
+# `claude` from a subdirectory or from a `.claude/worktrees/` worktree still
+# opens where the developer stands; it is the `claude` typed in a home
+# directory, or in some unrelated tree, that lands on the repository instead of
+# on a list of every session on the machine.
+#
+# Only where the checkout is on disk. A path that is gone opens a view onto an
+# empty list naming a directory nobody has, which is worse than the view this
+# launcher opened before the flag existed.
 if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]; then
-  set -- {bypass} agents
+{agents_view}
 else
   set -- {flag} {bypass} "$@"
 fi
@@ -286,12 +375,20 @@ mod tests {
     use super::*;
     use riabuild_fetch::archive::make_executable;
 
+    /// The checkout the fixture launcher opens its agents view on.
+    const PROJECT: &str = "/Users/ada/Clubria/ai-builders-hub";
+
     fn script() -> String {
+        script_for(Some(Path::new(PROJECT)))
+    }
+
+    fn script_for(project: Option<&Path>) -> String {
         launcher_script(
             Path::new("/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"),
             "/Users/ada/.riabuild/node/22.23.1/bin/claude",
             Path::new("/Users/ada/.riabuild/org-settings.json"),
             Path::new("/Users/ada/.riabuild/bin"),
+            project,
         )
     }
 
@@ -453,6 +550,94 @@ mod tests {
         assert!(line_of("set -- ") < line_of("exec "), "{script}");
     }
 
+    #[test]
+    fn the_agents_view_opens_on_the_checkout() {
+        // The feature. Without it a `claude` typed anywhere but the checkout
+        // opens a view listing every session on the machine, from every
+        // directory the developer has ever worked in.
+        let script = script();
+        assert!(
+            script.contains(&format!(
+                r#"set -- {ALLOW_BYPASS} agents {VIEW_CWD} "{PROJECT}""#
+            )),
+            "{script}"
+        );
+        // Quoted, and the assertion above would pass on an unquoted path too
+        // if the fixture had no space in it. `/Users/Ada Smith/…` is an
+        // ordinary macOS home, and unquoted it reaches Claude Code as two
+        // arguments — the second of which is not an option at all.
+        assert!(
+            script.contains(&format!(r#"{VIEW_CWD} "{PROJECT}""#)),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_view_cwd_never_reaches_a_launch_that_carries_arguments() {
+        // `--cwd` belongs to the `agents` subcommand and to nothing else:
+        // `claude --cwd <path> mcp list` is "error: unknown option '--cwd'".
+        // So a copy of it on the other branch would not scope anything — it
+        // would break every `claude -p`, `claude --resume` and `claude auth
+        // login` on every laptop at once, in Claude Code's own parser.
+        let script = script();
+        for line in script.lines().map(str::trim) {
+            if !line.starts_with("set -- ") && !line.starts_with("exec ") {
+                continue;
+            }
+            let Some(cwd) = line.find(VIEW_CWD) else {
+                continue;
+            };
+            let agents = line
+                .find(" agents")
+                .unwrap_or_else(|| panic!("{VIEW_CWD} on a line with no agents view:\n{line}"));
+            assert!(
+                agents < cwd,
+                "{VIEW_CWD} is ahead of the positional:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_checkout_yet_opens_the_view_as_it_always_did() {
+        // Every machine before its first clone. There is no path to name, and
+        // naming one anyway — the default the picker would offer, say — would
+        // point the view at a directory nobody has cloned into yet.
+        let script = script_for(None);
+        assert!(
+            script.contains(&format!("set -- {ALLOW_BYPASS} agents\n")),
+            "{script}"
+        );
+        // On the lines that run, not in the whole file: the comment above the
+        // branch names the flag, and a whole-script search would fail on a
+        // launcher that never passes it.
+        for line in script.lines().map(str::trim) {
+            if line.starts_with("set -- ") || line.starts_with("exec ") {
+                assert!(!line.contains(VIEW_CWD), "{line}");
+            }
+        }
+        // And no `-d` test either — there is no checkout to look for, so the
+        // branch is the single line it has always been.
+        assert!(!script.contains("if [ -d "), "{script}");
+    }
+
+    #[test]
+    fn a_checkout_that_is_gone_opens_the_view_as_it_always_did() {
+        // A developer who deleted or renamed their checkout by hand, in the gap
+        // between two riabuild runs. Claude Code does not refuse a `--cwd` that
+        // is not there — it opens the view on an empty list naming a directory
+        // nobody has, which is a worse `claude` than the one this launcher
+        // wrote before the flag existed.
+        let script = script();
+        assert!(
+            script.contains(&format!(r#"if [ -d "{PROJECT}" ]; then"#)),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!("  else\n    set -- {ALLOW_BYPASS} agents\n  fi")),
+            "{script}"
+        );
+    }
+
     /// Each guard on the agents-view branch, and what dropping it would cost.
     #[test]
     fn the_agents_view_is_guarded_three_ways() {
@@ -514,11 +699,14 @@ mod tests {
         tokio::fs::write(&settings, "{}").await.unwrap();
 
         let launcher = home.path().join("launcher");
+        let project = home.path().join("checkout");
+        tokio::fs::create_dir_all(&project).await.unwrap();
         let script = launcher_script(
             &home.path().join("profile"),
             &claude.to_string_lossy(),
             &settings,
             &home.path().join("bin"),
+            Some(&project),
         );
         tokio::fs::write(&launcher, &script).await.unwrap();
         make_executable(&launcher).await.unwrap();
@@ -572,6 +760,15 @@ mod tests {
             .unwrap_or_else(|| panic!("{carried:?}"));
         let prompt = carried.iter().position(|arg| arg == "-p").unwrap();
         assert!(flag < prompt, "{carried:?}");
+
+        // Neither launch may carry `--cwd`: it is an option of the `agents`
+        // subcommand, and on either of these lines Claude Code's own parser
+        // stops with "unknown option". Asserted on the arguments the launcher
+        // really produced rather than on its text, because this is the failure
+        // that takes `claude -p` away from every laptop at once.
+        for args in [&bare, &carried] {
+            assert!(!args.iter().any(|arg| arg == VIEW_CWD), "{args:?}");
+        }
     }
 
     /// The pair that must never share a line.
@@ -606,16 +803,35 @@ mod tests {
         // does not, with nothing to see in either terminal.
         let script = script();
 
-        // Half one: exactly two branches build a line, and the one that is not
-        // the agents view carries the flag ahead of `"$@"` — so a developer's
-        // own trailing arguments still reach Claude Code as arguments, rather
-        // than landing after a flag that has already consumed the line.
+        // Half one: exactly one line carries a developer's own arguments, and
+        // it carries the flag ahead of `"$@"` — so those arguments still reach
+        // Claude Code as arguments, rather than landing after a flag that has
+        // already consumed the line.
+        //
+        // Counted rather than asserted at three, which is what the agents view
+        // now spells itself in — one line with `--cwd` and one without, chosen
+        // by whether the checkout is on disk. Both of those are the *same*
+        // branch as far as this test is concerned: neither may carry the flag,
+        // and a fourth spelling of the view would not make this assertion
+        // wrong.
         let built: Vec<&str> = script
             .lines()
             .map(str::trim)
             .filter(|line| line.starts_with("set -- "))
             .collect();
-        assert_eq!(built.len(), 2, "{script}");
+        assert_eq!(
+            built.iter().filter(|line| line.contains(r#""$@""#)).count(),
+            1,
+            "{script}"
+        );
+        assert_eq!(
+            built
+                .iter()
+                .filter(|line| line.contains(STATIC_SYSTEM_PROMPT))
+                .count(),
+            1,
+            "{script}"
+        );
         let carried = built
             .iter()
             .find(|line| line.contains(STATIC_SYSTEM_PROMPT))
@@ -653,13 +869,20 @@ mod tests {
         // flag, this one is stripped before the `agents` positional is tested
         // *and* carried into the sessions the view dispatches, so it belongs on
         // both lines and there is no reason to drop it from either.
+        //
+        // Three lines rather than two, because the view spells itself twice —
+        // with `--cwd` and without, chosen by whether the checkout is on disk.
+        // That is exactly why this loops over every line it finds instead of
+        // checking the two it expects: a branch added later is covered the day
+        // it is written, and the machine with no checkout is the one that would
+        // otherwise have been left out.
         let script = script();
         let built: Vec<&str> = script
             .lines()
             .map(str::trim)
             .filter(|line| line.starts_with("set -- "))
             .collect();
-        assert_eq!(built.len(), 2, "{script}");
+        assert_eq!(built.len(), 3, "{script}");
         for line in built {
             assert!(line.contains(ALLOW_BYPASS), "{line}");
         }
@@ -690,6 +913,7 @@ mod tests {
             "claude",
             Path::new("/Users/ada/.riabuild/org-settings.json"),
             Path::new("/Users/ada/.riabuild/bin"),
+            Some(Path::new(PROJECT)),
         );
         assert!(script.contains(r#"case "$claude_binary" in"#), "{script}");
         assert!(script.contains(r#"*) claude_binary="" ;;"#), "{script}");
@@ -978,5 +1202,72 @@ mod tests {
         let sessions: serde_json::Value =
             serde_json::from_str(output.trimmed()).expect("claude agents --json must print JSON");
         assert!(sessions.is_array(), "{sessions:?}");
+    }
+
+    /// Pins `--cwd` where the launcher puts it, against a real Claude Code.
+    ///
+    /// Two claims, and the launcher is wrong if either stops holding.
+    ///
+    /// It is an option of the **`agents` subcommand**, so it is accepted after
+    /// the positional and rejected before it. The rejection is the half worth
+    /// testing: `--cwd` ahead of the line does not scope a session, it stops
+    /// Claude Code's parser, and a refactor that "tidied" the flag in beside
+    /// `--settings` would take `claude -p` off every laptop at once.
+    ///
+    /// And an option in that position does not cost the view. Ahead of the
+    /// positional an unrecognised option does — see
+    /// `the_agents_view_and_the_static_prompt_flag_never_share_a_line` — so
+    /// "after `agents` is the safe place for options" is a fact about Claude
+    /// Code rather than something the shape of the launcher implies.
+    ///
+    /// `#[ignore]`d because it needs a real install: run
+    /// `cargo test -- --ignored` when the pinned Claude Code version moves.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code install; pins where --cwd is accepted"]
+    async fn the_view_cwd_is_an_agents_option_and_only_an_agents_option() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+        let runner = RealRunner;
+        let Some(_) = runner.which("claude") else {
+            panic!("claude is not installed; this test needs it");
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let checkout = home.path().join("checkout");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+        let checkout = checkout.to_string_lossy().into_owned();
+
+        // Where the launcher puts it. `--json` stands in for the interactive
+        // view, which cannot run under `cargo test`: it takes the same parse
+        // and the same `cwd` filter, and prints instead of mounting.
+        let accepted = runner
+            .run(
+                "claude",
+                &["agents", VIEW_CWD, &checkout, "--json"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude agents --cwd <path> --json");
+        assert!(
+            accepted.ok(),
+            "claude rejected {VIEW_CWD} after the positional: {accepted:?}"
+        );
+        let sessions: serde_json::Value = serde_json::from_str(accepted.trimmed())
+            .expect("claude agents --cwd <path> --json must print JSON");
+        assert!(sessions.is_array(), "{sessions:?}");
+
+        // And the spelling the launcher must never write.
+        let rejected = runner
+            .run(
+                "claude",
+                &[VIEW_CWD, &checkout, "mcp", "list"],
+                &RunOptions::default(),
+            )
+            .await
+            .expect("claude --cwd <path> mcp list");
+        assert!(
+            !rejected.ok(),
+            "claude now accepts {VIEW_CWD} as a root option — the launcher's \
+             reason for keeping it off the other branch has gone: {rejected:?}"
+        );
     }
 }
