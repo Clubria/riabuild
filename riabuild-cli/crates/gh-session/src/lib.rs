@@ -32,10 +32,12 @@
 //! on live beside it: `runtime_dir` decides *where* the directory goes, and
 //! `private_dir` creates it in a way another local account cannot subvert.
 
-// `unwrap_used` is denied workspace-wide. In tests a panic *is* the reporting
-// mechanism for a failed precondition, so unwrapping a fixture there is
-// correct and this keeps the deny from forcing ceremony into every test module.
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+// The panic lints are denied workspace-wide. In tests a panic *is* the
+// reporting mechanism for a failed precondition, so unwrapping a fixture there
+// is correct and this keeps the deny from forcing ceremony into every test
+// module. The exemption is `test` and nothing wider — see the workspace
+// manifest for what an `any(test, feature = "testing")` spelling of it costs.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 mod private_dir;
 mod runtime_dir;

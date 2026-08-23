@@ -72,11 +72,7 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
       // others. An exact-path entry would have to be edited in the dashboard
       // every time one is added, and would silently leave the new file readable
       // until someone did. `.env.local` stays covered by the same glob.
-      deny: [
-        "Read(./.env)",
-        "Read(./.env.*)",
-        "Bash(git push --force:*)",
-      ],
+      deny: ["Read(./.env)", "Read(./.env.*)", "Bash(git push --force:*)"],
     },
     skipDangerousModePermissionPrompt: true,
     env: { CLUBRIA_ORG: "1" },
@@ -178,12 +174,41 @@ export async function loadConfig(ctx: QueryCtx): Promise<OrgConfig> {
   };
 }
 
+/**
+ * The org config a signed-in dashboard renders from.
+ *
+ * Signed in, and a *member*. The Convex deployment URL ships in the browser
+ * bundle, so "the dashboard skips this query when signed out" is a statement
+ * about our client and about nobody else's: without the check below, the org's
+ * Claude settings, its repo slug, its version floors and the ngrok token's
+ * last four characters were readable by anyone who could type a URL.
+ * `org.update` below has always checked; this is the read half catching up.
+ *
+ * Membership rather than *active* membership, deliberately. A suspended member
+ * still renders the dashboard — that is where they are told they are suspended
+ * — and a query that threw would replace that screen with an error boundary.
+ * Nothing here is a credential, and every path that hands one out re-verifies
+ * GitHub org membership on its own.
+ *
+ * The ngrok hint is the exception and is lead-only. It is four characters of a
+ * live team credential, it exists so the lead who pasted it can recognise it,
+ * and `LeadPanel` is the only thing that renders it. An empty string is what
+ * "no token is set" already looks like to that panel, so a non-lead is shown
+ * exactly what a lead with no token configured is shown.
+ */
 export const get = query({
   args: {},
   returns: publicConfigView,
   handler: async (ctx) => {
+    const member = await viewerMember(ctx);
+    if (member === null) throw new Error("Not signed in.");
+    const isLead = member.role === "lead" && member.status === "active";
+
     const { ngrokAuthToken, ...config } = await loadConfig(ctx);
-    return { ...config, ngrokAuthTokenHint: ngrokAuthTokenHint(ngrokAuthToken) };
+    return {
+      ...config,
+      ngrokAuthTokenHint: isLead ? ngrokAuthTokenHint(ngrokAuthToken) : "",
+    };
   },
 });
 
@@ -236,6 +261,158 @@ function checkRepoSlug(raw: string): void {
   }
 }
 
+/**
+ * Top-level settings keys whose value *is* a program, or names one.
+ *
+ * **`riabuild-cli/crates/tasks/src/org_settings/vetting.rs` is the authority,
+ * and the CLI is the real gate.** This list is a copy of `EXECUTES_A_PROGRAM`
+ * there, kept in agreement by hand. It has to be a copy: the two live in
+ * different languages in different deployables, and the CLI treats this server
+ * as untrusted precisely so that a compromised deployment, a hand-edited
+ * `orgConfig` row or a proxy between the two cannot choose what runs on a
+ * laptop. Nothing here is a security control — the check that is happens on the
+ * developer's machine.
+ *
+ * What it buys is a lead being told at *save* time. Without it the dashboard
+ * accepts a blob the whole fleet then refuses, and the first person to find out
+ * is every developer at once, on their next run, with a hard failure naming a
+ * key they did not write.
+ *
+ * If the two lists drift, the CLI's wins and this one is a bug: a key it
+ * refuses and this one accepts is the outage above; a key this one refuses and
+ * it accepts is a lead blocked from something that would have worked.
+ */
+const EXECUTES_A_PROGRAM = [
+  "apiKeyHelper",
+  "awsAuthRefresh",
+  "awsCredentialExport",
+  "enableAllProjectMcpServers",
+  "enabledMcpjsonServers",
+  "enabledPlugins",
+  "extraKnownMarketplaces",
+  "hooks",
+  "mcpServers",
+  "otelHeadersHelper",
+];
+
+/**
+ * Environment variable names that make `env` a program-carrying key. A copy of
+ * `INJECTS_A_PROGRAM` in `vetting.rs`, under the same terms as above.
+ *
+ * `env` is data in every ordinary use, and it is also the quietest way left to
+ * run code once `hooks` is refused: `NODE_OPTIONS=--require /tmp/x.js` loads a
+ * file into a session that never names a hook, and `PATH` decides which `node`
+ * and `sh` that session finds at all.
+ */
+const INJECTS_A_PROGRAM = [
+  "BASH_ENV",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "ENV",
+  "LD_AUDIT",
+  "LD_LIBRARY_PATH",
+  "LD_PRELOAD",
+  "NODE_OPTIONS",
+  "PATH",
+  "PERL5OPT",
+  "PYTHONSTARTUP",
+  "RUBYOPT",
+];
+
+/** What a lead is told to do about a key riabuild will not write. */
+const REMOVE_IT =
+  "riabuild-web supplies settings data; the programs a laptop runs ship inside " +
+  "the riabuild binary. Remove it and save again.";
+
+function refuse(key: string, why: string): never {
+  throw new Error(`riabuild will not write \`${key}\` — ${why}. ${REMOVE_IT}`);
+}
+
+/**
+ * The half of `vet()` that is worth doing twice.
+ *
+ * Deliberately **not** a full mirror. The CLI has two tiers: a key that names a
+ * program is refused, and a key it does not recognise is *stripped* with a note
+ * so a Claude Code release that adds one does not brick the org. Only the first
+ * tier is enforced here. Refusing an unrecognised key at save time would make
+ * this server the thing that decides what a lead may write, and the CLI ships
+ * on a slower clock than Claude Code does — a lead would be locked out of a new
+ * inert preference until riabuild cut a release. An unknown key saved here is
+ * accepted, stored, and dropped on the laptop with a note, which is the
+ * behaviour the CLI already documents.
+ *
+ * `statusLine` is checked against `DEFAULT_STATUS_LINE.command`, which is the
+ * command `claude_statusline` installs. The CLI compares against the path it
+ * actually wrote on *that* machine rather than against a constant, so this
+ * check is the weaker of the two by construction.
+ */
+function checkClaudeSettings(raw: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // The CLI hands this file straight to `claude --settings`. Invalid JSON
+    // here breaks every developer's launcher at once.
+    throw new Error("Claude settings must be valid JSON.");
+  }
+  if (!isSettingsObject(parsed)) {
+    throw new Error(
+      "Claude settings must be valid JSON — a JSON object, which is what " +
+        "`claude --settings` reads.",
+    );
+  }
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (EXECUTES_A_PROGRAM.includes(key)) {
+      refuse(key, "it names a program for Claude Code to run");
+    }
+    if (key === "statusLine") checkStatusLine(value);
+    if (key === "env") checkEnv(value);
+  }
+}
+
+/**
+ * The one key allowed to name a program, and only the program riabuild put
+ * there itself.
+ *
+ * Equality, not a prefix: `node ~/.riabuild/claude-statusline.js; curl … | sh`
+ * starts with the right thing and is a shell command Claude Code runs on every
+ * render.
+ */
+function checkStatusLine(value: unknown): void {
+  if (!isSettingsObject(value)) {
+    refuse(
+      "statusLine",
+      "riabuild only writes the status line it installs itself",
+    );
+  }
+  if (value.type !== "command") {
+    refuse("statusLine", "riabuild only writes a `command` status line");
+  }
+  if (value.command === undefined) {
+    refuse("statusLine", "it carries no `command`");
+  }
+  if (value.command !== DEFAULT_STATUS_LINE.command) {
+    refuse(
+      "statusLine.command",
+      "the only one riabuild writes is the command the `claude_statusline` task " +
+        `installs, \`${DEFAULT_STATUS_LINE.command}\``,
+    );
+  }
+}
+
+function checkEnv(value: unknown): void {
+  if (!isSettingsObject(value)) refuse("env", "it is not a JSON object");
+  for (const [name, entry] of Object.entries(value)) {
+    if (INJECTS_A_PROGRAM.includes(name)) {
+      refuse(`env.${name}`, "setting it chooses what the session executes");
+    }
+    if (typeof entry !== "string") {
+      refuse(`env.${name}`, "an environment variable has to be a string");
+    }
+  }
+}
+
 export const update = mutation({
   args: {
     claudeSettings: v.optional(v.string()),
@@ -264,13 +441,7 @@ export const update = mutation({
     }
 
     if (args.claudeSettings !== undefined) {
-      try {
-        JSON.parse(args.claudeSettings);
-      } catch {
-        // The CLI hands this file straight to `claude --settings`. Invalid JSON
-        // here breaks every developer's launcher at once.
-        throw new Error("Claude settings must be valid JSON.");
-      }
+      checkClaudeSettings(args.claudeSettings);
     }
 
     // parseVersion is forgiving by design — it maps anything unparseable to 0
@@ -450,7 +621,11 @@ export const backfillStatusLine = internalMutation({
     let settings: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(row.claudeSettings);
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      )
         throw new Error("not an object");
       settings = parsed as Record<string, unknown>;
     } catch {
@@ -673,7 +848,8 @@ export const denyEveryDotenvFile = internalMutation({
     if (row === null) {
       return {
         updated: false,
-        reason: "No stored config — the served defaults already carry the glob.",
+        reason:
+          "No stored config — the served defaults already carry the glob.",
       };
     }
 

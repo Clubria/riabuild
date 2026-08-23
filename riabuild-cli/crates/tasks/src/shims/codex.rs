@@ -31,7 +31,6 @@
 //! behaviour rather than accommodating one.
 
 use anyhow::Result;
-use riabuild_fetch::archive::make_executable;
 use std::path::Path;
 
 /// What `--yolo` is short for, and what the launcher has to look for in the
@@ -138,19 +137,19 @@ exec "$codex_binary" --yolo "$@"
 /// mean profile 1 — the shape `shims::write_all` already uses for `claude` and
 /// `claude-1`.
 ///
-/// Each is landed by rename and then made executable, like every other
-/// generated script: the hazard is an interrupt mid-write leaving a truncated
-/// launcher that fails with a shell syntax error.
+/// Each goes through [`shims::write_script`](super::write_script), like every
+/// other generated script, so it is landed by rename and then made executable:
+/// the hazard is an interrupt mid-write leaving a truncated launcher that fails
+/// with a shell syntax error.
 pub async fn write(ctx: &crate::Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
-    tokio::fs::create_dir_all(&bin).await?;
     let codex = ctx.codex();
 
     for profile in 1..=PROFILES {
         let script = launcher_script(&ctx.paths.codex_profile_dir(profile), &codex, &bin);
-        write_launcher(&bin.join(format!("codex-{profile}")), &script).await?;
+        super::write_script(&bin, &format!("codex-{profile}"), &script).await?;
         if profile == 1 {
-            write_launcher(&bin.join("codex"), &script).await?;
+            super::write_script(&bin, "codex", &script).await?;
         }
     }
     Ok(())
@@ -173,16 +172,11 @@ pub fn profile_of(name: &str) -> usize {
         .unwrap_or(1)
 }
 
-async fn write_launcher(path: &Path, script: &str) -> Result<()> {
-    riabuild_paths::config::write_atomic(path, script.as_bytes()).await?;
-    make_executable(path).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::ctx_with;
+    use riabuild_fetch::archive::make_executable;
     use riabuild_runner::FakeRunner;
 
     fn script() -> String {

@@ -9,7 +9,10 @@ import { expect, Page, test as base, TestInfo } from "@playwright/test";
  * warning or an unhandled rejection is a real defect that a screenshot alone
  * will happily show you as a perfectly nice-looking page.
  */
-export const test = base.extend<{ consoleErrors: string[]; fontsStubbed: boolean }>({
+export const test = base.extend<{
+  consoleErrors: string[];
+  fontsStubbed: boolean;
+}>({
   /**
    * Keeps the suite off the network.
    *
@@ -30,8 +33,10 @@ export const test = base.extend<{ consoleErrors: string[]; fontsStubbed: boolean
    */
   fontsStubbed: [
     async ({ page }, use) => {
-      await page.route(/^https:\/\/fonts\.(googleapis|gstatic)\.com\//, (route) =>
-        route.fulfill({ status: 200, contentType: "text/css", body: "" }),
+      await page.route(
+        /^https:\/\/fonts\.(googleapis|gstatic)\.com\//,
+        (route) =>
+          route.fulfill({ status: 200, contentType: "text/css", body: "" }),
       );
       await use(true);
     },
@@ -78,7 +83,13 @@ export async function checkPage(
   consoleErrors: string[],
   options: CheckOptions = {},
 ): Promise<void> {
-  await page.waitForLoadState("networkidle");
+  // Every screen this runs against draws the terminal frame, so its body is the
+  // one thing whose presence means "React has mounted and rendered". A
+  // web-first assertion rather than `networkidle`: the only third-party request
+  // the app ever made was the Google Fonts stylesheet, which the `fontsStubbed`
+  // fixture answers locally, so waiting for the network to fall quiet was
+  // waiting on nothing and then guessing when nothing had finished.
+  await expect(page.locator("main")).toBeVisible();
   // The blinking cursor animates forever; stop it so screenshots are stable.
   await page.addStyleTag({
     content: `*, *::before, *::after { animation: none !important; transition: none !important; }`,
@@ -112,7 +123,9 @@ export async function checkPage(
   }
   const results = await axe.analyze();
   expect(
-    results.violations.map((v) => `${v.id}: ${v.nodes.length} node(s) — ${v.help}`),
+    results.violations.map(
+      (v) => `${v.id}: ${v.nodes.length} node(s) — ${v.help}`,
+    ),
     "axe-core accessibility violations",
   ).toEqual([]);
 
@@ -201,43 +214,76 @@ async function expectAnchorTargetsExist(page: Page): Promise<void> {
 
 /**
  * The page handles no keystrokes, so the browser's own tab order is the entire
- * keyboard story. Every interactive element must therefore be reachable and
- * must show where the focus went.
+ * keyboard story. Every interactive element must therefore be reachable by Tab
+ * and must show where the focus went.
+ *
+ * Reached the way a keyboard user reaches it, which took two goes to get right.
+ * The first version called `handle.focus()` and read
+ * `getComputedStyle(el, ":focus-visible")` — and that assertion could not fail.
+ * The second argument to `getComputedStyle` takes a *pseudo-element*, so Chrome
+ * ignored `:focus-visible` and handed back the element's ordinary style; and
+ * programmatic `focus()` does not put a button into `:focus-visible` in the
+ * first place, so the rule under that selector was not in the style being read
+ * either. Two mistakes that cancelled into a green check on a page that could
+ * have had no focus ring at all.
+ *
+ * Tab is the fix for both. It sets the state for real, so the ordinary computed
+ * style already carries the `:focus-visible` rule, and `:focus-visible` itself
+ * becomes something worth asserting. It also walks the tab order rather than
+ * the DOM order, which is the thing a keyboard user actually has.
  */
 async function expectVisibleFocus(page: Page, info: TestInfo): Promise<void> {
   const selector =
     "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])";
-  const handles = await page.locator(selector).all();
+  const reachable = await page.locator(selector).count();
+
+  // Focus starts at the document, so the first Tab lands on the first element
+  // in the browser's own order rather than continuing from wherever an earlier
+  // assertion left it.
+  await page.evaluate(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+  });
 
   const LIMIT = 60;
-  if (handles.length > LIMIT) {
-    info.annotations.push({
-      type: "note",
-      description: `focus check covered ${LIMIT} of ${handles.length} interactive elements`,
-    });
-  }
-
   const invisible: string[] = [];
-  for (const handle of handles.slice(0, LIMIT)) {
-    if (!(await handle.isVisible())) continue;
-    await handle.focus();
-    const ok = await handle.evaluate((el) => {
-      const style = getComputedStyle(el, ":focus-visible");
+  let stopped = 0;
+  for (let step = 0; step < LIMIT; step++) {
+    await page.keyboard.press("Tab");
+    const focused = await page.evaluate(() => {
+      const el = document.activeElement;
+      // Tabbing past the last control hands focus back to the document (and
+      // then to the browser's own chrome, which is not ours to check).
+      if (!(el instanceof HTMLElement) || el === document.body) return null;
+      const style = getComputedStyle(el);
       const width = parseFloat(style.outlineWidth || "0");
-      return (
-        (style.outlineStyle !== "none" && width > 0) ||
-        style.boxShadow !== "none"
-      );
+      return {
+        label: `${el.tagName.toLowerCase()} "${(el.textContent ?? "").trim().slice(0, 30)}"`,
+        // The state the ring is written under. A control the browser refuses
+        // to mark focus-visible on a keyboard tab is one whose ring nobody
+        // will ever see, whatever the stylesheet says.
+        focusVisible: el.matches(":focus-visible"),
+        ringed:
+          (style.outlineStyle !== "none" && width > 0) ||
+          style.boxShadow !== "none",
+      };
     });
-    if (!ok) {
-      invisible.push(
-        await handle.evaluate(
-          (el) =>
-            `${el.tagName.toLowerCase()} "${(el.textContent ?? "").trim().slice(0, 30)}"`,
-        ),
-      );
+    if (focused === null) break;
+    stopped = step + 1;
+    if (!focused.focusVisible) {
+      invisible.push(`${focused.label} — not :focus-visible after Tab`);
+    } else if (!focused.ringed) {
+      invisible.push(`${focused.label} — :focus-visible with no outline`);
     }
   }
+
+  if (stopped >= LIMIT) {
+    info.annotations.push({
+      type: "note",
+      description: `focus check covered the first ${LIMIT} stops of ${reachable} interactive elements`,
+    });
+  }
+  expect(stopped, "elements reached by Tab").toBeGreaterThan(0);
   expect(invisible, "interactive elements with no visible focus ring").toEqual(
     [],
   );

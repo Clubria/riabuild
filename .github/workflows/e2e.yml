@@ -24,6 +24,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Read-only. The job checks out, builds, and runs the end-to-end suite against a
+# throwaway backend; nothing it does needs write access to this repository, and
+# it runs on `pull_request`, where the code it compiles is the contributor's.
+permissions:
+  contents: read
+
 concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
@@ -39,7 +45,7 @@ jobs:
     env:
       E2E_GITHUB_TOKEN: ${{ secrets.E2E_GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # This repository is public, so pull requests from forks get no secrets
       # and there is nothing this job could do with the ones it has. Skipping
@@ -62,25 +68,11 @@ jobs:
             echo "have_token=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         if: steps.identity.outputs.have_token == 'true'
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-pnpm
         if: steps.identity.outputs.have_token == 'true'
-        with:
-          workspaces: riabuild-cli
-
-      - uses: pnpm/action-setup@v4
-        if: steps.identity.outputs.have_token == 'true'
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        if: steps.identity.outputs.have_token == 'true'
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: riabuild-web/pnpm-lock.yaml
 
       # The backend is served by `npx convex dev` out of this directory, so its
       # dependencies have to be present before run.sh starts.
@@ -99,7 +91,7 @@ jobs:
       # into an artifact — so the logs are copied out by run.sh itself.
       - name: Upload logs
         if: failure() && steps.identity.outputs.have_token == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-logs
           path: e2e-logs/

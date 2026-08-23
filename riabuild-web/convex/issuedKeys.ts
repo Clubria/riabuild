@@ -125,9 +125,7 @@ export const list = query({
   handler: async (ctx) => {
     await requireLead(ctx);
     const rows = await ctx.db.query("issuedKeys").take(200);
-    return rows
-      .map(toView)
-      .sort((a, b) => a.label.localeCompare(b.label));
+    return rows.map(toView).sort((a, b) => a.label.localeCompare(b.label));
   },
 });
 
@@ -227,7 +225,9 @@ export const setIssuedTo = mutation({
     const removed = [...before].filter((id) => !after.has(id));
 
     const loginOf = async (id: Id<"members">) =>
-      members.get(id) ?? (await ctx.db.get("members", id))?.githubLogin ?? "(removed)";
+      members.get(id) ??
+      (await ctx.db.get("members", id))?.githubLogin ??
+      "(removed)";
 
     await ctx.db.patch("issuedKeys", args.id, {
       issuedTo: [...after],

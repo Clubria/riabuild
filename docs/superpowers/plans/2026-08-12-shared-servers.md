@@ -1,6 +1,10 @@
 # Shared SSH servers — implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Completed — historical record, do not execute.** Shipped in #60, 2026-08-13. The
+> unchecked `- [ ]` boxes below are how the plan was written and not work outstanding, and
+> the instruction to an agentic worker to implement it task-by-task that stood here has
+> been removed: acting on it would rebuild something that already ships. See
+> [`README.md`](README.md) for the index, and the design spec for what the code does now.
 
 **Goal:** Leads add a server's address once in riabuild-web, and it appears in every
 developer's `riabuild remote` picker as `shared-<name>`, while every credential for it

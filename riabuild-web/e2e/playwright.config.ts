@@ -15,6 +15,22 @@ import { defineConfig, devices } from "@playwright/test";
 const PORT = Number(process.env.RIABUILD_UI_PORT ?? 5199);
 
 /**
+ * Tests that assert nothing about width, and are run once rather than three
+ * times.
+ *
+ * Three viewports exist because the failures live at the edges — a table with
+ * no room for its columns, a page that looks empty — and every test that
+ * renders a page keeps all three. What does not is the handful whose subject is
+ * behaviour: that a path is escaped rather than parsed as markup, that eight
+ * typed characters find a machine, that an unknown fixture name fails loudly.
+ * Running those at 380 and at 1440 asserts the same thing about the same DOM
+ * and calls it coverage.
+ *
+ * The smoke suite is tagged too, for a different reason given at its `describe`.
+ */
+const VIEWPORT_AGNOSTIC = /@viewport-agnostic/;
+
+/**
  * Three viewports, because the failures live at the edges: 380 is a small phone
  * where a table has no room for its columns, 1440 is where a page can look
  * empty, and 768 is the breakpoint itself.
@@ -61,15 +77,29 @@ export default defineConfig({
   projects: [
     {
       name: "narrow",
-      use: { ...devices["Desktop Chrome"], viewport: { width: 380, height: 800 } },
+      grepInvert: VIEWPORT_AGNOSTIC,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 380, height: 800 },
+      },
     },
     {
+      // The one project that runs everything, so a viewport-agnostic test still
+      // runs exactly once rather than not at all. 768 because a test that has
+      // to pick a width should pick the breakpoint.
       name: "medium",
-      use: { ...devices["Desktop Chrome"], viewport: { width: 768, height: 1024 } },
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 768, height: 1024 },
+      },
     },
     {
       name: "wide",
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
+      grepInvert: VIEWPORT_AGNOSTIC,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1440, height: 900 },
+      },
     },
   ],
 

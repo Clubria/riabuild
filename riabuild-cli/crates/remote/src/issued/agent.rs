@@ -37,7 +37,8 @@
 //! before a developer's seventh key was ever tried.
 
 use crate::Remote;
-use crate::identity::{set_private_dir, ssh_options};
+use crate::identity::{Offered, ensure_private_dir};
+use crate::ssh::Ssh;
 use anyhow::Result;
 use riabuild_api::issued::IssuedKey;
 use riabuild_paths::Paths;
@@ -87,11 +88,12 @@ impl Agent {
         }
 
         let dir = paths.agent_dir(&remote.hash());
-        tokio::fs::create_dir_all(&dir).await?;
-        // Repaired unconditionally, before anything is written into it — the
-        // same order `identity::ensure_key` uses, so a directory left
-        // world-readable by an older riabuild does not stay that way.
-        set_private_dir(&dir).await?;
+        // Created at 0700 and repaired unconditionally, before anything is
+        // written into it — the same call `identity::ensure_key` and
+        // `host_key::pin` make, so an agent socket is never reachable by
+        // another account on the box, not even for the two syscalls a
+        // create-then-chmod leaves open.
+        ensure_private_dir(&dir).await?;
 
         let socket = dir.join("sock");
         // A killed run leaves its socket behind, and `ssh-agent` refuses to
@@ -113,9 +115,16 @@ impl Agent {
         Ok(Some(agent))
     }
 
+    /// Measured on `tokio::time::Instant`, never `std`'s — the same rule the
+    /// pump's keepalive states: the sleep below is tokio's, so a deadline taken
+    /// off the other clock is one the two halves disagree about. Under a paused
+    /// or advanced test clock the sleeps return at once while `std`'s clock
+    /// crawls at wall speed, which turns a bounded wait into a hot spin for the
+    /// full two seconds and makes the deadline something no test can reach
+    /// deliberately.
     async fn await_socket(&self) {
-        let deadline = std::time::Instant::now() + SOCKET_WAIT;
-        while std::time::Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+        while tokio::time::Instant::now() < deadline {
             if tokio::fs::metadata(&self.socket).await.is_ok() {
                 return;
             }
@@ -184,12 +193,13 @@ impl Agent {
     /// `IdentitiesOnly=yes` plus `-i <public half>` restricts the attempt to a
     /// single agent key, so the answer names a key rather than the set.
     ///
-    /// `RunOptions::default()`, deliberately, and for the reason
-    /// `authorise::can_sign_in` sets out at length: this is the *only* family
-    /// of ssh calls in remote mode that must not carry `askpass::run_options`.
-    /// A saved password could otherwise answer a prompt and make the answer yes
-    /// for a key that does not work at all. `BatchMode=yes` already forbids
-    /// every prompt; this is the belt beside those braces.
+    /// `without_askpass`, deliberately, and for the reason
+    /// `authorise::can_sign_in` sets out at length: this and that probe are
+    /// the only ssh calls in remote mode that must not carry
+    /// `askpass::run_options`. A saved password could otherwise answer a
+    /// prompt and make the answer yes for a key that does not work at all.
+    /// `BatchMode=yes` already forbids every prompt; this is the belt beside
+    /// those braces.
     pub async fn probe(
         &self,
         remote: &Remote,
@@ -197,20 +207,21 @@ impl Agent {
         runner: Arc<dyn CommandRunner>,
         public_key_path: &Path,
     ) -> Result<bool> {
-        let mut args = vec!["-o".to_string(), "BatchMode=yes".to_string()];
-        // Reused rather than restated, so the pinned `known_hosts`, the
-        // `-F /dev/null` and the port all stay in one place. The identity it
-        // names is riabuild's own, which `-i` below overrides.
-        args.extend(ssh_options(remote, paths, true, None));
-        args.push("-o".to_string());
-        args.push(format!("IdentityAgent={}", self.socket.to_string_lossy()));
-        args.push("-i".to_string());
-        args.push(public_key_path.to_string_lossy().into_owned());
-        args.push(remote.target());
-        args.push("true".to_string());
-
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let probe = runner.run("ssh", &refs, &RunOptions::default()).await?;
+        // Composed rather than restated, so the pinned `known_hosts`, the
+        // `-F /dev/null`, the port and the bound on the dial all stay in one
+        // place. `offering` names this one agent key beside riabuild's own,
+        // which is the same shape a carried identity takes everywhere else —
+        // there is just no `Working` yet, because whether there is one is the
+        // question being asked.
+        let probe = Ssh::to(remote, paths, runner)
+            .offering(Offered {
+                socket: &self.socket,
+                public_key_path,
+            })
+            .option("BatchMode=yes")
+            .without_askpass()
+            .run("true")
+            .await?;
         Ok(probe.ok())
     }
 
@@ -223,9 +234,42 @@ impl Agent {
     /// Best effort throughout: a failure here must not surface as a failure of
     /// the run. The keys are gone with the process either way, and the two
     /// things left on disk — a socket and a public key — are inert.
+    ///
+    /// This is the *orderly* teardown, and [`Drop`] below is what makes it
+    /// unmissable. Both exist because neither is enough on its own: only this
+    /// one can `await` the kill and know the process is signalled before the
+    /// run moves on, and only `Drop` runs on the paths that never reach it.
     pub async fn stop(self) {
         let _ = self.child.kill().await;
         let _ = tokio::fs::remove_dir_all(&self.dir).await;
+        // `self` is dropped here, so `Drop::drop` runs immediately after and
+        // finds the directory already gone. Both halves are idempotent
+        // precisely so that is a no-op rather than a second error to swallow.
+    }
+}
+
+impl Drop for Agent {
+    /// The backstop for every path out of a run that does not reach
+    /// [`Agent::stop`] — which, until this existed, was the whole success path
+    /// through `flow::connect` and every `?` in it: only `--check` and a failed
+    /// `authorise` called `stop`, though `Issued::stop`'s doc claimed every
+    /// path did.
+    ///
+    /// Two different things are being cleaned up and only one of them was ever
+    /// safe to leave to chance. **The process** goes with the handle —
+    /// `RealRunner::spawn` sets `kill_on_drop`, so dropping `child` signals the
+    /// agent — which is why an orphaned `ssh-agent` was not the visible
+    /// symptom. **The directory** does not: `<root>/agent/<hash>` was left
+    /// behind on every successful run, holding the public halves that name
+    /// which org keys this laptop was issued and a dead socket the next run's
+    /// `Agent::start` then has to unlink.
+    ///
+    /// `std::fs`, and this is the one place in the crate where that is not the
+    /// bug `CLAUDE.md` says it is: a `Drop` cannot `await`, and the choice here
+    /// is not between blocking and not blocking, it is between an `unlink` of a
+    /// handful of small files under `~/.riabuild` and never cleaning up at all.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -293,6 +337,39 @@ mod tests {
                 "key material in an argv: {call}"
             );
         }
+    }
+
+    /// The wait for the socket ends on the clock its sleeps are on.
+    ///
+    /// A `FakeRunner` binds no socket, so this is the path that runs the
+    /// deadline out — the same path a real `ssh-agent` that never came up
+    /// takes. With the deadline on `std::time::Instant` and the sleep on
+    /// tokio's, a paused clock lets every sleep return at once while the
+    /// deadline crawls at wall speed: the bounded poll becomes a hot spin for
+    /// two real seconds, and the loop's own bound is something no test can
+    /// reach on purpose. Asserting on elapsed *virtual* time is what tells the
+    /// two apart — spinning would run the clock far past `SOCKET_WAIT` before
+    /// `std` agreed the wait was over.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_a_socket_is_bounded_on_the_clock_its_sleeps_use() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let started = tokio::time::Instant::now();
+
+        Agent::start(&remote(), &paths, runner())
+            .await
+            .expect("start")
+            .expect("an agent");
+
+        let waited = started.elapsed();
+        assert!(
+            waited >= SOCKET_WAIT,
+            "the deadline must be reachable at all: {waited:?}"
+        );
+        assert!(
+            waited < SOCKET_WAIT + SOCKET_POLL * 4,
+            "the deadline is on the same clock as the sleeps: {waited:?}"
+        );
     }
 
     #[tokio::test]
@@ -393,6 +470,65 @@ mod tests {
         // And it still pins riabuild's own known_hosts rather than the
         // developer's.
         assert!(call.contains("-F /dev/null"), "{call}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_nobody_stopped_still_takes_its_directory_with_it() {
+        // `Issued::stop`'s doc claimed it was "called on every path out of
+        // connect". It was called on two: `--check`, and a failed `authorise`.
+        // The whole success path — and every `?` below the copy — left
+        // `<root>/agent/<hash>` on disk holding the public halves that name
+        // which org keys this laptop was issued, plus a dead socket the next
+        // run's `Agent::start` then has to unlink. Since `connect` cannot be
+        // reached from this crate's tests, the guarantee is asserted where it
+        // now lives: dropping the agent, by any route, cleans up.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = runner();
+        let dir = paths.agent_dir(&remote().hash());
+
+        {
+            let agent = Agent::start(&remote(), &paths, fake.clone())
+                .await
+                .expect("start")
+                .expect("an agent");
+            agent
+                .add(fake.clone(), &key(), Some(PROBE_LIFETIME))
+                .await
+                .expect("add");
+            assert!(
+                tokio::fs::metadata(&dir).await.is_ok(),
+                "the agent has to have somewhere to keep the public halves first"
+            );
+            // No `stop()`. This is the shape of every path that forgot one.
+        }
+
+        assert!(
+            tokio::fs::metadata(&dir).await.is_err(),
+            "an agent that went out of scope left {} behind",
+            dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_an_agent_twice_over_is_not_an_error() {
+        // `stop` consumes the agent, so `Drop` runs immediately after it and
+        // finds the directory already gone. Both halves have to be idempotent
+        // or the orderly teardown would panic on the tidy path and only the
+        // forgotten one would work.
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = RealPaths::rooted_at(home.path());
+        let fake = runner();
+        let dir = paths.agent_dir(&remote().hash());
+
+        let agent = Agent::start(&remote(), &paths, fake.clone())
+            .await
+            .expect("start")
+            .expect("an agent");
+        agent.stop().await;
+
+        assert!(tokio::fs::metadata(&dir).await.is_err());
+        assert_eq!(fake.killed().len(), 1, "{:?}", fake.spawns());
     }
 
     #[tokio::test]

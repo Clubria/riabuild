@@ -11,9 +11,10 @@
 //! Design: `docs/superpowers/specs/2026-08-12-shared-servers-design.md`.
 
 use super::Remote;
-use super::store::{Origin, Record, Store};
+use super::store::{self, Origin, Record, Store};
 use riabuild_api::remotes::{self, SharedServer};
 use riabuild_tasks::Ctx;
+use riabuild_ui::Ui;
 
 /// Fetches the team's servers, and never fails.
 ///
@@ -50,7 +51,7 @@ pub async fn fetch(ctx: &Ctx) -> Vec<SharedServer> {
 /// retire — see [`reconcile`].
 pub async fn refresh(ctx: &Ctx, store: &mut Store) -> Vec<Record> {
     let servers = fetch(ctx).await;
-    reconcile(store, &servers)
+    reconcile(&ctx.ui, store, &servers)
 }
 
 /// The same, for `riabuild remote list`, which only reads.
@@ -74,7 +75,7 @@ pub async fn refresh_for_listing(ctx: &mut Ctx, store: &mut Store) {
         return;
     }
     let servers = fetch(ctx).await;
-    reconcile(store, &servers);
+    reconcile(&ctx.ui, store, &servers);
 }
 
 /// Folds a fetch into the store, and reports the identities it replaced.
@@ -96,12 +97,13 @@ pub async fn refresh_for_listing(ctx: &mut Ctx, store: &mut Store) {
 /// machine holding a key riabuild put there and, possibly, a live session.
 /// They are returned rather than acted on here because acting means SSH and an
 /// API call, and this function is also what `remote list` runs.
-pub fn reconcile(store: &mut Store, servers: &[SharedServer]) -> Vec<Record> {
+pub fn reconcile(ui: &Ui, store: &mut Store, servers: &[SharedServer]) -> Vec<Record> {
     let mut superseded = Vec::new();
 
     for server in servers {
+        let name = usable_name(ui, server);
         let remote = Remote {
-            name: server.name.clone(),
+            name: name.clone(),
             host: server.host.clone(),
             port: server.port,
             user: server.user.clone(),
@@ -114,7 +116,7 @@ pub fn reconcile(store: &mut Store, servers: &[SharedServer]) -> Vec<Record> {
             .find(|record| record.shared_id == server.id)
         else {
             store.remotes.push(Record {
-                name: server.name.clone(),
+                name: name.clone(),
                 hash,
                 host: server.host.clone(),
                 port: server.port,
@@ -143,7 +145,7 @@ pub fn reconcile(store: &mut Store, servers: &[SharedServer]) -> Vec<Record> {
             record.last_used_at = 0;
         }
 
-        record.name = server.name.clone();
+        record.name = name;
         record.host = server.host.clone();
         record.port = server.port;
         record.user = server.user.clone();
@@ -152,6 +154,51 @@ pub fn reconcile(store: &mut Store, servers: &[SharedServer]) -> Vec<Record> {
     }
 
     superseded
+}
+
+/// What one of the team's servers is called on *this* laptop.
+///
+/// A locally typed name is put through `store::sanitise_name` and refused the
+/// reserved prefix; a server-supplied one used to be copied onto `Record::name`
+/// exactly as it arrived. That field is not decoration — it becomes
+/// `RIABUILD_REMOTE=<name>` inside the single-quoted `env …` prefix every
+/// remote invocation is wrapped in, and it is the key `find`, `persist_one` and
+/// `forget_one` all match on. `api::remotes::usable` does refuse both shapes on
+/// the way in, so this is the second of two checks rather than the only one —
+/// which is the point: the field is used as a shell word and a lookup key here,
+/// so the rule belongs here too and cannot be lost by a change to the wire
+/// format.
+///
+/// Said out loud when it changes anything, once per server, because the name a
+/// lead typed into the dashboard and the name in `riabuild remote list` are
+/// then two different strings and nothing else would explain why.
+fn usable_name(ui: &Ui, server: &SharedServer) -> String {
+    let sanitised = store::sanitise_name(&server.name);
+    let usable = if sanitised.is_empty()
+        || sanitised
+            .to_ascii_lowercase()
+            .starts_with(store::DISPLAY_PREFIX)
+    {
+        // Derived from the address rather than invented, so it is the same
+        // string on every run and on every laptop — a name that moved between
+        // runs would fork one server into two records. `allocate_name` is given
+        // no taken list on purpose: a collision here is two rows a developer
+        // has to tell apart, which the `shared-` prefix already handles, while
+        // an unstable name is a row nobody can forget.
+        store::allocate_name(&server.host, &[])
+    } else {
+        sanitised
+    };
+
+    if usable != server.name {
+        ui.warn(&format!(
+            "One of the team's servers is listed as {:?}, which riabuild cannot use as a name. \
+             It is shown here as {}{usable}.",
+            server.name,
+            store::DISPLAY_PREFIX
+        ));
+    }
+    usable
 }
 
 /// Whether anything in the store is one of the team's servers that this run
@@ -191,6 +238,12 @@ mod tests {
         }
     }
 
+    /// A `Ui` whose warnings a test can read back. `reconcile` only ever
+    /// speaks when it had to change a name.
+    fn ui() -> Ui {
+        Ui::new(false)
+    }
+
     /// A store holding one of the team's servers, as a previous run left it:
     /// on disk, with state, and *not* refreshed by anything yet.
     fn saved_shared(id: &str, name: &str, host: &str) -> Store {
@@ -208,7 +261,7 @@ mod tests {
     fn a_server_this_laptop_has_never_seen_arrives_with_empty_state() {
         let mut store = Store::default();
 
-        let superseded = reconcile(&mut store, &[server("k1", "gpu", "gpu.internal")]);
+        let superseded = reconcile(&ui(), &mut store, &[server("k1", "gpu", "gpu.internal")]);
 
         assert!(superseded.is_empty());
         assert_eq!(store.remotes.len(), 1);
@@ -225,7 +278,7 @@ mod tests {
         // is replaced, the session is this laptop's and is not.
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
 
-        reconcile(&mut store, &[server("k1", "gpu", "gpu.internal")]);
+        reconcile(&ui(), &mut store, &[server("k1", "gpu", "gpu.internal")]);
 
         let record = &store.remotes[0];
         assert_eq!(record.session_id, "sess_1");
@@ -238,7 +291,11 @@ mod tests {
     fn a_renamed_server_keeps_its_session_because_a_name_is_not_an_identity() {
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
 
-        let superseded = reconcile(&mut store, &[server("k1", "trainer", "gpu.internal")]);
+        let superseded = reconcile(
+            &ui(),
+            &mut store,
+            &[server("k1", "trainer", "gpu.internal")],
+        );
 
         assert!(superseded.is_empty(), "a rename is not a new machine");
         assert_eq!(store.remotes[0].display_name(), "shared-trainer");
@@ -253,7 +310,7 @@ mod tests {
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
         let was = store.remotes[0].hash.clone();
 
-        let superseded = reconcile(&mut store, &[server("k1", "gpu", "gpu-2.internal")]);
+        let superseded = reconcile(&ui(), &mut store, &[server("k1", "gpu", "gpu-2.internal")]);
 
         assert_eq!(superseded.len(), 1);
         assert_eq!(superseded[0].host, "gpu.internal");
@@ -276,7 +333,7 @@ mod tests {
     fn a_server_the_leads_removed_is_left_alone_and_goes_out_of_reach() {
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
 
-        reconcile(&mut store, &[]);
+        reconcile(&ui(), &mut store, &[]);
 
         assert_eq!(store.remotes.len(), 1, "its session may still be live");
         assert_eq!(store.remotes[0].origin(), Origin::Stale);
@@ -294,7 +351,7 @@ mod tests {
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
         store.remotes.push(record_for(&remote("mine", "mine.dev")));
 
-        reconcile(&mut store, &[]);
+        reconcile(&ui(), &mut store, &[]);
 
         let reachable: Vec<String> = store
             .reachable()
@@ -309,7 +366,7 @@ mod tests {
         let mut store = Store::default();
         store.remotes.push(record_for(&remote("gpu", "gpu.local")));
 
-        reconcile(&mut store, &[server("k1", "gpu", "gpu.internal")]);
+        reconcile(&ui(), &mut store, &[server("k1", "gpu", "gpu.internal")]);
 
         assert_eq!(store.remotes.len(), 2, "two servers, both called gpu");
         assert_eq!(store.remotes[0].origin(), Origin::Local);
@@ -323,8 +380,8 @@ mod tests {
         let mut store = Store::default();
         let servers = [server("k1", "gpu", "gpu.internal")];
 
-        reconcile(&mut store, &servers);
-        reconcile(&mut store, &servers);
+        reconcile(&ui(), &mut store, &servers);
+        reconcile(&ui(), &mut store, &servers);
 
         assert_eq!(store.remotes.len(), 1);
     }
@@ -336,9 +393,94 @@ mod tests {
         // laptop's session under a record nothing looks at again.
         let mut store = saved_shared("k1", "gpu", "gpu.internal");
 
-        reconcile(&mut store, &[server("k1", "trainer", "gpu-2.internal")]);
+        reconcile(
+            &ui(),
+            &mut store,
+            &[server("k1", "trainer", "gpu-2.internal")],
+        );
 
         assert_eq!(store.remotes.len(), 1, "{:?}", store.names());
         assert_eq!(store.remotes[0].shared_id, "k1");
+    }
+
+    /// I009. `Record::name` becomes `RIABUILD_REMOTE=<name>` inside the
+    /// single-quoted `env …` prefix every remote invocation is wrapped in, and
+    /// it is the key `find`, `persist_one` and `forget_one` all match on. A
+    /// locally typed name is reduced to what a shell word and a lookup key can
+    /// both carry; a server-supplied one used to be copied across untouched.
+    #[test]
+    fn a_name_from_riabuild_web_is_held_to_the_rule_a_typed_one_is() {
+        let ui = ui();
+        let mut store = Store::default();
+
+        reconcile(
+            &ui,
+            &mut store,
+            &[server("k1", "gpu box'; rm -rf /", "gpu.internal")],
+        );
+
+        let name = &store.remotes[0].name;
+        assert!(
+            !name.contains(['\'', ' ', ';', '/']),
+            "{name} would not survive being quoted into a command"
+        );
+        assert_eq!(store.remotes[0].display_name(), "shared-gpuboxrm-rf");
+        assert!(
+            ui.warned()
+                .iter()
+                .any(|warning| warning.contains("cannot use as a name")),
+            "a name the developer will not recognise has to be explained: {:?}",
+            ui.warned()
+        );
+    }
+
+    #[test]
+    fn a_name_already_wearing_the_display_prefix_does_not_get_a_second_one() {
+        // Reserved: the prefix is how the team's servers are shown, so a bare
+        // name carrying it would render as `shared-shared-gpu` and collide
+        // with whatever `shared-gpu` already means.
+        let mut store = Store::default();
+
+        reconcile(
+            &ui(),
+            &mut store,
+            &[server("k1", "shared-gpu", "gpu.internal")],
+        );
+
+        assert_eq!(store.remotes[0].display_name(), "shared-gpu");
+        assert_eq!(store.remotes[0].name, "gpu");
+    }
+
+    #[test]
+    fn a_name_with_nothing_usable_in_it_falls_back_to_the_address_not_to_nothing() {
+        // An empty name is worse than a wrong one: `RIABUILD_REMOTE=` on the
+        // wire, and a lookup key nothing can type. The fallback is derived
+        // from the address so it is the same string on every run — a name that
+        // moved between runs would fork one server into two records.
+        let mut store = Store::default();
+        let servers = [server("k1", "🚀🚀", "gpu-7.internal")];
+
+        reconcile(&ui(), &mut store, &servers);
+        let first = store.remotes[0].name.clone();
+        reconcile(&ui(), &mut store, &servers);
+
+        assert_eq!(first, "gpu-7");
+        assert_eq!(store.remotes.len(), 1, "{:?}", store.names());
+        assert_eq!(store.remotes[0].name, first);
+    }
+
+    #[test]
+    fn an_ordinary_name_is_passed_through_and_says_nothing() {
+        let ui = ui();
+        let mut store = Store::default();
+
+        reconcile(
+            &ui,
+            &mut store,
+            &[server("k1", "gpu.eu_west-2", "gpu.internal")],
+        );
+
+        assert_eq!(store.remotes[0].name, "gpu.eu_west-2");
+        assert!(ui.warned().is_empty(), "{:?}", ui.warned());
     }
 }

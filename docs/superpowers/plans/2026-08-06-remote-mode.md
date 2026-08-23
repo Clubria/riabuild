@@ -1,6 +1,10 @@
 # Remote Mode Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Completed — historical record, do not execute.** Shipped in #33, 2026-08-09. The
+> unchecked `- [ ]` boxes below are how the plan was written and not work outstanding, and
+> the instruction to an agentic worker to implement it task-by-task that stood here has
+> been removed: acting on it would rebuild something that already ships. See
+> [`README.md`](README.md) for the index, and the design spec for what the code does now.
 
 **Goal:** `riabuild remote` provisions a Linux or macOS server over SSH and opens a mosh shell on it, with the laptop holding the SSH identity, the server's riabuild session, and the GitHub sign-in the server borrows.
 

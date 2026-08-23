@@ -1,50 +1,37 @@
-/// <reference types="vite/client" />
-import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import { api, internal } from "./_generated/api";
-import schema from "./schema";
 import { claimOrCreateMember } from "./members";
 import { ED25519_PRIVATE } from "./lib/opensshKey.fixtures";
+import {
+  Role,
+  seedMember as seedMemberRow,
+  setup,
+  TestConvex,
+} from "./testing.fixtures";
 
-const modules = import.meta.glob("./**/*.ts");
+/**
+ * An invitation and the sign-in that adopts it: the row a lead creates before
+ * anyone has authenticated, and what `claimOrCreateMember` does when the
+ * person it names finally arrives.
+ */
 
-function setup() {
-  return convexTest(schema, modules);
+/**
+ * A `gh-` prefixed `githubId` per login, so a seeded row is never mistaken for
+ * one `signIn` below is about to claim — `findByGithub` matches that field
+ * before it looks at the login.
+ */
+async function seedMember(t: TestConvex, login: string, role: Role) {
+  return await seedMemberRow(t, { login, githubId: `gh-${login}`, role });
 }
 
-async function seedMember(
-  t: ReturnType<typeof setup>,
-  login: string,
-  role: "candidate" | "developer" | "lead",
-) {
-  return await t.run(async (ctx) => {
-    const userId = await ctx.db.insert("users", {
-      name: login,
-      email: `${login}@clubria.dev`,
-    });
-    const rowId = await ctx.db.insert("members", {
-      userId,
-      githubLogin: login,
-      githubId: `gh-${login}`,
-      memberId: crypto.randomUUID(),
-      firstName: login,
-      lastName: "Tester",
-      email: `${login}@clubria.dev`,
-      role,
-      status: "active",
-    });
-    return { userId, rowId };
-  });
-}
-
-async function asLead(t: ReturnType<typeof setup>) {
+async function asLead(t: TestConvex) {
   const { userId, rowId } = await seedMember(t, "grace", "lead");
   return { as: t.withIdentity({ subject: `${userId}|session` }), id: rowId };
 }
 
 /** The sign-in, as far as the `members` table is concerned. */
 async function signIn(
-  t: ReturnType<typeof setup>,
+  t: TestConvex,
   args: {
     githubLogin: string;
     githubId: string;
@@ -70,11 +57,11 @@ async function signIn(
   });
 }
 
-async function memberRows(t: ReturnType<typeof setup>) {
+async function memberRows(t: TestConvex) {
   return await t.run(async (ctx) => await ctx.db.query("members").collect());
 }
 
-async function auditActions(t: ReturnType<typeof setup>) {
+async function auditActions(t: TestConvex) {
   return await t.run(async (ctx) => {
     const rows = await ctx.db.query("auditLog").collect();
     return rows.map((row) => row.action);
@@ -334,9 +321,9 @@ describe("withdrawing an invitation", () => {
 
     await lead.mutation(api.members.removeInvite, { memberId });
 
-    expect(
-      (await memberRows(t)).some((m) => m.githubLogin === "priya"),
-    ).toBe(false);
+    expect((await memberRows(t)).some((m) => m.githubLogin === "priya")).toBe(
+      false,
+    );
     const [key] = await lead.query(api.issuedKeys.list, {});
     // Left behind, this id makes `setIssuedTo` throw for everyone, on behalf of
     // somebody who no longer exists.

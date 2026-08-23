@@ -1,6 +1,7 @@
 import { v } from "convex/values";
-import { action } from "./_generated/server";
+import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { fetchUpstream } from "./lib/http";
 
 /**
  * The release pipeline's entry point into riabuild-web.
@@ -24,19 +25,31 @@ export const RELEASE_REPO = "Clubria/riabuild";
  * so a forgotten field left every machine on the old build with nothing
  * anywhere reporting a problem.
  *
- * Public, but not trusting. It accepts a version only after confirming GitHub
- * really has a published release tagged `v<version>`, and
- * `org.setLatestCliVersion` refuses to move backwards. Between them, the only
- * value anyone can put here is the newest genuinely published riabuild —
- * exactly the state this field is meant to be in — so exposing it costs
- * nothing.
+ * Internal, like the `org.setLatestCliVersion` it ends in: reachable from CI
+ * and the Convex dashboard with a deploy key, and from no browser client. The
+ * release workflow already runs it that way —
+ * `npx convex run release:publishCliVersion` under `CONVEX_DEPLOY_KEY` — so
+ * nothing about the pipeline changes, and no new secret has to be installed
+ * by hand. That last part is why a *shared secret* was the wrong design here:
+ * a Convex deploy key cannot write environment variables, so the credential
+ * could only be set up manually, and an automation needing a manual step
+ * before it runs is the problem this exists to remove. `internalAction` gets
+ * the same property for free.
  *
- * A shared secret would have been the obvious design and is the wrong one: a
- * Convex deploy key cannot write environment variables, so the credential
- * could only be installed by hand, and an automation that needs a manual step
- * before it runs is the problem this exists to remove.
+ * It was public, on the argument that it verifies everything it accepts: the
+ * version must name a published, non-draft GitHub release, and
+ * `org.setLatestCliVersion` refuses to move backwards, so the only value
+ * anyone could store is the newest genuinely published riabuild. That reasons
+ * about the *stored value* and says nothing about the *call*. Each one spends
+ * a request from `GITHUB_ORG_TOKEN`, and that token is the same one every
+ * secret-brokering membership re-check uses. Anyone on the internet could
+ * therefore burn its 5000/hr budget from an empty request loop, at which point
+ * `checkOrgMembership` starts returning `unavailable` and riabuild fails
+ * closed for the whole org — every `/secrets/token`, every `ngrok`. A write
+ * nobody can misdirect is still a write nobody outside CI should be able to
+ * pay for.
  */
-export const publishCliVersion = action({
+export const publishCliVersion = internalAction({
   args: { version: v.string() },
   returns: v.object({
     updated: v.boolean(),
@@ -59,7 +72,7 @@ export const publishCliVersion = action({
     const url = `https://api.github.com/repos/${RELEASE_REPO}/releases/tags/v${version}`;
     let response: Response;
     try {
-      response = await fetch(url, {
+      response = await fetchUpstream(url, {
         headers: {
           Accept: "application/vnd.github+json",
           "User-Agent": "riabuild",

@@ -1,7 +1,7 @@
 # Choosing and moving the project checkout
 
-Date: 2026-08-06
-Status: approved
+**Date:** 2026-08-06
+**Status:** Implemented
 
 ## Why
 

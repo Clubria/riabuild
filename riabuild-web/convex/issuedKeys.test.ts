@@ -1,8 +1,5 @@
-/// <reference types="vite/client" />
-import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import { api, internal } from "./_generated/api";
-import schema from "./schema";
 import {
   ED25519_FINGERPRINT,
   ED25519_PRIVATE,
@@ -11,48 +8,31 @@ import {
   RSA_FINGERPRINT,
   RSA_PRIVATE,
 } from "./lib/opensshKey.fixtures";
+import {
+  auditRows,
+  Role,
+  seedMember as seedMemberRow,
+  setup,
+  TestConvex,
+} from "./testing.fixtures";
 
-const modules = import.meta.glob("./**/*.ts");
+/**
+ * The dashboard side of the SSH keys the org issues: pasting one, deriving its
+ * public half, and naming who it is issued to. `issuedKeysApi.test.ts` covers
+ * the endpoint a CLI pulls one from.
+ */
 
-function setup() {
-  return convexTest(schema, modules);
+/**
+ * Every member here gets a `githubId` of their own, because these tests seed
+ * several at once and `findByGithub` matches on that field first.
+ */
+async function seedMember(t: TestConvex, login: string, role: Role) {
+  return await seedMemberRow(t, { login, githubId: login, role });
 }
 
-async function seedMember(
-  t: ReturnType<typeof setup>,
-  login: string,
-  role: "candidate" | "developer" | "lead",
-) {
-  return await t.run(async (ctx) => {
-    const userId = await ctx.db.insert("users", {
-      name: login,
-      email: `${login}@clubria.dev`,
-    });
-    const rowId = await ctx.db.insert("members", {
-      userId,
-      githubLogin: login,
-      githubId: login,
-      memberId: crypto.randomUUID(),
-      firstName: login,
-      lastName: "Tester",
-      email: `${login}@clubria.dev`,
-      role,
-      status: "active",
-    });
-    return { userId, rowId };
-  });
-}
-
-async function asLead(t: ReturnType<typeof setup>) {
+async function asLead(t: TestConvex) {
   const { userId, rowId } = await seedMember(t, "grace", "lead");
   return { as: t.withIdentity({ subject: `${userId}|session` }), id: rowId };
-}
-
-async function auditRows(t: ReturnType<typeof setup>) {
-  return await t.run(async (ctx) => {
-    const rows = await ctx.db.query("auditLog").collect();
-    return rows.map((row) => ({ action: row.action, meta: row.meta }));
-  });
 }
 
 const BASTION = { label: "prod-bastion", privateKey: ED25519_PRIVATE };

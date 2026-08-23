@@ -8,12 +8,14 @@
     "dev": "convex dev --start 'vite --open'",
     "predev": "convex init && node setup.mjs --once",
     "build": "tsc -b && vite build",
-    "lint": "tsc -b && eslint .  --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "lint": "tsc -b && eslint .  --ext ts,tsx --report-unused-disable-directives --max-warnings 0 && pnpm format:check",
+    "format": "prettier --write",
+    "format:check": "prettier --check src/App.tsx src/main.tsx src/components/Invite.tsx src/components/IssuedKeys.tsx src/components/LeadPanel.tsx src/components/LeadPanel.test.tsx src/components/SharedServers.tsx src/data src/dev src/lib src/routes/CliAuthorize.tsx convex e2e eslint.config.js",
     "preview": "vite preview",
     "test": "vitest run",
     "deploy:web": "vite build && wrangler pages deploy dist --project-name riabuild-web --branch main",
     "e2e": "playwright test -c e2e/playwright.config.ts",
-    "ui:check": "playwright test -c e2e/playwright.config.ts visual.spec.ts"
+    "ui:check": "pnpm e2e"
   },
   "dependencies": {
     "@auth/core": "^0.37.4",

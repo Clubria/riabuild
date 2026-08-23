@@ -168,22 +168,42 @@ fn add_one(ctx: &Ctx, store: &mut Store) -> Result<Remote> {
 /// `ask_required`, not `ask`: a hostname has no default that could be right,
 /// and this is the one place in riabuild that is true of. It refuses rather
 /// than inventing one — see the `_required` pair in `ui/prompt.rs`.
+///
+/// Every answer goes through [`Remote::parse`], which is the same route
+/// `riabuild remote <target>` takes, and it is what makes the three prompts
+/// one question rather than three. A developer typing the address they know —
+/// `ada@gpu:2222` — at a prompt labelled `Hostname` is not making a mistake,
+/// and this used to build `ada@ada@gpu:2222` out of it by pasting the answers
+/// together unread. Parsing the first answer also gives the two prompts after
+/// it their defaults, so the parts already stated are offered back rather than
+/// asked for again; and parsing the composed result validates the port and the
+/// username too — the port used to be `unwrap_or(22)`, which silently turned a
+/// typo into a connection to the wrong service.
 fn ask_for_one(ctx: &Ctx, store: &Store) -> Result<Remote> {
     ctx.ui.heading("Adding a server");
-    let host = ctx.ui.ask_required("Hostname  ", None)?;
-    let port: u16 = ctx
+    let whoami = store::whoami();
+    let spec = Remote::parse(&ctx.ui.ask_required("Hostname  ", None)?, &whoami)?;
+    let port = ctx
         .ui
-        .ask_required("Port      ", Some("22"))?
-        .parse()
-        .unwrap_or(22);
-    let user = ctx.ui.ask_required("Username  ", Some(&store::whoami()))?;
-    let name = store::ask_name(&ctx.ui, &host, &store.names());
-    Ok(Remote {
-        name,
-        host,
-        port,
-        user,
-    })
+        .ask_required("Port      ", Some(&spec.port.to_string()))?;
+    let user = ctx.ui.ask_required("Username  ", Some(&spec.user))?;
+    let mut remote = composed(&spec.host, &port, &user)?;
+    remote.name = store::ask_name(&ctx.ui, &remote.host, &store.names());
+    Ok(remote)
+}
+
+/// The three answers read back as one address, through the same
+/// [`Remote::parse`] that `riabuild remote <target>` goes through.
+///
+/// Split from the prompts above because `ask_required` reads the real stdin —
+/// it is the one prompt `Ui::scripted` cannot drive — so this is the half a
+/// test can reach, and the half where every one of these bugs lived.
+///
+/// `default_user` is not a parameter: `host` and `user` have both already been
+/// through `Remote::parse` by the time they get here, so there is nothing left
+/// to default and passing one would only describe a case that cannot happen.
+fn composed(host: &str, port: &str, user: &str) -> Result<Remote> {
+    Remote::parse(&format!("{user}@{host}:{port}"), user)
 }
 
 #[cfg(test)]
@@ -481,4 +501,50 @@ mod tests {
     // `the_add_option_can_also_be_typed_as_a_word` and
     // `the_number_after_the_last_server_adds_one` cover the decision, and what
     // is left in `pick` is the one match arm that calls the questions.
+    //
+    // What `composed` makes testable is the other half — what `ask_for_one`
+    // does with the answers once it has them, which is where every bug in this
+    // prompt has been.
+
+    #[test]
+    fn an_address_typed_at_the_hostname_prompt_is_read_as_one() {
+        // A developer types the address they already know at the first prompt
+        // it looks like it belongs in. The three answers used to be pasted
+        // together unread, which made `ada@gpu:2222` into a connection to
+        // `ada@ada@gpu:2222` — a host that does not exist, named in no error
+        // message.
+        let spec = Remote::parse("ada@gpu:2222", "root").expect("an address");
+        assert_eq!(spec.host, "gpu");
+        assert_eq!(spec.port, 2222);
+        assert_eq!(spec.user, "ada");
+
+        // …and pressing Enter at the two prompts after it takes those, which
+        // is what the parsed answer is for.
+        let remote = composed(&spec.host, &spec.port.to_string(), &spec.user).expect("a server");
+        assert_eq!(remote.host, "gpu");
+        assert_eq!(remote.port, 2222);
+        assert_eq!(remote.user, "ada");
+    }
+
+    #[test]
+    fn a_plain_hostname_still_takes_the_two_defaults() {
+        let spec = Remote::parse("gpu.internal", "ada").expect("a hostname");
+        let remote = composed(&spec.host, &spec.port.to_string(), &spec.user).expect("a server");
+        assert_eq!(remote.host, "gpu.internal");
+        assert_eq!(remote.port, 22);
+        assert_eq!(remote.user, "ada");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_port_or_a_username_is_refused_rather_than_guessed_at() {
+        // The port was `parse().unwrap_or(22)`, so a fat-fingered `2222x` was
+        // silently a connection to 22 — the same class of guess
+        // `anything_that_is_not_an_answer_is_not_guessed_at` covers for the
+        // picker itself. Nothing at these prompts was validated at all: the
+        // hostname prompt is where `-oProxyCommand=…` would have been typed.
+        assert!(composed("gpu", "2222x", "ada").is_err());
+        assert!(composed("gpu", "0", "ada").is_err());
+        assert!(composed("-oProxyCommand=x", "22", "ada").is_err());
+        assert!(composed("gpu", "22", "ada bob").is_err());
+    }
 }

@@ -15,8 +15,14 @@ Design rules for the UI itself are in `.claude/skills/riabuild-ui/SKILL.md`.
 
 ```sh
 cd riabuild-web
-pnpm ui:check                 # all scenarios × 380 / 768 / 1440
+pnpm ui:check                 # every spec: scenarios × 380 / 768 / 1440, plus smoke
 ```
+
+`ui:check` is the whole Playwright suite, not the visual spec alone. Most tests run three
+times, once per viewport; a test tagged `@viewport-agnostic` runs once, at 768, because
+running an assertion about escaping — or about wiring — at 380 and again at 1440 asserts
+the same thing about the same DOM and calls it coverage. `smoke.spec.ts` carries that tag
+and needs a backend; see the smoke section below.
 
 1. Run it.
 2. **Open every screenshot in `e2e/__screens__/` and look at it.** Read the PNGs. This is
@@ -108,16 +114,27 @@ pnpm exec playwright test -c e2e/playwright.config.ts smoke.spec.ts
 ```
 
 Signs in for real against a local Convex deployment and walks the pages. It needs
-`RIABUILD_DEV_AUTH=1` and `RIABUILD_DEV_SEED=1` on that deployment, and skips itself when
-no backend is reachable — so the visual suite is never blocked by backend availability.
+`RIABUILD_DEV_AUTH=1`, `RIABUILD_DEV_SEED=1` and `RIABUILD_BOOTSTRAP_LEADS=devlead` on
+that deployment, and skips itself when no backend is reachable — so on a laptop with no
+`pnpm dev` running, the rest of the suite is never blocked by backend availability.
+
+`RIABUILD_E2E_BACKEND=1` turns that skip into a failure, and belongs on any run that
+arranged a deployment: a silent skip there is the suite reporting green for the tests that
+answer the one question fixtures cannot.
 
 Fixtures prove the shapes render. The smoke suite proves the wiring is real. You want both
 and they answer different questions.
 
 ## CI
 
-CI runs the structural assertions and uploads the screenshots as artifacts. **There are no
-committed pixel baselines**, deliberately: font rasterisation differs between a laptop and
-a CI container, so a pixel gate would fail forever for reasons unrelated to any change.
-Pixel judgement stays with the human-in-the-loop step above. Do not add snapshot
-baselines to CI.
+CI runs the whole suite in two invocations. `404 renders with no backend at all` goes
+first, while there genuinely is no backend: once `.env.local` names a deployment, Vite
+inlines `VITE_CONVEX_URL`, the app takes the live branch, and that test keeps passing
+without exercising the offline fallback it is named after. Then the job stands up an
+anonymous `convex-local-backend`, gives it the dev variables and a signing key pair, and
+runs everything else with `RIABUILD_E2E_BACKEND=1`.
+
+It uploads the screenshots as artifacts. **There are no committed pixel baselines**,
+deliberately: font rasterisation differs between a laptop and a CI container, so a pixel
+gate would fail forever for reasons unrelated to any change. Pixel judgement stays with
+the human-in-the-loop step above. Do not add snapshot baselines to CI.

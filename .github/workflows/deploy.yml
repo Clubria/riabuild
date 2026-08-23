@@ -14,6 +14,11 @@ on:
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
+# Read-only. The deploy targets Convex and Cloudflare with their own
+# credentials; GITHUB_TOKEN is only ever used to clone.
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-web
   # Never cancel: interrupting `convex deploy` or a Pages upload leaves the
@@ -42,7 +47,7 @@ jobs:
       # The client API hostname, baked into the bundle at build time. Public.
       VITE_CONVEX_URL: ${{ vars.VITE_CONVEX_URL || 'https://handsome-vulture-127.eu-west-1.convex.cloud' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Check for a Cloudflare token
         run: |
@@ -52,15 +57,7 @@ jobs:
             exit 1
           fi
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Install
         run: pnpm install --frozen-lockfile

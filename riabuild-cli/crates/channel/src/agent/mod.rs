@@ -3,40 +3,61 @@
 //! This file answers requests; `server` carries the answers over a socket. The
 //! split is what lets every dispatch decision — the snapshot, the size cap, the
 //! empty-versus-raced distinction — be tested without a socket anywhere.
+//!
+//! Two files hold the answers themselves. `snapshot` owns the three clipboard
+//! operations and the snapshot that makes a two-call paste coherent; `browser`
+//! owns the one operation that reaches past the laptop. What stays here is the
+//! agent, the dispatch, and the deadline every one of those calls runs under.
 
+mod browser;
 mod pipe;
 mod server;
+mod snapshot;
 
 /// What one pipe connection carried, which is the supervisor's evidence about
 /// the connection it has just lost. Re-exported because `pipe` is private and
 /// the supervisor is the caller it was written for.
 pub use pipe::Served;
+/// How long a `TARGETS` answer stays good for the read that follows it — see
+/// `snapshot`, which owns the mechanism.
+pub use snapshot::SNAPSHOT_TTL;
 
 use crate::clipboard::Clipboard;
 use crate::opener::Opener;
-use crate::protocol::{ErrorCode, MAX_PAYLOAD, Request, Response};
-use crate::resize;
+use crate::protocol::{ErrorCode, Request, Response};
+use snapshot::Snapshot;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-/// How long a `TARGETS` answer stays good for the read that follows it.
+/// How long one clipboard or browser subprocess may take before the agent
+/// answers without it.
 ///
-/// A paste is two round trips. Long enough to cover a slow link, short enough
-/// that this is a snapshot for one paste rather than a cache of the clipboard.
-pub const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
-
-struct Snapshot {
-    taken: Instant,
-    types: Vec<String>,
-    /// Filled lazily: `TARGETS` records what was advertised, and the read that
-    /// follows stores the bytes it fetched under that advertisement.
-    content: Vec<(String, Vec<u8>)>,
-}
+/// **Nothing else bounds them, and one that wedges takes the whole session
+/// with it.** `xclip`, `osascript` and `xdg-open` are all capable of never
+/// returning — a compositor that stops answering a selection request, a
+/// Privacy dialog nobody is at the laptop to dismiss, a `.desktop` handler
+/// waiting on a lock. `serve_pipe` cannot finish while a spawned answer still
+/// holds its sender, so one wedged tool stopped the pipe from draining, which
+/// stopped the supervisor's teardown, which stopped `remote::channel` — and
+/// the developer's `riabuild remote` hung after their shell had already
+/// exited, with nothing on screen naming a clipboard.
+///
+/// Shorter than every deadline downstream of it — `client::REQUEST_TIMEOUT`
+/// (20 s) and `pump::REPLY_TIMEOUT` (25 s) — so the shim gets this sentence,
+/// which names the laptop's tool, rather than its own timeout, which names
+/// nothing. The subprocess itself dies with the dropped future: `RealRunner`
+/// sets `kill_on_drop`, so this is a bound on the tool and not merely on
+/// riabuild's patience.
+pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Agent {
     clipboard: Box<dyn Clipboard>,
     opener: Box<dyn Opener>,
     snapshot: Mutex<Option<Snapshot>>,
+    /// Hands out `Snapshot::seq`. Never reset: a wrap at `u64` is not a thing
+    /// a laptop reaches.
+    snapshots: AtomicU64,
 }
 
 impl Agent {
@@ -45,6 +66,7 @@ impl Agent {
             clipboard,
             opener,
             snapshot: Mutex::new(None),
+            snapshots: AtomicU64::new(0),
         }
     }
 
@@ -68,196 +90,39 @@ impl Agent {
             Request::OpenUrl { url } => self.open(url).await,
         }
     }
-
-    /// Opens a link on the laptop.
-    ///
-    /// No prompt, by decision: `clipboard.read` already hands the server the
-    /// contents of this laptop's clipboard without asking, and a confirmation
-    /// per URL turns a device-code login into a two-machine dance. The log line
-    /// is the audit trail, and it is written *before* the opener runs so a URL
-    /// that hangs a browser is still recorded.
-    ///
-    /// The scheme was settled in `decode_request`; by here the URL is http or
-    /// https and nothing else.
-    async fn open(&self, url: &str) -> (Response, Option<Vec<u8>>) {
-        note(&format!("opening {url}"));
-        match self.opener.open(url).await {
-            Ok(()) => (Response::Opened, None),
-            Err(error) => {
-                note(&format!("could not open {url}: {error:#}"));
-                (
-                    Response::Error {
-                        code: ErrorCode::Unavailable,
-                        message: format!("this laptop could not open the link: {error}"),
-                    },
-                    None,
-                )
-            }
-        }
-    }
-
-    /// The one operation that changes the laptop rather than reporting on it.
-    async fn write(
-        &self,
-        mime: &str,
-        body: Option<Vec<u8>>,
-        len: usize,
-    ) -> (Response, Option<Vec<u8>>) {
-        let bytes = body.unwrap_or_default();
-        if bytes.len() != len {
-            return (
-                Response::Error {
-                    code: ErrorCode::BadRequest,
-                    message: format!(
-                        "the write announced {len} bytes and carried {}",
-                        bytes.len()
-                    ),
-                },
-                None,
-            );
-        }
-
-        // The snapshot describes a clipboard that is about to stop existing.
-        // Dropped before the write rather than after, so a write that fails
-        // half-way cannot leave a reader being served content the laptop no
-        // longer holds.
-        *self.snapshot.lock().await = None;
-
-        match self.clipboard.write(mime, &bytes).await {
-            Ok(true) => (Response::Written, None),
-            Ok(false) => (
-                Response::Error {
-                    code: ErrorCode::Unsupported,
-                    message: format!("the channel does not carry `{mime}`"),
-                },
-                None,
-            ),
-            Err(error) => (
-                Response::Error {
-                    code: ErrorCode::Internal,
-                    message: format!("could not write the laptop's clipboard: {error}"),
-                },
-                None,
-            ),
-        }
-    }
-
-    async fn targets(&self, now: Instant) -> (Response, Option<Vec<u8>>) {
-        let types = match self.clipboard.targets().await {
-            Ok(types) => types,
-            Err(error) => return (internal(error), None),
-        };
-
-        *self.snapshot.lock().await = Some(Snapshot {
-            taken: now,
-            types: types.clone(),
-            content: Vec::new(),
-        });
-
-        (Response::Targets(types), None)
-    }
-
-    async fn read(&self, mime: &str, now: Instant) -> (Response, Option<Vec<u8>>) {
-        let mut snapshot = self.snapshot.lock().await;
-
-        // Expire first, so a stale snapshot never answers.
-        if snapshot
-            .as_ref()
-            .is_some_and(|held| now.duration_since(held.taken) > SNAPSHOT_TTL)
-        {
-            *snapshot = None;
-        }
-
-        if let Some(held) = snapshot.as_ref()
-            && let Some((_, bytes)) = held.content.iter().find(|(t, _)| t == mime)
-        {
-            return payload(mime, bytes.clone());
-        }
-
-        let fetched = match self.clipboard.read(mime).await {
-            Ok(found) => found,
-            Err(error) => return (internal(error), None),
-        };
-
-        let Some(bytes) = fetched else {
-            // The clipboard moved between the advertisement and the read. The
-            // caller is mid-paste, so say what happened rather than reporting
-            // an empty clipboard it can do nothing with.
-            let advertised = snapshot
-                .as_ref()
-                .is_some_and(|held| held.types.iter().any(|t| t == mime));
-            let message = if advertised {
-                format!("the clipboard changed while `{mime}` was being read")
-            } else {
-                "no clipboard content of that type".to_string()
-            };
-            return (
-                Response::Error {
-                    code: ErrorCode::Unavailable,
-                    message,
-                },
-                None,
-            );
-        };
-
-        let bytes = resize::to_ceiling(mime, bytes);
-
-        if let Some(held) = snapshot.as_mut() {
-            held.content.push((mime.to_string(), bytes.clone()));
-        }
-
-        payload(mime, bytes)
-    }
 }
 
-/// The laptop's record of what the server asked it to do.
+/// Bounds one clipboard or browser call. `None` means it did not answer inside
+/// [`DISPATCH_TIMEOUT`].
+async fn within<F: std::future::Future>(work: F) -> Option<F::Output> {
+    tokio::time::timeout(DISPATCH_TIMEOUT, work).await.ok()
+}
+
+/// What the server is told about a tool on the laptop that stopped answering.
 ///
-/// Only `browser.open` writes here. Clipboard traffic is high-volume and its
-/// content is the developer's own, so logging it would be both noisy and a
-/// place secrets accumulate; opening a link is rare, consequential, and the
-/// operation the developer agreed to have happen without a prompt. That trade
-/// is the reason there is no confirmation.
-fn note(message: &str) {
-    if let Ok(path) = std::env::var(crate::LOG_ENV) {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(file, "agent: {message}");
-        }
-    }
-    eprintln!("riabuild: {message}");
-}
-
-fn internal(error: anyhow::Error) -> Response {
+/// `Unavailable` rather than `Internal`: nothing is broken, and the state
+/// resolves itself the moment the tool comes back or the developer dismisses
+/// whatever it is waiting on. It reads the same way an empty clipboard does,
+/// which is the right altitude for a paste that did not happen.
+fn wedged(what: &str) -> Response {
     Response::Error {
-        code: ErrorCode::Internal,
-        message: format!("could not read the laptop's clipboard: {error}"),
+        code: ErrorCode::Unavailable,
+        message: format!(
+            "the laptop took longer than {} seconds to {what}",
+            DISPATCH_TIMEOUT.as_secs()
+        ),
     }
-}
-
-fn payload(mime: &str, bytes: Vec<u8>) -> (Response, Option<Vec<u8>>) {
-    if bytes.len() > MAX_PAYLOAD {
-        return (
-            Response::Error {
-                code: ErrorCode::TooLarge,
-                message: format!(
-                    "`{mime}` is {} bytes, over the {MAX_PAYLOAD} byte channel limit",
-                    bytes.len()
-                ),
-            },
-            None,
-        );
-    }
-    (Response::Payload { len: bytes.len() }, Some(bytes))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // Kept whole rather than split beside `snapshot` and `browser`: every case
+    // below is driven through `Agent::handle`, and they share one set of
+    // fixtures — the clipboard a test can change between calls, the opener that
+    // records what it was asked for, and the gated pair that never returns.
     use super::*;
     use crate::mime::{PNG, TEXT};
+    use crate::protocol::MAX_PAYLOAD;
     use anyhow::Result;
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -651,6 +516,106 @@ pub(crate) mod tests {
             .handle(&write_of(TEXT, b""), Some(Vec::new()), Instant::now())
             .await;
         assert_eq!(response, Response::Written);
+    }
+
+    /// A clipboard tool that never returns for one type and answers instantly
+    /// for the other. Both halves are load-bearing: the wedge is what the
+    /// deadline is for, and the answer beside it is what proves the lock was
+    /// not held across the wedge.
+    struct Gated;
+
+    #[async_trait]
+    impl Clipboard for Gated {
+        async fn targets(&self) -> Result<Vec<String>> {
+            Ok(vec![PNG.to_string(), TEXT.to_string()])
+        }
+        async fn read(&self, mime: &str) -> Result<Option<Vec<u8>>> {
+            if mime == PNG {
+                // `xclip` against a compositor that stopped answering a
+                // selection request: open, running, and never coming back.
+                std::future::pending::<()>().await;
+            }
+            Ok(Some(b"text".to_vec()))
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> Result<bool> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    fn gated() -> Agent {
+        Agent::new(Box::new(Gated), Box::new(Arc::new(FakeOpener::default())))
+    }
+
+    /// I054. A tool that never returns must not become a request that never
+    /// gets an answer.
+    ///
+    /// `serve_pipe` cannot finish while a spawned answer still holds its
+    /// sender, so one wedged `xclip` stopped the pipe draining, which stopped
+    /// the supervisor's teardown, which stopped `remote::channel` — and
+    /// `riabuild remote` hung on the laptop after the developer's shell had
+    /// already exited. Nothing on screen named a clipboard.
+    #[tokio::test(start_paused = true)]
+    async fn a_clipboard_tool_that_never_returns_is_answered_rather_than_waited_out() {
+        let agent = gated();
+        let request = Request::ClipboardRead { mime: PNG.into() };
+        let (response, body) = agent.handle(&request, None, Instant::now()).await;
+
+        let Response::Error { code, message } = response else {
+            panic!("expected an error, got {response:?}");
+        };
+        assert_eq!(code, ErrorCode::Unavailable);
+        assert!(message.contains("read the laptop's clipboard"), "{message}");
+        assert!(body.is_none());
+    }
+
+    /// …and a write, which is the other subprocess in the paste path.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_never_returns_is_answered_rather_than_waited_out() {
+        let agent = gated();
+        let request = Request::ClipboardWrite {
+            mime: TEXT.into(),
+            len: 2,
+        };
+        let (response, _) = agent
+            .handle(&request, Some(b"hi".to_vec()), Instant::now())
+            .await;
+        assert!(
+            matches!(&response, Response::Error { code, .. } if *code == ErrorCode::Unavailable),
+            "{response:?}"
+        );
+    }
+
+    /// I061. The snapshot mutex must not be held across the subprocess.
+    ///
+    /// Both `serve_pipe` and `agent::server` spawn a task per request on the
+    /// stated grounds that "a slow clipboard read must not hold up every other
+    /// shell" — and then every one of them queued behind one `xclip`, because
+    /// `read` took the lock before the fetch and gave it back after. One
+    /// developer pasting a screenshot stalled every other shell into the
+    /// server for as long as it took.
+    ///
+    /// Under the old code this does not fail, it *hangs*, so the wait is
+    /// bounded: a hang has to present as a red test rather than a slow one.
+    #[tokio::test]
+    async fn a_read_waiting_on_its_subprocess_does_not_hold_up_every_other_read() {
+        let agent = gated();
+        let now = Instant::now();
+        let stuck = Request::ClipboardRead { mime: PNG.into() };
+        let other = Request::ClipboardRead { mime: TEXT.into() };
+
+        let answered = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                _ = agent.handle(&stuck, None, now) => panic!("the wedged read should not finish"),
+                answer = agent.handle(&other, None, now) => answer,
+            }
+        })
+        .await
+        .expect("a second read must not queue behind the first one's subprocess");
+
+        assert_eq!(answered.0, Response::Payload { len: 4 });
+        assert_eq!(answered.1, Some(b"text".to_vec()));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import { useData } from "../data/context";
 import { SharedServer } from "../data/types";
 import { readError } from "../lib/errors";
@@ -74,7 +74,8 @@ export function SharedServers() {
     setError(null);
   }
 
-  function submit() {
+  function submit(event: FormEvent) {
+    event.preventDefault();
     setError(null);
     setSaving(true);
     const address = {
@@ -127,11 +128,12 @@ export function SharedServers() {
   return (
     <>
       <p className="mb-4 max-w-prose text-fg-dim">
-        Every developer sees these in <span className="text-fg">riabuild remote</span>,
-        named <span className="text-fg">shared-&lt;name&gt;</span> so they cannot be
+        Every developer sees these in{" "}
+        <span className="text-fg">riabuild remote</span>, named{" "}
+        <span className="text-fg">shared-&lt;name&gt;</span> so they cannot be
         confused with a server somebody added themselves. Only the address is
-        shared: each laptop keeps its own key, its own saved password and its own
-        session.
+        shared: each laptop keeps its own key, its own saved password and its
+        own session.
       </p>
 
       <DataTable
@@ -183,7 +185,10 @@ export function SharedServers() {
         }
       />
 
-      <div className="mt-6 max-w-2xl">
+      {/* A real form, so Enter in "hostname" saves the server the way every
+          other address box on the internet does, and the browser refuses an
+          empty field before riabuild-web has to. */}
+      <form className="mt-6 max-w-2xl" onSubmit={submit}>
         <p className="mb-3 flex flex-wrap items-center gap-2 text-fg-dim">
           <span aria-hidden="true" className="text-accent">
             ▸
@@ -204,6 +209,7 @@ export function SharedServers() {
             hint="Letters, digits, dots, dashes, underscores."
             value={draft.name}
             placeholder="gpu"
+            required
             spellCheck={false}
             onChange={(name) => setDraft({ ...draft, name })}
           />
@@ -212,6 +218,7 @@ export function SharedServers() {
             hint="The account riabuild signs in as."
             value={draft.user}
             placeholder="clubria"
+            required
             spellCheck={false}
             onChange={(user) => setDraft({ ...draft, user })}
           />
@@ -220,6 +227,7 @@ export function SharedServers() {
             hint="No username, no port — they have their own boxes."
             value={draft.host}
             placeholder="gpu.internal"
+            required
             spellCheck={false}
             onChange={(host) => setDraft({ ...draft, host })}
           />
@@ -228,6 +236,7 @@ export function SharedServers() {
             hint="22 unless this server says otherwise."
             value={draft.port}
             placeholder="22"
+            required
             spellCheck={false}
             onChange={(value) => setDraft({ ...draft, port: value })}
           />
@@ -250,11 +259,11 @@ export function SharedServers() {
 
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <Button
+            type="submit"
             variant="primary"
             pending={saving}
             pendingLabel="saving"
             disabled={busy !== null}
-            onClick={submit}
           >
             {editing === null ? "add server" : "save changes"}
           </Button>
@@ -272,7 +281,7 @@ export function SharedServers() {
             </Alert>
           </div>
         )}
-      </div>
+      </form>
     </>
   );
 }

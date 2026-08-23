@@ -80,22 +80,19 @@ impl Task for ClaudeStatusline {
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
         let file = ctx.paths.claude_statusline_file();
-        if let Some(parent) = file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
 
         // Written beside the target and renamed over it, never truncated in
         // place. On a server this path is shared by everyone with an account on
         // the box, and Claude Code re-runs the script on **every render** — so a
         // plain write hands whichever colleague is mid-render half a file. The
-        // temporary carries this process's pid because two developers can be
+        // temporary is named for this process because two developers can be
         // running `riabuild` at the same moment, and a shared temporary name
         // would let one of them rename the other's half-written copy into place:
         // the very failure the rename exists to prevent, reintroduced one level
-        // down.
-        let staged = file.with_extension(format!("js.{}.tmp", std::process::id()));
-        tokio::fs::write(&staged, SCRIPT).await?;
-        tokio::fs::rename(&staged, &file).await?;
+        // down. `config::write_atomic` is riabuild's one write with those
+        // properties, so this asks for it rather than restating it.
+        riabuild_paths::config::write_atomic(&file, SCRIPT.as_bytes()).await?;
+        readable_by_every_developer(&file).await?;
 
         // The copy every server provisioned before this landed still has in its
         // namespace. Inert — nothing reads it — but it is byte-identical to the
@@ -138,6 +135,30 @@ impl Task for ClaudeStatusline {
 fn superseded_copy(ctx: &Ctx) -> Option<std::path::PathBuf> {
     let namespaced = ctx.paths.root().join("claude-statusline.js");
     (namespaced != ctx.paths.claude_statusline_file()).then_some(namespaced)
+}
+
+/// Puts the script back at `0644` after the atomic write, which lands `0600`.
+///
+/// **Not tidiness, and not a mode this file could inherit instead.**
+/// `write_atomic` is private from the instant the temporary exists precisely so
+/// that a file holding a secret is never briefly readable — the right default,
+/// and the wrong answer here. This script holds nothing secret and lives under
+/// `tools_root()`, which is one directory shared by *every* developer with an
+/// account on a server; a `0600` copy is one only whoever ran `riabuild` last
+/// can read, and Claude Code renders a status line whose command fails as **no
+/// status line at all**. So every co-tenant would silently lose theirs, with
+/// `check()` reporting satisfied — the same invisible absence, and the same
+/// wrong reasoning about which root this file belongs to, that this module's
+/// own header records having already shipped once.
+async fn readable_by_every_developer(file: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).await?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,6 +327,33 @@ mod tests {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(!name.ends_with(".tmp"), "{name}");
         }
+    }
+
+    /// The script has to be readable by somebody other than whoever ran
+    /// `riabuild` last.
+    ///
+    /// It lives under `tools_root()`, which every developer with an account on
+    /// a server shares, and Claude Code runs it on every render. riabuild's
+    /// atomic write lands `0600` — correct for a secret, and here it would
+    /// silently take the status line away from every co-tenant while `check()`
+    /// went on reporting the machine satisfied, because a status line whose
+    /// command fails renders as no status line at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_installed_script_is_readable_by_a_co_tenant() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut ctx, _home) = crate::testing::ctx_on_a_server(FakeRunner::new()).await;
+        ClaudeStatusline.apply(&mut ctx).await.unwrap();
+
+        let file = ctx.paths.claude_statusline_file();
+        let mode = tokio::fs::metadata(&file)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "{} is {mode:o}", file.display());
     }
 
     /// The status line and the prompt answer the same question — *which

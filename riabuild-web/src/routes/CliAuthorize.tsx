@@ -18,6 +18,10 @@ import { Alert, Button, Field, KeyValue, Panel } from "../ui";
  */
 export function CliAuthorize() {
   const data = useData();
+  // Pulled out by name so the lookup effect can depend on the one function it
+  // calls. Both providers hand out a stable reference for it, which is what
+  // lets the dependency be honest instead of suppressed.
+  const { lookupDeviceCode } = data;
   const [typed, setTyped] = useState(prefilledCode);
   const [request, setRequest] = useState<DeviceRequest | null>(null);
   const [outcome, setOutcome] = useState<"approved" | "denied" | null>(null);
@@ -34,8 +38,7 @@ export function CliAuthorize() {
   useEffect(() => {
     if (!complete || outcome !== null) return;
     let current = true;
-    data
-      .lookupDeviceCode({ userCode: code })
+    lookupDeviceCode({ userCode: code })
       .then((found) => {
         if (!current) return;
         setRequest(found);
@@ -47,10 +50,7 @@ export function CliAuthorize() {
     return () => {
       current = false;
     };
-    // `data` is rebuilt on every provider render; the code is what identifies
-    // the request being looked at.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, complete, outcome]);
+  }, [code, complete, outcome, lookupDeviceCode]);
 
   if (outcome !== null) {
     return (
@@ -181,8 +181,8 @@ function Decision({
         ]}
       />
       <p className="mt-5 max-w-prose text-fg-dim">
-        Check that against the terminal you are signing in. Approving grants that
-        machine a token that expires in 90 days; you can revoke it from the
+        Check that against the terminal you are signing in. Approving grants
+        that machine a token that expires in 90 days; you can revoke it from the
         dashboard at any time.
       </p>
 
@@ -195,7 +195,11 @@ function Decision({
         >
           approve this machine
         </Button>
-        <Button variant="quiet" disabled={busy} onClick={() => onDecide("deny")}>
+        <Button
+          variant="quiet"
+          disabled={busy}
+          onClick={() => onDecide("deny")}
+        >
           deny
         </Button>
       </div>

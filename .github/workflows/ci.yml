@@ -10,6 +10,17 @@ on:
   # exist. It goes through the REST API instead, which stayed up throughout.
   workflow_dispatch:
 
+# Read-only, and stated rather than inherited. Without a block a workflow gets
+# the repository's default GITHUB_TOKEN scope, which on many repositories is
+# read *and write* — and this is the workflow that builds and runs code from a
+# pull request: `cargo test` compiles every `build.rs` in the dependency tree,
+# `pnpm build` runs whatever the lockfile resolved, and `docker run` executes an
+# image. None of that should be able to write to this repository.
+#
+# `changes` grants itself one thing more; see the job.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -34,6 +45,11 @@ jobs:
   changes:
     name: What changed
     runs-on: ubuntu-latest
+    # dorny/paths-filter asks the API which files a pull request touched, which
+    # the read-only default token cannot do on its own.
+    permissions:
+      contents: read
+      pull-requests: read
     # `workflow_dispatch` forces everything. It exists here because an Actions
     # incident once throttled webhooks for hours (see the trigger above), and
     # someone reaching for the manual button during one wants the whole suite —
@@ -51,27 +67,39 @@ jobs:
       # action deepens the clone itself to find it, and that is the path that
       # breaks: not here, but on main, after the merge, where a filter that
       # cannot see the diff decides nothing changed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         if: github.event_name != 'workflow_dispatch'
         with:
           filters: |
+            # `.github/actions/**` is listed beside this workflow for the same
+            # reason `Formula/**` is listed below: the toolchain setup these
+            # jobs run now lives there, so a change to it that this filter
+            # cannot see is a change no job would build against.
             cli:
               - 'riabuild-cli/**'
               - '.github/workflows/ci.yml'
+              - '.github/actions/**'
             remote:
               - 'riabuild-cli/**'
               - 'e2e/remote/**'
               - '.github/workflows/ci.yml'
+              - '.github/actions/**'
             web:
               - 'riabuild-web/**'
               - '.github/workflows/ci.yml'
+              - '.github/actions/**'
             packaging:
               - 'packaging/**'
+              # The rendered formula, which nothing but release.yml is supposed
+              # to write. It was not listed, so editing the one file CLAUDE.md
+              # forbids editing triggered no job at all — and the hand edit
+              # would survive until the next release silently overwrote it.
+              - 'Formula/**'
               - 'LICENSE'
               - '.github/workflows/ci.yml'
 
@@ -84,24 +112,26 @@ jobs:
       run:
         working-directory: riabuild-cli
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: riabuild-cli
-
+      # `--locked` everywhere below, and deliberately not here. Without it cargo
+      # is free to resolve a newer dependency than Cargo.lock pins, so CI can
+      # pass against a graph the release — which does pass `--locked` — never
+      # builds. `cargo fmt` is the one exception: it rejects the flag outright
+      # ("unexpected argument '--locked' found") because it never resolves a
+      # dependency graph to begin with.
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
       # `--all-targets` selects *targets*, not packages, and lint configuration
       # is per-package: a member that forgets to inherit simply has the lint
@@ -224,20 +254,16 @@ jobs:
       run:
         working-directory: riabuild-cli
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: riabuild-cli
+      - uses: ./.github/actions/setup-rust
 
       # `--test-threads` is left alone, but the timeout above is a blunt
       # instrument: it names the job, not the test. libtest's own warning is
       # what names the test, and it only reaches the log if the output is not
       # still sitting in a buffer when the job is killed — hence `--nocapture`.
       - name: Test
-        run: cargo test --workspace --all-targets -- --nocapture
+        run: cargo test --workspace --all-targets --locked -- --nocapture
 
   web:
     name: riabuild-web
@@ -248,17 +274,9 @@ jobs:
       run:
         working-directory: riabuild-web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -310,17 +328,9 @@ jobs:
       run:
         working-directory: riabuild-web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -332,7 +342,7 @@ jobs:
       # fetch again. That costs an occasional needless miss and can never serve
       # a browser build the installed Playwright would refuse.
       - name: Cache Chromium
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('riabuild-web/pnpm-lock.yaml') }}
@@ -355,18 +365,125 @@ jobs:
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
 
+      # The one case that needs there to be no backend, run while there is
+      # none.
+      #
+      # `main.tsx` picks the offline data source when `VITE_CONVEX_URL` is
+      # unset, and Vite reads that out of `.env.local` — so the moment the next
+      # step writes one, this test navigates to a 404 served by a *live*
+      # client. It keeps passing, having stopped asserting anything about the
+      # screen it is named after, which is the failure mode the whole
+      # `RIABUILD_E2E_BACKEND` flag below exists to avoid elsewhere. Two
+      # invocations is what keeps it a test that can fail: this one before the
+      # deployment exists, and the suite below with it grepped out.
+      - name: The offline 404, before there is a deployment
+        run: pnpm ui:check --grep "404 renders with no backend at all"
+        timeout-minutes: 10
+
+      # A deployment for `smoke.spec.ts`, which signs in for real and is the
+      # one suite that can catch a field renamed on the Convex side — fixtures
+      # implement the `Data` contract and cannot. It skips itself when nothing
+      # answers, so until this step existed it ran here and asserted nothing.
+      #
+      # Anonymous mode is what makes that need no Convex account and no deploy
+      # key: the CLI downloads `convex-local-backend` and runs it against local
+      # state, the way `e2e/run.sh` does. CI therefore cannot reach, or damage,
+      # the production deployment.
+      #
+      # `convex dev` keeps running in the background for the rest of the job;
+      # the runner takes it down with everything else.
+      - name: Start a Convex deployment
+        timeout-minutes: 10
+        run: |
+          rm -f .env.local
+          CONVEX_AGENT_MODE=anonymous npx convex dev --tail-logs disable --typecheck disable &
+          for _ in $(seq 1 120); do [ -f .env.local ] && grep -q VITE_CONVEX_URL .env.local && break; sleep 1; done
+          grep -q VITE_CONVEX_URL .env.local
+          for kv in "RIABUILD_DEV_AUTH 1" "RIABUILD_DEV_SEED 1" "RIABUILD_BOOTSTRAP_LEADS devlead"; do
+            CONVEX_AGENT_MODE=anonymous npx convex env set $kv
+          done
+
+      # The keys `@convex-dev/auth` signs a session with. Without them the dev
+      # sign-in button is there, the click reaches the backend, and the action
+      # throws on a missing `JWT_PRIVATE_KEY` — a smoke failure that says
+      # nothing about the change under test.
+      #
+      # Set here rather than by running `npx @convex-dev/auth`, which is what
+      # `pnpm predev` does on a laptop: that command also wants to rewrite
+      # `convex/auth.ts` and `convex/http.ts` to its own templates, and ours
+      # match neither, so it stops on an interactive "Ready to continue?" that
+      # no CI runner can answer. What it does to the keys themselves is these
+      # four lines — an RS256 pair, the private half as PKCS#8 with its
+      # newlines flattened to spaces, the public half as a one-key JWKS.
+      #
+      # `SITE_URL` is only read on the OAuth redirect path, which the anonymous
+      # provider never takes. It is set anyway: the three arrive together, and
+      # a deployment missing one of them is a puzzle to debug from a test
+      # failure.
+      - name: Give the deployment its auth signing keys
+        timeout-minutes: 5
+        run: |
+          node --input-type=module -e '
+            import { generateKeyPairSync } from "node:crypto";
+            import { writeFileSync } from "node:fs";
+            const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+              modulusLength: 2048,
+            });
+            const pem = privateKey.export({ type: "pkcs8", format: "pem" });
+            writeFileSync(process.env.RUNNER_TEMP + "/jwt.pem", pem.trimEnd().replace(/\n/g, " "));
+            const jwk = publicKey.export({ format: "jwk" });
+            writeFileSync(
+              process.env.RUNNER_TEMP + "/jwks.json",
+              JSON.stringify({ keys: [{ use: "sig", ...jwk }] }),
+            );
+          '
+          CONVEX_AGENT_MODE=anonymous npx convex env set -- JWT_PRIVATE_KEY "$(cat "$RUNNER_TEMP/jwt.pem")"
+          CONVEX_AGENT_MODE=anonymous npx convex env set -- JWKS "$(cat "$RUNNER_TEMP/jwks.json")"
+          CONVEX_AGENT_MODE=anonymous npx convex env set -- SITE_URL http://127.0.0.1:5199
+          rm -f "$RUNNER_TEMP/jwt.pem" "$RUNNER_TEMP/jwks.json"
+          # A 401 from our own route proves the backend is listening *and* that
+          # convex/http.ts is deployed. Waiting on the URL alone races the
+          # function push and fails later, further from the cause.
+          #
+          # The version header is not decoration. `guard` runs the version
+          # floor *before* authentication, and an absent
+          # `x-riabuild-cli-version` counts as version `0` rather than as an
+          # exemption — so a bare curl against a deployment with no `orgConfig`
+          # row is answered 409 `cli_too_old` against the default floor of
+          # 0.1.0, and never 401. Sending a version that clears any floor is
+          # what keeps this poll an assertion about the *auth* path, which is
+          # the one smoke.spec.ts is about to walk.
+          SITE="$(sed -n 's/^VITE_CONVEX_SITE_URL=//p' .env.local | tr -d '\r')"
+          probe() {
+            curl -s -o /dev/null -w '%{http_code}' \
+              -H 'x-riabuild-cli-version: 9999.0.0' "$SITE/api/v1/me"
+          }
+          for _ in $(seq 1 120); do
+            [ "$(probe)" = "401" ] && break
+            sleep 1
+          done
+          [ "$(probe)" = "401" ]
+
       # Structural assertions only — horizontal overflow, clipping, focus
       # visibility, axe, console errors. Deliberately no committed pixel
       # baselines: font rasterisation differs between a laptop and this
       # container, so a pixel gate would fail forever for reasons unrelated to
       # any change. Judging pixels is the human-in-the-loop step documented in
       # .claude/skills/visual-testing/SKILL.md.
+      #
+      # `RIABUILD_E2E_BACKEND=1` because this job went to the trouble of
+      # standing a deployment up: if it is not answering, the smoke suite has
+      # to say so rather than skip itself and report green for tests that never
+      # ran.
       - name: Visual suite
-        run: pnpm ui:check
+        run: pnpm ui:check --grep-invert "404 renders with no backend at all"
+        timeout-minutes: 20
+        env:
+          RIABUILD_E2E_BACKEND: "1"
 
       - name: Upload screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ui-screenshots
           path: riabuild-web/e2e/__screens__/
@@ -374,7 +491,7 @@ jobs:
 
       - name: Upload traces on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ui-traces
           path: riabuild-web/e2e/__results__/
@@ -398,29 +515,61 @@ jobs:
     env:
       RIABUILD_E2E_GH_TOKEN: ${{ secrets.RIABUILD_E2E_GH_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: riabuild-cli
+      # Three packages, and each earns its place. `xvfb` and `xclip` give
+      # `channel.sh`'s laptop side a real clipboard to serve rather than a
+      # scripted stand-in (that script's header explains the trade);
+      # `musl-tools` is for the *server* binary both scripts now copy into
+      # their container, because the container's glibc is older than this
+      # runner's and musl is what release.yml ships for Linux anyway.
+      - name: Install what the container tests drive
+        run: sudo apt-get update && sudo apt-get install -y xvfb xclip musl-tools
 
       - run: cargo build --release --locked
         working-directory: riabuild-cli
 
+      # Built BEFORE `run.sh` rather than after it, which is the change that
+      # gave this job something to gate.
+      #
+      # `run.sh`'s act one installs a real published release on the container —
+      # that is the only thing `install::ensure_riabuild` can do, and it is
+      # real coverage of the download-and-verify path. But it also means the
+      # binary that runs the task DAG is the *last release*, so a server-side
+      # regression this pull request introduces could not turn this job red and
+      # a server-side bug it fixes could not turn it green. Act two copies this
+      # musl build onto the same container and drives the server side with it,
+      # and that is the half that gates the change. `channel.sh` takes the same
+      # binary afterwards, so nothing is built twice.
+      #
+      # `ring` builds C, and cc-rs looks for a compiler named after the target;
+      # Ubuntu's musl-tools ships `musl-gcc` under that one name. release.yml
+      # sets the same two variables for the same reason.
+      - name: Build the server's riabuild
+        working-directory: riabuild-cli
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc \
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            cargo build --release --locked --target x86_64-unknown-linux-musl
+
       # `run.sh` distinguishes a real regression (SSH, identity, host-key
-      # trust, authorising the key, riabuild-web) from the one known, tracked
-      # gap: no published release has a Linux/musl checksum yet, so
-      # `install::ensure_riabuild` cannot finish on this container today. That
-      # gap exits 0 with a clearly labelled banner — but only after asserting,
-      # against the container, that the earlier stages really ran. Anything
-      # else, including a hang, fails this step for real.
+      # trust, authorising the key, installing and verifying the release,
+      # riabuild-web) from the one known, tracked gap: the stand-in
+      # riabuild-web does not implement every route a full server-side
+      # provisioning run needs. That gap exits 0 with a banner naming the
+      # routes the run actually asked for and did not get — but only after
+      # asserting, against the container, that the earlier stages really ran.
+      # Anything else, including a hang, fails this step for real, and so does
+      # act two: that half runs the binary built above and is judged outright.
       - run: bash e2e/remote/run.sh
         if: env.RIABUILD_E2E_GH_TOKEN != ''
-        timeout-minutes: 20
+        timeout-minutes: 25
         env:
           RIABUILD_BIN: ${{ github.workspace }}/riabuild-cli/target/release/riabuild
+          RIABUILD_SERVER_BIN: ${{ github.workspace }}/riabuild-cli/target/x86_64-unknown-linux-musl/release/riabuild
 
       - name: Report that the container test was skipped
         if: env.RIABUILD_E2E_GH_TOKEN == ''
@@ -433,26 +582,6 @@ jobs:
       # `channel.sh` needs no GitHub token: it never runs `riabuild remote`, so
       # nothing re-verifies org membership. It is therefore ungated — this job
       # does real work on a fork's pull request instead of only warning.
-      #
-      # Three packages, and each earns its place. `xvfb` and `xclip` give the
-      # laptop side a real clipboard to serve rather than a scripted stand-in
-      # (the header explains that trade); `musl-tools` is for the *server*
-      # binary, because the container's glibc is older than this runner's and
-      # musl is what release.yml ships for Linux anyway.
-      - name: Install what the clipboard channel test drives
-        run: sudo apt-get update && sudo apt-get install -y xvfb xclip musl-tools
-
-      # `ring` builds C, and cc-rs looks for a compiler named after the target;
-      # Ubuntu's musl-tools ships `musl-gcc` under that one name. release.yml
-      # sets the same two variables for the same reason.
-      - name: Build the server's riabuild
-        working-directory: riabuild-cli
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          CC_x86_64_unknown_linux_musl=musl-gcc \
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-            cargo build --release --locked --target x86_64-unknown-linux-musl
-
       - run: bash e2e/remote/channel.sh
         timeout-minutes: 20
         env:
@@ -469,7 +598,7 @@ jobs:
     if: needs.changes.outputs.packaging == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Render and validate the formula
         run: |
@@ -500,6 +629,55 @@ jobs:
           done
           echo "Formula renders, parses, and points at the artifacts the release builds."
 
+      # The check above proves the *template* is sound. This one proves nobody
+      # edited its output.
+      #
+      # `Formula/riabuild.rb` is written by release.yml and says so in its own
+      # header — "Edit this file, never Formula/riabuild.rb". Nothing enforced
+      # it: a hand edit sat on main looking authoritative until the next release
+      # overwrote it, and in between it was what every `brew install` read.
+      #
+      # The version and the two digests are taken *from the committed file* and
+      # substituted back in, so this asserts only that the rest of the formula
+      # is the template's output. A real release changing those three values is
+      # not a failure; anything else changing is.
+      - name: The committed formula is the template's output
+        run: |
+          set -euo pipefail
+          committed=Formula/riabuild.rb
+          if [ ! -f "$committed" ]; then
+            echo "No $committed yet — the first release creates it."
+            exit 0
+          fi
+
+          version=$(sed -n 's/^  version "\(.*\)"$/\1/p' "$committed")
+          aarch64=$(sed -n '/on_arm do/,/end/s/^    sha256 "\(.*\)"$/\1/p' "$committed")
+          x86_64=$(sed -n '/on_intel do/,/end/s/^    sha256 "\(.*\)"$/\1/p' "$committed")
+
+          for name in version aarch64 x86_64; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Could not read $name out of $committed."
+              echo "::error::Either the formula was hand-edited into a shape this cannot"
+              echo "::error::read, or packaging/homebrew/riabuild.rb changed shape and this"
+              echo "::error::check needs updating with it."
+              exit 1
+            fi
+          done
+
+          sed \
+            -e "s|@VERSION@|$version|g" \
+            -e "s|@SHA256_AARCH64@|$aarch64|g" \
+            -e "s|@SHA256_X86_64@|$x86_64|g" \
+            packaging/homebrew/riabuild.rb > expected.rb
+
+          if ! diff -u expected.rb "$committed"; then
+            echo "::error::$committed is not what packaging/homebrew/riabuild.rb renders."
+            echo "::error::It is generated: edit the template, and the next release"
+            echo "::error::regenerates the formula. A hand edit here is overwritten."
+            exit 1
+          fi
+          echo "$committed matches the template at $version."
+
       - name: Install the Linux packaging tools
         run: sudo apt-get update && sudo apt-get install -y rpm
 
@@ -509,113 +687,67 @@ jobs:
       # right path — and a two-line shell script exercises all of that without a
       # musl toolchain and a five-minute build in front of it.
       #
+      # The rendering and the assertions are packaging/build-packages.sh and
+      # packaging/verify-packages.sh, which release.yml also calls. They used to
+      # be a hundred lines written out in both files, and the copies had drifted:
+      # only release.yml checked the deb's Architecture field and its copyright
+      # file, only this one checked that the rpm still declares `Requires: git`,
+      # and each miss was invisible from the file it was missing in.
+      #
       # Only the runner's own architecture gets an rpm. `rpmbuild --target
       # aarch64` on an x86_64 host fails with "No compatible architectures found
       # for build", and so does `rpmspec -P`, so the aarch64 spec cannot even be
-      # parsed here. It differs from the one below by a single substituted
-      # token, and the release workflow builds it for real on an arm64 runner.
+      # parsed here. dpkg-deb does not care what it is packaging, so both deb
+      # architectures are built — which is what catches a wrong Architecture
+      # field.
       - name: Render the Linux templates and build real packages
         run: |
           set -euo pipefail
           version=2026.08.06
-          mkdir -p build dist
+          mkdir -p build
 
           printf '#!/bin/sh\necho "riabuild %s"\n' "$version" > build/riabuild
           chmod 0755 build/riabuild
 
-          # dpkg-deb does not care what it is packaging, so both architectures
-          # are built here — which is what catches a wrong Architecture field.
-          for deb_arch in amd64 arm64; do
-            root="build/deb-$deb_arch"
-            mkdir -p "$root/DEBIAN" "$root/usr/bin"
-            cp build/riabuild "$root/usr/bin/riabuild"
-            sed -e "s|@VERSION@|$version|g" -e "s|@DEB_ARCH@|$deb_arch|g" \
-              packaging/debian/control.in > "$root/DEBIAN/control"
-            dpkg-deb --build --root-owner-group "$root" \
-              "dist/riabuild_${version}_${deb_arch}.deb"
-            test "$(dpkg-deb --field "dist/riabuild_${version}_${deb_arch}.deb" Architecture)" = "$deb_arch"
-          done
+          packaging/build-packages.sh --version "$version" \
+            --binary build/riabuild --deb-arch amd64
+          packaging/build-packages.sh --version "$version" \
+            --binary build/riabuild --deb-arch arm64 --rpm-arch x86_64
 
-          mkdir -p build/src
-          cp build/riabuild build/src/riabuild
-          cp LICENSE build/src/LICENSE
-          sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|x86_64|g" \
-            packaging/rpm/riabuild.spec.in > build/riabuild.spec
-          rpmbuild -bb build/riabuild.spec \
-            --define "_sourcedir $PWD/build/src" \
-            --define "_rpmdir $PWD/dist" \
-            --define "_topdir $PWD/build/rpm"
-          mv dist/x86_64/*.rpm dist/
-          rmdir dist/x86_64
-
-          # The aarch64 spec cannot be built here, but it can be rendered and
-          # checked for the mistake that actually happens: a placeholder the
-          # release workflow does not substitute.
-          sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|aarch64|g" \
+      # The aarch64 spec cannot be built here, but it can be rendered and
+      # checked for the mistake that actually happens: a placeholder the release
+      # workflow does not substitute. build-packages.sh rejects one outright, so
+      # this only has to prove the architecture reached the spec.
+      - name: The aarch64 spec renders
+        run: |
+          set -euo pipefail
+          sed -e "s|@VERSION@|2026.08.06|g" -e "s|@RPM_ARCH@|aarch64|g" \
             packaging/rpm/riabuild.spec.in > build/riabuild-aarch64.spec
           grep -qx 'BuildArch:      aarch64' build/riabuild-aarch64.spec
-
-          for rendered in build/deb-*/DEBIAN/control build/*.spec; do
-            if grep -q '@[A-Z0-9_]*@' "$rendered"; then
-              echo "::error::$rendered has a placeholder the release workflow does not substitute:"
-              grep -n '@[A-Z0-9_]*@' "$rendered"
-              exit 1
-            fi
-          done
-
-          # A package that does not put the binary on PATH installs nothing
-          # useful, and neither dpkg-deb nor rpmbuild would say so.
-          # Captured before searching, never piped into `grep -q`: grep exits
-          # at its first match and closes the pipe, dpkg-deb's tar subprocess
-          # fails its next write, and `pipefail` makes that a failed step. The
-          # race only shows once the archive is long enough that tar is still
-          # writing when grep leaves, which is why it took a release to find.
-          for deb in dist/*.deb; do
-            grep -q './usr/bin/riabuild' <<<"$(dpkg-deb --contents "$deb")"
-            test "$(dpkg-deb --field "$deb" Version)" = "$version"
-          done
-          for rpm in dist/*.rpm; do
-            grep -qx '/usr/bin/riabuild' <<<"$(rpm -qlp "$rpm")"
-            test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version"
-            # AutoReq is off, so an explicit Requires is the only way git gets
-            # declared — and dropping it is invisible until someone installs on
-            # a machine without git and riabuild fails at the first checkout.
-            grep -qx 'git' <<<"$(rpm -qp --requires "$rpm")"
-            # MIT asks that the notice travel with every copy. `-qL` lists only
-            # files marked %license, so this checks the marking too, not merely
-            # that a file called LICENSE got swept into the payload.
-            grep -q 'LICENSE' <<<"$(rpm -qLp "$rpm")"
-            test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
-          done
-
-          ls -l dist/
+          if grep -q '@[A-Z0-9_]*@' build/riabuild-aarch64.spec; then
+            echo "::error::The aarch64 spec has a placeholder the release does not substitute:"
+            grep -n '@[A-Z0-9_]*@' build/riabuild-aarch64.spec
+            exit 1
+          fi
 
       # The rendered templates producing a *file* is not the same as a package
       # manager accepting it. A bad Depends line, a malformed description, or a
-      # spec that installs somewhere unexpected all pass every check above.
+      # spec that installs somewhere unexpected all pass every check above, so
+      # --containers puts both through a real apt and a real dnf.
       #
-      # `dpkg -S` and `rpm -qf` are asserted here because that is how update.rs
-      # decides which package manager owns the running binary: a package that
-      # installs but is not attributable would leave riabuild unable to upgrade
-      # itself, and nothing else in the suite would notice.
-      - name: Both package managers install it
+      # Only the amd64 deb and the x86_64 rpm can be installed on this runner;
+      # the arm64 deb gets its metadata checked and nothing more. release.yml
+      # runs the container half natively on both architectures.
+      - name: Verify the packages, and install them
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/dist:/dist:ro" debian:12 bash -eux -c '
-            apt-get update -qq
-            apt-get install -y -qq /dist/riabuild_2026.08.06_amd64.deb
-            test "$(riabuild)" = "riabuild 2026.08.06"
-            # How update.rs decides it can upgrade itself. A package that
-            # installs but is not attributable leaves riabuild stuck on the
-            # version it has, and nothing else in the suite would notice.
-            dpkg -S "$(command -v riabuild)" | grep -q riabuild
-          '
-          docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 bash -eux -c '
-            dnf install -y /dist/riabuild-2026.08.06-1.x86_64.rpm
-            test "$(riabuild)" = "riabuild 2026.08.06"
-            rpm -qf "$(command -v riabuild)" | grep -q riabuild
-          '
-          echo "apt and dnf both install the rendered packages."
+          version=2026.08.06
+          packaging/verify-packages.sh --version "$version" \
+            --deb "dist/riabuild_${version}_amd64.deb" --deb-arch amd64 \
+            --rpm "dist/riabuild-$version-1.x86_64.rpm" --rpm-arch x86_64 \
+            --containers
+          packaging/verify-packages.sh --version "$version" \
+            --deb "dist/riabuild_${version}_arm64.deb" --deb-arch arm64
 
       # riabuild's versions are zero-padded release dates, which exercise the
       # parts of dpkg's and rpm's comparison that differ from semver. Getting
@@ -647,3 +779,89 @@ jobs:
           check_rpm 2026.12.01 2026.02.01 1
 
           echo "dpkg and rpm agree with version.rs on riabuild's dates."
+
+      # Rendered by the pages job *after* the GitHub release is public, which is
+      # the worst moment to find out one of them is wrong: a broken @VERSION@ or
+      # a wrong baseurl is then live on the site developers are being sent to,
+      # and the only fix is another release. The homebrew, debian and rpm
+      # templates were checked here and these two were not.
+      - name: The published page and the dnf repo file render
+        run: |
+          set -euo pipefail
+          sed -e "s|@VERSION@|2026.08.06|g" packaging/pages/index.html.in > index.html
+          if grep -q '@[A-Z0-9_]*@' index.html; then
+            echo "::error::index.html still contains unsubstituted placeholders:"
+            grep -n '@[A-Z0-9_]*@' index.html
+            exit 1
+          fi
+          grep -q '2026.08.06' index.html
+
+          # Well-formedness, through the parser rather than by eye. An unclosed
+          # tag renders as something, and "something" on the page that tells
+          # people how to install riabuild is not good enough.
+          #
+          # Stricter than HTML requires: a browser closes <p> and <li> for you,
+          # this does not. The page is one hand-written file that closes every
+          # tag today, and demanding it keeps doing so costs nothing and is the
+          # only version of this check that can be written in twenty lines.
+          python3 - <<'PY'
+          import html.parser
+          import sys
+
+
+          class Strict(html.parser.HTMLParser):
+              VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                      "link", "meta", "source", "track", "wbr"}
+
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.stack = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag not in self.VOID:
+                      self.stack.append(tag)
+
+              def handle_startendtag(self, tag, attrs):
+                  pass
+
+              def handle_endtag(self, tag):
+                  if tag in self.VOID:
+                      return
+                  if not self.stack:
+                      sys.exit(f"::error::stray </{tag}> in index.html")
+                  open_tag = self.stack.pop()
+                  if open_tag != tag:
+                      sys.exit(f"::error::</{tag}> closes <{open_tag}> in index.html")
+
+
+          parser = Strict()
+          parser.feed(open("index.html", encoding="utf-8").read())
+          parser.close()
+          if parser.stack:
+              sys.exit("::error::unclosed tags in index.html: " + ", ".join(parser.stack))
+          print("index.html is well formed.")
+          PY
+
+          # clubria.repo is copied verbatim rather than rendered, so what matters
+          # is that it keeps saying the two things that make the signing in the
+          # pages job mean anything. gpgcheck alone would accept a repomd.xml
+          # anyone could serve; repo_gpgcheck alone would accept any package a
+          # valid index happened to point at.
+          repo=packaging/rpm/clubria.repo
+          grep -qx 'gpgcheck=1' "$repo"
+          grep -qx 'repo_gpgcheck=1' "$repo"
+
+          # The layout the pages job actually builds is $site/rpm/<arch>, and the
+          # key it publishes is $site/clubria.asc. A baseurl or gpgkey pointing
+          # anywhere else is a repository nobody can install from.
+          base=https://clubria.github.io/riabuild
+          grep -qx "baseurl=$base/rpm/\$basearch" "$repo"
+          grep -qx "gpgkey=$base/clubria.asc" "$repo"
+
+          # And the landing page has to send people to the same place it is
+          # served from, or the copy-pasted command installs from nowhere.
+          grep -q "$base/rpm/clubria.repo" index.html
+          grep -q "$base/deb stable main" index.html
+          grep -q "$base/clubria.gpg" index.html
+
+          echo "index.html and clubria.repo render and agree with the pages job."

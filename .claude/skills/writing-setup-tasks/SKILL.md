@@ -12,15 +12,24 @@ is worse than no task at all.
 ## The contract
 
 ```rust
+#[async_trait]
 pub trait Task: Send + Sync {
     fn id(&self) -> TaskId;
     fn title(&self) -> &str;
     fn version(&self) -> u32;
     fn depends_on(&self) -> &[TaskId];
-    fn check(&self, ctx: &Ctx) -> Result<Status>;   // Satisfied | Needs(Reason)
-    fn apply(&self, ctx: &mut Ctx) -> Result<()>;
+    async fn check(&self, ctx: &Ctx) -> Result<Status>;   // Satisfied | Needs(Reason)
+    async fn apply(&self, ctx: &mut Ctx) -> Result<()>;
 }
 ```
+
+**`#[async_trait]` is not decoration, and it goes on your `impl` too.** All IO is async
+here, so `check()` and `apply()` are `async fn` — and a trait with an `async fn` in it is
+not dyn-compatible on stable, while `registry()` is a `Vec<Box<dyn Task>>`. `async_trait`
+rewrites both methods to return a boxed future, which is what lets the engine hold your
+task at all. Writing the trait block from memory as two synchronous `fn`s is the mistake
+this section exists to stop: it does not compile, and the error it produces names
+lifetimes rather than the missing attribute.
 
 The runner decides a task needs to run when: there is no record in `state.json`
 (`NeverRun`), the recorded version differs from `version()` (`VersionChanged`), a
@@ -36,10 +45,39 @@ surfaced to the developer, never a recorded success.
 |---|---|
 | `apply()` must be safe to run twice | Tasks re-run on dependency change, version bump, or check failure. There is no "already done" branch to rely on. |
 | `check()` must detect real drift, not just first-run absence | A check that only asks "does the file exist?" will report a satisfied machine with an expired token in it. |
-| All subprocesses go through `CommandRunner` | It is the only thing that makes `check()` unit-testable. No `std::process::Command` outside `runner.rs`. |
+| All subprocesses go through `CommandRunner` | It is the only thing that makes `check()` unit-testable. No `std::process::Command` outside `riabuild-runner`, which the crate graph enforces — it is the only crate that names `tokio/process` at all. |
 | Declare every dependency in `depends_on()` | This is what makes `UpstreamChanged` meaningful. An undeclared edge means the task silently runs against stale state. |
-| Never write a secret to `~/.riabuild/` | Session tokens go to the Keychain. Infisical tokens are short-lived and piped straight into `infisical export`. |
+| Never write a **brokered** secret to `~/.riabuild/` | Infisical tokens are minted per use and piped straight into `infisical export`. Four named exceptions exist and a task is not one of them — see below. |
 | Failure messages name a next action | "Attempted X, ran `cmd`, stderr was Y, do Z, safe to re-run." |
+
+### The secrets rule, and the four things it does not cover
+
+The rule a task must not break is about the **brokered** secret: the Infisical credential
+is minted per use, piped into `infisical export`, and never written down. That has never
+been the whole of it, and reading it as "nothing secret ever lands on disk" is how a task
+gets written that quietly re-implements one of the exceptions badly.
+
+Four secrets riabuild does keep, none of them brokered, and each one local to the single
+machine that made it:
+
+- **this machine's own riabuild session token** — the Keychain where there is one, and
+  `~/.riabuild/session.token` at 0600 where there is not, which includes a managed server
+  and a headless Linux box;
+- **the cache of a *server's* session on a keyring-less laptop**, at
+  `~/.riabuild/remote-sessions/<hash>`, so `riabuild remote` does not mint a fresh 90-day
+  session on every run and record it nowhere this laptop can revoke it;
+- **a server's SSH password**, under `remote-password:<hash>`, kept because one
+  `riabuild remote` run opens around ten SSH connections;
+- **an issued SSH key**, which is the one that lands on no filesystem at all — it is held
+  in an `ssh-agent` riabuild owns, for the length of one bootstrap.
+
+`keychain::keyring_answers` is the only thing that decides whether this machine has a
+keyring. `runner.which("secret-tool")` is **not** an answer to that question —
+`libsecret-tools` arrives as a transitive dependency on boxes with no D-Bus session bus
+at all — and reintroducing that test is how the bug comes back, looking correct and
+passing CI. Read "No secrets in `~/.riabuild/`" in `riabuild-cli/CLAUDE.md` before going
+near any of this; it is the authority, and duplicating it here would only give it a
+second place to drift.
 
 ## When to bump `version()`
 
@@ -57,17 +95,29 @@ unobservable, and nothing else.
 A good check answers "is this machine correct right now?", not "did I run before?"
 
 ```rust
+let Some(project) = ctx.project_dir() else { return Ok(Status::needs("no checkout yet")) };
+let Some(org) = ctx.org.as_ref() else { return Ok(Status::needs("waiting for sign-in")) };
+let file = project.join(".env.dev");
+
 // Weak: passes on an expired token, a wrong version, a revoked session.
-if ctx.paths.env_local().exists() { return Ok(Status::Satisfied); }
+if tokio::fs::try_exists(&file).await.unwrap_or(false) { return Ok(Status::Satisfied); }
 
 // Real: every way this can be wrong is a way this check can fail.
-let f = ctx.paths.env_local();
-if !f.exists() { return Ok(Status::Needs(Reason::CheckFailed("missing".into()))); }
-if !dotenv_parses(&f)? { return Ok(Status::Needs(Reason::CheckFailed("unparseable".into()))); }
-if mtime(&f)? < ctx.org.secrets_updated_at { return Ok(Status::Needs(Reason::CheckFailed("stale".into()))); }
-if !gitignored(&ctx, &f)? { return Ok(Status::Needs(Reason::CheckFailed("not gitignored".into()))); }
+if !tokio::fs::try_exists(&file).await.unwrap_or(false) { return Ok(Status::needs(".env.dev is missing")); }
+let Ok(text) = tokio::fs::read_to_string(&file).await else { return Ok(Status::needs(".env.dev cannot be read")); };
+if !parses_as_dotenv(&text) { return Ok(Status::needs(".env.dev is not a readable env file")); }
+if modified_millis(&file).await < org.secrets_updated_at { return Ok(Status::needs("the team rotated secrets after it was written")); }
+if !is_ignored(ctx, &project, ".env.dev").await? { return Ok(Status::needs(".env.dev is not ignored by git")); }
 Ok(Status::Satisfied)
 ```
+
+Three things in that shape are load-bearing rather than incidental. Every filesystem call
+is `tokio::fs` and awaited. `Status::needs` is the convenience for the common
+`Needs(CheckFailed(…))`, and the string it takes is printed to the developer as the reason
+the task is about to run, so it is a sentence about their machine rather than a status
+code. And the checkout is `ctx.project_dir()`, an `Option` — the repository a run is about
+is `Ctx::repo`, chosen by the picker or `--repo`, and neither a path nor a slug is
+something a task may go and work out for itself.
 
 Ask of each check: what is every way this can be wrong on a machine that ran this task
 six weeks ago? Expired tokens, upgraded CLIs, downgraded CLIs, edited files, deleted

@@ -1,7 +1,7 @@
 # Picking a server, and being told how to forget one
 
-Date: 2026-08-12
-Status: approved
+**Date:** 2026-08-12
+**Status:** Implemented
 
 ## Why
 

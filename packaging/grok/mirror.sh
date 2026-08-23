@@ -31,6 +31,7 @@
 #   ./packaging/grok/mirror.sh            # latest stable: download, report, upload
 #   ./packaging/grok/mirror.sh 1.0.5      # a particular version
 #   ./packaging/grok/mirror.sh --dry-run  # download and report only
+#   ./packaging/grok/mirror.sh --force    # replace assets already mirrored
 #
 # Design: docs/superpowers/specs/2026-08-21-grok-build-design.md
 
@@ -65,10 +66,12 @@ PLATFORMS=(
 )
 
 dry_run=false
+force=false
 target=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
+    --force) force=true ;;
     -*) echo "unknown option $arg" >&2; exit 1 ;;
     *) target="$arg" ;;
   esac
@@ -170,9 +173,11 @@ notes="$work/notes.md"
   echo "|---|---|---|"
 } > "$notes"
 
+declare -A digests=()
 for platform in "${PLATFORMS[@]}"; do
   asset="grok-$version-$platform.bin"
   digest="$(shasum -a 256 "$work/$asset" | awk '{print $1}')"
+  digests["$asset"]="$digest"
   os="${platform%-*}"
   arch="${platform#*-}"
   printf '      ("%s", "%s", "%s"),\n' "$os" "$arch" "$digest"
@@ -195,19 +200,80 @@ echo
   echo '```'
 } >> "$notes"
 
+# Compared against what is already published *before* anything is uploaded, and
+# on --dry-run too: the question a re-run most needs answered is whether it would
+# replace bytes somebody is already pinning.
+#
+# xAI's URLs at least name a version, so a re-run here is likelier to fetch the
+# same bytes than it is against ngrok's floating channel — but "likelier" is not
+# a guarantee, and a version re-cut under its old name is the exact failure this
+# mirror exists to absorb. `--clobber` would let that re-cut replace the published
+# bytes under a tag `tools.rs` pins with `Checksum::Pinned`. Every laptop would
+# then fetch an asset whose digest no longer matches the constant compiled into
+# the binary it is running, and `tools::install` would refuse it. The whole fleet
+# loses Grok Build, and nothing in this repository changed.
+#
+# Identical bytes are a no-op worth allowing: at 588 MB a version, a run that dies
+# after two of the four uploads has to be finishable without redoing the other
+# two. Different bytes are a different build wearing an old name, and the answer
+# to that is a new version, not --force. --force is for the one case that is
+# neither — an asset uploaded corrupt, being replaced by what it should have been
+# all along.
+#
+# GitHub reports each asset's sha256 in the API, so asking costs one request
+# rather than re-downloading half a gigabyte.
+release_exists=false
+if gh release view "$tag" >/dev/null 2>&1; then
+  release_exists=true
+  existing="$(gh api "repos/{owner}/{repo}/releases/tags/$tag" \
+    --jq '.assets[] | "\(.name) \(.digest // "unknown")"')"
+
+  conflict=false
+  while read -r name remote_digest; do
+    [[ -n "$name" ]] || continue
+    local_digest="${digests[$name]:-}"
+    # An asset this run is not producing is none of its business.
+    [[ -n "$local_digest" ]] || continue
+    [[ "$remote_digest" == "sha256:$local_digest" ]] && continue
+
+    if [[ "$remote_digest" == "unknown" ]]; then
+      echo "  $name: GitHub reports no digest, so it cannot be shown to match" >&2
+    else
+      echo "  $name" >&2
+      echo "    published:  ${remote_digest#sha256:}" >&2
+      echo "    downloaded: $local_digest" >&2
+    fi
+    conflict=true
+  done <<<"$existing"
+
+  if $conflict; then
+    echo >&2
+    echo "$tag already holds bytes this run cannot show to be the same." >&2
+    if ! $force; then
+      echo "Refusing to overwrite them: a laptop pinning $tag would stop being able" >&2
+      echo "to install Grok Build at all, because tools.rs verifies the digest of" >&2
+      echo "what it downloads against a constant it was compiled with. Publish these" >&2
+      echo "bytes under the version they actually are, or re-run with --force if you" >&2
+      echo "are deliberately replacing a bad upload." >&2
+      exit 1
+    fi
+    echo "--force given: replacing them." >&2
+  fi
+fi
+
 if $dry_run; then
   echo "--dry-run: nothing uploaded." >&2
   exit 0
 fi
 
-if ! gh release view "$tag" >/dev/null 2>&1; then
+if $release_exists; then
+  # A re-run after a partial upload should not leave last run's digests standing.
+  gh release edit "$tag" --notes-file "$notes"
+else
   gh release create "$tag" \
     --title "Grok Build $version (mirrored)" \
     --notes-file "$notes" \
     --latest=false
-else
-  # A re-run after a partial upload should not leave last run's digests standing.
-  gh release edit "$tag" --notes-file "$notes"
 fi
 gh release upload "$tag" "$work"/grok-"$version"-*.bin --clobber
 

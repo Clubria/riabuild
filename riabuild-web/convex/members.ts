@@ -158,17 +158,39 @@ export const setStatus = mutation({
 
     await ctx.db.patch("members", subject._id, { status: args.status });
 
-    // Suspension has to reach live CLI sessions, not just the next sign-in.
+    // Suspension has to reach live CLI sessions, not just the next sign-in —
+    // and it has to reach *all* of them. This used to `.take(100)` and stop,
+    // which meant a member with more than a hundred `cliSessions` rows (ninety
+    // days of them, one per laptop and one per delegated server, and until
+    // `sessions.reapDead` nothing deleted the dead ones) kept live credentials
+    // on whichever machines happened to sort past the hundredth row.
+    //
+    // Batched rather than `.collect()`ed: the fix for an unbounded set is not
+    // to read the whole unbounded set into memory.
+    //
+    // Each batch is re-queried from the start rather than carried on a cursor,
+    // because both obvious cursors are wrong here. `.paginate()` may be called
+    // only once per Convex function execution, and `_creationTime` is not
+    // reliably distinct enough to page on without risking a skipped row.
+    // Filtering to the sessions that are still live *is* the cursor: every
+    // pass revokes at least one, so the set shrinks monotonically and the loop
+    // ends on "none left" — the actual condition, rather than a row count
+    // somebody has to keep ahead of.
     if (args.status === "suspended") {
-      const sessions = await ctx.db
-        .query("cliSessions")
-        .withIndex("by_memberId", (q) => q.eq("memberId", subject._id))
-        .take(100);
-      for (const session of sessions) {
-        if (session.revokedAt === undefined) {
-          await ctx.db.patch("cliSessions", session._id, {
-            revokedAt: Date.now(),
-          });
+      const revokedAt = Date.now();
+      for (;;) {
+        const live = await ctx.db
+          .query("cliSessions")
+          .withIndex("by_memberId", (q) => q.eq("memberId", subject._id))
+          // The index has already narrowed this to one member's sessions, and
+          // the filter is what makes the loop terminate rather than what finds
+          // the rows.
+          // eslint-disable-next-line @convex-dev/no-filter-in-query
+          .filter((q) => q.eq(q.field("revokedAt"), undefined))
+          .take(200);
+        if (live.length === 0) break;
+        for (const session of live) {
+          await ctx.db.patch("cliSessions", session._id, { revokedAt });
         }
       }
     }
@@ -426,7 +448,9 @@ export const backfillMemberIds = internalMutation({
     let filled = 0;
     for (const member of members) {
       if (member.memberId !== undefined) continue;
-      await ctx.db.patch("members", member._id, { memberId: crypto.randomUUID() });
+      await ctx.db.patch("members", member._id, {
+        memberId: crypto.randomUUID(),
+      });
       filled += 1;
     }
     return filled;

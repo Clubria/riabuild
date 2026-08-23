@@ -18,10 +18,20 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
+# Nothing by default, and every job below says what it needs.
+#
+# A workflow-level grant applies to *every* job, and two of the jobs here run
+# `cargo build` over the whole dependency tree. A `build.rs` anywhere in that
+# graph runs arbitrary code with whatever the job's GITHUB_TOKEN carries — and
+# what it carried was `contents: write`, which can push to main and rewrite the
+# tag being released, and `id-token: write`, which mints an OIDC token this
+# repository's identity is trusted by. Neither build job needs either: they
+# check out, compile, and upload an artifact.
+#
+# So the grants are per job, and the two that hold real authority — `publish`,
+# which creates the release, and `formula`, which commits to main — compile
+# nothing.
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -34,6 +44,9 @@ jobs:
   version:
     name: Resolve the version
     runs-on: ubuntu-latest
+    # It reads a tag name out of the event and checks its shape. It does not
+    # even check the repository out.
+    permissions: {}
     outputs:
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.version.outputs.publish }}
@@ -81,6 +94,10 @@ jobs:
     name: Build macOS ${{ matrix.arch }}
     needs: version
     runs-on: macos-latest
+    # Enough to clone and no more. This job compiles the dependency tree, so
+    # whatever it holds, every `build.rs` in that tree holds too.
+    permissions:
+      contents: read
     # Every job that compiles or runs a test carries one of these, because the
     # default is GitHub's six hours and a release is exactly where that is worst:
     # the tag is already pushed and public, so a wedged job is not a slow release
@@ -117,19 +134,15 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Keyed per target, exactly as the Linux matrix is. Two legs sharing one
       # cache key race to save different targets into it, and whichever lands
       # last is what both restore next release.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          workspaces: riabuild-cli
-          key: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
 
       # Once, on the leg whose runner can run what it compiles: there is nothing
       # to learn from running one suite twice on one machine against one host
@@ -199,7 +212,7 @@ jobs:
           # them over as job outputs.
           shasum -a 256 "dist/$tarball"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: riabuild-macos-${{ matrix.arch }}
           path: riabuild-cli/dist/*
@@ -216,6 +229,9 @@ jobs:
     name: Build Linux ${{ matrix.arch }}
     needs: version
     runs-on: ${{ matrix.runner }}
+    # As the macOS job: read, because it compiles the dependency tree.
+    permissions:
+      contents: read
     # The same deadlock detector as the macOS job above, and for the same reason.
     timeout-minutes: 25
     strategy:
@@ -236,16 +252,12 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: riabuild-cli
-          key: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
 
       # `ring` builds C, and cc-rs looks for `<arch>-linux-musl-gcc` — a name
       # Ubuntu's musl-tools does not provide; it ships `musl-gcc`. Without this
@@ -335,125 +347,48 @@ jobs:
       # `rpmspec -P`, so the spec cannot even be parsed there. Each runner
       # packaging what it just built sidesteps that entirely, and has the useful
       # side effect that the install test below runs natively too.
+      #
+      # The rendering, the dpkg-deb and rpmbuild invocations, the metadata
+      # assertions and the container install test all used to be written out
+      # here *and* in ci.yml, and the two copies had drifted: only this one
+      # checked the deb's Architecture field and its copyright file, and only
+      # ci.yml checked that the rpm still declares `Requires: git`. They are one
+      # pair of scripts now, so neither workflow can quietly lose a check the
+      # other has.
       - name: Build the packages
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          mkdir -p dist build
-          binary="riabuild-cli/target/${{ matrix.target }}/release/riabuild"
-          arch=${{ matrix.arch }}
-          deb_arch=${{ matrix.deb_arch }}
+          mkdir -p dist
 
-          # A plain tarball too, for anyone not using a package manager.
+          # A plain tarball too, for anyone not using a package manager. Not the
+          # packaging scripts' business: it is the same binary with no metadata
+          # around it.
           tar -czf "dist/riabuild-$VERSION-${{ matrix.target }}.tar.gz" \
             -C "riabuild-cli/target/${{ matrix.target }}/release" riabuild
 
-          root="build/deb-$deb_arch"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/riabuild"
-          install -m0755 "$binary" "$root/usr/bin/riabuild"
-          cp README.md "$root/usr/share/doc/riabuild/README.md"
-          # Debian looks for the licence under this name, and MIT asks that the
-          # notice travel with every copy — including a binary one.
-          cp LICENSE "$root/usr/share/doc/riabuild/copyright"
-          sed -e "s|@VERSION@|$VERSION|g" -e "s|@DEB_ARCH@|$deb_arch|g" \
-            packaging/debian/control.in > "$root/DEBIAN/control"
-          # --root-owner-group so the package does not carry the runner's uid,
-          # which would install files owned by a user that does not exist.
-          dpkg-deb --build --root-owner-group "$root" \
-            "dist/riabuild_${VERSION}_${deb_arch}.deb"
+          packaging/build-packages.sh \
+            --version "$VERSION" \
+            --binary "riabuild-cli/target/${{ matrix.target }}/release/riabuild" \
+            --deb-arch "${{ matrix.deb_arch }}" \
+            --rpm-arch "${{ matrix.arch }}"
 
-          mkdir -p "build/src"
-          install -m0755 "$binary" "build/src/riabuild"
-          cp LICENSE "build/src/LICENSE"
-          sed -e "s|@VERSION@|$VERSION|g" -e "s|@RPM_ARCH@|$arch|g" \
-            packaging/rpm/riabuild.spec.in > "build/riabuild.spec"
-          rpmbuild -bb "build/riabuild.spec" \
-            --define "_sourcedir $PWD/build/src" \
-            --define "_rpmdir $PWD/dist" \
-            --define "_topdir $PWD/build/rpm"
-          # rpmbuild nests output under the architecture; flatten it so the
-          # publish job does not have to know that.
-          mv "dist/$arch"/*.rpm dist/
-          rmdir "dist/$arch"
-
-          for rendered in "$root/DEBIAN/control" build/riabuild.spec; do
-            if grep -q '@[A-Z0-9_]*@' "$rendered"; then
-              echo "::error::$rendered still contains unsubstituted placeholders:"
-              grep -n '@[A-Z0-9_]*@' "$rendered"
-              exit 1
-            fi
-          done
-
-          ls -l dist/
-
-      - name: Verify the packages describe what they contain
+      # Everything above this line can pass while the package still installs
+      # something that will not start, so --containers puts the real binary
+      # through a real package manager on the architecture it was built for.
+      - name: Verify the packages
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          # Listings are captured before being searched, never piped into
-          # `grep -q`. grep exits at its first match and closes the pipe;
-          # dpkg-deb's tar subprocess then fails its next write, and `pipefail`
-          # turns that into a failed step. It is a race, so it stays invisible
-          # until the archive is long enough that tar is still writing when
-          # grep leaves — adding the copyright file was enough to cross that
-          # line, and the assertion that broke was not the one that changed.
-          for deb in dist/*.deb; do
-            dpkg-deb --info "$deb"
-            contents=$(dpkg-deb --contents "$deb")
-            # A package that does not put the binary on PATH installs nothing
-            # useful, and neither dpkg-deb nor apt would complain.
-            grep -q './usr/bin/riabuild' <<<"$contents"
-            # MIT asks that the notice travel with every copy, including a
-            # binary one. Debian looks for it under this exact name.
-            grep -q './usr/share/doc/riabuild/copyright' <<<"$contents"
-            test "$(dpkg-deb --field "$deb" Version)" = "$VERSION"
-            test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
-          done
-          for rpm in dist/*.rpm; do
-            rpm -qip "$rpm"
-            grep -qx '/usr/bin/riabuild' <<<"$(rpm -qlp "$rpm")"
-            test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$VERSION"
-            test "$(rpm -qp --queryformat '%{ARCH}' "$rpm")" = "${{ matrix.arch }}"
-            # `-qL` lists only what is marked %license, so this checks the
-            # marking rather than that a file called LICENSE got swept in.
-            grep -q 'LICENSE' <<<"$(rpm -qLp "$rpm")"
-            test "$(rpm -qp --queryformat '%{LICENSE}' "$rpm")" = "MIT"
-          done
+          packaging/verify-packages.sh \
+            --version "$VERSION" \
+            --deb "dist/riabuild_${VERSION}_${{ matrix.deb_arch }}.deb" \
+            --deb-arch "${{ matrix.deb_arch }}" \
+            --rpm "dist/riabuild-$VERSION-1.${{ matrix.arch }}.rpm" \
+            --rpm-arch "${{ matrix.arch }}" \
+            --containers
 
-      # The real binary, installed by a real package manager, on the
-      # architecture it was built for. Everything above this line can pass while
-      # the package still installs something that will not start.
-      - name: Both package managers install the real thing
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          # Names computed out here and passed through the environment, so the
-          # container scripts can be single-quoted. A double-quoted one has to
-          # escape every `$` it wants the container to expand, and the first
-          # missed backslash silently interpolates on the host instead.
-          export DEB="riabuild_${VERSION}_${{ matrix.deb_arch }}.deb"
-          export RPM="riabuild-${VERSION}-1.${{ matrix.arch }}.rpm"
-
-          docker run --rm -e VERSION -e DEB -v "$PWD/dist:/dist:ro" debian:12 \
-            bash -eux -c '
-              apt-get update -qq
-              apt-get install -y -qq "/dist/$DEB"
-              test "$(riabuild --version)" = "riabuild $VERSION"
-              # How update.rs decides it can upgrade itself. A package that
-              # installs but is not attributable leaves riabuild stuck.
-              dpkg -S "$(command -v riabuild)" | grep -q riabuild
-            '
-
-          docker run --rm -e VERSION -e RPM -v "$PWD/dist:/dist:ro" fedora:41 \
-            bash -eux -c '
-              dnf install -y "/dist/$RPM"
-              test "$(riabuild --version)" = "riabuild $VERSION"
-              rpm -qf "$(command -v riabuild)" | grep -q riabuild
-            '
-
-          echo "apt and dnf both installed riabuild $VERSION on ${{ matrix.arch }}."
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: riabuild-linux-${{ matrix.arch }}
           path: dist/*
@@ -463,13 +398,26 @@ jobs:
     needs: [version, macos, linux]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    # The one job that creates a release, and the one that attests to what it
+    # published. `id-token` and `attestations` are what
+    # actions/attest-build-provenance signs with; nothing is compiled here, so
+    # no third-party code is in reach of them.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.version.outputs.version }}
+      # The same key the apt and dnf repositories are signed with. It is here so
+      # the checksums file gets the same treatment the package indexes already
+      # get; see "Sign the checksums" below.
+      SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+      SIGNING_KEY_ID: ${{ secrets.PACKAGE_SIGNING_KEY_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: riabuild-*
           path: dist
@@ -515,32 +463,96 @@ jobs:
 
           cat "$checksums"
 
+      # The apt and dnf repositories are signed with this key and the GitHub
+      # release was not, which is the odd way round: `remote/src/install.rs`
+      # fetches `checksums.txt` over plain HTTPS and then trusts every digest in
+      # it, so whoever can serve that file chooses which bytes riabuild installs
+      # on a server. The key is already published at
+      # clubria.github.io/riabuild/clubria.asc for the repositories, so
+      # verifying this needs nothing new distributed.
+      #
+      # Guarded on the secret rather than required, matching how `announce`
+      # treats CONVEX_DEPLOY_KEY: a release that is unsigned is worse than one
+      # that is signed and better than one that never happened.
+      - name: Sign the checksums
+        if: env.SIGNING_KEY != '' && env.SIGNING_KEY_ID != ''
+        run: |
+          set -euo pipefail
+          printf '%s' "$SIGNING_KEY" | gpg --batch --import
+          gpg --batch --yes --local-user "$SIGNING_KEY_ID" \
+            --detach-sign --armor \
+            -o "dist/riabuild-$VERSION-checksums.txt.asc" \
+            "dist/riabuild-$VERSION-checksums.txt"
+          gpg --verify "dist/riabuild-$VERSION-checksums.txt.asc" \
+            "dist/riabuild-$VERSION-checksums.txt"
+
+      - name: Note that the checksums were not signed
+        if: env.SIGNING_KEY == '' || env.SIGNING_KEY_ID == ''
+        run: |
+          echo "::warning::PACKAGE_SIGNING_KEY is not set, so checksums.txt was published"
+          echo "::warning::unsigned. Anything that can serve that file chooses which bytes"
+          echo "::warning::riabuild installs. See docs/releasing.md for the key setup."
+
+      # Provenance for every artifact in the release: which workflow, at which
+      # commit, on which runner, built these exact bytes. Verified with
+      # `gh attestation verify <file> --repo Clubria/riabuild`, and it is what
+      # `id-token: write` on this job is for — the permission was granted
+      # workflow-wide and used by nothing at all before this.
+      #
+      # Attested before the release stops being a draft, so nothing is public
+      # and unattested even for a moment.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/riabuild-*-checksums.txt
+
+      # Created as a draft and published at the very end.
+      #
+      # `gh release create` publishes the moment it returns, and the upload came
+      # afterwards — so between the two there was a real, visible release with no
+      # tarballs and no checksums file behind it. `remote/src/install.rs` fetches
+      # the checksums first and fails closed when it cannot find a digest, so a
+      # `riabuild remote` landing in that window does not merely wait: it reports
+      # that it cannot install the version it can plainly see.
       - name: Publish
         run: |
           set -euo pipefail
           tag="v$VERSION"
 
           # A dispatch-triggered publish has no tag yet; a tag push already has one.
+          # A re-run after a failure finds a release either way, draft or not.
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" \
               --title "riabuild $VERSION" \
               --generate-notes \
+              --draft \
               --target "$GITHUB_SHA"
           fi
 
           ls -l dist/
           gh release upload "$tag" dist/* --clobber
 
+          # Everything is uploaded; only now does the release exist for anyone
+          # else. Unconditional rather than conditional on having just created
+          # it, so a re-run that repairs a half-uploaded draft also publishes it.
+          gh release edit "$tag" --draft=false
+
   formula:
     name: Update the Homebrew formula
     needs: [version, macos, publish]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    # Commits Formula/riabuild.rb to main. Nothing is compiled here either.
+    permissions:
+      contents: write
     steps:
       # The release is triggered by a tag, but the formula has to land on the
       # default branch: `brew tap` clones that and reads nothing else. Checking
       # out main rather than the tag is what makes the push below meaningful.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
 
@@ -552,7 +564,7 @@ jobs:
       # them here instead has no such race, and has each digest describe the
       # bytes that were actually published rather than the ones a build job
       # reported having.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: riabuild-macos-*
           path: dist
@@ -633,8 +645,49 @@ jobs:
           git pull --rebase origin main
           git push origin HEAD:main
 
+  # Whether the apt and dnf repositories can be signed at all, answered once and
+  # published as a job output.
+  #
+  # This was a step inside `pages`, with its answer repeated as an `if:` on the
+  # ten steps that followed. With the key unset all ten skipped and the job
+  # reported *green* — a release that published no apt repository and no dnf
+  # repository, and said so only in a warning. That is the silent success the
+  # `announce` job's own check exists to prevent, and it is also why the body of
+  # `pages` was unreadable.
+  #
+  # It cannot simply become a job-level `if:` on `pages`, because the `secrets`
+  # context is not available there — only `needs`, `github`, `vars` and `inputs`
+  # are. A job that can read the secret answers the question instead, and `pages`
+  # gates on the answer, so an unsigned release now reports "skipped".
+  signing:
+    name: Check the package signing key
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    env:
+      SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+      SIGNING_KEY_ID: ${{ secrets.PACKAGE_SIGNING_KEY_ID }}
+    steps:
+      - name: Check the signing key is configured
+        id: check
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ] || [ -z "$SIGNING_KEY_ID" ]; then
+            echo "::warning::PACKAGE_SIGNING_KEY is not set, so the apt and dnf"
+            echo "::warning::repositories will NOT be updated. The release will be on"
+            echo "::warning::GitHub, but no Linux developer will be offered it."
+            echo "::warning::See docs/releasing.md for the one-time key setup."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # The apt and dnf repositories, rebuilt from the newest few GitHub releases
   # and deployed to Pages.
+  #
+  # Runs only when `signing` says the key is there; see that job for why the
+  # guard lives outside this one.
   #
   # Rebuilt rather than appended to, which is what keeps this cheap: nothing is
   # stored between runs, so there is no branch accumulating every package ever
@@ -642,9 +695,16 @@ jobs:
   # ends up corrupt is repaired by re-running the job rather than by hand.
   pages:
     name: Publish the apt and dnf repositories
-    needs: [version, publish]
-    if: needs.version.outputs.publish == 'true'
+    needs: [version, publish, signing]
+    if: needs.version.outputs.publish == 'true' && needs.signing.outputs.configured == 'true'
     runs-on: ubuntu-latest
+    # `contents: read` for the `gh release download` that collects the packages;
+    # `pages` and `id-token` are what actions/deploy-pages needs, and this is
+    # the only job that deploys.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -658,30 +718,14 @@ jobs:
       # published site stays small.
       KEEP: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check the signing key is configured
-        id: signing
-        run: |
-          set -euo pipefail
-          if [ -z "$SIGNING_KEY" ] || [ -z "$SIGNING_KEY_ID" ]; then
-            echo "::warning::PACKAGE_SIGNING_KEY is not set, so the apt and dnf"
-            echo "::warning::repositories were NOT updated. $VERSION is on the GitHub"
-            echo "::warning::release, but no Linux developer will be offered it."
-            echo "::warning::See docs/releasing.md for the one-time key setup."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install repository tools
-        if: steps.signing.outputs.configured == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-utils createrepo-c rpm
 
       - name: Import the signing key
-        if: steps.signing.outputs.configured == 'true'
         run: |
           set -euo pipefail
           printf '%s' "$SIGNING_KEY" | gpg --batch --import
@@ -718,7 +762,6 @@ jobs:
           echo "%_gpg_name $SIGNING_KEY_ID" > ~/.rpmmacros
 
       - name: Collect the newest releases
-        if: steps.signing.outputs.configured == 'true'
         run: |
           set -euo pipefail
           mkdir -p packages
@@ -751,7 +794,6 @@ jobs:
           ls -l packages/
 
       - name: Build the apt repository
-        if: steps.signing.outputs.configured == 'true'
         run: |
           set -euo pipefail
           site=site
@@ -791,7 +833,6 @@ jobs:
           find . -type f | sort
 
       - name: Build the dnf repository
-        if: steps.signing.outputs.configured == 'true'
         run: |
           set -euo pipefail
           site=site
@@ -827,7 +868,6 @@ jobs:
           find "$site/rpm" -type f | sort
 
       - name: Publish the key and the landing page
-        if: steps.signing.outputs.configured == 'true'
         run: |
           set -euo pipefail
           site=site
@@ -853,13 +893,23 @@ jobs:
       # mismatch all produce a site that looks perfectly healthy in this log and
       # fails on the developer's first command.
       - name: Install from the repositories in a real container
-        if: steps.signing.outputs.configured == 'true'
+        env:
+          # Pinned by digest, not by tag. `debian:12` is whatever was pushed
+          # under that name this morning, and this step is a *gate*: it exists to
+          # say that a specific apt and a specific dnf accept what was just
+          # built. The Rocky 8 leg is the sharpest case — it is here because rpm
+          # 4.14 cannot verify an ed25519 signature and calls such a package
+          # corrupt, which is exactly the behaviour a retag can change out from
+          # under the assertion that was written to catch it.
+          DEBIAN: "debian:12@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931"
+          FEDORA: "fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d"
+          ROCKY: "rockylinux:8@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c"
         run: |
           set -euo pipefail
           ( cd site && python3 -m http.server 8080 & )
           sleep 2
 
-          docker run --rm --network host -v "$PWD/site:/site:ro" debian:12 bash -eux -c '
+          docker run --rm --network host -v "$PWD/site:/site:ro" "$DEBIAN" bash -eux -c '
             apt-get update -qq && apt-get install -y -qq curl gnupg >/dev/null
             cp /site/clubria.gpg /usr/share/keyrings/clubria.gpg
             echo "deb [arch=amd64 signed-by=/usr/share/keyrings/clubria.gpg] http://127.0.0.1:8080/deb stable main" \
@@ -874,7 +924,7 @@ jobs:
           # on Rocky 8 cannot verify ed25519 and calls such a package corrupt,
           # while Fedora takes it happily. Testing only the newer one would
           # publish a repository that half the RPM world silently rejects.
-          for image in fedora:41 rockylinux:8; do
+          for image in "$FEDORA" "$ROCKY"; do
             docker run --rm --network host -v "$PWD/site:/site:ro" "$image" bash -eux -c '
               rpm --import /site/clubria.asc
               sed "s|https://clubria.github.io/riabuild|http://127.0.0.1:8080|" \
@@ -886,23 +936,22 @@ jobs:
 
           echo "apt and dnf both installed riabuild from the generated repositories."
 
-      - uses: actions/configure-pages@v5
-        if: steps.signing.outputs.configured == 'true'
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 
-      - uses: actions/upload-pages-artifact@v3
-        if: steps.signing.outputs.configured == 'true'
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: site
 
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
         id: deploy
-        if: steps.signing.outputs.configured == 'true'
 
   announce:
     name: Offer the release to developers
     needs: [version, publish]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: riabuild-web
@@ -910,17 +959,9 @@ jobs:
       CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: riabuild-web/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Install
         run: pnpm install --frozen-lockfile

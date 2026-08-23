@@ -1,5 +1,9 @@
 # A password is a way in, not a failure
 
+**Date:** 2026-08-12
+**Status:** Implemented
+**Extends:** [`2026-08-06-remote-mode-design.md`](2026-08-06-remote-mode-design.md)
+
 `riabuild remote` treats one outcome as fatal that is not:
 
 ```
@@ -117,11 +121,29 @@ terminal themselves — degraded to today's behaviour, never broken.
    which riabuild neither owns nor manages;
 3. otherwise looks the account up. A hit is printed to stdout and nothing is
    asked. A miss is asked for once, with echo off, on `/dev/tty` — never stdout,
-   which is the answer channel — then saved, then printed.
+   which is the answer channel — then saved *pending*, then printed.
 
 A stored password that the server rejects is cleared, so the next run asks again
 rather than looping on a stale one. `riabuild remote forget` deletes it beside
 the session token it already revokes.
+
+**"Saved" and "kept" are two steps, because the helper cannot tell them apart.**
+`ssh` hands the helper a prompt from inside an authentication attempt and never
+says how the attempt ended, so a password written straight into the account the
+next lookup reads is a password nothing has checked. One typo then became the
+answer to all ten connections of every future run — around thirty failed
+authentications a run, enough to lock the account — and to `ssh`'s own second
+and third attempts at the *same* connection, so the prompt offering to correct
+the slip was answered with the slip.
+
+So there are two accounts per server, `remote-password:<hash>` and
+`remote-password:<hash>.pending`. The helper's answer goes to the pending one,
+which nothing ever reads back as a password. `authorise`'s copy — the first and
+usually only `ssh` a typed password can answer — reads its own exit status and
+promotes the pending half when sshd authenticated it, or deletes **both** halves
+when sshd refused a password. A refusal that names only `publickey` is not one:
+that is a key being turned away, and clearing a good password there would cost
+the developer a prompt for nothing. `remote forget` deletes both halves too.
 
 ### Where it is stored, and the invariant that moves
 

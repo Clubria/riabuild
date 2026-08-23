@@ -1,90 +1,28 @@
-# Welcome to your Convex functions directory!
+# convex/
 
-Write your Convex functions here.
-See https://docs.convex.dev/functions for more.
+The riabuild backend: the dashboard's queries and mutations, the `/api/v1`
+contract the CLI depends on (`http.ts`), and the brokers that stand between a
+laptop and GitHub, Infisical and ngrok.
 
-A query function that takes two arguments looks like:
+Read these before changing anything here:
 
-```ts
-// convex/myFunctions.ts
-import { query } from "./_generated/server";
-import { v } from "convex/values";
+- **`../CLAUDE.md`** — the invariants. Tokens stored hashed, org membership
+  re-verified on every secret-brokering request, the two validators that keep a
+  secret out of a browser, and the backfill rule for
+  `DEFAULT_CLAUDE_SETTINGS`.
+- **`_generated/ai/guidelines.md`** — generated for the pinned Convex version
+  and the authority on function syntax, validators and schema rules. Always
+  declare `args` and `returns`; anything not called from a browser client is an
+  `internalQuery` / `internalMutation` / `internalAction`.
+- **`../.claude/skills/riabuild-api/SKILL.md`** — before adding or changing an
+  endpoint.
 
-export const myQueryFunction = query({
-  // Validators for arguments.
-  args: {
-    first: v.number(),
-    second: v.string(),
-  },
+Two local rules the generated guidelines do not cover:
 
-  // Function implementation.
-  handler: async (ctx, args) => {
-    // Read the database as many times as you need here.
-    // See https://docs.convex.dev/database/reading-data.
-    const documents = await ctx.db.query("tablename").collect();
+**Every outbound call goes through `lib/http.ts`.** `fetchUpstream` carries a
+deadline; a bare `fetch` does not, and an upstream that hangs takes every CLI
+request waiting behind it with it.
 
-    // Arguments passed from the client are properties of the args object.
-    console.log(args.first, args.second);
-
-    // Write arbitrary JavaScript here: filter, aggregate, build derived data,
-    // remove non-public properties, or create new objects.
-    return documents;
-  },
-});
-```
-
-Using this query function in a React component looks like:
-
-```ts
-const data = useQuery(api.myFunctions.myQueryFunction, {
-  first: 10,
-  second: "hello",
-});
-```
-
-A mutation function looks like:
-
-```ts
-// convex/myFunctions.ts
-import { mutation } from "./_generated/server";
-import { v } from "convex/values";
-
-export const myMutationFunction = mutation({
-  // Validators for arguments.
-  args: {
-    first: v.string(),
-    second: v.string(),
-  },
-
-  // Function implementation.
-  handler: async (ctx, args) => {
-    // Insert or modify documents in the database here.
-    // Mutations can also read from the database like queries.
-    // See https://docs.convex.dev/database/writing-data.
-    const message = { body: args.first, author: args.second };
-    const id = await ctx.db.insert("messages", message);
-
-    // Optionally, return a value from your mutation.
-    return await ctx.db.get("messages", id);
-  },
-});
-```
-
-Using this mutation function in a React component looks like:
-
-```ts
-const mutation = useMutation(api.myFunctions.myMutationFunction);
-function handleButtonPress() {
-  // fire and forget, the most common way to use mutations
-  mutation({ first: "Hello!", second: "me" });
-  // OR
-  // use the result once the mutation has completed
-  mutation({ first: "Hello!", second: "me" }).then((result) =>
-    console.log(result),
-  );
-}
-```
-
-Use the Convex CLI to push your functions to a deployment. See everything
-the Convex CLI can do by running `npx convex -h` in your project root
-directory. To learn more, launch the docs with `npx convex docs`.
+**No component calls `useQuery`.** `src/data/convexProvider.tsx` is the only
+file in `src/` allowed to import from `convex/react` — see `../CLAUDE.md` for
+the grep that checks it.

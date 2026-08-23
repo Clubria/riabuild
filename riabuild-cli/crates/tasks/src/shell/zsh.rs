@@ -39,7 +39,10 @@ export ZDOTDIR="{user}"
 /// rather than `&&` so a shell that is not a terminal does not start life with
 /// a non-zero `$?` for a prompt to report.
 pub fn banner_command(text: &str) -> String {
-    format!("if [[ -t 1 ]]; then print -r -- {}; fi", shell_quote(text))
+    format!(
+        "if [[ -t 1 ]]; then print -r -- {}; fi",
+        super::shell_quote(text)
+    )
 }
 
 /// Prefixes the prompt through a `precmd` hook rather than assigning `PROMPT`
@@ -67,12 +70,8 @@ _riabuild_prompt() {{
     [[ $PROMPT == "$_riabuild_prefix"* ]] || PROMPT="$_riabuild_prefix$PROMPT"
 }}
 add-zsh-hook precmd _riabuild_prompt"#,
-        prefix = shell_quote(&prefix),
+        prefix = super::shell_quote(&prefix),
     )
-}
-
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 pub async fn prepare(

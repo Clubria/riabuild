@@ -1,79 +1,165 @@
 //! The X11 and Wayland clipboards, read through `xclip` and `wl-paste`.
+//!
+//! **One backend, two invocation tables.** These were two structs of roughly
+//! seventy structurally identical lines that differed in a program name and an
+//! argument order and in nothing else — same three methods, same vocabulary
+//! lookup, same "127 is a fault and every other non-zero exit is an empty
+//! clipboard" rule, same context sentences with a different tool spliced into
+//! them. Two copies of one behaviour is a fix applied to one of them, and the
+//! shape made that invisible: a reviewer reading either half sees a complete
+//! and correct backend.
+//!
+//! What actually varies is the argv. [`CliClipboard`] takes it as data — the
+//! vocabulary the tool speaks, the command that lists what is on the clipboard,
+//! and the two commands that have a type name in the middle of them — so
+//! adding a third session (a `termux-clipboard`, a `wsl` bridge) is a table
+//! rather than a file, and a change to how a fault is told from an empty
+//! clipboard lands on every one of them at once.
 
 use super::Clipboard;
+use crate::clipboard::{NOT_FOUND, missing, write_failed};
 use crate::mime::{self, Vocabulary};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use riabuild_runner::{CommandRunner, RunOptions};
 use std::sync::Arc;
 
-/// The shell's code for "no such command".
+/// An invocation with no type name in it: the one that lists the clipboard.
+struct Listing {
+    program: &'static str,
+    argv: &'static [&'static str],
+}
+
+/// An invocation whose argv carries a type name somewhere in the middle.
 ///
-/// This is the one exit status that is a genuine fault rather than an empty
-/// clipboard: the tool riabuild was told to use is not installed, and every
-/// read will fail the same way until someone installs it. Reported with the
-/// tool's own stderr, because "paste does not work" is not actionable.
-const NOT_FOUND: i32 = 127;
-
-fn fault(tool: &str, stderr: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "`{tool}` is not installed on this laptop: {}",
-        stderr.trim()
-    )
+/// Split into `before` and `after` rather than a format string because the
+/// pieces reach `CommandRunner` as separate arguments, and a tool's own
+/// vocabulary — `UTF8_STRING`, `text/plain;charset=utf-8` — is exactly the sort
+/// of value a shell would have to quote.
+struct Typed {
+    program: &'static str,
+    before: &'static [&'static str],
+    after: &'static [&'static str],
 }
 
-pub struct X11Clipboard {
+impl Typed {
+    fn argv<'a>(&self, native: &'a str) -> Vec<&'a str> {
+        let mut argv: Vec<&'a str> = Vec::with_capacity(self.before.len() + self.after.len() + 1);
+        argv.extend_from_slice(self.before);
+        argv.push(native);
+        argv.extend_from_slice(self.after);
+        argv
+    }
+}
+
+/// A clipboard reached through a command-line tool.
+pub struct CliClipboard {
     runner: Arc<dyn CommandRunner>,
+    /// What this tool calls the types the channel carries — X11 atoms, or the
+    /// MIME spellings Wayland uses.
+    vocabulary: Vocabulary,
+    /// How this tool is asked what is on the clipboard. Its `program` is also
+    /// the name spliced into the context sentence, because "could not ask
+    /// wl-paste what is on the clipboard" is the line a developer reads.
+    listing: Listing,
+    reading: Typed,
+    /// Writes go to a *different program* under Wayland — `wl-copy`, not
+    /// `wl-paste` — which is the one asymmetry between the two sessions and the
+    /// reason this is a whole `Typed` rather than a flag on `reading`.
+    writing: Typed,
 }
 
-impl X11Clipboard {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+impl CliClipboard {
+    /// `xclip`, which does all three through one program and one selection.
+    ///
+    /// `-selection clipboard` on every call, never `PRIMARY`: PRIMARY changes
+    /// on every mouse drag, so a paste would carry whatever the developer last
+    /// happened to highlight.
+    pub fn x11(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            runner,
+            vocabulary: Vocabulary::X11,
+            listing: Listing {
+                program: "xclip",
+                argv: &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+            },
+            reading: Typed {
+                program: "xclip",
+                before: &["-selection", "clipboard", "-t"],
+                after: &["-o"],
+            },
+            writing: Typed {
+                program: "xclip",
+                before: &["-selection", "clipboard", "-t"],
+                after: &["-i"],
+            },
+        }
+    }
+
+    /// `wl-paste` for reads and `wl-copy` for writes. The pair is one package
+    /// and one session, so a laptop that can paste can also copy.
+    ///
+    /// `-n` matters for every type and not just for images: without it
+    /// `wl-paste` appends a newline, which corrupts a PNG and silently changes
+    /// a string.
+    pub fn wayland(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            runner,
+            vocabulary: Vocabulary::Wayland,
+            listing: Listing {
+                program: "wl-paste",
+                argv: &["-l"],
+            },
+            reading: Typed {
+                program: "wl-paste",
+                before: &["-n", "-t"],
+                after: &[],
+            },
+            writing: Typed {
+                program: "wl-copy",
+                before: &["--type"],
+                after: &[],
+            },
+        }
     }
 }
 
 #[async_trait]
-impl Clipboard for X11Clipboard {
+impl Clipboard for CliClipboard {
     async fn targets(&self) -> Result<Vec<String>> {
+        let program = self.listing.program;
         let output = self
             .runner
-            .run(
-                "xclip",
-                &["-selection", "clipboard", "-t", "TARGETS", "-o"],
-                &RunOptions::default(),
-            )
+            .run(program, self.listing.argv, &RunOptions::default())
             .await
-            .context("could not ask xclip what is on the clipboard")?;
+            .with_context(|| format!("could not ask {program} what is on the clipboard"))?;
 
         if output.code == Some(NOT_FOUND) {
-            bail!(fault("xclip", &output.stderr));
+            bail!(missing(program, &output.stderr));
         }
         // Any other non-zero exit is an empty clipboard. That is not a fault.
         if !output.ok() {
             return Ok(Vec::new());
         }
 
-        let atoms: Vec<String> = output.stdout.lines().map(|line| line.to_string()).collect();
-        Ok(mime::normalise_targets(Vocabulary::X11, &atoms))
+        let native: Vec<String> = output.stdout.lines().map(|line| line.to_string()).collect();
+        Ok(mime::normalise_targets(self.vocabulary, &native))
     }
 
     async fn read(&self, mime_type: &str) -> Result<Option<Vec<u8>>> {
-        let Some(atom) = mime::from_mime(Vocabulary::X11, mime_type) else {
+        let Some(native) = mime::from_mime(self.vocabulary, mime_type) else {
             return Ok(None);
         };
 
+        let program = self.reading.program;
         let output = self
             .runner
-            .run_bytes(
-                "xclip",
-                &["-selection", "clipboard", "-t", atom, "-o"],
-                &RunOptions::default(),
-            )
+            .run_bytes(program, &self.reading.argv(native), &RunOptions::default())
             .await
-            .context("could not read the clipboard with xclip")?;
+            .with_context(|| format!("could not read the clipboard with {program}"))?;
 
         if output.code == Some(NOT_FOUND) {
-            bail!(fault("xclip", &output.stderr));
+            bail!(missing(program, &output.stderr));
         }
         if !output.ok() || output.stdout.is_empty() {
             return Ok(None);
@@ -82,111 +168,26 @@ impl Clipboard for X11Clipboard {
     }
 
     async fn write(&self, mime_type: &str, bytes: &[u8]) -> Result<bool> {
-        let Some(atom) = mime::from_mime(Vocabulary::X11, mime_type) else {
+        let Some(native) = mime::from_mime(self.vocabulary, mime_type) else {
             return Ok(false);
         };
 
+        let program = self.writing.program;
         let code = self
             .runner
             .run_forking(
-                "xclip",
-                &["-selection", "clipboard", "-t", atom, "-i"],
+                program,
+                &self.writing.argv(native),
                 &RunOptions {
                     stdin: Some(bytes.to_vec()),
                     ..Default::default()
                 },
             )
             .await
-            .context("could not write the clipboard with xclip")?;
+            .with_context(|| format!("could not write the clipboard with {program}"))?;
 
         if code != 0 {
-            bail!(write_failed("xclip", code));
-        }
-        Ok(true)
-    }
-}
-
-/// A write has no stderr to quote — the fork holds that pipe — so the exit
-/// status is the whole diagnostic and the message has to carry it.
-fn write_failed(tool: &str, code: i32) -> anyhow::Error {
-    anyhow::anyhow!("`{tool}` could not take the laptop's clipboard (exit {code})")
-}
-
-pub struct WaylandClipboard {
-    runner: Arc<dyn CommandRunner>,
-}
-
-impl WaylandClipboard {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
-    }
-}
-
-#[async_trait]
-impl Clipboard for WaylandClipboard {
-    async fn targets(&self) -> Result<Vec<String>> {
-        let output = self
-            .runner
-            .run("wl-paste", &["-l"], &RunOptions::default())
-            .await
-            .context("could not ask wl-paste what is on the clipboard")?;
-
-        if output.code == Some(NOT_FOUND) {
-            bail!(fault("wl-paste", &output.stderr));
-        }
-        if !output.ok() {
-            return Ok(Vec::new());
-        }
-
-        let types: Vec<String> = output.stdout.lines().map(|line| line.to_string()).collect();
-        Ok(mime::normalise_targets(Vocabulary::Wayland, &types))
-    }
-
-    async fn read(&self, mime_type: &str) -> Result<Option<Vec<u8>>> {
-        let Some(native) = mime::from_mime(Vocabulary::Wayland, mime_type) else {
-            return Ok(None);
-        };
-
-        // `-n` matters for every type, not just images: without it wl-paste
-        // appends a newline, which corrupts a PNG and silently changes a
-        // string.
-        let output = self
-            .runner
-            .run_bytes("wl-paste", &["-n", "-t", native], &RunOptions::default())
-            .await
-            .context("could not read the clipboard with wl-paste")?;
-
-        if output.code == Some(NOT_FOUND) {
-            bail!(fault("wl-paste", &output.stderr));
-        }
-        if !output.ok() || output.stdout.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(output.stdout))
-    }
-
-    /// Writes go to `wl-copy`; only reads go to `wl-paste`. The pair is one
-    /// package and one session, so a laptop that can paste can also copy.
-    async fn write(&self, mime_type: &str, bytes: &[u8]) -> Result<bool> {
-        let Some(native) = mime::from_mime(Vocabulary::Wayland, mime_type) else {
-            return Ok(false);
-        };
-
-        let code = self
-            .runner
-            .run_forking(
-                "wl-copy",
-                &["--type", native],
-                &RunOptions {
-                    stdin: Some(bytes.to_vec()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("could not write the clipboard with wl-copy")?;
-
-        if code != 0 {
-            bail!(write_failed("wl-copy", code));
+            bail!(write_failed(program, code));
         }
         Ok(true)
     }
@@ -210,7 +211,7 @@ mod tests {
             "TARGETS\nTIMESTAMP\nimage/png\nimage/tiff\ntext/uri-list\n",
             "",
         ));
-        let clipboard = X11Clipboard::new(runner);
+        let clipboard = CliClipboard::x11(runner);
         // TARGETS and TIMESTAMP are not content, TIFF is redundant beside PNG,
         // and a file reference never crosses.
         assert_eq!(clipboard.targets().await.unwrap(), vec![PNG]);
@@ -225,7 +226,7 @@ mod tests {
             &png,
             "",
         ));
-        let clipboard = X11Clipboard::new(runner);
+        let clipboard = CliClipboard::x11(runner);
         assert_eq!(clipboard.read(PNG).await.unwrap(), Some(png.to_vec()));
     }
 
@@ -239,7 +240,7 @@ mod tests {
             b"hello",
             "",
         ));
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
         assert_eq!(clipboard.read(TEXT).await.unwrap(), Some(b"hello".to_vec()));
         assert!(
             runner.calls().iter().any(|c| c.contains("UTF8_STRING")),
@@ -259,25 +260,39 @@ mod tests {
             "",
             "Error: target image/png not available",
         ));
-        let clipboard = X11Clipboard::new(runner);
+        let clipboard = CliClipboard::x11(runner);
         assert_eq!(clipboard.read(PNG).await.unwrap(), None);
     }
 
     /// The one exit status that is a genuine fault. Left as an empty clipboard,
     /// a laptop with no xclip installed reports "nothing copied" forever and
     /// nobody ever finds out why paste does not work.
+    ///
+    /// Asserted for **both** sessions rather than for xclip alone, which is the
+    /// point of there being one backend: the Wayland copy of this rule used to
+    /// be a separate seventy lines that nothing tied to this one.
     #[tokio::test]
     async fn a_missing_tool_is_a_fault_rather_than_an_empty_clipboard() {
-        let runner = arc(FakeRunner::new().with(
-            "xclip -selection clipboard -t TARGETS -o",
-            127,
-            "",
-            "xclip: command not found",
-        ));
-        let clipboard = X11Clipboard::new(runner);
-        let error = clipboard.targets().await.expect_err("should be a fault");
-        assert!(error.to_string().contains("not installed"), "{error}");
-        assert!(error.to_string().contains("command not found"), "{error}");
+        type Build = fn(Arc<dyn CommandRunner>) -> CliClipboard;
+        let cases: [(&str, Build, &str); 2] = [
+            (
+                "xclip -selection clipboard -t TARGETS -o",
+                CliClipboard::x11,
+                "xclip",
+            ),
+            ("wl-paste -l", CliClipboard::wayland, "wl-paste"),
+        ];
+        for (invocation, build, tool) in cases {
+            let runner = arc(FakeRunner::new().with(
+                invocation,
+                127,
+                "",
+                &format!("{tool}: command not found"),
+            ));
+            let error = build(runner).targets().await.unwrap_err().to_string();
+            assert!(error.contains("not installed"), "{error}");
+            assert!(error.contains(tool), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -288,7 +303,7 @@ mod tests {
             "",
             "Error: target TARGETS not available",
         ));
-        let clipboard = X11Clipboard::new(runner);
+        let clipboard = CliClipboard::x11(runner);
         assert!(clipboard.targets().await.unwrap().is_empty());
     }
 
@@ -296,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn a_type_outside_the_table_is_never_shelled_out_for() {
         let runner = Arc::new(FakeRunner::new());
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
         assert_eq!(clipboard.read("application/pdf").await.unwrap(), None);
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
@@ -312,7 +327,7 @@ mod tests {
             "",
             "",
         ));
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
 
         assert!(clipboard.write(PNG, &png).await.unwrap());
         assert_eq!(runner.input_for("xclip"), Some(png.to_vec()));
@@ -329,7 +344,7 @@ mod tests {
             "",
             "",
         ));
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
 
         assert!(clipboard.write(TEXT, b"hello").await.unwrap());
         assert!(
@@ -348,7 +363,7 @@ mod tests {
             "",
             "",
         ));
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
         clipboard.write(TEXT, b"hi").await.unwrap();
 
         let call = runner.calls().first().cloned().unwrap_or_default();
@@ -360,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_of_an_uncarried_type_never_shells_out() {
         let runner = Arc::new(FakeRunner::new());
-        let clipboard = X11Clipboard::new(runner.clone());
+        let clipboard = CliClipboard::x11(runner.clone());
         assert!(!clipboard.write("application/pdf", b"%PDF").await.unwrap());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
@@ -371,7 +386,7 @@ mod tests {
     async fn a_failed_write_names_its_exit_status() {
         let runner =
             arc(FakeRunner::new().with("xclip -selection clipboard -t UTF8_STRING -i", 1, "", ""));
-        let clipboard = X11Clipboard::new(runner);
+        let clipboard = CliClipboard::x11(runner);
         let error = clipboard
             .write(TEXT, b"hi")
             .await
@@ -379,11 +394,13 @@ mod tests {
         assert!(error.to_string().contains("exit 1"), "{error}");
     }
 
-    /// Writes go to wl-copy; only reads go to wl-paste.
+    /// Writes go to wl-copy; only reads go to wl-paste. The one place the two
+    /// sessions genuinely differ, and the reason the write invocation is its
+    /// own table rather than a flag on the read.
     #[tokio::test]
     async fn wayland_writes_through_wl_copy() {
         let runner = Arc::new(FakeRunner::new().with("wl-copy --type image/png", 0, "", ""));
-        let clipboard = WaylandClipboard::new(runner.clone());
+        let clipboard = CliClipboard::wayland(runner.clone());
 
         assert!(clipboard.write(PNG, b"\x89PNG").await.unwrap());
         assert_eq!(runner.input_for("wl-copy"), Some(b"\x89PNG".to_vec()));
@@ -397,7 +414,7 @@ mod tests {
             "text/html\ntext/plain;charset=utf-8\ntext/plain\n",
             "",
         ));
-        let clipboard = WaylandClipboard::new(runner);
+        let clipboard = CliClipboard::wayland(runner);
         // Text leads, and the spellings of it collapse to one entry.
         assert_eq!(clipboard.targets().await.unwrap(), vec![TEXT, "text/html"]);
     }
@@ -406,7 +423,7 @@ mod tests {
     async fn wayland_reads_without_a_trailing_newline() {
         let runner =
             Arc::new(FakeRunner::new().with_bytes("wl-paste -n -t image/png", 0, b"\x89PNG", ""));
-        let clipboard = WaylandClipboard::new(runner.clone());
+        let clipboard = CliClipboard::wayland(runner.clone());
         assert_eq!(
             clipboard.read(PNG).await.unwrap(),
             Some(b"\x89PNG".to_vec())
@@ -416,6 +433,34 @@ mod tests {
             runner.calls().iter().any(|c| c.contains("-n")),
             "{:?}",
             runner.calls()
+        );
+    }
+
+    /// The argv is data now, so what each session actually runs is worth
+    /// pinning in one place: the type name goes in the middle, and every
+    /// argument around it survives.
+    #[tokio::test]
+    async fn each_session_runs_the_invocation_it_names() {
+        let runner = Arc::new(FakeRunner::new());
+        CliClipboard::wayland(runner.clone())
+            .read(PNG)
+            .await
+            .unwrap_or_default();
+        CliClipboard::wayland(runner.clone())
+            .write(TEXT, b"hi")
+            .await
+            .unwrap_or_default();
+
+        let calls = runner.calls();
+        assert!(
+            calls.iter().any(|c| c == "wl-paste -n -t image/png"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "wl-copy --type text/plain;charset=utf-8"),
+            "{calls:?}"
         );
     }
 }

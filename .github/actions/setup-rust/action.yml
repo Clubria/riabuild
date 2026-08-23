@@ -1,0 +1,54 @@
+name: Set up Rust
+description: Installs the pinned stable toolchain and restores the riabuild-cli cargo cache.
+
+# Why this is an action rather than four lines copied into each job: the
+# `dtolnay/rust-toolchain` line below is a *pin*, and it was living in six jobs
+# across three workflows at once. Six copies of one pin is six chances to bump
+# five of them, and the job left behind is a job compiling the release binary
+# with a toolchain action nobody reviewed the move of. Dependabot edits this
+# file; every job follows.
+#
+# An input exists here only where the call sites genuinely disagreed. `toolchain`
+# and `workspaces` are not inputs, because all six wanted the same answer — and
+# an input with one possible value is a difference waiting to be introduced by
+# accident.
+
+inputs:
+  components:
+    description: Comma-separated rustup components, for the job that runs rustfmt and clippy.
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated target triples, for the release jobs that cross-compile.
+    required: false
+    default: ""
+  cache-key:
+    description: >-
+      An extra cargo cache key. The release matrices key per target: two legs
+      sharing one key race to save different targets into it, and whichever
+      lands last is what both restore next release.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Pinned to a commit, and this one is the reason every action in this
+    # repository is: `dtolnay/rust-toolchain@stable` was a *branch*. Whoever
+    # controls that repository could change what compiles the release binary,
+    # retroactively, with no version number ever seen to move. The branch is also
+    # what chose the toolchain, so `toolchain: stable` is stated outright rather
+    # than inherited from whichever branch the pinned commit sat on.
+    - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # the stable branch as of 2026-08-05
+      with:
+        toolchain: stable
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # `workspaces` is resolved against the repository root, not against a job's
+    # `defaults.run.working-directory` — which is why it reads the same here as
+    # it did at every call site.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        workspaces: riabuild-cli
+        key: ${{ inputs.cache-key }}

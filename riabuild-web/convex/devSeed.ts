@@ -30,7 +30,10 @@ export const seedForE2e = internalMutation({
     tokenHash: v.string(),
     role: v.optional(roleValidator),
   },
-  returns: v.object({ memberId: v.id("members"), sessionId: v.id("cliSessions") }),
+  returns: v.object({
+    memberId: v.id("members"),
+    sessionId: v.id("cliSessions"),
+  }),
   handler: async (ctx, args) => {
     requireDevSeed();
 

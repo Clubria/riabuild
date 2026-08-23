@@ -12,10 +12,52 @@ use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::{CommandRunner, RunOptions};
 use riabuild_ui::{Failure, Ui};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Seconds to wait for a connection to be established, per attempt.
+///
+/// Here rather than beside a call site, and that placement is the fix rather
+/// than a tidy: this pair lived next to the two `shell.rs` handoffs, so the
+/// other nine `ssh` calls a run makes had no bound at all and fell back to the
+/// kernel's SYN retry — minutes each, on a server that is simply switched off.
+/// The comment that put them there argued a probe should not wait three
+/// minutes, which is right about the *keepalive* tolerance and backwards about
+/// this: omitting a `ConnectTimeout` is what made those probes wait longest.
+const CONNECT_TIMEOUT: u32 = 15;
+
+/// A lost SYN is a retry, not a failed run. `ssh` sleeps a second between
+/// attempts, so the bound above is what keeps this from doubling an
+/// unreachable server's wait rather than merely surviving a dropped packet.
+const CONNECTION_ATTEMPTS: u32 = 2;
+
+/// One identity in an agent riabuild owns, offered *beside* riabuild's own key.
+///
+/// The triple this expands to — `IdentityAgent`, the public half as `-i`, and
+/// the `IdentitiesOnly=yes` that makes naming both of them mean something —
+/// was hand-assembled at three call sites, in two different orders. It is one
+/// shape with one meaning: "try this key too, and nothing that was not named".
+#[derive(Clone, Copy)]
+pub(crate) struct Offered<'a> {
+    pub(crate) socket: &'a Path,
+    pub(crate) public_key_path: &'a Path,
+}
+
+impl<'a> From<&'a crate::issued::Working> for Offered<'a> {
+    fn from(working: &'a crate::issued::Working) -> Self {
+        Self {
+            socket: &working.socket,
+            public_key_path: &working.public_key_path,
+        }
+    }
+}
+
 /// The `ssh` options every connection to this server uses.
+///
+/// `pub(crate)`, and reached only through [`crate::ssh::Ssh`]: an option list
+/// is half an invocation, and the half that used to be pasted together nine
+/// different ways. Nothing outside this crate composes an `ssh` — the channel
+/// supervisor is handed the finished list rather than building one.
 ///
 /// `identities_only` is false for exactly one step — authorising the new key
 /// (Task 16) — where an existing key or the agent is what proves who we are.
@@ -31,11 +73,11 @@ use std::sync::Arc;
 /// instead of it. `IdentitiesOnly=yes` restricts the offer to the identities
 /// named here, so both have to be named for either to be tried, and dropping
 /// riabuild's own would silently give up the key that works everywhere else.
-pub fn ssh_options(
+pub(crate) fn ssh_options(
     remote: &Remote,
     paths: &dyn Paths,
     identities_only: bool,
-    carry: Option<&crate::issued::Working>,
+    carry: Option<Offered<'_>>,
 ) -> Vec<String> {
     let mut options = vec![
         "-p".to_string(),
@@ -52,6 +94,11 @@ pub fn ssh_options(
         ),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
+        // Every connection, not the two that remembered to ask for it.
+        "-o".to_string(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
+        "-o".to_string(),
+        format!("ConnectionAttempts={CONNECTION_ATTEMPTS}"),
         "-i".to_string(),
         key_path(remote, paths).to_string_lossy().into_owned(),
     ];
@@ -112,11 +159,11 @@ pub async fn ensure_key(
     member_id: &str,
 ) -> Result<PathBuf> {
     let path = key_path(remote, paths);
-    // Repaired unconditionally, before the existence check — same order as
-    // `keychain/file.rs`'s `ensure_private_dir`, so a world-readable directory
-    // doesn't stay that way just because riabuild finds it already there.
-    tokio::fs::create_dir_all(paths.identity_dir()).await?;
-    set_private_dir(&paths.identity_dir()).await?;
+    // Created at 0700 and repaired unconditionally, before the existence
+    // check: a directory this run makes is never briefly world-readable, and
+    // one an older riabuild left open does not stay that way just because it
+    // is already there.
+    ensure_private_dir(&paths.identity_dir()).await?;
 
     if tokio::fs::metadata(&path).await.is_ok() {
         // Found on a later run, not just written below — repair its mode
@@ -174,14 +221,56 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Creates a directory riabuild owns under `~/.riabuild`, private from the
+/// first instant, and repairs the mode of one that is already there.
+///
+/// The three sites this replaces — here, `host_key::pin` and
+/// `issued::agent::start` — each wrote `create_dir_all` and then
+/// `set_private_dir`, which is right about the second run and wrong about the
+/// first: `create_dir_all` applies the process umask, so a directory holding a
+/// private key or a `known_hosts` existed world-readable for the width of two
+/// syscalls before the chmod landed. The root `CLAUDE.md` states the rule for
+/// the channel socket's parent — created **at** 0700 rather than created and
+/// then chmod'd — and it is the same rule here.
+///
+/// Repairing afterwards is still needed and is not the same thing.
+/// `create_dir_all` does not re-apply `mode` to a directory that already
+/// exists, so one left open by an older riabuild, an admin script or a wide
+/// umask would otherwise keep that mode for ever. `keychain/file.rs`'s
+/// `ensure_private_dir` argues both halves at length.
+///
+/// What this deliberately does **not** do is `keychain/file.rs`'s third step:
+/// opening the result with `O_NOFOLLOW | O_DIRECTORY` and checking the owner.
+/// That is there because a server namespace is a predictable path under a home
+/// directory every developer on the box can write to. These three live under
+/// `~/.riabuild` on the laptop, whose root the same run created.
+#[cfg(unix)]
+pub(super) async fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
+    match tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .await
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    set_private_dir(path).await
+}
+
+#[cfg(not(unix))]
+pub(super) async fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
+    tokio::fs::create_dir_all(path).await?;
+    Ok(())
+}
+
 /// Locks a directory riabuild owns under `~/.riabuild` down to `0700`.
 ///
-/// `pub(super)` rather than private because `host_key::pin` needs the same
-/// treatment for `~/.riabuild/ssh` — a second copy over there would be two
-/// definitions of one rule, and the mode that matters would be whichever
-/// copy the reader happened to find. This is a filesystem-permissions
-/// helper, not a trust decision, so sharing it does not put the two trust
-/// concerns back into one place.
+/// Separate from [`ensure_private_dir`] above, which calls it: creating at the
+/// right mode and repairing a mode already on disk are two different
+/// guarantees, and only the second one applies to a directory somebody else
+/// made.
 #[cfg(unix)]
 pub(super) async fn set_private_dir(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -241,6 +330,10 @@ mod tests {
         assert!(options.contains("IdentitiesOnly=yes"), "{options}");
         // riabuild ignores the developer's own ssh config outright.
         assert!(options.contains("-F /dev/null"), "{options}");
+        // The bound on the dial belongs to *every* connection — see the two
+        // constants above, and `ssh.rs` for why it moved here.
+        assert!(options.contains("ConnectTimeout=15"), "{options}");
+        assert!(options.contains("ConnectionAttempts=2"), "{options}");
     }
 
     #[test]
@@ -258,7 +351,7 @@ mod tests {
             public_key_path: "/run/riabuild/k1.pub".into(),
         };
 
-        let options = ssh_options(&remote(), &paths, true, Some(&carried)).join(" ");
+        let options = ssh_options(&remote(), &paths, true, Some((&carried).into())).join(" ");
 
         assert!(
             options.contains("IdentityAgent=/run/riabuild/sock"),

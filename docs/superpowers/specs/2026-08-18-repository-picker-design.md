@@ -1,7 +1,7 @@
 # Picking a repository
 
-Date: 2026-08-18
-Status: approved
+**Date:** 2026-08-18
+**Status:** Implemented
 
 ## Why
 

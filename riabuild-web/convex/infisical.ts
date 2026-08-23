@@ -10,6 +10,8 @@
  * it into `infisical export`. Path scoping is Infisical's RBAC, not our code.
  */
 
+import { fetchUpstream } from "./lib/http";
+
 export type Role = "candidate" | "developer" | "lead";
 
 export type BrokerResult =
@@ -105,11 +107,14 @@ export async function brokerToken(role: Role): Promise<BrokerResult> {
 
   let response: Response;
   try {
-    response = await fetch(`${siteUrl()}/api/v1/auth/universal-auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ clientId, clientSecret }),
-    });
+    response = await fetchUpstream(
+      `${siteUrl()}/api/v1/auth/universal-auth/login`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId, clientSecret }),
+      },
+    );
   } catch (error) {
     return {
       status: "upstream_error",

@@ -1,7 +1,7 @@
 # riabuild — Design
 
 **Date:** 2026-08-04
-**Status:** Approved
+**Status:** Implemented
 **Scope:** Provisioner only. See [Non-goals](#non-goals).
 
 ## Purpose
@@ -159,15 +159,35 @@ Three properties this buys:
 
 All CLI requests carry `Authorization: Bearer <session token>`. The handler hashes it,
 looks it up in `cliSessions`, rejects revoked or expired sessions, and updates
-`lastUsedAt`.
+`lastUsedAt`. The two sign-in routes are the exception that proves it: `cli/device` and
+`cli/token` are how a laptop with no session gets one, so there is nothing to send, and
+the version floor is the only gate they can enforce.
+
+The table below is the whole of `convex/http.ts` as it stands, not the five routes this
+document originally proposed. `/api/v1` is add-only, so it has only ever grown — device
+authorisation replaced the loopback exchange, remote mode added a way for a laptop to sign
+a server in and for the dashboard to hand out addresses and issued keys, and ngrok added
+one route that mints nothing and merely hands back a token a lead set.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/v1/cli/token` | exchange one-time code for a session token |
+| `POST /api/v1/cli/device` | start a device authorisation |
+| `POST /api/v1/cli/token` | poll a device code, eventually for a session token |
+| `POST /api/v1/cli/sessions` | a signed-in laptop mints a session for a server it is provisioning |
+| `DELETE /api/v1/cli/sessions/<id>` | revoke a session |
 | `GET /api/v1/me` | member profile, role, status |
-| `GET /api/v1/org/config` | `repoSlug`, `minCliVersion`, `latestCliVersion` (plus a frozen `defaultProjectPath`, retired — see below) |
+| `GET /api/v1/org/config` | `repoSlug`, `minCliVersion`, `latestCliVersion`, `secretsUpdatedAt`, `secretEnvironments`, `ngrokAuthTokenUpdatedAt` (plus a frozen `defaultProjectPath`, retired — see below) |
 | `GET /api/v1/org/claude-settings` | org Claude Code settings JSON + `updatedAt` |
+| `GET /api/v1/org/ngrok-token` | the team's ngrok authtoken, fetched by the `ngrok` shim on every invocation and never written to a filesystem |
+| `GET /api/v1/remotes/shared` | the addresses of the team's shared servers — hostname, port, username, and nothing else |
+| `GET /api/v1/issued-keys` | the SSH private keys a lead issued to this developer, held only in an `ssh-agent` riabuild owns |
 | `POST /api/v1/secrets/token` | short-lived Infisical access token |
+
+The three routes that hand out a live credential — `org/ngrok-token`, `issued-keys` and
+`secrets/token` — each write an `auditLog` row, because a team-held secret with no record
+of who fetched it is the attribution this design already accepted losing, lost twice.
+`org/config` carries `ngrokAuthTokenUpdatedAt` rather than the token for the same reason:
+it lets the CLI say "your lead has not set one" without brokering anything.
 
 ### Where the checkout goes
 
@@ -188,7 +208,14 @@ installed CLI predates the change.
 |---|---|
 | `/` | developer: profile, active CLI sessions, revoke buttons, install instructions |
 | `/` | lead: the above plus member list, role assignment, suspend, audit log |
-| `/cli/authorize` | loopback approval screen |
+| `/cli` | the device-code approval screen |
+| `/__ui` | the component gallery, dev builds only — a 404 anywhere else |
+
+There are three paths and no router library: `src/app/route.ts` is one `route(pathname)`
+function returning a discriminated union, which is what makes a 404 an outcome the tests
+can name rather than a blank page. The approval screen is `/cli`, not the
+`/cli/authorize` the loopback section above proposed; that section is superseded, and so
+was its URL.
 
 ### Auth stack note
 
@@ -219,25 +246,18 @@ The riabuild session token lives in the Keychain, never in this tree.
 
 ### Crate layout
 
-Files stay small and single-purpose. When one grows past roughly 300 lines, that is a
-signal it is doing too much.
+> **Superseded on 2026-08-12** by
+> [`2026-08-12-cargo-workspace-design.md`](2026-08-12-cargo-workspace-design.md). The flat
+> `riabuild-cli/src/` this section used to list does not exist: `riabuild-cli/` is now a
+> virtual cargo workspace, every file it named moved into one of thirteen crates under
+> `crates/`, and the binary is `crates/cli/`. The current crate table — and the dependency
+> order that turns what used to be prose about module boundaries into things that fail to
+> compile — lives in `riabuild-cli/CLAUDE.md` under *Layout*. It is deliberately not
+> copied here, because a second copy is the one that goes stale.
 
-```
-riabuild-cli/src/
-  main.rs              top-level flow
-  cli.rs               clap definitions
-  config.rs            ~/.riabuild layout, state.json load/save
-  paths.rs             path resolution behind a trait (macOS now, Linux-shaped)
-  keychain.rs          secret storage behind a trait (macOS impl, Linux stub)
-  runner.rs            CommandRunner trait — every external process goes through this
-  update.rs            version check, brew upgrade, re-exec
-  ui.rs                terminal output and prompts
-  api/                 riabuild-web client: mod, auth, org, secrets
-  tasks/               mod (trait + registry + DAG runner) + one file per task
-  shell/               mod, zsh, bash, fish
-  shims/               generation of ~/.riabuild/bin entries
-  accounts/            Claude Code accounts: registry, status, box, `riabuild claude`
-```
+Files stay small and single-purpose. When one grows past roughly 300 lines, that is a
+signal it is doing too much. That rule survives the workspace unchanged; what changed is
+that a file now sits in a crate that cannot reach the crates below it.
 
 ### The task engine
 
@@ -286,21 +306,32 @@ names a registered task.
 
 ### Setup tasks
 
+Eighteen tasks, listed in the order `riabuild_tasks::registry()` declares them — which is
+the order they are read in, not the order they run in, because the engine sorts by
+`depends_on`. Dependencies are given by task id rather than by number: the id is what the
+code names, the numbers are only the ones the task modules' own headers assert, and three
+tasks added after this document was written never took one.
+
 | # | Task | Depends on | Check |
 |---|---|---|---|
-| 1 | `login` | — | Keychain token present; `/api/v1/me` returns 200 with `status == active`. Refreshes proactively when expiring within 7 days. |
-| 2 | `github_cli` | — | `gh --version` ≥ floor; `gh auth status` exits 0; `/user/memberships/orgs/Clubria` reports an active membership. The capability is tested, never the scope string: GitHub accepts five scopes there and folds `read:org` into `admin:org`. |
-| 3 | `infisical_cli` | — | `infisical --version` ≥ floor. **No token is installed** — credentials are brokered per use. |
-| 4 | `toolchain` | — | `~/.riabuild/node/<pinned>/bin/node -v` matches the repo's `.nvmrc`; `~/.riabuild/bin/pnpm -v` matches the repo's `packageManager` field. |
-| 5 | `project` | 2 | configured directory exists, is a git repo, `origin` is `Clubria/ai-builders-hub`. |
-| 6 | `repo_status` | 5 | **Reports only.** Ahead/behind counts and dirty-tree state. Never pulls. |
-| 7 | `claude_accounts` | 4 | at least one account directory exists, account 1 is signed in, `claude --version` ≥ floor. |
-| 8 | `org_settings` | 1 | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
-| 9 | `env_local` | 1, 3, 5 | one `.env.<environment>` per environment in `orgConfig.secretEnvironments` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. A developer or lead gets `.env.dev` and `.env.staging`; a candidate gets `.env.dev`. The task id is historical — it wrote a single `.env.local` before environments were plural. |
-| 10 | `claude_trust` | 5, 7 | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
-| 11 | `claude_statusline` | — | `~/.riabuild/claude-statusline.js` is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. |
-| 12 | `claude_onboarding` | 7 | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Depends on 7 alone: unlike trust, nothing here needs a checkout. |
-| 13 | `git_credentials` | 2 | git's effective credential helper for `https://github.com` delegates to the `gh` riabuild owns, by absolute path. The sign-in path already runs `gh auth setup-git`, but only when riabuild performs the sign-in — a `gh` already signed in (by the developer, by an older riabuild, or by `internal seed-github` on every managed server) satisfies task 2 on its first check, so nothing writes the helper and the developer can clone but not push. Matching the *path* rather than "a helper exists" is what rejects a signed-out system `gh` answering for git. |
+| 1 | `login` | — | a live session: `ctx.member` was populated by asking `/api/v1/me` at startup, and `status == active`. A suspended account is a hard stop rather than a check failure, because signing in again would succeed and change nothing. Refreshes proactively when the session expires within 7 days. |
+| 2 | `github_cli` | — | the `gh` **riabuild owns** exists under `~/.riabuild`, reports a usable version, `gh auth status` exits 0, and `/user/memberships/orgs/Clubria` reports an active membership. The capability is tested, never the scope string: GitHub accepts five scopes there and folds `read:org` into `admin:org`. |
+| 15 | `git_credentials` | `github_cli` | git's effective credential helper for `https://github.com` delegates to the `gh` riabuild owns, by absolute path. The sign-in path already runs `gh auth setup-git`, but only when riabuild performs the sign-in — a `gh` already signed in (by the developer, by an older riabuild, or by `internal seed-github` on every managed server) satisfies `github_cli` on its first check, so nothing writes the helper and the developer can clone but not push. Matching the *path* rather than "a helper exists" is what rejects a signed-out system `gh` answering for git. |
+| 3 | `infisical_cli` | — | the `infisical` riabuild owns exists and reports a usable version. **No token is installed** — credentials are brokered per use. |
+| — | `ngrok` | — | the ngrok riabuild owns is installed, and `~/.riabuild/bin/ngrok` is byte-identical to the shim this binary writes. **No authtoken is installed**: the shim fetches the team's from `/api/v1/org/ngrok-token` on every invocation and puts it in one process's environment. Comparing the shim's text is what catches one written by an older riabuild whose own path has since moved. |
+| 4 | `toolchain` | `project` | `~/.riabuild/node/<pinned>/bin/node -v` matches the repo's `.nvmrc`; `~/.riabuild/bin/pnpm -v` matches the repo's `packageManager` field. The edge on `project` is not in this document's original table and was added because it has to be: a check that reads files out of the checkout cannot run before the checkout exists. |
+| 5 | `project` | `github_cli` | the chosen directory exists, is a git checkout, and its `origin` matches **the repository this run is about** — which the developer picked from the list `gh` says they are authorized to see, defaulting to `orgConfig.repoSlug`. This document's original row named `Clubria/ai-builders-hub` outright; see [`2026-08-18-repository-picker-design.md`](2026-08-18-repository-picker-design.md). |
+| 6 | `repo_status` | `project` | **Reports only.** Ahead/behind counts and dirty-tree state. Never pulls. |
+| — | `codex_cli` | `toolchain` | the Codex CLI is installed with riabuild's Node and reports a usable version, and all nine `CODEX_HOME` profile directories exist. Declared *ahead* of `claude_accounts` deliberately: nothing about Codex depends on the Claude sign-in, and a task that waits on a browser must not be able to strand one that does not. **Nobody is signed in** — a Codex sign-in is the developer's own OpenAI account. |
+| — | `grok_cli` | — | Grok Build is installed from riabuild's own mirror against a committed digest, and all nine `GROK_HOME` profile directories exist. No `toolchain` edge, because it is a static binary and needs no Node. **Nobody is signed in**, for the same reason as Codex. |
+| 7 | `claude_accounts` | `toolchain` | at least one account directory exists, account 1 is signed in, `claude --version` ≥ floor. |
+| 8 | `org_settings` | `login` | `org-settings.json` is valid JSON and matches the server's `updatedAt`. |
+| 10 | `claude_trust` | `claude_accounts`, `project` | *every* account's `.claude.json` records `projects[<checkout>].hasTrustDialogAccepted == true`, under both the literal and the resolved path. |
+| 12 | `claude_onboarding` | `claude_accounts` | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Deliberately not on `project`: unlike trust, nothing here needs a checkout. |
+| 14 | `claude_agents_view` | `claude_accounts` | *every* account's `.claude.json` carries the `defaultToAgentsView` key. Presence, not truth — a developer who turned the view off has answered the question, and re-asking it every run is how riabuild would keep overruling them. |
+| 9 | `env_local` | `login`, `infisical_cli`, `project` | one `.env.<environment>` per environment in `orgConfig.secretEnvironments` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. A developer or lead gets `.env.dev` and `.env.staging`; a candidate gets `.env.dev`. The task id is historical — it wrote a single `.env.local` before environments were plural. |
+| 11 | `claude_statusline` | — | the status line script is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. The path is `Paths::claude_statusline_file`, and it is `~/.riabuild/claude-statusline.js` on a server as well as on a laptop: the shared tools root, not the per-developer namespace, because the org settings name it through a `~` the shell expands to the account's home. A copy in the namespace is a status line whose command silently fails, which is what remote mode had until 2026-08-17 with the task reporting satisfied throughout. |
+| 13 | `claude_plugins` | `claude_accounts`, `project` | every marketplace and plugin the *checkout's own* `.claude/settings.json` declares is installed, once per account. Satisfied with zero subprocesses when the checkout declares none. **Nothing here decides what to install**: an org setting naming a marketplace would be the server-driven task manifest under another name. |
 
 > **Superseded for Claude Code.** This document's single-profile model — one
 > `~/.riabuild/claude/<uuid>/` reached by a `c` launcher — was replaced by an ordered list

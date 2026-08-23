@@ -1,7 +1,7 @@
 # The channel over an exec session, not a forward — Design
 
 **Date:** 2026-08-13
-**Status:** Draft
+**Status:** Implemented
 **Amends:** [`2026-08-07-clipboard-channel-design.md`](2026-08-07-clipboard-channel-design.md)
 
 ## Purpose

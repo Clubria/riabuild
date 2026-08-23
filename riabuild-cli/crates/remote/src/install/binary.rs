@@ -249,6 +249,57 @@ mod tests {
 
     const EXPECTED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    /// The bound every call carried, recorded through the same `Delegating`
+    /// base the production wrappers are built on.
+    ///
+    /// `FakeRunner` records argv, the environment and stdin, and not
+    /// `RunOptions.timeout` — so without this the patience a call site chose is
+    /// invisible to the suite, which is how the one upload in remote mode gets
+    /// silently held to the ceiling meant for a round trip.
+    #[derive(Clone, Default)]
+    struct Bounds(Arc<std::sync::Mutex<Vec<Bounded>>>);
+
+    /// One call, and the bound it was given.
+    type Bounded = (String, Option<std::time::Duration>);
+
+    impl Bounds {
+        fn watching(
+            &self,
+            inner: Arc<dyn riabuild_runner::CommandRunner>,
+        ) -> Arc<dyn riabuild_runner::CommandRunner> {
+            Arc::new(riabuild_runner::Delegating::around(inner, self.clone()))
+        }
+
+        /// The bound the first call whose invocation contains `fragment` was
+        /// given. A fragment nothing ran panics rather than reading as "no
+        /// bound".
+        fn of(&self, fragment: &str) -> Option<std::time::Duration> {
+            self.0
+                .lock()
+                .expect("bounds")
+                .iter()
+                .find(|(call, _)| call.contains(fragment))
+                .map(|(_, bound)| *bound)
+                .expect("nothing ran that matched the fragment")
+        }
+    }
+
+    #[async_trait]
+    impl riabuild_runner::Decoration for Bounds {
+        async fn before(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &riabuild_runner::RunOptions,
+        ) -> Result<()> {
+            self.0
+                .lock()
+                .expect("bounds")
+                .push((format!("{program} {}", args.join(" ")), options.timeout));
+            Ok(())
+        }
+    }
+
     /// The exact prefix `identity::ssh_options` plus the login target
     /// produces — shared by every command sent to `remote`, so it is what
     /// lets `FakeRunner::then` sequence responses to *successive* remote
@@ -404,6 +455,59 @@ mod tests {
             fake.calls().iter().any(|call| call.contains("chmod 755")),
             "{:?}",
             fake.calls()
+        );
+    }
+
+    /// The push is the one `ssh` remote mode does not hold to the default
+    /// ceiling, and the round trip beside it still is.
+    ///
+    /// Pinned against the literal rather than against `PUSH_PATIENCE`, which
+    /// would agree with itself: the failure this catches is the explicit bound
+    /// being dropped so that an upload inherits whatever the default happens to
+    /// be, which fails on a slow uplink and nowhere a test would notice.
+    #[tokio::test]
+    async fn the_binary_push_is_given_its_own_patience() {
+        let laptop = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(laptop.path());
+        let fake = Arc::new(
+            FakeRunner::new()
+                .containing("mkdir -p", 0, "", "")
+                .containing("sha256sum", 0, &format!("{EXPECTED}\n"), ""),
+        );
+        let bounds = Bounds::default();
+        let remote = remote();
+        let ctx = SshCtx {
+            carry: None,
+            remote: &remote,
+            paths: &paths,
+            runner: bounds.watching(fake),
+            ui: &Ui::new(true),
+        };
+
+        write_binary(
+            &ctx,
+            "/home/dev",
+            "2026.08.06",
+            EXPECTED,
+            b"fake riabuild binary".to_vec(),
+        )
+        .await
+        .expect("writes");
+
+        assert_eq!(
+            bounds.of("cat >"),
+            Some(std::time::Duration::from_secs(1800)),
+            "the upload sets its own patience"
+        );
+        assert_ne!(
+            bounds.of("cat >"),
+            riabuild_runner::RunOptions::default().timeout,
+            "an upload is not the hung call the default ceiling is a bound against"
+        );
+        assert_eq!(
+            bounds.of("sha256sum"),
+            riabuild_runner::RunOptions::default().timeout,
+            "and nothing else moved: the verify is a round trip like every other"
         );
     }
 

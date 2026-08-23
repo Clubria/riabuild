@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { action, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
+import { fetchUpstream, UPSTREAM_TIMEOUT_MS } from "./lib/http";
 
 /**
  * GitHub org membership is the trust boundary. Convex only decides *how much*
@@ -12,7 +13,8 @@ import { getAuthUserId } from "@convex-dev/auth/server";
  * months after sign-in, from an HTTP action that has no user session in hand.
  */
 
-export const orgLogin = (): string => process.env.RIABUILD_GITHUB_ORG ?? "Clubria";
+export const orgLogin = (): string =>
+  process.env.RIABUILD_GITHUB_ORG ?? "Clubria";
 
 export type MembershipResult =
   | { status: "member" }
@@ -28,6 +30,12 @@ export type MembershipResult =
  */
 export async function checkOrgMembership(
   login: string,
+  /**
+   * Overridden only by the test that proves a hung GitHub becomes
+   * `unavailable` rather than a request nobody ever answers. Every caller
+   * takes the default.
+   */
+  timeoutMs: number = UPSTREAM_TIMEOUT_MS,
 ): Promise<MembershipResult> {
   const token = process.env.GITHUB_ORG_TOKEN;
   if (!token) {
@@ -40,7 +48,7 @@ export async function checkOrgMembership(
   const org = orgLogin();
   let response: Response;
   try {
-    response = await fetch(
+    response = await fetchUpstream(
       `https://api.github.com/orgs/${encodeURIComponent(org)}/members/${encodeURIComponent(login)}`,
       {
         headers: {
@@ -51,6 +59,7 @@ export async function checkOrgMembership(
         },
         redirect: "manual",
       },
+      timeoutMs,
     );
   } catch (error) {
     return {
@@ -105,7 +114,10 @@ export const listOrgMembers = action({
   args: {},
   returns: v.array(v.object({ login: v.string(), githubId: v.string() })),
   handler: async (ctx): Promise<OrgCandidate[]> => {
-    const isLead: boolean = await ctx.runQuery(internal.github.viewerIsLead, {});
+    const isLead: boolean = await ctx.runQuery(
+      internal.github.viewerIsLead,
+      {},
+    );
     if (!isLead) throw new Error("Only team leads can do that.");
 
     // Same deployment-level gate as the dev sign-in provider, for the same
@@ -124,7 +136,7 @@ export const listOrgMembers = action({
     const org = orgLogin();
     const found: OrgCandidate[] = [];
     for (let page = 1; page <= MEMBER_PAGES; page += 1) {
-      const response = await fetch(
+      const response = await fetchUpstream(
         `https://api.github.com/orgs/${encodeURIComponent(org)}/members?per_page=${PER_PAGE}&page=${page}`,
         {
           headers: {
@@ -147,7 +159,10 @@ export const listOrgMembers = action({
       for (const entry of body) {
         const login = (entry as { login?: unknown }).login;
         const id = (entry as { id?: unknown }).id;
-        if (typeof login === "string" && (typeof id === "number" || typeof id === "string")) {
+        if (
+          typeof login === "string" &&
+          (typeof id === "number" || typeof id === "string")
+        ) {
           found.push({ login, githubId: String(id) });
         }
       }
@@ -210,7 +225,8 @@ export const viewerOrgMembership = action({
       internal.github.viewerGithubLogin,
       {},
     );
-    if (login === null) return { org: orgLogin(), status: "signed_out" as const };
+    if (login === null)
+      return { org: orgLogin(), status: "signed_out" as const };
 
     // A dev deployment has no real GitHub org to ask about, and without this
     // every local page renders the "check unavailable" banner — the happy path

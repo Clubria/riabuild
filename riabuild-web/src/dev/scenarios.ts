@@ -1,3 +1,4 @@
+import type { Id, TableNames } from "../../convex/_generated/dataModel";
 import {
   AuditEntry,
   Data,
@@ -23,11 +24,23 @@ import {
  */
 export const NOW = 1_785_000_000_000;
 
+/**
+ * A made-up row id, branded as the table it stands for.
+ *
+ * Convex ids are opaque strings with a table in their type, and the fixtures
+ * are the one place a row exists without a database having minted it. The table
+ * comes from whatever field this is assigned to, so a session id written into a
+ * `Member` is still a compile error — the point of branding them at all.
+ */
+function id<Table extends TableNames>(value: string): Id<Table> {
+  return value as Id<Table>;
+}
+
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 
 const LEAD: Member = {
-  _id: "m_lead",
+  _id: id("m_lead"),
   memberId: "4a1e9c2d-6b3f-4a17-9d2e-8c5f1a3b7e60",
   githubLogin: "ilya",
   githubId: "1",
@@ -41,7 +54,7 @@ const LEAD: Member = {
 };
 
 const DEVELOPER: Member = {
-  _id: "m_dev",
+  _id: id("m_dev"),
   memberId: "7f2b3d5a-9c1e-4b26-8a4f-2d6e9b1c5f83",
   githubLogin: "dana",
   githubId: "2",
@@ -55,7 +68,7 @@ const DEVELOPER: Member = {
 };
 
 const CANDIDATE: Member = {
-  _id: "m_cand",
+  _id: id("m_cand"),
   memberId: "1c8e4f6b-2a9d-4e37-b1c8-5f3a7d2e9b41",
   githubLogin: "sam",
   githubId: "3",
@@ -69,7 +82,7 @@ const CANDIDATE: Member = {
 };
 
 const SUSPENDED: Member = {
-  _id: "m_susp",
+  _id: id("m_susp"),
   memberId: "9d3a7c1e-5b8f-4c92-a6d1-3e7b9c2f5a84",
   githubLogin: "rowan",
   githubId: "4",
@@ -88,7 +101,7 @@ const SUSPENDED: Member = {
  * email longer than any column, and empty strings where the UI expects text.
  */
 const HOSTILE: Member = {
-  _id: "m_hostile",
+  _id: id("m_hostile"),
   // A full, unbroken 36-character UUID — the `overflow` scenario exists to
   // catch exactly this shape. A shorter stand-in here would not exercise it.
   memberId: "2e6b9d4a-8c1f-4a53-9b7e-6d1a3c8f5b92",
@@ -104,7 +117,7 @@ const HOSTILE: Member = {
 };
 
 const UNICODE: Member = {
-  _id: "m_unicode",
+  _id: id("m_unicode"),
   memberId: "5c1f8a3d-9b6e-4d74-8c2a-7e9b1d5f3a60",
   githubLogin: "田中さん",
   githubId: "6",
@@ -126,7 +139,7 @@ const UNICODE: Member = {
  * profile in. `joinedAt` is when they were invited.
  */
 const INVITED: Member = {
-  _id: "m_invited",
+  _id: id("m_invited"),
   memberId: "8b4d2f7a-3c6e-4915-b8d2-1f7a4c9e6b35",
   githubLogin: "priya",
   githubId: "7",
@@ -145,7 +158,7 @@ const INVITED: Member = {
  * because it is the one a reader would assume the worst about.
  */
 const INVITED_LEAD: Member = {
-  _id: "m_invited_lead",
+  _id: id("m_invited_lead"),
   memberId: "3f9c1e5b-7d2a-4864-9c1e-5b8d3a7f2c94",
   githubLogin: "morgan",
   githubId: "8",
@@ -169,7 +182,7 @@ const ORG_CANDIDATES: OrgCandidate[] = [
 ];
 
 const ACTIVE_SESSION: Session = {
-  _id: "s_active",
+  _id: id("s_active"),
   deviceLabel: "dana-mbp-16",
   cliVersion: "2026.08.04",
   createdAt: NOW - 20 * DAY,
@@ -185,7 +198,7 @@ const ACTIVE_SESSION: Session = {
  * row carries the extra line saying nobody approved this one in a browser.
  */
 const DELEGATED_SESSION: Session = {
-  _id: "s_delegated",
+  _id: id("s_delegated"),
   deviceLabel: "build-01.fly.dev",
   cliVersion: "2026.08.04",
   createdAt: NOW - 3 * DAY,
@@ -196,7 +209,7 @@ const DELEGATED_SESSION: Session = {
 };
 
 const EXPIRED_SESSION: Session = {
-  _id: "s_expired",
+  _id: id("s_expired"),
   deviceLabel: "old-thinkpad",
   cliVersion: "2026.06.11",
   createdAt: NOW - 120 * DAY,
@@ -207,7 +220,7 @@ const EXPIRED_SESSION: Session = {
 };
 
 const REVOKED_SESSION: Session = {
-  _id: "s_revoked",
+  _id: id("s_revoked"),
   deviceLabel: "borrowed-laptop",
   cliVersion: "2026.07.20",
   createdAt: NOW - 40 * DAY,
@@ -218,7 +231,7 @@ const REVOKED_SESSION: Session = {
 };
 
 const HOSTILE_SESSION: Session = {
-  _id: "s_hostile",
+  _id: id("s_hostile"),
   deviceLabel:
     "MacBook-Pro-de-" + "Wolfeschlegelsteinhausenbergerdorff".repeat(9),
   cliVersion: "0.0.0-nightly+build.20260804.deadbeefcafebabe.longsuffix",
@@ -231,7 +244,7 @@ const HOSTILE_SESSION: Session = {
 
 const AUDIT: AuditEntry[] = [
   {
-    _id: "a1",
+    _id: id("a1"),
     at: NOW - 30 * MINUTE,
     action: "role.set",
     actorLogin: "ilya",
@@ -239,7 +252,7 @@ const AUDIT: AuditEntry[] = [
     meta: { from: "candidate", to: "developer" },
   },
   {
-    _id: "a2",
+    _id: id("a2"),
     at: NOW - 3 * DAY,
     action: "member.suspend",
     actorLogin: "ilya",
@@ -247,7 +260,7 @@ const AUDIT: AuditEntry[] = [
     meta: { reason: "left the company" },
   },
   {
-    _id: "a3",
+    _id: id("a3"),
     at: NOW - 5 * DAY,
     action: "session.revoke",
     actorLogin: "dana",
@@ -255,7 +268,7 @@ const AUDIT: AuditEntry[] = [
     meta: { device: "borrowed-laptop" },
   },
   {
-    _id: "a4",
+    _id: id("a4"),
     at: NOW - 9 * DAY,
     action: "org.secretsRotated",
     actorLogin: "ilya",
@@ -263,7 +276,7 @@ const AUDIT: AuditEntry[] = [
     meta: {},
   },
   {
-    _id: "a5",
+    _id: id("a5"),
     at: 0,
     action: "org.cliFloorRaised",
     actorLogin: null,
@@ -274,8 +287,19 @@ const AUDIT: AuditEntry[] = [
 
 const ORG: OrgConfig = {
   repoSlug: "Clubria/ai-builders-hub",
+  // `statusLine` is here because every real stored blob carries it, and the
+  // settings screen has to be looked at with one present: it is taken out of
+  // the box a lead types in and shown read-only underneath. A fixture without
+  // it would render the one state that never happens.
   claudeSettings: JSON.stringify(
-    { permissions: { allow: ["Bash(pnpm *)"] }, model: "claude-opus-5" },
+    {
+      permissions: { allow: ["Bash(pnpm *)"] },
+      model: "claude-opus-5",
+      statusLine: {
+        type: "command",
+        command: "node ~/.riabuild/claude-statusline.js",
+      },
+    },
     null,
     2,
   ),
@@ -294,7 +318,7 @@ const ORG: OrgConfig = {
  */
 const SHARED_SERVERS: SharedServer[] = [
   {
-    _id: "s_build",
+    _id: id("s_build"),
     name: "build",
     host: "build-01.fly.dev",
     port: 22,
@@ -302,7 +326,7 @@ const SHARED_SERVERS: SharedServer[] = [
     updatedAt: NOW - 30 * DAY,
   },
   {
-    _id: "s_gpu",
+    _id: id("s_gpu"),
     name: "gpu",
     host: "gpu.internal",
     port: 2222,
@@ -310,7 +334,7 @@ const SHARED_SERVERS: SharedServer[] = [
     updatedAt: NOW - 2 * DAY,
   },
   {
-    _id: "s_long",
+    _id: id("s_long"),
     name: "a".repeat(32),
     host: `${"long-hostname-segment.".repeat(4)}example.test`,
     port: 65535,
@@ -330,7 +354,7 @@ const SHARED_SERVERS: SharedServer[] = [
  */
 const ISSUED_KEYS: IssuedKey[] = [
   {
-    _id: "k_bastion",
+    _id: id("k_bastion"),
     label: "prod-bastion",
     keyType: "ssh-ed25519",
     // Deliberately *not* the key `opensshKey.fixtures` holds. The interaction
@@ -344,7 +368,7 @@ const ISSUED_KEYS: IssuedKey[] = [
     updatedAt: NOW - 9 * DAY,
   },
   {
-    _id: "k_gpu",
+    _id: id("k_gpu"),
     label: "gpu-box",
     keyType: "ssh-rsa",
     publicKey: `ssh-rsa AAAAB3NzaC1yc2E${"A".repeat(340)}`,
@@ -353,7 +377,7 @@ const ISSUED_KEYS: IssuedKey[] = [
     updatedAt: NOW - 180 * MINUTE,
   },
   {
-    _id: "k_long",
+    _id: id("k_long"),
     label: "a".repeat(32),
     keyType: "ecdsa-sha2-nistp521",
     publicKey: `ecdsa-sha2-nistp521 AAAAE2V${"B".repeat(200)}`,
@@ -374,7 +398,10 @@ function base(viewer: Member | null): Data {
   return {
     auth: viewer === null ? "signed-out" : "signed-in",
     viewer: { state: "ready", value: viewer },
-    membership: { org: "Clubria", status: viewer === null ? "signed_out" : "member" },
+    membership: {
+      org: "Clubria",
+      status: viewer === null ? "signed_out" : "member",
+    },
     sessions: { state: "ready", value: [ACTIVE_SESSION] },
     members: {
       state: "ready",
@@ -447,6 +474,25 @@ export const SCENARIOS: Record<string, () => Data> = {
     },
   }),
 
+  /**
+   * The lead panel's queries can each fail on their own, and each one renders
+   * its own `Alert` rather than taking the page down — so each one needs a
+   * scenario. `viewer-error` and `sessions-error` had one; the five below are
+   * the panels a lead sees, which nobody had ever looked at broken.
+   *
+   * The message is the string Convex actually throws, because that string is
+   * what the panel prints. A fixture carrying a tidy sentence would only prove
+   * the layout copes with a tidy sentence.
+   */
+  "org-config-error": () => ({
+    ...base(LEAD),
+    orgConfig: {
+      state: "error",
+      message:
+        "[CONVEX Q(org:get)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
+  }),
+
   "not-member": () => ({
     ...base(DEVELOPER),
     membership: { org: "Clubria", status: "not_member" },
@@ -464,6 +510,24 @@ export const SCENARIOS: Record<string, () => Data> = {
   "viewer-missing": () => ({
     ...base(DEVELOPER),
     viewer: { state: "ready", value: null },
+  }),
+
+  /**
+   * The "who am I" query failed outright.
+   *
+   * Not the same as `viewer-missing`, where the answer arrived and was "no row
+   * yet". Here there is no answer, so nothing below it can be drawn — every
+   * panel keys off the member — and the page has to say that rather than spin.
+   * Unreachable in the real app until the provider learned to catch a query
+   * error instead of throwing it at the boundary.
+   */
+  "viewer-error": () => ({
+    ...base(DEVELOPER),
+    viewer: {
+      state: "error",
+      message:
+        "[CONVEX Q(members:viewer)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
   }),
 
   "sessions-empty": () => ({
@@ -495,7 +559,7 @@ export const SCENARIOS: Record<string, () => Data> = {
       state: "ready",
       value: Array.from({ length: 24 }, (_, i) => ({
         ...ACTIVE_SESSION,
-        _id: `s_${i}`,
+        _id: id(`s_${i}`),
         deviceLabel: `machine-${String(i).padStart(2, "0")}`,
         lastUsedAt: NOW - i * 3 * DAY,
       })),
@@ -514,7 +578,10 @@ export const SCENARIOS: Record<string, () => Data> = {
 
   "sessions-error": () => ({
     ...base(DEVELOPER),
-    sessions: { state: "error", message: "Server Error: could not reach Convex" },
+    sessions: {
+      state: "error",
+      message: "Server Error: could not reach Convex",
+    },
   }),
 
   "audit-empty": () => ({
@@ -528,9 +595,18 @@ export const SCENARIOS: Record<string, () => Data> = {
       state: "ready",
       value: Array.from({ length: 40 }, (_, i) => ({
         ...AUDIT[i % AUDIT.length],
-        _id: `a_${i}`,
+        _id: id(`a_${i}`),
         at: NOW - i * 90 * MINUTE,
       })),
+    },
+  }),
+
+  "audit-error": () => ({
+    ...base(LEAD),
+    auditLog: {
+      state: "error",
+      message:
+        "[CONVEX Q(members:auditLog)] Uncaught Error: Server Error — the deployment is not answering.",
     },
   }),
 
@@ -549,6 +625,15 @@ export const SCENARIOS: Record<string, () => Data> = {
     members: {
       state: "ready",
       value: [LEAD, INVITED_LEAD, DEVELOPER, INVITED, CANDIDATE],
+    },
+  }),
+
+  "members-error": () => ({
+    ...base(LEAD),
+    members: {
+      state: "error",
+      message:
+        "[CONVEX Q(members:list)] Uncaught Error: Server Error — the deployment is not answering.",
     },
   }),
 
@@ -605,6 +690,15 @@ export const SCENARIOS: Record<string, () => Data> = {
     sharedServers: { state: "ready", value: [] },
   }),
 
+  "shared-servers-error": () => ({
+    ...base(LEAD),
+    sharedServers: {
+      state: "error",
+      message:
+        "[CONVEX Q(sharedServers:list)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
+  }),
+
   /**
    * The address a lead typed came back refused. The message is the real one
    * riabuild-web sends for the rule that matters — a hostname `ssh` would read
@@ -623,6 +717,15 @@ export const SCENARIOS: Record<string, () => Data> = {
   "issued-keys-empty": () => ({
     ...base(LEAD),
     issuedKeys: { state: "ready", value: [] },
+  }),
+
+  "issued-keys-error": () => ({
+    ...base(LEAD),
+    issuedKeys: {
+      state: "error",
+      message:
+        "[CONVEX Q(issuedKeys:list)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
   }),
 
   /**
@@ -674,7 +777,7 @@ export const SCENARIOS: Record<string, () => Data> = {
         // is where a table with an extra badge runs out of room first.
         {
           ...HOSTILE,
-          _id: "m_invited_hostile",
+          _id: id("m_invited_hostile"),
           githubLogin: `invited-${"b".repeat(52)}`,
           githubId: "99",
           role: "lead",
@@ -702,7 +805,7 @@ export const SCENARIOS: Record<string, () => Data> = {
       state: "ready",
       value: [
         {
-          _id: "a_overflow",
+          _id: id("a_overflow"),
           at: NOW - MINUTE,
           action: "org.claudeSettingsUpdated",
           actorLogin: "a".repeat(60),

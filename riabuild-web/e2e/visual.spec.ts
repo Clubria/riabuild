@@ -1,3 +1,4 @@
+import type { Page } from "@playwright/test";
 import {
   ED25519_FINGERPRINT,
   ED25519_PRIVATE,
@@ -29,7 +30,9 @@ test.describe("scenarios", () => {
 
 test("component gallery", async ({ page, consoleErrors }, info) => {
   await page.goto("/__ui?scenario=signed-out");
-  await expect(page.getByText(/Component gallery\. Dev builds only/)).toBeVisible();
+  await expect(
+    page.getByText(/Component gallery\. Dev builds only/),
+  ).toBeVisible();
   await checkPage(page, info, consoleErrors, { screenshot: "gallery" });
 });
 
@@ -39,11 +42,19 @@ test("404", async ({ page, consoleErrors }, info) => {
   await checkPage(page, info, consoleErrors, { screenshot: "404" });
 });
 
-test("404 does not render a path as markup", async ({ page }) => {
-  await page.goto("/%3Cimg%20src=x%20onerror=alert(1)%3E?scenario=signed-out");
-  await expect(page.locator("body img")).toHaveCount(0);
-  await expect(page.getByText("command not found")).toBeVisible();
-});
+test(
+  "404 does not render a path as markup",
+  {
+    tag: "@viewport-agnostic",
+  },
+  async ({ page }) => {
+    await page.goto(
+      "/%3Cimg%20src=x%20onerror=alert(1)%3E?scenario=signed-out",
+    );
+    await expect(page.locator("body img")).toHaveCount(0);
+    await expect(page.getByText("command not found")).toBeVisible();
+  },
+);
 
 /**
  * The 404 must survive the backend being unreachable — it is one of the screens
@@ -93,25 +104,61 @@ test.describe("section anchors", () => {
 
     const clipped: string[] = [];
     for (const href of hrefs) {
-      await page.locator(`nav[aria-label="Sections"] a[href="${href}"]`).click();
-      // The jump is the browser's, not ours; give it a frame to settle.
-      await page.waitForTimeout(300);
-
-      const top = await page.evaluate((selector) => {
-        const title = document.querySelector(selector)?.querySelector("h2");
-        return title === null || title === undefined
-          ? null
-          : Math.round(title.getBoundingClientRect().top);
-      }, href);
-
+      await page
+        .locator(`nav[aria-label="Sections"] a[href="${href}"]`)
+        .click();
+      const top = await settledTitleTop(page, href);
       if (top === null || top < 0) clipped.push(`${href} title at y=${top}`);
     }
 
-    expect(clipped, "panel titles cut off above the fold after a tab jump").toEqual(
-      [],
-    );
+    expect(
+      clipped,
+      "panel titles cut off above the fold after a tab jump",
+    ).toEqual([]);
   });
 });
+
+/**
+ * Where a panel's title has come to rest after the browser's jump, or `null` if
+ * the panel has no title at all.
+ *
+ * This used to be `waitForTimeout(300)` — a number chosen to be longer than a
+ * scroll usually takes, in the one test whose entire subject is where the page
+ * ends up. A slow machine reads mid-scroll and fails for no reason; a scroll
+ * that quietly grows past 300ms passes for no reason. Two identical readings
+ * fifty milliseconds apart is the actual question ("has it stopped moving?"),
+ * asked of the actual thing being measured.
+ */
+async function settledTitleTop(
+  page: Page,
+  href: string,
+): Promise<number | null> {
+  const read = () =>
+    page.evaluate((selector) => {
+      const title = document.querySelector(selector)?.querySelector("h2");
+      return title === null || title === undefined
+        ? null
+        : Math.round(title.getBoundingClientRect().top);
+    }, href);
+
+  let previous = await read();
+  await expect
+    .poll(
+      async () => {
+        const current = await read();
+        const stopped = current === previous;
+        previous = current;
+        return stopped;
+      },
+      {
+        message: `the jump to ${href} never came to rest`,
+        intervals: [50],
+        timeout: 5_000,
+      },
+    )
+    .toBe(true);
+  return previous;
+}
 
 /**
  * Failure states that only exist after someone clicks something. A scenario that
@@ -146,9 +193,51 @@ test.describe("interaction states", () => {
     await page.getByLabel("hostname").fill("-oProxyCommand=x");
     await page.getByLabel("username").fill("ada");
     await page.getByRole("button", { name: /add server/i }).click();
-    await expect(page.getByText("A hostname cannot start with a dash.")).toBeVisible();
+    await expect(
+      page.getByText("A hostname cannot start with a dash."),
+    ).toBeVisible();
     await checkPage(page, info, consoleErrors, {
       screenshot: "shared-server-refused-after-add",
+    });
+  });
+
+  test(
+    "Enter in the hostname box does what the button does",
+    {
+      tag: "@viewport-agnostic",
+    },
+    async ({ page }) => {
+      // The panel was four fields in a `div`, so Enter did nothing at all. The
+      // refusal only appears if a submit actually ran, which makes it the proof
+      // that one did.
+      await page.goto("/?scenario=shared-server-refused");
+      await page.getByLabel("name", { exact: true }).fill("gpu");
+      await page.getByLabel("username").fill("ada");
+      await page.getByLabel("hostname").fill("-oProxyCommand=x");
+      await page.getByLabel("hostname").press("Enter");
+      await expect(
+        page.getByText("A hostname cannot start with a dash."),
+      ).toBeVisible();
+    },
+  );
+
+  test("removing the ngrok token asks first, and names what goes", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // The only irreversible control in the dashboard: no route returns the
+    // token, so the click that destroys it cannot be the same one that reaches
+    // for it by accident next to "save org config".
+    await page.goto("/?scenario=lead");
+    await page.getByRole("button", { name: /remove ngrok authtoken/i }).click();
+    await expect(
+      page.getByText("Remove the ngrok authtoken ending …tok3?"),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /^remove the token$/i }),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "ngrok-token-removal-confirm",
     });
   });
 
@@ -250,7 +339,9 @@ test.describe("interaction states", () => {
       .first();
     await key.click();
     await expect(key).toHaveAttribute("aria-pressed", "true");
-    await checkPage(page, info, consoleErrors, { screenshot: "invite-with-key" });
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "invite-with-key",
+    });
   });
 
   test("an org riabuild cannot list says so, and offers the retry", async ({
@@ -261,7 +352,9 @@ test.describe("interaction states", () => {
     // missing is the thing that makes a typo impossible.
     await page.goto("/?scenario=invite-org-unreachable");
     await page.getByRole("button", { name: /list the org.s members/i }).click();
-    await expect(page.getByText("Could not list the org's members")).toBeVisible();
+    await expect(
+      page.getByText("Could not list the org's members"),
+    ).toBeVisible();
     await expect(page.getByText(/GITHUB_ORG_TOKEN is not set/)).toBeVisible();
     await checkPage(page, info, consoleErrors, {
       screenshot: "invite-org-unreachable-after-list",
@@ -351,7 +444,9 @@ test.describe("interaction states", () => {
     await page.goto(`/cli?scenario=authorize&${AUTHORIZE_QUERY.authorize}`);
     await page.getByRole("button", { name: /approve this machine/i }).click();
     await expect(page.getByText("Back to your terminal.")).toBeVisible();
-    await checkPage(page, info, consoleErrors, { screenshot: "authorize-done" });
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "authorize-done",
+    });
   });
 
   test("denying says plainly that nothing was granted", async ({
@@ -366,20 +461,30 @@ test.describe("interaction states", () => {
     });
   });
 
-  test("typing a code by hand finds the machine", async ({ page }) => {
-    // The SSH path: no prefilled code, the developer reads eight characters off
-    // a terminal on another computer and types them here.
-    await page.goto(`/cli?scenario=authorize-empty`);
-    await page
-      .getByLabel(/code from your terminal/i)
-      .fill("wxzbcdfg");
-    await expect(
-      page.getByRole("button", { name: /approve this machine/i }),
-    ).toBeVisible();
-  });
+  test(
+    "typing a code by hand finds the machine",
+    {
+      tag: "@viewport-agnostic",
+    },
+    async ({ page }) => {
+      // The SSH path: no prefilled code, the developer reads eight characters off
+      // a terminal on another computer and types them here.
+      await page.goto(`/cli?scenario=authorize-empty`);
+      await page.getByLabel(/code from your terminal/i).fill("wxzbcdfg");
+      await expect(
+        page.getByRole("button", { name: /approve this machine/i }),
+      ).toBeVisible();
+    },
+  );
 
-  test("an unknown scenario name fails loudly", async ({ page }) => {
-    await page.goto("/?scenario=no-such-fixture");
-    await expect(page.getByText("unknown scenario")).toBeVisible();
-  });
+  test(
+    "an unknown scenario name fails loudly",
+    {
+      tag: "@viewport-agnostic",
+    },
+    async ({ page }) => {
+      await page.goto("/?scenario=no-such-fixture");
+      await expect(page.getByText("unknown scenario")).toBeVisible();
+    },
+  );
 });

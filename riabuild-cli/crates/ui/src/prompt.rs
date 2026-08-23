@@ -29,7 +29,7 @@
 
 use super::{Failure, Ui};
 use anyhow::Result;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 
 /// What a typed answer means, given a default. Pure, so the rules are testable
 /// without a terminal.
@@ -87,8 +87,8 @@ impl Ui {
 
     #[cfg(any(test, feature = "testing"))]
     fn read_answer(&self, question: &str) -> Option<String> {
-        self.asked.lock().unwrap().push(question.to_string());
-        self.answers.lock().unwrap().pop_front()
+        crate::recorded(&self.asked).push(question.to_string());
+        crate::recorded(&self.answers).pop_front()
     }
 
     /// Asks a yes/no question, defaulting to yes.
@@ -121,7 +121,7 @@ impl Ui {
     /// blocks on read rather than returning EOF, so `IsTerminal` — "is a
     /// human plausibly there" — is checked before any read is attempted.
     pub fn ask_required(&self, label: &str, default: Option<&str>) -> Result<String> {
-        if !std::io::stdin().is_terminal() {
+        if !crate::tty::stdin_answers() {
             return Err(Failure::new(
                 format!("asking you for {label}"),
                 "Pass the server as `riabuild remote <user>@<host>:<port>` — \
@@ -159,7 +159,7 @@ impl Ui {
     /// to give up. That default is right for "shall I upgrade?" and wrong for
     /// every question here.
     pub fn confirm_required(&self, question: &str) -> Result<bool> {
-        if !std::io::stdin().is_terminal() {
+        if !crate::tty::stdin_answers() {
             return Err(Failure::new(
                 format!("asking you to confirm: {question}"),
                 "Run `riabuild remote` from a terminal, where you can answer this.",

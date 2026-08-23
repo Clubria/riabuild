@@ -11,7 +11,7 @@
 //! `sudo apt-get` holds this loop for as long as the developer takes to type a
 //! password, and a blocking read would hold the reactor with it.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,11 +20,13 @@ use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
 
 use super::subdue::Subdue;
-use riabuild_theme::{Role, Theme};
+use riabuild_theme::Theme;
 
-/// The indent child output is printed at — `ui::note`'s, because that is what
-/// a line from a child is: a note under the task that started it.
-const INDENT: &str = "    ";
+mod painter;
+mod terminal;
+
+use painter::{Painter, emit, show};
+use terminal::{Borrowed, Restore, open, stdio, winsize};
 
 /// How long to keep reading after the child has exited.
 ///
@@ -76,6 +78,14 @@ pub(super) async fn run(mut command: Command, theme: Theme, program: &str) -> Re
         });
     }
 
+    // For the reason `child.rs` sets it: every path out of this function below
+    // the spawn — the terminal that cannot be read, a pump that fails, a
+    // cancelled task — drops the child, and a child dropped without this is
+    // left running against a master nobody is reading and then left as a
+    // zombie. A subdued child is `sudo apt-get`, so the one left behind holds
+    // the package lock the next run needs.
+    command.kill_on_drop(true);
+
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start `{program}`"))?;
@@ -93,192 +103,22 @@ pub(super) async fn run(mut command: Command, theme: Theme, program: &str) -> Re
     outcome.with_context(|| format!("`{program}` did not finish"))
 }
 
-/// Renders subdued lines, and remembers how much of the terminal the last
-/// unterminated one occupied.
-struct Painter {
-    theme: Theme,
-    /// Columns written by the last `partial`, still on screen. A shorter redraw
-    /// has to cover them or the tail of the longer frame stays visible.
-    open: usize,
-    /// What that partial said, so an unchanged repaint writes nothing.
-    last: String,
-}
-
-impl Painter {
-    fn new(theme: Theme) -> Self {
-        Self {
-            theme,
-            open: 0,
-            last: String::new(),
-        }
-    }
-
-    /// A finished line. Ends with a newline; nothing is left open.
-    fn line(&mut self, text: &str) -> String {
-        let out = self.draw(text);
-        self.open = 0;
-        self.last.clear();
-        out + "\n"
-    }
-
-    /// The line as it currently stands, with the child still writing it.
-    ///
-    /// Empty when nothing has changed. The pump repaints after every read, and
-    /// a child that prints `Password: ` and then waits must not have it
-    /// reprinted on every wakeup.
-    fn partial(&mut self, text: &str) -> String {
-        if text == self.last {
-            return String::new();
-        }
-        let out = self.draw(text);
-        self.open = text.chars().count();
-        self.last = text.to_string();
-        out
-    }
-
-    /// The same idiom `ui::applied` uses over a status line: return to the
-    /// start, write, and pad over whatever the longer previous frame left.
-    fn draw(&self, text: &str) -> String {
-        let padding = " ".repeat(self.open.saturating_sub(text.chars().count()));
-        format!("\r{INDENT}{}{padding}", self.theme.paint(Role::Muted, text))
-    }
-}
-
-/// How wide the child is told its terminal is.
+/// Whether a read from the master says the child has closed the last copy of
+/// the slave.
 ///
-/// The real width less the indent, so a child that wraps at the width it was
-/// given does not push every wrapped line past the right edge. Never zero: a
-/// terminal of no width makes some children divide by it.
-fn child_columns(terminal: u16) -> u16 {
-    terminal.saturating_sub(INDENT.len() as u16).max(1)
-}
-
-/// The developer's terminal, put back the way it was found.
-///
-/// Raw mode and `O_NONBLOCK` are changes to a file description the shell
-/// shares. Restoring them on an early return is not tidiness: a terminal left
-/// raw with no echo outlives the process that did it, and the developer's next
-/// command is typed into a shell that shows them nothing.
-struct Restore {
-    termios: libc::termios,
-    flags: libc::c_int,
-}
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        // SAFETY: both calls take the values read from this same descriptor.
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.termios);
-            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.flags);
-        }
+/// Zero bytes on macOS, `EIO` on Linux; both are end of file. Ignoring one is
+/// not enough — the arm has to be *disabled*. `AsyncFd::try_io` clears
+/// readiness only on `WouldBlock`, so a master left watched after end of file
+/// is ready on every pass and spins the pump at 100% CPU until `child.wait()`
+/// resolves — which is for ever if the child closed its own copies of the slave
+/// and kept running, and on a current-thread runtime takes the reactor with it.
+/// The input arm has carried the same guard, for the same reason, since it was
+/// written.
+fn closed(outcome: &std::io::Result<Vec<u8>>) -> bool {
+    match outcome {
+        Ok(bytes) => bytes.is_empty(),
+        Err(error) => error.raw_os_error() == Some(libc::EIO),
     }
-}
-
-impl Restore {
-    /// Puts the terminal into raw mode and fd 0 into non-blocking mode,
-    /// returning the guard that undoes both.
-    ///
-    /// `O_NONBLOCK` is what lets `AsyncFd` watch fd 0. The alternative,
-    /// `tokio::io::stdin()`, reads on a blocking thread that cannot be
-    /// cancelled — so a keystroke typed after the child exits would be
-    /// swallowed by a read nobody is waiting for, and the next `ui::ask` would
-    /// lose it.
-    fn take() -> Result<Self> {
-        // SAFETY: fd 0 is a terminal — `available()` checked — and every
-        // pointer below is to a local this function owns.
-        unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) != 0 {
-                return Err(std::io::Error::last_os_error()).context("could not read the terminal");
-            }
-            let flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
-            if flags < 0 {
-                return Err(std::io::Error::last_os_error()).context("could not read the terminal");
-            }
-            // Constructed before the changes, so a failure half-way still
-            // restores what did take.
-            let guard = Self { termios, flags };
-
-            // Raw, so keystrokes reach the child unbuffered and unechoed: the
-            // pty's own line discipline is what echoes them, which is how
-            // `sudo` turning ECHO off still hides a password. It also turns
-            // ISIG off here, so Ctrl-C is forwarded as a byte and the *child's*
-            // line discipline raises SIGINT — the signal reaches the process
-            // the developer is looking at.
-            let mut raw = termios;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
-                return Err(std::io::Error::last_os_error()).context("could not set the terminal");
-            }
-            if libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(std::io::Error::last_os_error()).context("could not set the terminal");
-            }
-            Ok(guard)
-        }
-    }
-}
-
-/// A descriptor `AsyncFd` can watch without owning.
-///
-/// fd 0 belongs to the shell. Wrapping it in anything that closes on drop would
-/// close the developer's terminal out from under riabuild.
-struct Borrowed(RawFd);
-
-impl AsRawFd for Borrowed {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
-/// The size to give the child: the developer's terminal, less the indent.
-fn winsize() -> libc::winsize {
-    // SAFETY: a zeroed `winsize` is valid, and the ioctl writes into a local.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ as _, &mut size) };
-    if size.ws_row == 0 {
-        size.ws_row = 24;
-    }
-    size.ws_col = child_columns(if size.ws_col == 0 { 80 } else { size.ws_col });
-    size
-}
-
-/// `openpty`, as an owned pair.
-///
-/// The size is taken by `&mut` and the null termios is `null_mut` because
-/// Apple's libc declares both of those parameters `*mut` where Linux's declares
-/// them `*const`. A `*mut` coerces to a `*const`, so passing the mutable form
-/// is the one spelling that compiles on both — and this is `runner/`, which is
-/// not a file allowed to branch on the operating system.
-fn open(size: &mut libc::winsize) -> Result<(OwnedFd, OwnedFd)> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    // SAFETY: both out-parameters are locals, and the size is borrowed for the
-    // duration of the call.
-    let made = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            size,
-        )
-    };
-    if made != 0 {
-        return Err(std::io::Error::last_os_error()).context("could not open a pseudo-terminal");
-    }
-    // `AsyncFd` requires it, and the master is riabuild's own descriptor.
-    // SAFETY: `openpty` succeeded, so both are open descriptors this function
-    // is the sole owner of.
-    unsafe {
-        libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
-        Ok((OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)))
-    }
-}
-
-fn stdio(fd: &OwnedFd) -> Result<std::process::Stdio> {
-    Ok(std::process::Stdio::from(
-        fd.try_clone().context("could not duplicate the terminal")?,
-    ))
 }
 
 /// Both directions, until the child exits and its output has been drained.
@@ -292,18 +132,21 @@ async fn pump(child: &mut Child, master: OwnedFd, theme: Theme) -> Result<i32> {
     let mut painter = Painter::new(theme);
     // Whether the developer's stdin is still worth watching.
     let mut listening = true;
+    // And whether the child's end of the pty is. Both flags exist for the same
+    // reason: `try_io` clears readiness only on `WouldBlock`, so an arm left
+    // enabled after end of file is ready on every pass.
+    let mut watching = true;
 
     let code = loop {
         tokio::select! {
-            ready = master.readable() => {
+            ready = master.readable(), if watching => {
                 let mut guard = ready.context("could not watch the pseudo-terminal")?;
                 match guard.try_io(|fd| read(fd.as_raw_fd())) {
-                    Ok(Ok(bytes)) if bytes.is_empty() => {}
+                    // The exit status is what the loop is waiting for from
+                    // here on; the drain below picks up anything still in the
+                    // buffer.
+                    Ok(outcome) if closed(&outcome) => watching = false,
                     Ok(Ok(bytes)) => show(&mut filter, &mut painter, &bytes),
-                    // A read on the master once the child has closed the slave
-                    // is EIO on Linux and zero bytes on macOS. Both are EOF,
-                    // and the exit status is what the loop is waiting for.
-                    Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => {}
                     Ok(Err(error)) => {
                         return Err(error).context("could not read from the pseudo-terminal");
                     }
@@ -377,30 +220,6 @@ async fn drain(master: &AsyncFd<OwnedFd>, filter: &mut Subdue, painter: &mut Pai
     }
 }
 
-/// Runs one read's worth of bytes through the filter and paints the result.
-fn show(filter: &mut Subdue, painter: &mut Painter, bytes: &[u8]) {
-    let mut out = String::new();
-    for line in filter.feed(bytes) {
-        out.push_str(&painter.line(&line));
-    }
-    if let Some(text) = filter.partial() {
-        out.push_str(&painter.partial(&text));
-    }
-    emit(&out);
-}
-
-fn emit(text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    use std::io::Write;
-    // Raw mode is on, so a bare `\n` moves down without returning to column
-    // zero. Every line the painter produces starts with `\r`, which is what
-    // puts it back.
-    print!("{text}");
-    let _ = std::io::stdout().flush();
-}
-
 /// Writes every byte to the master, waiting for room rather than dropping any.
 ///
 /// A keystroke dropped because the pty's input buffer was momentarily full is a
@@ -441,69 +260,28 @@ fn write(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use riabuild_theme::Depth;
 
     #[test]
-    fn a_line_is_indented_to_note_depth_and_dimmed() {
-        let mut painter = Painter::new(Theme::with_depth(Depth::Ansi16));
-        assert_eq!(painter.line("Unpacking"), "\r    \x1b[2mUnpacking\x1b[0m\n");
+    fn a_master_at_end_of_file_stops_being_watched() {
+        // Both spellings of the same event: macOS reads zero bytes where Linux
+        // fails with EIO. Either one left on the watched list is a pump that
+        // spins at 100% CPU for as long as the child lives, so both have to
+        // end the arm rather than merely be ignored.
+        assert!(closed(&Ok(Vec::new())), "a zero-byte read is end of file");
+        assert!(
+            closed(&Err(std::io::Error::from_raw_os_error(libc::EIO))),
+            "EIO is end of file"
+        );
     }
-
     #[test]
-    fn a_plain_theme_still_indents_and_still_ends_the_line() {
-        let mut painter = Painter::new(Theme::plain());
-        assert_eq!(painter.line("Unpacking"), "\r    Unpacking\n");
+    fn a_master_with_something_to_say_is_still_watched() {
+        // And a failure that is not end of file is not silently turned into
+        // one: it is the error the pump reports.
+        assert!(!closed(&Ok(b"Unpacking".to_vec())));
+        assert!(!closed(&Err(std::io::Error::from_raw_os_error(
+            libc::EBADF
+        ))));
     }
-
-    #[test]
-    fn a_partial_line_is_written_without_ending_it() {
-        let mut painter = Painter::new(Theme::plain());
-        assert_eq!(painter.partial("Password: "), "\r    Password: ");
-    }
-
-    #[test]
-    fn a_redraw_covers_what_the_longer_frame_left_behind() {
-        let mut painter = Painter::new(Theme::plain());
-        painter.partial("Reading database... 45%");
-        assert_eq!(painter.partial("Done"), "\r    Done                   ");
-    }
-
-    #[test]
-    fn a_line_after_a_partial_covers_it_too() {
-        let mut painter = Painter::new(Theme::plain());
-        painter.partial("Progress: 100%");
-        assert_eq!(painter.line("Done"), "\r    Done          \n");
-    }
-
-    #[test]
-    fn repainting_the_same_partial_writes_nothing() {
-        // The pump repaints after every read. A child that writes a prompt and
-        // then waits must not have it reprinted on each wakeup.
-        let mut painter = Painter::new(Theme::plain());
-        painter.partial("Password: ");
-        assert_eq!(painter.partial("Password: "), "");
-    }
-
-    #[test]
-    fn a_finished_line_stops_covering_for_the_next_one() {
-        // `line` clears the open width; otherwise the padding from a long
-        // progress bar would be re-applied to every line after it.
-        let mut painter = Painter::new(Theme::plain());
-        painter.partial("a very long progress line");
-        painter.line("short");
-        assert_eq!(painter.line("also short"), "\r    also short\n");
-    }
-
-    #[test]
-    fn the_child_gets_the_terminal_width_less_the_indent() {
-        // Otherwise the child wraps at the full width and the indent pushes
-        // every wrapped line four columns past the right edge.
-        assert_eq!(child_columns(80), 76);
-        // Never zero, whatever the terminal claims.
-        assert_eq!(child_columns(4), 1);
-        assert_eq!(child_columns(0), 1);
-    }
-
     #[test]
     fn a_pty_is_only_offered_when_both_ends_are_a_terminal() {
         // Under `cargo test` they are not, which is the degradation the design
@@ -513,7 +291,6 @@ mod tests {
             assert!(!available());
         }
     }
-
     /// The terminal's `c_lflag`, which carries `ECHO` and `ICANON` — the two
     /// bits a developer notices the loss of.
     #[cfg(any(test, feature = "testing"))]
@@ -525,7 +302,6 @@ mod tests {
             termios.c_lflag
         }
     }
-
     /// End to end: a real `openpty`, a real `setsid`, a real child.
     ///
     /// Ignored because it needs a controlling terminal, which `cargo test` does

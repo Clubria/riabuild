@@ -16,9 +16,24 @@ use crate::mux::{Frame, KEEPALIVE_ID, read_frame, write_frame};
 use crate::protocol::{ErrorCode, Request, Response, decode_request, encode_response};
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
+
+/// How long the writer is given to drain once the pipe has ended.
+///
+/// The queue's senders are held by the answer tasks still in flight, so
+/// `writing` cannot resolve until the last of them drops one — which made this
+/// await inherit whatever the slowest clipboard subprocess was doing. Bounded
+/// now, and bounded independently of `Agent::DISPATCH_TIMEOUT` rather than
+/// derived from it: this is the shutdown path, the connection it was writing to
+/// is already gone, and the only thing left to protect is the caller's return.
+///
+/// `supervisor::run` awaits this before it can rebuild, and `remote::channel`
+/// awaits the supervisor before the developer's `riabuild remote` returns — so
+/// an unbounded await here is a laptop-side hang two layers up, on a session
+/// whose shell has already exited.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What one connection turned out to be, once it had ended.
 ///
@@ -71,7 +86,7 @@ impl Agent {
         // and two of them writing a header and a body without coordination
         // would splice one answer into another.
         let (replies, mut queued) = mpsc::channel::<Frame>(32);
-        let writing = tokio::spawn(async move {
+        let mut writing = tokio::spawn(async move {
             let mut output = output;
             while let Some(frame) = queued.recv().await {
                 if write_frame(&mut output, &frame).await.is_err() {
@@ -125,7 +140,18 @@ impl Agent {
         }
 
         drop(replies);
-        let _ = writing.await;
+        // Bounded, and then abandoned. An answer task that is still holding a
+        // sender keeps `queued.recv()` alive, so waiting on this without a
+        // deadline is waiting on whatever that task is waiting on — which used
+        // to be an unbounded clipboard subprocess. `Agent::handle` bounds those
+        // now; this is the backstop that keeps the guarantee true of anything
+        // added later.
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut writing)
+            .await
+            .is_err()
+        {
+            writing.abort();
+        }
         Ok(served)
     }
 }
