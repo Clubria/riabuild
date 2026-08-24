@@ -25,7 +25,7 @@ fn state_style(state: State, theme: Theme) -> Style {
     theme.style(match state {
         State::Trouble => Role::Danger,
         State::Idle => Role::Ok,
-        State::Busy | State::Starting => Role::Busy,
+        State::Busy => Role::Busy,
         State::Gone => Role::Muted,
     })
 }
@@ -436,8 +436,33 @@ mod tests {
         let text = text_of(&header_line(&app, Theme::plain()));
         // Singular, because "1 sessions" is the kind of detail that makes a
         // tool feel unfinished.
-        assert!(text.contains("1 session "), "{text}");
-        assert!(text.contains("1 working"), "{text}");
+        assert!(text.contains("1 session"), "{text}");
+        // Opening a session is not working. The window opens with three of
+        // them and has asked none of them anything, so a header claiming three
+        // are busy would be wrong on the very first frame.
+        assert!(!text.contains("working"), "{text}");
+
+        app.sent("do the thing");
+        let busy = text_of(&header_line(&app, Theme::plain()));
+        assert!(busy.contains("1 working"), "{busy}");
+    }
+
+    #[test]
+    fn the_window_opens_one_pane_per_harness_riabuild_installs() {
+        // No flag decides this. All three are installed, and the two that start
+        // no process until they are spoken to cost nothing to have open.
+        let mut app = App::new();
+        for (index, kind) in Kind::ALL.into_iter().enumerate() {
+            app.opened(SessionId(index as u64 + 1), kind, "/work/repo".into());
+        }
+        let rendered: Vec<String> = list_lines(&app, Theme::plain(), true)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert_eq!(rendered.len(), 3);
+        for (row, kind) in rendered.iter().zip(Kind::ALL) {
+            assert!(row.contains(kind.tag()), "{row}");
+        }
     }
 
     #[test]

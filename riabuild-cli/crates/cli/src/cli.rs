@@ -4,7 +4,7 @@
 //! what drifted, drop into the environment. Everything else is a way to do less
 //! than that.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use riabuild_version::VERSION;
 
 #[derive(Debug, Parser)]
@@ -110,32 +110,19 @@ pub enum Command {
     },
     /// Run Claude Code, Codex and Grok Build sessions in one window.
     ///
+    /// All three open, always. riabuild installs all three, and the two that
+    /// answer one turn per process start no process until they are spoken to —
+    /// so there is nothing for a developer to enable, and asking them which to
+    /// enable would be a decision riabuild made them make for no benefit.
+    ///
     /// Every session is started with that harness's approvals turned off, which
     /// is what riabuild's own launchers already do — see `Kind::bypass` in
     /// `riabuild-harness` for the three spellings.
     Agents {
-        /// A harness to open a session with on start. Repeatable, and the same
-        /// one twice opens two sessions.
-        #[arg(long = "with", value_name = "HARNESS")]
-        with: Vec<HarnessArg>,
-
-        /// The first thing to say to each session `--with` opened.
+        /// The first thing to say, asked of all three at once.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
     },
-}
-
-/// Which agent harness, as a developer spells it on the command line.
-///
-/// A clap type, so it lives here: `riabuild-harness::Kind` is the library's
-/// word for the same thing and `dispatch` maps between them. A library crate
-/// that derived `ValueEnum` would have to be compiled with the parser, which is
-/// what the layout rule in `CLAUDE.md` exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum HarnessArg {
-    Claude,
-    Codex,
-    Grok,
 }
 
 #[derive(Debug, Clone, Subcommand)]

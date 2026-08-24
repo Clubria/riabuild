@@ -102,6 +102,15 @@ pub enum Restart {
 }
 
 impl Kind {
+    /// Every harness riabuild drives, in the order they are shown.
+    ///
+    /// A window opens one session per entry: riabuild installs all three, so
+    /// asking a developer which ones to enable is a decision riabuild made them
+    /// make for no benefit. A per-turn harness costs nothing until it is spoken
+    /// to — no process is started — so the two that are idle are three lines on
+    /// screen and nothing else.
+    pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Codex, Kind::Grok];
+
     /// The name this harness is known by, for a pane title.
     pub fn label(self) -> &'static str {
         match self {
@@ -339,8 +348,17 @@ impl Fleet {
         });
         self.by_id.insert(id, index);
 
-        if let Some(prompt) = launch.prompt.clone() {
-            self.send(id, &prompt).await?;
+        match (launch.kind.restart(), launch.prompt.clone()) {
+            (_, Some(prompt)) => self.send(id, &prompt).await?,
+            // A persistent harness starts with the window: it introduces itself
+            // — which is where the thread id comes from — and is warm by the
+            // time the developer has finished typing.
+            (Restart::Persistent, None) => self.spawn_turn(index, None).await?,
+            // A per-turn one is not started until it is spoken to. `codex exec`
+            // and `grok -p` with nothing to answer print nothing and exit, so
+            // starting one here would spend a process to produce an immediate
+            // `Exited` and an empty pane.
+            (Restart::PerTurn, None) => {}
         }
         Ok(id)
     }
@@ -422,7 +440,11 @@ impl Fleet {
         // the handle only keeps a dead pipe open.
         {
             let session = &mut self.sessions[index];
-            session.busy = true;
+            // Busy only if something was actually asked. A persistent harness
+            // is started with the window and then sits waiting on stdin, which
+            // is not work — reporting it as work would show every session
+            // spinning from the moment the window opened.
+            session.busy = prompt.is_some();
             session.child = match kind.restart() {
                 Restart::Persistent => Some(child),
                 Restart::PerTurn => None,

@@ -86,8 +86,12 @@ pub struct Request {
     pub programs: Programs,
     /// The checkout every session works in.
     pub cwd: String,
-    /// Sessions to open before the first frame.
-    pub open: Vec<(Kind, Option<String>)>,
+    /// The first thing to say to every session, if anything.
+    ///
+    /// One prompt for all three rather than one each: asking the same question
+    /// of Claude Code, Codex and Grok Build at once is the thing three panes
+    /// side by side are actually for.
+    pub prompt: Option<String>,
     pub theme: Theme,
     /// Whether this terminal can be trusted with the block glyphs, which is
     /// `riabuild-ui`'s decision rather than one made again here.
@@ -207,9 +211,13 @@ pub async fn run(runner: Arc<dyn CommandRunner>, request: Request) -> Result<()>
     let mut fleet = Fleet::new(runner);
     let mut app = App::new();
 
-    for (kind, prompt) in &request.open {
-        open(&mut fleet, &mut app, &request, *kind, prompt.clone()).await?;
+    // Every harness riabuild installs gets a pane, always. The two that do not
+    // start a process until they are spoken to cost nothing to have open.
+    for kind in Kind::ALL {
+        open(&mut fleet, &mut app, &request, kind, request.prompt.clone()).await?;
     }
+    // The first session is the one a developer starts typing at.
+    app.selected = 0;
 
     let mut terminal = claim().context("could not take the terminal")?;
     // Whatever happens below, the terminal is handed back. A provisioner that
@@ -305,12 +313,18 @@ async fn open(
         kind,
         program: request.programs.get(kind).to_string(),
         cwd: request.cwd.clone(),
-        prompt,
+        prompt: prompt.clone(),
     };
     let id = fleet.open(launch).await?;
     app.opened(id, kind, request.cwd.clone());
     // The newest session is the one the developer just asked for.
     app.selected = app.panes.len().saturating_sub(1);
+    // An opening prompt is still a prompt: it has to show in the transcript and
+    // mark the pane busy, or a session started with `--prompt` reads as idle
+    // through the whole of the model's first think.
+    if let Some(prompt) = prompt {
+        app.sent(&prompt);
+    }
     Ok(())
 }
 

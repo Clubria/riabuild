@@ -16,12 +16,18 @@ use riabuild_harness::{Event, Kind, SessionId};
 pub enum State {
     /// Something went wrong and was reported.
     Trouble,
-    /// The turn is over; it is waiting for a person.
+    /// Waiting for a person: either nothing has been asked yet, or the last
+    /// turn is over.
+    ///
+    /// There is deliberately no `Starting` beside it. Two of the three
+    /// harnesses do not start a process until they are spoken to, so "started"
+    /// is not a state they can be in — and for the one that does, the gap
+    /// between spawning and `system/init` is too short to draw. What a
+    /// developer needs to tell apart is *asked and working* from *waiting for
+    /// me*, and a third word between them only makes that read slower.
     Idle,
     /// A turn is in flight.
     Busy,
-    /// Started, but the harness has not said anything yet.
-    Starting,
     /// The child has exited and this session takes no more turns.
     Gone,
 }
@@ -40,8 +46,6 @@ impl State {
             (State::Idle, false) => "*",
             (State::Busy, true) => "◐",
             (State::Busy, false) => "~",
-            (State::Starting, true) => "◌",
-            (State::Starting, false) => ".",
             (State::Gone, true) => "×",
             (State::Gone, false) => "x",
         }
@@ -52,7 +56,6 @@ impl State {
             State::Trouble => "trouble",
             State::Idle => "idle",
             State::Busy => "working",
-            State::Starting => "starting",
             State::Gone => "ended",
         }
     }
@@ -101,7 +104,10 @@ impl Pane {
             cwd,
             thread: None,
             model: None,
-            state: State::Starting,
+            // Idle rather than anything more hopeful: a window that opens with
+            // three sessions has asked none of them anything yet, and every one
+            // of them is genuinely waiting for the developer.
+            state: State::Idle,
             input_tokens: 0,
             output_tokens: 0,
             entries: Vec::new(),
@@ -145,12 +151,12 @@ impl Pane {
                 if model.is_some() {
                     self.model = model.clone();
                 }
-                // `Ready` says the harness started, not that it finished. A
-                // session that went straight to `Idle` here would look ready for
-                // a prompt it is not yet able to answer.
-                if self.state == State::Starting {
-                    self.state = State::Busy;
-                }
+                // Deliberately does not touch the state. `Ready` only says the
+                // harness introduced itself, which happens both when a session
+                // opens with nothing to do and in the middle of a turn that is
+                // very much in flight — so reading it as either would be wrong
+                // half the time. `App::sent` is what marks a session busy,
+                // because sending is the only thing that makes one busy.
             }
             Event::Said(text) => self.push(Entry::Said(text.clone()), delegated),
             Event::Thought(text) => self.push(Entry::Thought(text.clone()), delegated),
@@ -209,7 +215,7 @@ impl Pane {
                 if self.kind.restart() == riabuild_harness::Restart::PerTurn {
                     // Expected: these harnesses exit at the end of every turn.
                     // The session is still there and still resumable.
-                    if self.state == State::Busy || self.state == State::Starting {
+                    if self.state == State::Busy {
                         self.state = State::Idle;
                     }
                 } else {
@@ -318,7 +324,7 @@ impl App {
     pub fn busy_count(&self) -> usize {
         self.panes
             .iter()
-            .filter(|pane| pane.state == State::Busy || pane.state == State::Starting)
+            .filter(|pane| pane.state == State::Busy)
             .count()
     }
 }

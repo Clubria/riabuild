@@ -12,11 +12,10 @@
 //! `RealPaths::new()` at a time until the library it lives in cannot be built
 //! without the binary.
 
-use crate::cli::{ChannelAction, ClaudeAction, Cli, HarnessArg, RemoteAction};
+use crate::cli::{ChannelAction, ClaudeAction, Cli, RemoteAction};
 use anyhow::Result;
 use riabuild_agents as agents;
 use riabuild_channel as channel;
-use riabuild_harness as harness;
 use riabuild_paths::{Paths, RealPaths};
 use riabuild_remote as remote;
 use riabuild_runner::{CommandRunner, RealRunner};
@@ -185,7 +184,7 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
 /// harnesses riabuild already installed, in a checkout riabuild already cloned,
 /// and talks to no riabuild-web route. A developer on a plane gets the same
 /// window as one at a desk.
-pub async fn agents(ctx: &mut Ctx, with: Vec<HarnessArg>, prompt: Option<String>) -> Result<i32> {
+pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
     let Some(cwd) = ctx.project_dir() else {
         return Err(Failure::new(
             "opening the agents window",
@@ -206,10 +205,7 @@ pub async fn agents(ctx: &mut Ctx, with: Vec<HarnessArg>, prompt: Option<String>
             grok: ctx.grok(),
         },
         cwd: cwd.display().to_string(),
-        open: with
-            .into_iter()
-            .map(|harness| (kind_of(harness), prompt.clone()))
-            .collect(),
+        prompt,
         theme: ctx.ui.theme(),
         // The same question `riabuild-ui` already answered for the banner, asked
         // once and in one place rather than decided again with different rules.
@@ -218,19 +214,6 @@ pub async fn agents(ctx: &mut Ctx, with: Vec<HarnessArg>, prompt: Option<String>
 
     agents::run(ctx.runner.clone(), request).await?;
     Ok(0)
-}
-
-/// The clap spelling to the library's.
-///
-/// Two enums rather than one because a library crate that derived `ValueEnum`
-/// would have to be compiled with the parser — see the layout rule in
-/// `CLAUDE.md`. The cost is this function, and it is the whole cost.
-fn kind_of(harness: HarnessArg) -> harness::Kind {
-    match harness {
-        HarnessArg::Claude => harness::Kind::Claude,
-        HarnessArg::Codex => harness::Kind::Codex,
-        HarnessArg::Grok => harness::Kind::Grok,
-    }
 }
 
 /// `riabuild remote …`
