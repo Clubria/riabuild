@@ -27,36 +27,33 @@
 
 use serde_json::Value;
 
-use super::{Decoder, Encoder, Event, Kind, Launch};
+use super::{Decode, Event, Kind};
 
-pub(super) struct Grok;
-
-impl Encoder for Grok {
-    fn argv(&self, launch: &Launch, thread: Option<&str>, prompt: Option<&str>) -> Vec<String> {
-        let mut args: Vec<String> = Vec::new();
-        // Root options only, and there is no subcommand here — but the order is
-        // kept anyway, because `--always-approve` after a subcommand is
-        // `unexpected argument` and this argv is the template anything later
-        // will copy.
-        args.extend(Kind::Grok.bypass().iter().map(|flag| (*flag).to_string()));
-        args.push("--output-format".into());
-        args.push("streaming-json".into());
-        // Grok Build updates itself in place unless told not to. A provisioner
-        // that owns the binary — riabuild downloads it from its own mirror and
-        // verifies a pinned digest — must never let it replace itself, or the
-        // digest describes bytes that are no longer on disk.
-        args.push("--no-auto-update".into());
-        if let Some(thread) = thread {
-            args.push("--resume".into());
-            args.push(thread.to_string());
-        }
-        if let Some(prompt) = prompt {
-            args.push("-p".into());
-            args.push(prompt.to_string());
-        }
-        let _ = launch;
-        args
+/// One turn.
+///
+/// `-p/--single` is documented as "single-turn prompt … and exits", so like
+/// Codex this was always one process per turn; continuity is `--resume <id>`.
+pub(super) fn argv(thread: Option<&str>, prompt: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    // Root options only, and there is no subcommand here — but the order is
+    // kept anyway, because `--always-approve` after a subcommand is
+    // `unexpected argument` and this argv is the template anything later
+    // will copy.
+    args.extend(Kind::Grok.bypass().iter().map(|flag| (*flag).to_string()));
+    args.push("--output-format".into());
+    args.push("streaming-json".into());
+    // Grok Build updates itself in place unless told not to. A provisioner that
+    // owns the binary — riabuild downloads it from its own mirror and verifies a
+    // pinned digest — must never let it replace itself, or the digest describes
+    // bytes that are no longer on disk.
+    args.push("--no-auto-update".into());
+    if let Some(thread) = thread {
+        args.push("--resume".into());
+        args.push(thread.to_string());
     }
+    args.push("-p".into());
+    args.push(prompt.to_string());
+    args
 }
 
 #[derive(Default)]
@@ -64,7 +61,7 @@ pub(super) struct Reader {
     thread: Option<String>,
 }
 
-impl Decoder for Reader {
+impl Decode for Reader {
     fn read(&mut self, line: &str) -> Vec<Event> {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
@@ -303,13 +300,7 @@ mod tests {
 
     #[test]
     fn the_launch_bypasses_approvals_and_refuses_to_self_update() {
-        let launch = Launch {
-            kind: Kind::Grok,
-            program: "/opt/grok".into(),
-            cwd: "/work".into(),
-            prompt: None,
-        };
-        let args = Grok.argv(&launch, None, Some("hello"));
+        let args = argv(None, "hello");
         assert!(args.iter().any(|a| a == "--always-approve"));
         assert!(
             args.windows(2)
@@ -320,7 +311,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--no-auto-update"));
         assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
 
-        let resumed = Grok.argv(&launch, Some("s1"), Some("again"));
+        let resumed = argv(Some("s1"), "again");
         assert!(resumed.windows(2).any(|w| w == ["--resume", "s1"]));
     }
 

@@ -26,7 +26,6 @@ fn state_style(state: State, theme: Theme) -> Style {
         State::Trouble => Role::Danger,
         State::Idle => Role::Ok,
         State::Busy => Role::Busy,
-        State::Gone => Role::Muted,
     })
 }
 
@@ -50,10 +49,10 @@ pub fn list_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> 
         .enumerate()
         .map(|(index, pane)| {
             let selected = index == app.selected;
-            let mark = if pane.state == State::Busy && unicode {
+            let mark = if pane.state() == State::Busy && unicode {
                 SPINNER[app.tick % SPINNER.len()]
             } else {
-                pane.state.mark(unicode)
+                pane.state().mark(unicode)
             };
             // The selected row is marked by a leading bar rather than by a
             // reversed background: a session list is read down its left edge,
@@ -66,9 +65,9 @@ pub fn list_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> 
             };
             Line::from(vec![
                 Span::styled(cursor, theme.style(Role::Brand)),
-                Span::styled(format!("{mark} "), state_style(pane.state, theme)),
+                Span::styled(format!("{mark} "), state_style(pane.state(), theme)),
                 Span::styled(
-                    pane.title(),
+                    pane.label(),
                     theme.style(if selected { Role::Strong } else { Role::Muted }),
                 ),
                 Span::styled(format!(" {}", pane.kind.tag()), theme.style(Role::Muted)),
@@ -215,10 +214,7 @@ pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
 /// The prompt box.
 pub fn compose_line(app: &App, theme: Theme) -> Line<'static> {
     let writing = app.focus == Focus::Compose;
-    let can_send = app
-        .selected()
-        .map(|pane| pane.state != State::Gone)
-        .unwrap_or(false);
+    let can_send = app.selected().is_some();
     if !can_send {
         return Line::from(Span::styled(
             "this session has ended",
@@ -310,7 +306,8 @@ fn render_transcript(frame: &mut Frame, app: &App, theme: Theme, unicode: bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use riabuild_harness::{Kind, SessionId, testing};
+    use crate::app::Pane as TestPane;
+    use riabuild_harness::{Kind, testing};
     use riabuild_theme::Depth;
 
     fn text_of(line: &Line<'_>) -> String {
@@ -322,10 +319,9 @@ mod tests {
 
     fn played(kind: Kind, transcript: &str) -> App {
         let mut app = App::new();
-        let id = SessionId(1);
-        app.opened(id, kind, "/work/ai-builders-hub".into());
+        app.add(TestPane::new("s1".into(), kind, "the first prompt".into()));
         for event in testing::decode(kind, transcript) {
-            app.observe(id, &event);
+            app.observe("s1", &event);
         }
         app
     }
@@ -411,10 +407,10 @@ mod tests {
     #[test]
     fn a_delegated_line_is_indented_under_the_session_that_asked_for_it() {
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
-        app.observe(SessionId(1), &riabuild_harness::Event::Said("mine".into()));
+        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
+        app.observe("s1", &riabuild_harness::Event::Said("mine".into()));
         app.observe(
-            SessionId(1),
+            "s1",
             &riabuild_harness::Event::Delegated {
                 parent: "toolu_1".into(),
                 inner: Box::new(riabuild_harness::Event::Said("theirs".into())),
@@ -432,7 +428,7 @@ mod tests {
         let mut app = App::new();
         assert!(text_of(&header_line(&app, Theme::plain())).contains("0 sessions"));
 
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
+        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
         let text = text_of(&header_line(&app, Theme::plain()));
         // Singular, because "1 sessions" is the kind of detail that makes a
         // tool feel unfinished.
@@ -453,7 +449,7 @@ mod tests {
         // no process until they are spoken to cost nothing to have open.
         let mut app = App::new();
         for (index, kind) in Kind::ALL.into_iter().enumerate() {
-            app.opened(SessionId(index as u64 + 1), kind, "/work/repo".into());
+            app.add(TestPane::new(format!("s{index}"), kind, String::new()));
         }
         let rendered: Vec<String> = list_lines(&app, Theme::plain(), true)
             .iter()
@@ -477,7 +473,7 @@ mod tests {
     #[test]
     fn the_footer_says_what_the_keyboard_is_talking_to() {
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
+        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
         assert!(text_of(&footer_line(&app, Theme::plain())).contains("new"));
         app.focus = Focus::Compose;
         let writing = text_of(&footer_line(&app, Theme::plain()));
@@ -487,12 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn an_ended_session_says_so_instead_of_offering_a_prompt() {
+    fn a_session_can_always_be_written_to() {
+        // There is no ended state any more: a session is a thread id and a
+        // spool, and both outlive every process. Whatever happened to the last
+        // turn, the next one resumes it.
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
-        app.observe(SessionId(1), &riabuild_harness::Event::Exited(1));
-        let text = text_of(&compose_line(&app, Theme::plain()));
-        assert_eq!(text, "this session has ended");
+        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
+        app.set_running("s1", true);
+        assert!(text_of(&compose_line(&app, Theme::plain())).contains("enter"));
     }
 
     #[test]

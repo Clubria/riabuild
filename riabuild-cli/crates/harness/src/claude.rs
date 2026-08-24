@@ -14,51 +14,43 @@
 
 use serde_json::Value;
 
-use super::{Decoder, Encoder, Event, Kind, Launch};
+use super::{Decode, Event, Kind};
 
-pub(super) struct Claude;
-
-impl Encoder for Claude {
-    fn argv(&self, launch: &Launch, thread: Option<&str>, _prompt: Option<&str>) -> Vec<String> {
-        let mut args: Vec<String> = vec![
-            "-p".into(),
-            "--output-format".into(),
-            "stream-json".into(),
-            // Both halves are required together. Without the input format
-            // `-p` reads one prompt off stdin, answers it and exits — which is
-            // a persistent session that ends after one turn.
-            "--input-format".into(),
-            "stream-json".into(),
-            // `--verbose` is not optional under `-p`: without it the stream is
-            // the final result and nothing else, so every tool call, every
-            // subagent and the whole of the reasoning never arrive.
-            "--verbose".into(),
-        ];
-        args.extend(Kind::Claude.bypass().iter().map(|flag| (*flag).to_string()));
-        if let Some(thread) = thread {
-            args.push("--resume".into());
-            args.push(thread.to_string());
-        }
-        let _ = launch;
-        args
+/// One turn.
+///
+/// `-p` is a flag and the prompt is a positional, which is what lets a turn be
+/// one process: `--input-format stream-json` would make this a conversation that
+/// reads stdin for ever, and a detached child has nobody left holding the write
+/// end of that pipe.
+///
+/// Verified against Claude Code 2.1.235: this exact argv, with `--resume`,
+/// answers inside the session the id names.
+pub(super) fn argv(thread: Option<&str>, prompt: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        // Not optional under `-p`: without it the stream is the final result and
+        // nothing else, so every tool call, every subagent and the whole of the
+        // reasoning never arrive.
+        "--verbose".into(),
+    ];
+    args.extend(Kind::Claude.bypass().iter().map(|flag| (*flag).to_string()));
+    if let Some(thread) = thread {
+        args.push("--resume".into());
+        args.push(thread.to_string());
     }
-
-    fn stdin_prompt(&self, text: &str) -> Option<String> {
-        // The wire shape Claude Code expects, which is the Messages API's user
-        // message rather than a bare string.
-        let message = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
-        });
-        Some(format!("{message}\n"))
-    }
+    // Last, and a positional. `--resume` takes an optional value, so the prompt
+    // has to be separated from it by nothing that could be read as one.
+    args.push(prompt.to_string());
+    args
 }
 
 /// Stateless: every frame Claude Code writes carries its own `session_id`, so
 /// nothing has to be remembered between lines.
 pub(super) struct Reader;
 
-impl Decoder for Reader {
+impl Decode for Reader {
     fn read(&mut self, line: &str) -> Vec<Event> {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
@@ -451,20 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn both_format_flags_and_the_bypass_are_always_passed() {
-        let launch = Launch {
-            kind: Kind::Claude,
-            program: "/opt/claude".into(),
-            cwd: "/work".into(),
-            prompt: None,
-        };
-        let args = Claude.argv(&launch, None, None);
-        // `--input-format` without which the session answers once and exits,
-        // and `--verbose` without which tool calls never appear at all.
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--input-format", "stream-json"])
-        );
+    fn a_turn_asks_for_the_whole_stream_and_carries_the_bypass() {
+        let args = argv(None, "hello");
+        // `--verbose`, without which the stream is the final result and nothing
+        // else — no tool calls, no subagents, no reasoning.
         assert!(
             args.windows(2)
                 .any(|w| w == ["--output-format", "stream-json"])
@@ -475,20 +457,22 @@ mod tests {
                 .any(|w| w == ["--permission-mode", "bypassPermissions"])
         );
         assert!(!args.iter().any(|a| a == "--resume"));
-
-        let resumed = Claude.argv(&launch, Some("abc"), None);
-        assert!(resumed.windows(2).any(|w| w == ["--resume", "abc"]));
+        // Never `--input-format stream-json`: that makes the process a
+        // conversation reading stdin for ever, and a detached child has nobody
+        // holding the write end of that pipe.
+        assert!(!args.iter().any(|a| a == "--input-format"));
     }
 
     #[test]
-    fn a_prompt_is_a_messages_api_user_message_and_ends_in_a_newline() {
-        // NDJSON on stdin: without the trailing newline the harness never sees a
-        // complete frame and the session hangs with no error anywhere.
-        let line = Claude.stdin_prompt("hello").unwrap();
-        assert!(line.ends_with('\n'));
-        let parsed: Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(parsed["type"], "user");
-        assert_eq!(parsed["message"]["role"], "user");
-        assert_eq!(parsed["message"]["content"][0]["text"], "hello");
+    fn the_prompt_is_the_last_argument_so_resume_cannot_swallow_it() {
+        // `--resume` takes an *optional* value. With the id immediately before
+        // the prompt, the prompt is the next positional and the id is the
+        // option's value; any other order risks the prompt being read as the id.
+        let args = argv(Some("abc"), "hello");
+        assert_eq!(args.last().unwrap(), "hello");
+        assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
+        let resume_at = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[resume_at + 1], "abc");
+        assert_eq!(args[resume_at + 2], "hello");
     }
 }

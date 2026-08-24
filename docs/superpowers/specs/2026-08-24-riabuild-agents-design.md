@@ -5,83 +5,159 @@
 
 `riabuild agents` runs Claude Code, Codex and Grok Build sessions in one terminal window.
 It is reached as `agents` — a generated shim in `~/.riabuild/bin`, which riabuild already
-owns and already keeps at the front of `PATH`.
+owns and already keeps at the front of `PATH`. All three harnesses open, always. Sessions
+live on disk, survive the window closing and the machine restarting, and a turn keeps
+running when nobody is watching.
 
 ## Why this is in scope
 
 riabuild is a provisioner, and `CLAUDE.md` rules out "agent session sharing" by name. This
-is not that. Nothing here is shared between developers, nothing is persisted to
-riabuild-web, and no session leaves the laptop it started on. What it does is shorten the
-path riabuild already exists to shorten: riabuild installs three agent harnesses, writes
-nineteen launchers for them, and then leaves the developer to open three terminals and
-remember which of them is waiting. One window that says which agent is blocked is the
-provisioner finishing its own sentence.
+is not that. Nothing is shared between developers, nothing is persisted to riabuild-web,
+and no session leaves the machine it started on — the store sits under `root()`, which on a
+server is the per-developer namespace, so two people on one box cannot see each other's
+sessions at all.
 
-The line it must not cross is durability. If a future version starts recording sessions
-somewhere a colleague can open them, that is session sharing and belongs to a different
-product.
+What it does is shorten the path riabuild already exists to shorten: riabuild installs
+three agent harnesses, writes nineteen launchers for them, and then leaves the developer to
+open three terminals and remember which of them is waiting.
+
+The line it must not cross is durability *off this machine*. If a future version syncs
+sessions to the dashboard, that is session sharing and belongs to a different product.
 
 ## The decision that shaped everything: render, don't embed
 
 Two ways to put three agents in one window.
 
 **Embed.** Run each harness's real TUI in a pty, emulate the terminal, draw the grids side
-by side. Perfect fidelity for free, survives upstream changes, and needs no knowledge of
-any vendor's protocol.
+by side. Perfect fidelity for free and no knowledge of any vendor's protocol.
 
 **Render.** Run each harness in its structured output mode and draw from the events.
 
-Embedding was rejected, and the reason is not fidelity. It is that a pty gives you *pixels*
-and this window's entire purpose is *state* — which agent is blocked, which is running a
-command, which has failed, what each has spent. Recovering that from a screen means
-matching on somebody's spinner. Three vendors' spinners.
+Embedding was rejected, and the reason is not fidelity. A pty gives you *pixels*, and this
+window's entire purpose is *state* — which agent is blocked, which is running a command,
+which has failed, what each has spent. Recovering that from a screen means matching on
+somebody's spinner. Three vendors' spinners. It also makes persistence nearly impossible:
+what would you replay, and into what?
 
-Two smaller facts confirmed it. `riabuild-runner` already has the pty machinery, and it is
-the wrong shape: `Subdue` is a line-level emulator that deliberately discards the alternate
-screen, cursor motion and colour — precisely what a pane would need. And the only turnkey
+Two smaller facts confirmed it. `riabuild-runner` already has pty machinery and it is the
+wrong shape — `Subdue` is a line-level emulator that deliberately discards the alternate
+screen, cursor motion and colour, precisely what a pane would need. And the only turnkey
 ratatui pty widget, `tui-term`, drives `vt100` and documents its lifecycle controller as
-oneshot-only, which is not what a long-lived agent session is. The better emulator,
-`wezterm-term`, **is not published on crates.io**: a git dependency, in a binary shipped
-through signed Homebrew, apt and dnf releases, is a supply-chain regression against
-riabuild's own rules.
+oneshot-only; the better emulator, `wezterm-term`, **is not published on crates.io**, and a
+git dependency in a binary shipped through signed Homebrew, apt and dnf releases is a
+supply-chain regression against riabuild's own rules.
 
-The cost accepted is that riabuild owns the rendering, and that a harness feature with no
-representation in the event stream is invisible here. That is the trade, and it is the
-right way round: the developer can always run `claude` directly, and the launchers that let
-them do it are untouched.
+The cost accepted is that riabuild owns the rendering, and a harness feature with no
+representation in the event stream is invisible here. The developer can always run `claude`
+directly, and the launchers that let them do it are untouched.
 
-## The transport genuinely differs per harness
+## Persistence, and the simplification it forced
 
-This was the working hypothesis and it turned out to be stronger than expected. The three
-vendors did not merely diverge; they answered the same question three incompatible ways,
-and none is a superset.
+The requirement: close the window, reopen it, see your agents and carry on — and a turn
+must keep working while nobody is watching, across a reboot.
 
-| Harness | Session shape | Continuity |
-|---|---|---|
-| Claude Code 2.1.235 | one process, many turns | `--input-format stream-json` never closes stdin |
-| codex-cli 0.148.0 | one process per turn | `codex exec resume <SESSION_ID> <PROMPT>` |
-| Grok Build 1.0.5 | one process per turn | `--resume <id>` |
+Most of the machinery for the first half already existed. All three harnesses persist their
+own transcripts and all three resume by id; the resume argv was written and tested before
+any of this. What was missing was only that nothing remembered the id.
 
-So `Kind::restart` is a field, not three code paths, and the fleet reads a child exiting as
-the end of a *turn* for two of them and the end of the *session* for one. Modelling Codex
-as persistent produces an agent that appears to die after every reply — a bug that looks
-like a crash and is a category error.
+The second half — a turn that outlives its window — is what forced the interesting change.
 
-Both per-turn harnesses also speak a persistent protocol — `codex app-server` (JSON-RPC
-2.0) and `grok agent stdio` (native ACP) — and either would be better than respawning.
-Neither is used yet, deliberately: `codex --help` marks `app-server` `[experimental]` and
-OpenAI documents it as changing without notice, and `grok agent stdio` is beta with
-reported gaps in resume and managed MCP injection. Both are schema-per-version, so adopting
-one means generating types against a pinned release. That is worth doing and is a separate
-change. The decoders are already written against ACP's own discriminant names for exactly
-this reason: when `grok agent stdio` stabilises, the transport is replaced and the decoder
-is kept.
+**Detached execution and Claude Code's persistent stdin are incompatible.** A detached
+child has nobody left holding the write end of its stdin, so `--input-format stream-json`
+sees EOF and Claude Code exits. So every harness now runs **one child per turn**, resumed
+by id, and `Restart::Persistent` is gone. The difference between the three collapses to how
+they spell resume:
+
+| Harness | Resume |
+|---|---|
+| Claude Code | `--resume <uuid>` |
+| Codex CLI | `exec resume <SESSION_ID> <PROMPT>` |
+| Grok Build | `--resume <id>` |
+
+What that costs is process warmth, not context. Verified against Claude Code 2.1.235 by
+running it: `claude -p --output-format stream-json --verbose --permission-mode
+bypassPermissions --resume <uuid> "…"` answers inside the session that id names.
+
+That simplification paid for the rest. Every turn became fire-and-forget, which made the
+spool possible, which made live viewing and rehydration the *same* code path.
+
+## The shape on disk
+
+```
+<root>/agents/<session-id>/
+  meta.json        harness, thread id, profile home, checkout, title, times
+  events.ndjson    every turn's stdout, appended, exactly as the harness wrote it
+  turn.lock        held by the running turn and by nothing else
+  pending/*.txt    prompts waiting for a turn to pick them up
+  errors.log       what riabuild itself could not do
+```
+
+**The spool is the harness's own bytes, not riabuild's event model.** Replaying it through
+the same `Reader` that reads a live turn yields precisely the events the window saw,
+because it is the same decoder over the same bytes. Storing decoded events would have meant
+a second format to version and a reopened session that could disagree with the one that was
+on screen.
+
+**`errors.log` is not redundant with it.** The spool holds one vendor's wire format, so a
+line riabuild wrote there would decode to nothing — and a detached wrapper has no stderr
+anybody reads. Without a second file, a harness that will not start produces a session that
+sits idle for ever with no explanation. The window tails both.
+
+**Prompts are a queue of files, not one file.** Two prompts sent while a turn is running are
+two waiting wrappers, and a single `prompt.txt` would have the second overwrite the first
+before either had read it — losing a message the developer watched being accepted. They are
+files rather than arguments because argv is world-readable through `ps`, and on a shared
+server `ps` shows other developers' processes.
+
+## Liveness is a lock, never a pid
+
+Whether a turn is running is answered by trying to take `turn.lock`. This is
+`remote::channel::lease`'s decision for the reasons `CLAUDE.md` already sets out: a pid in a
+file is a claim somebody has to check, a marker outlives the process that wrote it, and
+`kill -0` on a recycled pid answers about the wrong process.
+
+Here it also gets a reboot right for free. The kernel releases an `flock` when the holder
+exits however it exits, so after a restart every session reads as idle with nothing having
+to clean up after it.
+
+The lock is held by `riabuild internal agent-turn` rather than by the harness, because the
+harness is a third-party binary that knows nothing about riabuild. That wrapper exists for
+exactly three reasons, none of which a vendor's binary could be asked to do: it holds the
+lock, it appends the spool, and it writes down the thread id — without which the next turn
+starts a new conversation instead of continuing this one. It is not a supervisor: it runs
+one turn, records what happened, and exits.
+
+## Detaching, precisely
+
+`CommandRunner::spawn_detached` is the one method that starts a child riabuild does not stay
+responsible for. Three things together, and leaving out any one looks like it works until
+somebody closes a terminal:
+
+- **`setsid`**, so the child leads its own session. A terminal that goes away sends
+  `SIGHUP` to its foreground process group; being reparented to init is not enough.
+- **stdio nulled**, so the child holds no descriptor on the tty.
+- **no `kill_on_drop`**, which every other spawn in that crate sets.
+
+It returns no handle, deliberately: a process expected to outlive this one is not something
+this one can honestly claim to be able to wait for or kill. Liveness is answered by the
+lock instead.
+
+## The profile is recorded, never recomputed
+
+riabuild keeps nine sign-ins for each harness, and a session is only resumable under the one
+that created it — each tool stores its transcripts inside its own home. So `meta.json`
+carries the `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` the session was started with.
+
+This was a latent bug before persistence: the first version of this crate spawned the
+binaries with no home at all, so sessions landed in whichever default each tool picked.
+Recomputing it would be worse than not storing it — a changed primary Claude account would
+point the next turn at a different store, where it finds no session and quietly begins a new
+conversation under the same pane, with nothing on screen saying so.
+
+The *binary* is the opposite and is resolved per turn, because a versioned path moves with
+every riabuild upgrade: a session started last week must run this week's Claude Code.
 
 ## Permissions are bypassed, in three spellings
-
-riabuild provisions "agents can do anything" environments, and its launchers already say
-so. This crate spawns the harnesses directly — it needs argv the launchers do not pass — so
-it restates the bypass per harness:
 
 | Harness | Flags |
 |---|---|
@@ -89,111 +165,105 @@ it restates the bypass per harness:
 | Codex | `--dangerously-bypass-approvals-and-sandbox`, `--dangerously-bypass-hook-trust` |
 | Grok Build | `--always-approve` |
 
-None is interchangeable. `codex exec` does not accept the `--yolo` the launchers pass;
-Grok's `--permission-mode` is a root option only and would be `unexpected argument` after
-the `-p` this always passes. And `dontAsk`, which exists on two of the three and reads like
-the same thing, silently **denies** whatever was not pre-approved — an agent that refuses
-its own tools.
+None is interchangeable. `codex exec` does not accept the `--yolo` the launchers pass, and
+`dontAsk` — which exists on two of the three and reads like the same thing — silently
+**denies** whatever was not pre-approved, presenting as an agent that refuses its own tools.
 
-The consequence worth stating plainly: there is no approval round-trip anywhere in
-`riabuild-harness`. That is not an omission, it is what makes one event model possible. The
-three harnesses each ask permission in a different and badly documented way, and never
-being asked removes the hardest part of driving any of them headless.
+There is no approval round-trip anywhere in `riabuild-harness`. That is not an omission: the
+three harnesses each ask permission in a different and badly documented way, and never being
+asked is what makes one event model possible.
 
 ### The one thing full bypass cannot buy
 
-Claude Code's `--bare` is the flag that would suppress the remaining hook, LSP, plugin and
-MCP discovery. It is not passed, and its own `--help` says why:
+Claude Code's `--bare` would suppress the remaining hook, LSP, plugin and MCP discovery. Its
+own `--help` says why it is not passed:
 
 > Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via `--settings` (OAuth
 > and keychain are never read).
 
-Every Claude account riabuild manages is an OAuth sign-in, so `--bare` would break all
-nine. **Full prompt-suppression and subscription auth are mutually exclusive on that
-harness.** riabuild keeps the accounts. If a deployment ever wants `--bare` instead, it
-needs `ANTHROPIC_API_KEY`, and that is a decision about billing rather than about this
-window.
+Every Claude account riabuild manages is an OAuth sign-in, so `--bare` would break all nine.
+**Full prompt-suppression and subscription auth are mutually exclusive on that harness.**
+riabuild keeps the accounts.
 
-Codex has no such conflict, which is why `--dangerously-bypass-hook-trust` *is* passed:
-it grants hooks configured in a checkout riabuild itself cloned, and its absence means a
+Codex has no such conflict, which is why `--dangerously-bypass-hook-trust` *is* passed: it
+grants hooks configured in a checkout riabuild itself cloned, and its absence means a
 headless session waits for an interactive trust nobody can give.
 
 ## What is verified, and what is inferred
 
-Every wire format here is undocumented, explicitly unstable, or both. The response is to
-say which is which, at each match arm.
-
-- **Claude Code** — pinned against a transcript captured from 2.1.235 by running the real
-  binary. Every field the decoder reads is exactly as it was written.
-- **Codex** — the *envelope* (`thread.started`, `turn.started`, `item.completed`,
-  `turn.failed`, top-level `error`) is captured from 0.148.0, but only its **failure**
+- **Claude Code 2.1.235** — pinned against transcripts captured from the real binary,
+  including a resumed turn. Every field the decoder reads is exactly as it was written.
+- **codex-cli 0.148.0** — the *envelope* (`thread.started`, `turn.started`,
+  `item.completed`, `turn.failed`, top-level `error`) is captured, but only its **failure**
   path: the machine this was written on had no OpenAI sign-in. The successful item bodies
-  are from documentation and marked `INFERRED`.
-- **Grok Build** — only the error frame is captured from 1.0.5, from a machine with no xAI
-  sign-in. Everything else is ACP, marked `INFERRED`, and accepts both a bare update and
-  one nested under a JSON-RPC `params.update`, because which Grok writes could not be
-  observed.
+  are documentation, marked `INFERRED`.
+- **Grok Build 1.0.5** — only the error frame is captured. Everything else is ACP, marked
+  `INFERRED`, and accepts both a bare update and one nested under a JSON-RPC
+  `params.update`, because which Grok writes could not be observed.
 
 Two rules fall out and both are load-bearing. **Decoders degrade, never fail**: an
-unrecognised frame produces no events rather than an error, so a schema that moves under us
-costs a line of transcript instead of a session. And **stdout only**: Codex writes
-`tracing` diagnostics to stderr and a plain `Reading additional input from stdin...` to
-stdout, so a decoder that merged the streams would die on the first retry a flaky
-connection causes, and one that treated non-JSON as fatal would kill every Codex session at
-the moment it started.
+unrecognised frame produces no events rather than an error. And **stdout only**: Codex
+writes `tracing` diagnostics to stderr and a plain `Reading additional input from stdin...`
+to stdout, so a decoder that merged the streams would die on the first retry a flaky
+connection causes.
 
 ## Colour: ratatui's types, riabuild's ladder
 
-`riabuild-theme` was rewritten onto ratatui's `Color`, `Style` and `Modifier`. riabuild now
-paints two surfaces — printed lines and drawn frames — and a private `Rgb` would mean
-converting at that boundary, which is a second palette by another name.
+`riabuild-theme` was rewritten onto ratatui's `Color`, `Style` and `Modifier`, because
+riabuild now paints two surfaces — printed lines and drawn frames — and a private `Rgb`
+would mean converting at that boundary, which is a second palette by another name.
 
-Ratatui does not replace the crate, because it has no notion of terminal capability: its
-backends write a `Color::Rgb` as a 24-bit escape whatever is on the other end, and it has
-no `NO_COLOR`. So the depth ladder stays riabuild's and runs *before* a style reaches a
-frame, and `Theme::paint` — one styled string for a `println!` — stays riabuild's too,
-because ratatui only ever writes whole frames.
+Ratatui does not replace the crate: it has no notion of terminal capability (its backends
+write a `Color::Rgb` as a 24-bit escape whatever is on the other end) and no `NO_COLOR`. So
+the depth ladder stays riabuild's and runs *before* a style reaches a frame, and
+`Theme::paint` — one styled string for a `println!` — stays riabuild's too.
 
 One finding worth recording: `Role::legacy`, the sixteen-colour rendering, has to be a
-**chosen table rather than a nearest-match**. `--green` (`#3ddc84`) is nearer to `Cyan`
-than to `Green` on channel distance, and `--orange` lands on `Red` beside `Danger` — so
-computed downgrades would put "done" on cyan and make "in progress" and "fatal" the same
-colour.
+**chosen table rather than a nearest-match**. `--green` (`#3ddc84`) is nearer to `Cyan` than
+to `Green` on channel distance, and `--orange` lands on `Red` beside `Danger` — so computed
+downgrades would put "done" on cyan and make "in progress" and "fatal" the same colour.
 
 ## Testing
 
 The whole interface is tested against transcripts three real binaries produced.
 `riabuild_harness::testing::decode` runs the **production** decoder over canned bytes, so
-`riabuild-agents`' own tests fail when a decoder changes under them — the alternative,
-hand-written `Vec<Event>` fixtures, would test the renderer against a fiction.
+`riabuild-agents`' own tests fail when a decoder changes under them — hand-written
+`Vec<Event>` fixtures would test the renderer against a fiction.
 
-`app.rs` is pure: no terminal, no process, no IO. `draw.rs` splits line-building from
-widget rendering so that what the screen *says* is assertable without a backend. One test
-walks every span on every line and fails on a style that is not a `Role` from the palette,
-which is the rule ratatui makes easiest to break.
+`app.rs` is pure: no terminal, no process, no IO. `draw.rs` splits line-building from widget
+rendering so that what the screen *says* is assertable without a backend. One test walks
+every span on every line and fails on a style that is not a `Role` from the palette, which
+is the rule ratatui makes easiest to break. `store.rs` and `turn.rs` run against a temporary
+directory and a `FakeRunner`.
+
+`FakeRunner` gained `piping`, and its `spawn_piped` now closes the far end of a child
+scripted to exit. That is a bug fix as much as a feature: a scripted child whose pipe stayed
+open left a reader looping until EOF for ever, which is a hang rather than a failure — and
+hangs are what `ci.yml`'s macOS job exists to catch, after one cost a release twenty-five
+minutes of a runner building nothing.
 
 ## Threading
 
 Keys are read on a dedicated OS thread, not a task. `event::read` blocks, and riabuild runs
-a current-thread runtime, so reading on the reactor would hold every session's output
-behind whether a developer happens to be typing — the same reason `runner/pty.rs` uses
-`AsyncFd`. Each session's stdout is pumped by its own task reporting into one unbounded
-channel, so the draw loop awaits a single receiver rather than N children.
+a current-thread runtime, so reading on the reactor would hold every session's output behind
+whether a developer happens to be typing — the same reason `runner/pty.rs` uses `AsyncFd`.
 
-The thread is detached: it ends with the process, parked in a `read` only the terminal can
-complete. That is acceptable because `agents` is a command that owns the process for its
-lifetime, and it is the reason this crate would need revisiting before ever being embedded
-in something longer-lived.
+There is no reader task per session any more. The window polls the spools and the locks on
+its redraw tick, which is simpler than a channel *and* is the only thing that works: the
+turns are not this process's children, and there is no pipe to hold.
 
 ## Open questions
 
 - **`codex app-server` and `grok agent stdio`.** Both give real interrupts and steering,
-  which per-turn respawning cannot. Blocked on their schemas stabilising.
+  which per-turn respawning cannot. Blocked on their schemas stabilising; both are marked
+  experimental or beta by their own vendors. The decoders are already written against ACP's
+  own names so that adopting one replaces a transport and keeps a decoder.
 - **Cross-provider delegation.** `Event::Delegated` exists and Claude Code populates it
-  through `parent_tool_use_id`, which is the only attribution any of the three emits. An
-  agent in one provider spawning a subagent in another would be an MCP server that opens a
-  session here. Nothing is built for it yet, and the event model is the part that would
-  have been hard.
-- **Interrupts.** There is no key that stops a running turn. Claude Code takes a
-  `control_request` interrupt; the other two would have to be killed. Deliberately left
-  out rather than half-built.
+  through `parent_tool_use_id`, the only attribution any of the three emits. An agent in one
+  provider spawning a subagent in another would be an MCP server that opens a session here.
+  Nothing is built for it; the event model is the part that would have been hard.
+- **Interrupts.** There is no key that stops a running turn. Doing it properly means killing
+  a process this window deliberately does not own, which needs the lock to carry something
+  more than "held". Left out rather than half-built.
+- **`riabuild agents list|forget`.** The store has both operations and retention is enforced
+  on open (fifty per checkout). Neither is exposed as a command yet.

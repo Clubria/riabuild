@@ -212,6 +212,16 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::NgrokToken,
         }) => return internal::ngrok_token(ctx).await,
+        // Not behind `connect`: a turn is the harness riabuild already installed
+        // working in the checkout riabuild already cloned, and it has to keep
+        // running on a laptop that has gone offline since the window opened.
+        Some(Command::Internal {
+            action:
+                cli::InternalAction::AgentTurn {
+                    session,
+                    prompt_file,
+                },
+        }) => return internal::agent_turn(ctx, session, prompt_file).await,
         Some(Command::MoveProject { path }) => {
             return move_project::run(ctx, path.as_deref()).await;
         }

@@ -10,19 +10,12 @@
 //! crate is never compiled with `cfg(test)`, so a downstream test could not
 //! otherwise reach any of this.
 
-use super::{Decoder, Event, Kind, claude, codex, grok};
+use super::{Event, Kind};
 
-/// Runs the harness's own decoder over a transcript, as the pump would.
+/// Runs the harness's own decoder over a transcript, exactly as a spool replay
+/// or a live tail would.
 pub fn decode(kind: Kind, transcript: &str) -> Vec<Event> {
-    let mut decoder: Box<dyn Decoder> = match kind {
-        Kind::Claude => Box::new(claude::Reader),
-        Kind::Codex => Box::new(codex::Reader),
-        Kind::Grok => Box::new(grok::Reader::default()),
-    };
-    transcript
-        .lines()
-        .flat_map(|line| decoder.read(line))
-        .collect()
+    super::replay(kind, transcript)
 }
 
 /// A short Claude Code session: start, one tool call, an answer, idle.

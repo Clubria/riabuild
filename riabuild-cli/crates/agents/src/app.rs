@@ -4,40 +4,36 @@
 //! [`Event`]s, which is what lets the whole of the interface be tested against
 //! transcripts three real harnesses produced — see `riabuild_harness::testing`.
 //! A renderer that owned this state would only be testable by drawing it.
+//!
+//! History and live output arrive the same way. Reopening a session replays its
+//! spool through the same decoder that reads a running turn, so what a pane
+//! shows tomorrow is what it showed when the work happened rather than a
+//! reconstruction of it.
 
-use riabuild_harness::{Event, Kind, SessionId};
+use riabuild_harness::{Event, Kind};
 
 /// Where a session has got to.
 ///
-/// Ordered so that the most interesting state sorts first in a list: a
-/// developer scanning a column of nine agents is looking for the one that
-/// stopped, not the six that are working.
+/// Not stored — computed from two facts that are each answerable on their own:
+/// whether a turn holds the lock, and whether the last thing that happened was
+/// trouble. A `state` field would be a third copy of that, and the copy is what
+/// goes stale when a window reopens onto a turn that is already running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
-    /// Something went wrong and was reported.
+    /// Something went wrong and has not been acted on.
     Trouble,
-    /// Waiting for a person: either nothing has been asked yet, or the last
-    /// turn is over.
-    ///
-    /// There is deliberately no `Starting` beside it. Two of the three
-    /// harnesses do not start a process until they are spoken to, so "started"
-    /// is not a state they can be in — and for the one that does, the gap
-    /// between spawning and `system/init` is too short to draw. What a
-    /// developer needs to tell apart is *asked and working* from *waiting for
-    /// me*, and a third word between them only makes that read slower.
+    /// Waiting for a person.
     Idle,
     /// A turn is in flight.
     Busy,
-    /// The child has exited and this session takes no more turns.
-    Gone,
 }
 
 impl State {
     /// The one-glyph mark a dense list has room for.
     ///
-    /// Unicode only where the terminal can be trusted with it; the caller
-    /// passes what `riabuild-ui` already decided about this terminal, rather
-    /// than each widget guessing again.
+    /// Unicode only where the terminal can be trusted with it; the caller passes
+    /// what `riabuild-ui` already decided about this terminal, rather than each
+    /// widget guessing again.
     pub fn mark(self, unicode: bool) -> &'static str {
         match (self, unicode) {
             (State::Trouble, true) => "▲",
@@ -46,8 +42,6 @@ impl State {
             (State::Idle, false) => "*",
             (State::Busy, true) => "◐",
             (State::Busy, false) => "~",
-            (State::Gone, true) => "×",
-            (State::Gone, false) => "x",
         }
     }
 
@@ -56,7 +50,6 @@ impl State {
             State::Trouble => "trouble",
             State::Idle => "idle",
             State::Busy => "working",
-            State::Gone => "ended",
         }
     }
 }
@@ -74,19 +67,27 @@ pub enum Entry {
         ok: Option<bool>,
     },
     Trouble(String),
-    /// riabuild's own words — a session opening or ending.
+    /// riabuild's own words — a prompt going out.
     Note(String),
 }
 
 /// One session, as the screen understands it.
 #[derive(Debug, Clone)]
 pub struct Pane {
-    pub id: SessionId,
+    /// The store's id. A directory name, stable across windows and reboots.
+    pub id: String,
     pub kind: Kind,
-    pub cwd: String,
+    /// The first prompt, which is what tells two sessions apart. Sessions are
+    /// scoped to one checkout, so the directory never could.
+    pub title: String,
     pub thread: Option<String>,
     pub model: Option<String>,
-    pub state: State,
+    /// Whether a turn holds the session's lock right now.
+    pub running: bool,
+    /// Sticky until the next prompt. A session that goes quietly green the
+    /// instant after it failed is the one bug this screen exists to prevent, so
+    /// the turn ending is not what clears this — asking it something else is.
+    pub troubled: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub entries: Vec<Entry>,
@@ -94,42 +95,51 @@ pub struct Pane {
     /// Kept beside `entries` rather than inside `Entry` so that every variant
     /// does not carry a flag only two of them ever set.
     pub delegated: Vec<usize>,
+    /// How far into the spool this pane has read.
+    pub offset: u64,
+    /// How far into the error log this pane has read.
+    ///
+    /// A second offset rather than one, because they are two files with two
+    /// writers: the harness's own stream, and the wrapper saying what it could
+    /// not do. Sharing a counter would have one silently skip the other.
+    pub trouble_offset: u64,
 }
 
 impl Pane {
-    fn new(id: SessionId, kind: Kind, cwd: String) -> Self {
+    pub fn new(id: String, kind: Kind, title: String) -> Self {
         Self {
             id,
             kind,
-            cwd,
+            title,
             thread: None,
             model: None,
-            // Idle rather than anything more hopeful: a window that opens with
-            // three sessions has asked none of them anything yet, and every one
-            // of them is genuinely waiting for the developer.
-            state: State::Idle,
+            running: false,
+            troubled: false,
             input_tokens: 0,
             output_tokens: 0,
             entries: Vec::new(),
             delegated: Vec::new(),
+            offset: 0,
+            trouble_offset: 0,
+        }
+    }
+
+    pub fn state(&self) -> State {
+        if self.running {
+            State::Busy
+        } else if self.troubled {
+            State::Trouble
+        } else {
+            State::Idle
         }
     }
 
     /// The name this session goes by in the list.
-    ///
-    /// The working directory's last component, because that is what tells two
-    /// agents apart when both are Claude Code — the harness name does not.
-    pub fn title(&self) -> String {
-        let leaf = self
-            .cwd
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or_default();
-        if leaf.is_empty() {
-            self.kind.label().to_string()
+    pub fn label(&self) -> String {
+        if self.title.is_empty() {
+            format!("new {}", self.kind.tag())
         } else {
-            leaf.to_string()
+            self.title.clone()
         }
     }
 
@@ -140,9 +150,20 @@ impl Pane {
         self.entries.push(entry);
     }
 
-    /// Applies one event. `delegated` is set when it arrived wrapped in
+    /// Applies one event.
+    ///
+    /// Public because rehydration replays a spool straight into a pane before
+    /// the window exists, which is the same operation the live tail performs.
+    pub fn observe(&mut self, event: &Event) {
+        match event {
+            Event::Delegated { inner, .. } => self.apply(inner, true),
+            other => self.apply(other, false),
+        }
+    }
+
+    /// The body, with `delegated` set when the event arrived wrapped in
     /// [`Event::Delegated`].
-    fn observe(&mut self, event: &Event, delegated: bool) {
+    fn apply(&mut self, event: &Event, delegated: bool) {
         match event {
             Event::Ready { thread, model } => {
                 if thread.is_some() {
@@ -151,12 +172,6 @@ impl Pane {
                 if model.is_some() {
                     self.model = model.clone();
                 }
-                // Deliberately does not touch the state. `Ready` only says the
-                // harness introduced itself, which happens both when a session
-                // opens with nothing to do and in the middle of a turn that is
-                // very much in flight — so reading it as either would be wrong
-                // half the time. `App::sent` is what marks a session busy,
-                // because sending is the only thing that makes one busy.
             }
             Event::Said(text) => self.push(Entry::Said(text.clone()), delegated),
             Event::Thought(text) => self.push(Entry::Thought(text.clone()), delegated),
@@ -195,37 +210,21 @@ impl Pane {
                 // Cumulative for the turn, so the larger figure wins rather than
                 // being added: two `Usage` events in one turn are two reports of
                 // the same tokens, and summing them doubles the count.
+                //
+                // Across turns it is a floor rather than a total, which is the
+                // honest thing a per-turn harness can report: each turn starts
+                // its own count, and adding them would double every cached read.
                 self.input_tokens = self.input_tokens.max(*input);
                 self.output_tokens = self.output_tokens.max(*output);
             }
             Event::Trouble(text) => {
                 self.push(Entry::Trouble(text.clone()), delegated);
-                self.state = State::Trouble;
+                self.troubled = true;
             }
-            Event::Idle => {
-                // Trouble is not cleared by the turn ending. The developer has
-                // not seen it yet, and a session that goes quietly green the
-                // instant it fails is the one bug this whole screen exists to
-                // stop.
-                if self.state != State::Trouble {
-                    self.state = State::Idle;
-                }
-            }
-            Event::Exited(code) => {
-                if self.kind.restart() == riabuild_harness::Restart::PerTurn {
-                    // Expected: these harnesses exit at the end of every turn.
-                    // The session is still there and still resumable.
-                    if self.state == State::Busy {
-                        self.state = State::Idle;
-                    }
-                } else {
-                    self.state = State::Gone;
-                    self.push(
-                        Entry::Note(format!("the session ended ({code})")),
-                        delegated,
-                    );
-                }
-            }
+            // The turn saying it is done. Not what decides whether this pane is
+            // busy — the lock does, because a turn can also end by being killed,
+            // and nothing is emitted then.
+            Event::Idle => {}
             // Unwrapped by `App::observe` before it gets here.
             Event::Delegated { .. } => {}
         }
@@ -274,34 +273,46 @@ impl App {
         }
     }
 
-    pub fn opened(&mut self, id: SessionId, kind: Kind, cwd: String) {
-        self.panes.push(Pane::new(id, kind, cwd));
+    pub fn add(&mut self, pane: Pane) {
+        self.panes.push(pane);
     }
 
     pub fn selected(&self) -> Option<&Pane> {
         self.panes.get(self.selected)
     }
 
+    pub fn pane_mut(&mut self, id: &str) -> Option<&mut Pane> {
+        self.panes.iter_mut().find(|pane| pane.id == id)
+    }
+
     /// Records what a session said.
-    pub fn observe(&mut self, id: SessionId, event: &Event) {
-        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) else {
-            return;
-        };
-        match event {
-            Event::Delegated { inner, .. } => pane.observe(inner, true),
-            other => pane.observe(other, false),
+    pub fn observe(&mut self, id: &str, event: &Event) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            pane.observe(event);
+        }
+    }
+
+    /// Whether a turn holds this session's lock.
+    pub fn set_running(&mut self, id: &str, running: bool) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            pane.running = running;
         }
     }
 
     /// Marks the selected session busy, for the moment between a developer
-    /// pressing Enter and the harness saying anything.
+    /// pressing Enter and the wrapper taking the lock.
     ///
-    /// Without it the pane stays `idle` through the whole of a model's first
-    /// think, which reads as a prompt that was not delivered.
+    /// Without it the pane stays idle through the whole of a process start,
+    /// which reads as a prompt that was not delivered.
     pub fn sent(&mut self, text: &str) {
         if let Some(pane) = self.panes.get_mut(self.selected) {
             pane.push(Entry::Note(format!("› {text}")), false);
-            pane.state = State::Busy;
+            pane.running = true;
+            // A new question is the developer acting on whatever went wrong.
+            pane.troubled = false;
+            if pane.title.is_empty() {
+                pane.title = crate::store::title_of(text);
+            }
         }
         self.scrollback = 0;
     }
@@ -322,10 +333,7 @@ impl App {
 
     /// How many sessions are working right now, for the header.
     pub fn busy_count(&self) -> usize {
-        self.panes
-            .iter()
-            .filter(|pane| pane.state == State::Busy)
-            .count()
+        self.panes.iter().filter(|pane| pane.running).count()
     }
 }
 
@@ -336,10 +344,9 @@ mod tests {
 
     fn play(kind: Kind, transcript: &str) -> App {
         let mut app = App::new();
-        let id = SessionId(1);
-        app.opened(id, kind, "/work/ai-builders-hub".into());
+        app.add(Pane::new("s1".into(), kind, "the first prompt".into()));
         for event in testing::decode(kind, transcript) {
-            app.observe(id, &event);
+            app.observe("s1", &event);
         }
         app
     }
@@ -348,7 +355,7 @@ mod tests {
     fn a_real_claude_session_renders_as_a_turn_that_finished() {
         let app = play(Kind::Claude, testing::CLAUDE);
         let pane = app.selected().unwrap();
-        assert_eq!(pane.state, State::Idle);
+        assert_eq!(pane.state(), State::Idle);
         assert_eq!(pane.model.as_deref(), Some("claude-opus-5[1m]"));
         assert!(pane.thread.is_some());
         // The tool call resolved rather than being left open.
@@ -365,12 +372,12 @@ mod tests {
 
     #[test]
     fn a_session_that_failed_does_not_go_quietly_idle() {
-        // Codex's real 401 transcript ends `turn.failed` then idle. The pane
-        // must keep saying trouble: an agent that reports green after failing is
-        // the failure this screen exists to prevent.
+        // Codex's real 401 transcript. The pane must keep saying trouble: an
+        // agent that reports green after failing is the failure this screen
+        // exists to prevent.
         let app = play(Kind::Codex, testing::CODEX);
         let pane = app.selected().unwrap();
-        assert_eq!(pane.state, State::Trouble);
+        assert_eq!(pane.state(), State::Trouble);
         assert!(
             pane.entries
                 .iter()
@@ -379,10 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn asking_it_something_else_is_what_clears_trouble() {
+        // Not the turn ending, which is the harness's opinion. The developer
+        // having seen it and moved on is the only thing that means it is dealt
+        // with.
+        let mut app = play(Kind::Codex, testing::CODEX);
+        assert_eq!(app.selected().unwrap().state(), State::Trouble);
+        app.sent("try again");
+        assert!(!app.selected().unwrap().troubled);
+        assert_eq!(app.selected().unwrap().state(), State::Busy);
+    }
+
+    #[test]
     fn grok_reports_that_nobody_is_signed_in() {
         let app = play(Kind::Grok, testing::GROK);
         let pane = app.selected().unwrap();
-        assert_eq!(pane.state, State::Trouble);
+        assert_eq!(pane.state(), State::Trouble);
         let Some(Entry::Trouble(text)) = pane.entries.first() else {
             panic!("expected trouble, got {:?}", pane.entries);
         };
@@ -390,21 +409,16 @@ mod tests {
     }
 
     #[test]
-    fn a_per_turn_harness_exiting_ends_a_turn_and_not_the_session() {
-        // `codex exec` and `grok -p` exit after every reply. Treating that as
-        // the session ending would show every agent as dead the moment it
-        // answered.
-        for kind in [Kind::Codex, Kind::Grok] {
-            let mut app = App::new();
-            app.opened(SessionId(1), kind, "/work".into());
-            app.observe(SessionId(1), &Event::Exited(0));
-            assert_eq!(app.selected().unwrap().state, State::Idle, "{kind:?}");
-        }
-
-        let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
-        app.observe(SessionId(1), &Event::Exited(0));
-        assert_eq!(app.selected().unwrap().state, State::Gone);
+    fn busy_is_the_lock_and_not_the_harnesss_opinion() {
+        // A turn can end by being killed, and nothing is emitted then. Deriving
+        // busy from `Event::Idle` would leave such a session spinning for ever;
+        // deriving it from the lock cannot.
+        let mut app = play(Kind::Claude, testing::CLAUDE);
+        assert_eq!(app.selected().unwrap().state(), State::Idle);
+        app.set_running("s1", true);
+        assert_eq!(app.selected().unwrap().state(), State::Busy);
+        app.set_running("s1", false);
+        assert_eq!(app.selected().unwrap().state(), State::Idle);
     }
 
     #[test]
@@ -412,7 +426,7 @@ mod tests {
         // A long session reuses tool names constantly; only the id is unique,
         // and an older open call with the same id must not steal the result.
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         for event in [
             Event::ToolStarted {
                 id: "a".into(),
@@ -429,7 +443,7 @@ mod tests {
                 ok: false,
             },
         ] {
-            app.observe(SessionId(1), &event);
+            app.observe("s1", &event);
         }
         let entries = &app.selected().unwrap().entries;
         assert!(matches!(entries[0], Entry::Tool { ok: None, .. }));
@@ -445,9 +459,9 @@ mod tests {
     #[test]
     fn a_result_for_a_call_nobody_saw_is_recorded_rather_than_dropped() {
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
-            SessionId(1),
+            "s1",
             &Event::ToolFinished {
                 id: "orphan".into(),
                 ok: true,
@@ -459,10 +473,10 @@ mod tests {
     #[test]
     fn a_subagents_work_is_marked_as_its_own() {
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
-        app.observe(SessionId(1), &Event::Said("mine".into()));
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        app.observe("s1", &Event::Said("mine".into()));
         app.observe(
-            SessionId(1),
+            "s1",
             &Event::Delegated {
                 parent: "toolu_1".into(),
                 inner: Box::new(Event::Said("theirs".into())),
@@ -479,16 +493,16 @@ mod tests {
         // Both Claude and Codex report cumulative counts. Summing them makes a
         // session appear to have spent twice what it did.
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
-            SessionId(1),
+            "s1",
             &Event::Usage {
                 input: 100,
                 output: 5,
             },
         );
         app.observe(
-            SessionId(1),
+            "s1",
             &Event::Usage {
                 input: 180,
                 output: 9,
@@ -499,12 +513,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_is_named_after_its_checkout_not_its_vendor() {
-        // Two Claude Code sessions on two repositories are told apart by the
-        // repository. The harness name is the same on both.
+    fn a_session_is_named_by_what_it_was_asked() {
+        // Every session in the list is in the same checkout, so the directory
+        // cannot tell two apart. The first prompt can.
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work/ai-builders-hub/".into());
-        assert_eq!(app.panes[0].title(), "ai-builders-hub");
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        assert_eq!(app.selected().unwrap().label(), "new claude");
+        app.sent("fix the flaky test");
+        assert_eq!(app.selected().unwrap().label(), "fix the flaky test");
+        // and the title is not rewritten by the second prompt
+        app.sent("now ship it");
+        assert_eq!(app.selected().unwrap().label(), "fix the flaky test");
     }
 
     #[test]
@@ -515,8 +534,8 @@ mod tests {
         app.select_previous();
         assert_eq!(app.selected, 0);
 
-        for id in 1..=3 {
-            app.opened(SessionId(id), Kind::Claude, "/work".into());
+        for index in 1..=3 {
+            app.add(Pane::new(format!("s{index}"), Kind::Claude, String::new()));
         }
         app.select_previous();
         assert_eq!(app.selected, 2);
@@ -526,14 +545,13 @@ mod tests {
 
     #[test]
     fn sending_a_prompt_shows_it_and_marks_the_session_working() {
-        // Otherwise the pane reads `idle` through the whole of the model's
-        // first think, which looks like a prompt that never arrived.
+        // Otherwise the pane reads idle through the whole of a process start,
+        // which looks like a prompt that never arrived.
         let mut app = App::new();
-        app.opened(SessionId(1), Kind::Claude, "/work".into());
-        app.observe(SessionId(1), &Event::Idle);
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.sent("do the thing");
         let pane = app.selected().unwrap();
-        assert_eq!(pane.state, State::Busy);
+        assert_eq!(pane.state(), State::Busy);
         assert_eq!(
             pane.entries.last(),
             Some(&Entry::Note("› do the thing".into()))
@@ -543,7 +561,7 @@ mod tests {
     #[test]
     fn trouble_sorts_ahead_of_everything_that_is_merely_working() {
         // A developer scanning nine agents is looking for the one that stopped.
-        let mut states = [State::Gone, State::Busy, State::Trouble, State::Idle];
+        let mut states = [State::Busy, State::Trouble, State::Idle];
         states.sort();
         assert_eq!(states[0], State::Trouble);
     }

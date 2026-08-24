@@ -190,21 +190,20 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
             "opening the agents window",
             "Run `riabuild` first, which picks a repository and clones it.",
         )
-        .detail("No Clubria checkout is set up on this machine yet, so there is nothing for an agent to work on.")
+        .detail(
+            "No Clubria checkout is set up on this machine yet, so there is nothing \
+             for an agent to work on.",
+        )
         .into());
     };
 
     let request = agents::Request {
-        programs: agents::Programs {
-            // Absolute, versioned paths. `~/.riabuild/bin` is not on `PATH`
-            // during provisioning, so a bare name would find whichever copy the
-            // laptop already had — the thing riabuild owning its tools exists
-            // to prevent.
-            claude: ctx.claude(),
-            codex: ctx.codex(),
-            grok: ctx.grok(),
-        },
-        cwd: cwd.display().to_string(),
+        // The path a turn is started through. `shims::running_binary` rather
+        // than a bare name, for the reason every generated shim names riabuild
+        // in full: it is the one tool riabuild does not put on `PATH`.
+        riabuild: shims::running_binary()?,
+        cwd,
+        homes: homes(ctx),
         prompt,
         theme: ctx.ui.theme(),
         // The same question `riabuild-ui` already answered for the banner, asked
@@ -212,8 +211,29 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         unicode: riabuild_ui::glyphs_render(),
     };
 
-    agents::run(ctx.runner.clone(), request).await?;
+    agents::run(ctx.runner.clone(), ctx.paths.as_ref(), request).await?;
     Ok(0)
+}
+
+/// Which profile each harness runs under.
+///
+/// The first of riabuild's nine for each, and recorded on every session it
+/// starts. Resume is scoped to the profile that created a session — each tool
+/// keeps its transcripts inside its own home — so a session started under one
+/// and resumed under another finds nothing and quietly begins a new
+/// conversation, with nothing on screen saying so.
+///
+/// Claude's is keyed by the *primary account's* id rather than by position,
+/// because accounts can be deleted and renumbered and a session outlives that.
+/// Codex and Grok have a fixed set of nine, so the number is the name.
+fn homes(ctx: &Ctx) -> agents::Homes {
+    agents::Homes {
+        claude: accounts::id_of(&ctx.config, 1)
+            .ok()
+            .map(|id| ctx.paths.claude_profile_dir(&id)),
+        codex: Some(ctx.paths.codex_profile_dir(1)),
+        grok: Some(ctx.paths.grok_profile_dir(1)),
+    }
 }
 
 /// `riabuild remote …`

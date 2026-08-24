@@ -115,6 +115,19 @@ pub trait Paths: Send + Sync {
     fn tool_dir(&self, tool: &str, version: &str) -> PathBuf {
         self.root().join(tool).join(version)
     }
+    /// Where `riabuild agents` keeps its sessions.
+    ///
+    /// Under `root()` rather than `tools_root()`, which is the whole of what
+    /// makes two developers on one server invisible to each other: `root()` is
+    /// the per-developer namespace, and a session record names a checkout, a
+    /// thread id and a transcript that belong to one person.
+    fn agents_dir(&self) -> PathBuf {
+        self.root().join("agents")
+    }
+    /// One session's directory: its record, its spool, and its lock.
+    fn agent_session_dir(&self, id: &str) -> PathBuf {
+        self.agents_dir().join(id)
+    }
     fn claude_dir(&self) -> PathBuf {
         self.root().join("claude")
     }

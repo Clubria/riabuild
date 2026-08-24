@@ -22,41 +22,38 @@
 
 use serde_json::Value;
 
-use super::{Decoder, Encoder, Event, Kind, Launch};
+use super::{Decode, Event, Kind};
 
-pub(super) struct Codex;
-
-impl Encoder for Codex {
-    fn argv(&self, launch: &Launch, thread: Option<&str>, prompt: Option<&str>) -> Vec<String> {
-        let mut args: Vec<String> = vec!["exec".into()];
-        // `resume` is a subcommand of `exec`, and the id is its first
-        // positional. Options are given before both so that a prompt beginning
-        // with `-` cannot be read as one.
-        if thread.is_some() {
-            args.push("resume".into());
-        }
-        args.push("--json".into());
-        args.extend(Kind::Codex.bypass().iter().map(|flag| (*flag).to_string()));
-        // Hooks are configured in the checkout riabuild provisioned, and Codex
-        // otherwise refuses to run them until somebody has trusted them
-        // interactively — which in a headless session is nobody, for ever.
-        args.push("--dangerously-bypass-hook-trust".into());
-        if let Some(thread) = thread {
-            args.push(thread.to_string());
-        }
-        if let Some(prompt) = prompt {
-            args.push(prompt.to_string());
-        }
-        let _ = launch;
-        args
+/// One turn.
+///
+/// `codex exec` was always one turn per process, so nothing here changed when
+/// the other two joined it: continuity is `exec resume <SESSION_ID> <PROMPT>`,
+/// with the id as the first positional and the prompt as the second.
+pub(super) fn argv(thread: Option<&str>, prompt: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into()];
+    // `resume` is a subcommand of `exec`. Options are given before both
+    // positionals so that a prompt beginning with `-` cannot be read as one.
+    if thread.is_some() {
+        args.push("resume".into());
     }
+    args.push("--json".into());
+    args.extend(Kind::Codex.bypass().iter().map(|flag| (*flag).to_string()));
+    // Hooks are configured in the checkout riabuild provisioned, and Codex
+    // otherwise refuses to run them until somebody has trusted them
+    // interactively — which in a headless session is nobody, for ever.
+    args.push("--dangerously-bypass-hook-trust".into());
+    if let Some(thread) = thread {
+        args.push(thread.to_string());
+    }
+    args.push(prompt.to_string());
+    args
 }
 
 /// Stateless: `thread.started` is the only frame carrying the id, and it goes
 /// straight out as [`Event::Ready`].
 pub(super) struct Reader;
 
-impl Decoder for Reader {
+impl Decode for Reader {
     fn read(&mut self, line: &str) -> Vec<Event> {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
             // Codex prints `Reading additional input from stdin...` before its
@@ -284,19 +281,12 @@ mod tests {
 
     #[test]
     fn a_resumed_turn_names_the_thread_and_keeps_every_bypass() {
-        let launch = Launch {
-            kind: Kind::Codex,
-            program: "/opt/codex".into(),
-            cwd: "/work".into(),
-            prompt: None,
-        };
-
-        let first = Codex.argv(&launch, None, Some("hello"));
+        let first = argv(None, "hello");
         assert_eq!(first[0], "exec");
         assert!(!first.iter().any(|a| a == "resume"));
         assert_eq!(first.last().unwrap(), "hello");
 
-        let next = Codex.argv(&launch, Some("thread-1"), Some("again"));
+        let next = argv(Some("thread-1"), "again");
         assert_eq!(&next[..2], ["exec", "resume"]);
         // The id is the first positional and the prompt the second; swapping
         // them sends the prompt as a session id and resumes nothing.

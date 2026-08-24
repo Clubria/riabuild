@@ -118,6 +118,39 @@ pub trait CommandRunner: Send + Sync {
         anyhow::bail!("this CommandRunner cannot pipe `{program}`'s stdio")
     }
 
+    /// Starts a child that outlives riabuild, and returns without a handle.
+    ///
+    /// Every other spawn here is a child riabuild stays responsible for:
+    /// `spawn` and `spawn_piped` both set `kill_on_drop`, so the moment the
+    /// handle goes the child does too. That is right for a tunnel and wrong for
+    /// an agent turn, which has to keep running after the window that started it
+    /// has closed.
+    ///
+    /// Three things make it survive, and leaving out any one of them looks like
+    /// it works until somebody closes a terminal:
+    ///
+    /// - **`setsid`**, so the child leads its own session and process group. A
+    ///   terminal that goes away sends `SIGHUP` to its foreground process group,
+    ///   and a child still in that group dies with the window rather than with
+    ///   the command. Being reparented to init is not enough on its own.
+    /// - **stdio nulled**, so the child holds no descriptor on the terminal —
+    ///   an inherited one keeps the tty open and earns `SIGTTOU` on the first
+    ///   write after the session leader has gone.
+    /// - **no `kill_on_drop`**, which is the whole point.
+    ///
+    /// There is deliberately no handle back. A detached child is not something
+    /// this process can be trusted to wait for or to kill — it is expected to
+    /// outlive it — so liveness is answered where it can be answered honestly,
+    /// by an `flock` the child's own process holds. See `riabuild-agents`.
+    async fn spawn_detached(
+        &self,
+        program: &str,
+        _args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<()> {
+        anyhow::bail!("this CommandRunner cannot detach `{program}`")
+    }
+
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
     async fn run_interactive(

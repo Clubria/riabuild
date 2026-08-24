@@ -1427,11 +1427,16 @@ name = "riabuild-agents"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "getrandom 0.3.4",
  "ratatui",
  "riabuild-harness",
+ "riabuild-paths",
  "riabuild-runner",
  "riabuild-theme",
  "riabuild-ui",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1526,10 +1531,7 @@ dependencies = [
 name = "riabuild-harness"
 version = "0.0.0"
 dependencies = [
- "anyhow",
- "riabuild-runner",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

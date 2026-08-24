@@ -111,6 +111,38 @@ pub(crate) async fn ngrok_token(ctx: &mut Ctx) -> Result<i32> {
     Ok(0)
 }
 
+/// `riabuild internal agent-turn` — one turn of one agent session.
+///
+/// Started detached by `riabuild agents` and by nothing else. Deliberately not
+/// behind `connect`: the harness is already installed, the checkout is already
+/// cloned, and a turn has to keep running on a laptop that lost its network
+/// after the window opened.
+///
+/// The binary is resolved here rather than recorded on the session, because a
+/// versioned path moves with every riabuild upgrade — a session started last
+/// week must run this week's Claude Code, not a directory that no longer exists.
+/// The *profile* is the opposite and is recorded: it is what resume depends on.
+pub(crate) async fn agent_turn(ctx: &mut Ctx, session: &str, prompt_file: &str) -> Result<i32> {
+    let store = riabuild_agents::store::Store::new(ctx.paths.as_ref());
+    let record = store.read(session).await?;
+    let Some(kind) = record.harness() else {
+        anyhow::bail!("session {session} names a harness this riabuild does not know");
+    };
+    let program = match kind {
+        riabuild_harness::Kind::Claude => ctx.claude(),
+        riabuild_harness::Kind::Codex => ctx.codex(),
+        riabuild_harness::Kind::Grok => ctx.grok(),
+    };
+    riabuild_agents::turn::run(
+        ctx.runner.as_ref(),
+        &store,
+        session,
+        &program,
+        std::path::Path::new(prompt_file),
+    )
+    .await
+}
+
 fn not_signed_in() -> riabuild_ui::Failure {
     riabuild_ui::Failure::new(
         "fetching the team's ngrok authtoken",

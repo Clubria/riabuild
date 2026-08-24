@@ -91,6 +91,22 @@ impl CommandRunner for FakeRunner {
         Ok(Box::new(child))
     }
 
+    async fn spawn_detached(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<()> {
+        // Recorded and nothing else, which is the whole of what a test can
+        // check about a detached child: the real one is deliberately unwaitable
+        // and unkillable from here, so there is no handle to hand back and no
+        // outcome to script. What a caller must get right is *what it asked
+        // for* — the argv, the directory and the environment — and `calls()`
+        // is where that is asserted.
+        self.record(program, args, options);
+        Ok(())
+    }
+
     async fn spawn_piped(
         &self,
         program: &str,
@@ -111,20 +127,47 @@ impl CommandRunner for FakeRunner {
         // 64 KB each way, matching a real pipe's buffer closely enough that a
         // test can hit backpressure the same way production would.
         let (their_stdin, our_stdin) = tokio::io::duplex(64 * 1024);
-        let (their_stdout, our_stdout) = tokio::io::duplex(64 * 1024);
+        let (mut their_stdout, our_stdout) = tokio::io::duplex(64 * 1024);
+
+        let exit = match ending {
+            Ending::Alone(output) => Some(output),
+            Ending::OnlyWhenKilled => None,
+        };
+
+        // A child scripted to *exit* has a closed pipe, so its stdout is
+        // delivered here and the far end is dropped rather than handed back.
+        // Keyed on the ending rather than on whether any stdout was scripted:
+        // a stub that exits saying nothing is the commonest way to script a
+        // failure, and holding its pipe open would leave a reader looping until
+        // EOF waiting for ever. That is a hang rather than a failure, and hangs
+        // are precisely what this workspace's macOS CI job exists to catch —
+        // after one cost a release twenty-five minutes of a runner building
+        // nothing.
+        //
+        // `OnlyWhenKilled` keeps its pipes, because that stub is the live
+        // transport a test drives by hand through `pipes`.
+        let far = match &exit {
+            Some(output) => {
+                use tokio::io::AsyncWriteExt;
+                // Small enough for the buffer above, so this cannot block.
+                let _ = their_stdout.write_all(output.stdout.as_bytes()).await;
+                let _ = their_stdout.flush().await;
+                drop(their_stdout);
+                drop(their_stdin);
+                None
+            }
+            None => Some(FakePipes {
+                to_riabuild: their_stdout,
+                from_riabuild: their_stdin,
+            }),
+        };
 
         let child = Arc::new(FakeChild {
             invocation,
-            exit: match ending {
-                Ending::Alone(output) => Some(output),
-                Ending::OnlyWhenKilled => None,
-            },
+            exit,
             stdin: std::sync::Mutex::new(Some(Box::new(our_stdin) as ChildWriter)),
             stdout: std::sync::Mutex::new(Some(Box::new(our_stdout) as ChildReader)),
-            far: std::sync::Mutex::new(Some(FakePipes {
-                to_riabuild: their_stdout,
-                from_riabuild: their_stdin,
-            })),
+            far: std::sync::Mutex::new(far),
             killed: std::sync::Mutex::new(false),
             stopped: tokio::sync::Notify::new(),
         });

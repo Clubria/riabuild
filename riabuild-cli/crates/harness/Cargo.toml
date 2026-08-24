@@ -2,7 +2,7 @@
 name = "riabuild-harness"
 version = "0.0.0"
 edition.workspace = true
-description = "One event stream from Claude Code, the Codex CLI and Grok Build"
+description = "What to run for each agent harness, and how to read what it says"
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -12,21 +12,16 @@ publish = false
 workspace = true
 
 [features]
-# `Fleet::scripted` and the canned-transcript helpers. Behind a feature rather
-# than `#[cfg(test)]` because `riabuild-agents` tests its rendering against these
-# same transcripts, and a dependency crate is never compiled with `cfg(test)`.
+# The canned transcripts, so `riabuild-agents` can test its rendering against
+# bytes three real binaries produced. Behind a feature rather than
+# `#[cfg(test)]` because a dependency crate is never compiled with `cfg(test)`.
 testing = []
 
 [dependencies]
-anyhow.workspace = true
-riabuild-runner.workspace = true
+# The only dependency, and deliberately so. This crate builds argv and decodes
+# lines — it starts nothing, reads nothing and awaits nothing, which is what
+# lets three undocumented wire formats be tested against captured bytes rather
+# than against three signed-in vendor accounts. Spawning belongs to
+# `riabuild-runner`, and where a turn's output is written belongs to
+# `riabuild-agents`.
 serde_json.workspace = true
-# `io-util` is `AsyncBufReadExt::read_line` over the child's stdout; `sync` is
-# the unbounded channel every session's reader task reports on; `macros` is
-# `select!` in the pump. No `process` — spawning belongs to `riabuild-runner`,
-# and this crate could not reach it even if it tried.
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
-
-[dev-dependencies]
-riabuild-runner = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
