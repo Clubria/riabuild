@@ -942,6 +942,29 @@ answer no longer applies through the launcher, so `CLAUDE_CODE_DISABLE_AGENT_VIE
 their way out and the launcher honours it — without that guard a disabled view would not
 degrade to a session, it would exit 1 and take the `claude` command with it.
 
+**`--cwd` opens that view on the checkout, and it is the one flag only the bare line can
+carry.** It belongs to the `agents` *subcommand* rather than to `claude` — `claude --cwd
+<path> mcp list` is "unknown option" — so it sits after the positional, and a copy of it on
+the branch that forwards a developer's own arguments would not scope anything: it would
+break `claude -p`, `claude --resume` and `claude-2 auth login` on every laptop at once, in
+Claude Code's own parser. Which makes it the mirror of
+`--exclude-dynamic-system-prompt-sections`, the one flag only the *other* line can carry,
+and the reason "is it stripped before the positional is tested?" is the wrong question to
+ask of it. An option *after* `agents` costs the view nothing.
+
+Two things about what it does. It scopes the session list to that path — which is what its
+`--help` line says and all it says — *and* it becomes the working directory the view
+reports and dispatches from, which is the half worth having: a `claude` typed in a home
+directory used to open a list of every session on the machine from every checkout. And it
+is a **floor rather than a move**, because Claude Code keeps the process's own working
+directory when that directory is inside the one named here — so `claude` from
+`<checkout>/riabuild-cli`, or from a `.claude/worktrees/` worktree under it, still opens
+where the developer stands. Passed only where the checkout is on disk: a path that is gone
+does not error, it opens a view onto an empty list naming a directory nobody has, which is
+worse than the view the launcher wrote before the flag existed. Verified against 2.1.235 and
+pinned by `the_view_cwd_is_an_agents_option_and_only_an_agents_option`, which asserts both
+halves — accepted after the positional, rejected before it.
+
 **Trust is the only gate Claude Code puts in front of a checkout's settings, and the
 plugins ride on it.** `hasTrustDialogAccepted` — keyed by the checkout's *git root*, which
 is why a subdirectory and a `.claude/worktrees/` worktree both inherit it — is what the

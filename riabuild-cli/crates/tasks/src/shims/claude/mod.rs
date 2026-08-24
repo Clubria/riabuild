@@ -20,6 +20,12 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     let claude = ctx.claude();
     let settings = ctx.paths.org_settings_file();
     let ids = &ctx.config.claude_accounts;
+    // The checkout the agents view opens on. Read here rather than inside the
+    // loop because every account's launcher gets the same one: which repository
+    // this machine is set up for is a fact about the machine, not about a
+    // sign-in. `None` on a machine with no checkout yet, and the launcher then
+    // opens the view exactly as it did before the flag existed.
+    let project = ctx.project_dir();
 
     // Landed by rename, like every other file riabuild generates. Launcher
     // content is deterministic given the account list, so two concurrent
@@ -27,7 +33,13 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     // landing mid-write, which leaves a truncated `claude-2` that fails with a
     // shell syntax error. `write_script` is what guarantees that.
     for (index, id) in ids.iter().enumerate() {
-        let script = launcher_script(&ctx.paths.claude_profile_dir(id), &claude, &settings, &bin);
+        let script = launcher_script(
+            &ctx.paths.claude_profile_dir(id),
+            &claude,
+            &settings,
+            &bin,
+            project.as_deref(),
+        );
         write_script(&bin, &format!("claude-{}", index + 1), &script).await?;
         if index == 0 {
             write_script(&bin, "claude", &script).await?;
