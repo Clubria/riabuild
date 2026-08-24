@@ -12,15 +12,17 @@
 //! `RealPaths::new()` at a time until the library it lives in cannot be built
 //! without the binary.
 
-use crate::cli::{ChannelAction, ClaudeAction, Cli, RemoteAction};
+use crate::cli::{ChannelAction, ClaudeAction, Cli, HarnessArg, RemoteAction};
 use anyhow::Result;
+use riabuild_agents as agents;
 use riabuild_channel as channel;
+use riabuild_harness as harness;
 use riabuild_paths::{Paths, RealPaths};
 use riabuild_remote as remote;
 use riabuild_runner::{CommandRunner, RealRunner};
 use riabuild_tasks::Ctx;
 use riabuild_tasks::{accounts, shims};
-use riabuild_ui::Ui;
+use riabuild_ui::{Failure, Ui};
 use std::sync::Arc;
 
 /// Whether this shell was opened by `riabuild remote`.
@@ -174,6 +176,60 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
         ClaudeAction::New => accounts::command::new(ctx).await,
         ClaudeAction::Delete { number, yes } => accounts::command::delete(ctx, number, yes).await,
         ClaudeAction::Primary { number } => accounts::command::primary(ctx, number).await,
+    }
+}
+
+/// `riabuild agents`
+///
+/// Deliberately not behind `connect`, for the reason `claude` is not: it starts
+/// harnesses riabuild already installed, in a checkout riabuild already cloned,
+/// and talks to no riabuild-web route. A developer on a plane gets the same
+/// window as one at a desk.
+pub async fn agents(ctx: &mut Ctx, with: Vec<HarnessArg>, prompt: Option<String>) -> Result<i32> {
+    let Some(cwd) = ctx.project_dir() else {
+        return Err(Failure::new(
+            "opening the agents window",
+            "Run `riabuild` first, which picks a repository and clones it.",
+        )
+        .detail("No Clubria checkout is set up on this machine yet, so there is nothing for an agent to work on.")
+        .into());
+    };
+
+    let request = agents::Request {
+        programs: agents::Programs {
+            // Absolute, versioned paths. `~/.riabuild/bin` is not on `PATH`
+            // during provisioning, so a bare name would find whichever copy the
+            // laptop already had — the thing riabuild owning its tools exists
+            // to prevent.
+            claude: ctx.claude(),
+            codex: ctx.codex(),
+            grok: ctx.grok(),
+        },
+        cwd: cwd.display().to_string(),
+        open: with
+            .into_iter()
+            .map(|harness| (kind_of(harness), prompt.clone()))
+            .collect(),
+        theme: ctx.ui.theme(),
+        // The same question `riabuild-ui` already answered for the banner, asked
+        // once and in one place rather than decided again with different rules.
+        unicode: riabuild_ui::glyphs_render(),
+    };
+
+    agents::run(ctx.runner.clone(), request).await?;
+    Ok(0)
+}
+
+/// The clap spelling to the library's.
+///
+/// Two enums rather than one because a library crate that derived `ValueEnum`
+/// would have to be compiled with the parser — see the layout rule in
+/// `CLAUDE.md`. The cost is this function, and it is the whole cost.
+fn kind_of(harness: HarnessArg) -> harness::Kind {
+    match harness {
+        HarnessArg::Claude => harness::Kind::Claude,
+        HarnessArg::Codex => harness::Kind::Codex,
+        HarnessArg::Grok => harness::Kind::Grok,
     }
 }
 

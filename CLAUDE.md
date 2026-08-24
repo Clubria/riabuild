@@ -23,7 +23,7 @@ anything structural.
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI — a cargo workspace of thirteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
+| `riabuild-cli/` | Rust CLI — a cargo workspace of fifteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `e2e/` | the CLI and the backend tested together — `run.sh` on macOS, and `remote/` driving `riabuild remote` against a real Debian container. `e2e/README.md` |
 | `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies; `ngrok/` and `grok/` hold the mirror scripts for the two tools nobody publishes a digest for |

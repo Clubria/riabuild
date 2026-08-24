@@ -167,12 +167,17 @@ async fn write_launchers_with(ctx: &Ctx, socket: Option<&str>) -> Result<()> {
         return Ok(());
     }
     shims::write_all(ctx).await?;
+    // Resolved once, before the first write: every shim below names this
+    // path, and a run that cannot answer the question must fail rather
+    // than fall back to a bare `riabuild` that resolves to some other
+    // machine's copy or to nothing.
+    let riabuild = shims::running_binary()?;
+    // `agents` is written on every run rather than only where a channel exists,
+    // because most agent sessions are opened on a laptop and a laptop has no
+    // socket. It reaches nothing across the wire, so there is no condition for
+    // it to be conditional on.
+    shims::write_agents_shim(ctx, &riabuild).await?;
     if socket.is_some_and(|socket| !socket.is_empty()) {
-        // Resolved once, before the first write: every shim below names this
-        // path, and a run that cannot answer the question must fail rather
-        // than fall back to a bare `riabuild` that resolves to some other
-        // machine's copy or to nothing.
-        let riabuild = shims::running_binary()?;
         shims::write_clipboard_shims(ctx, &riabuild).await?;
         shims::write_browser_shim(ctx, &riabuild).await?;
         // And riabuild itself, so the developer whose session this is has the

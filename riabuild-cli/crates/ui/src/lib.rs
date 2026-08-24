@@ -23,6 +23,11 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 mod art;
+// Re-exported because "can this terminal draw the block glyphs?" now has a
+// second caller — `riabuild agents` picks its marks by the same answer. The
+// module stays private: the mark and the banner are this crate's to draw, and
+// only the decision underneath them is shared.
+pub use art::glyphs_render;
 use riabuild_theme::{Role, Theme};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};

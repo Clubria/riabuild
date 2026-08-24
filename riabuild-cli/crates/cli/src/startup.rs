@@ -47,6 +47,11 @@ pub(crate) fn opens_shell(cli: &Cli) -> bool {
             | Command::Channel { .. }
             | Command::Reset { .. }
             | Command::Claude { .. }
+            // `agents` holds the terminal for as long as a shell would, and is
+            // deliberately not one: it draws frames rather than handing the
+            // terminal to a child, so nothing about the GitHub-session marker
+            // an environment shell claims applies to it.
+            | Command::Agents { .. }
             | Command::Status,
         ) => false,
         None => !cli.check && !cli.no_shell,

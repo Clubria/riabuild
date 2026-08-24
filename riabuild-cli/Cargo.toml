@@ -141,6 +141,21 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff"]
 # on top to reach the same primitive. If rustls ever moves to another crypto
 # provider this stays correct and merely stops being free.
 ring = "0.17"
+# The terminal UI `riabuild agents` draws, in ratatui's 0.30 modular shape.
+#
+# `default-features = false` plus `crossterm` asks for exactly one backend. The
+# defaults also pull `ratatui-macros`, `palette` and `document-features`, none of
+# which this binary uses and all of which land in a download a developer waits
+# on. The `crossterm` feature re-exports the backend as `ratatui::crossterm`, so
+# nothing here names crossterm a second time and the two can never disagree
+# about a version.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# `riabuild-theme` is the palette and nothing else: it needs `Color`, `Style` and
+# `Modifier`, not a widget set and not a backend. `ratatui-core` is the crate
+# ratatui 0.30 split those types into for exactly this — colour described without
+# a renderer dragged in behind it, which matters because `riabuild-fetch` and
+# `riabuild-runner` depend on the palette and never draw a frame.
+ratatui-core = "0.1"
 # `rustls-tls-native-roots` reads the OS trust store rather than bundling
 # webpki-roots. A developer behind a corporate TLS-inspecting proxy has that
 # MITM root installed already; bundled roots reject it, and the symptom is an
@@ -182,10 +197,12 @@ zip = { version = "8.6.0", default-features = false, features = [
     "deflate-flate2",
 ] }
 
+riabuild-agents = { path = "crates/agents" }
 riabuild-api = { path = "crates/api" }
 riabuild-channel = { path = "crates/channel" }
 riabuild-fetch = { path = "crates/fetch" }
 riabuild-gh-session = { path = "crates/gh-session" }
+riabuild-harness = { path = "crates/harness" }
 riabuild-keychain = { path = "crates/keychain" }
 riabuild-paths = { path = "crates/paths" }
 riabuild-remote = { path = "crates/remote" }

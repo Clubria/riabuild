@@ -221,6 +221,11 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Claude { action }) => {
             return dispatch::claude(ctx, action.clone()).await;
         }
+        // Not behind `connect` either, and for the same reason: the harnesses
+        // and the checkout are already on this machine.
+        Some(Command::Agents { with, prompt }) => {
+            return dispatch::agents(ctx, with.clone(), prompt.clone()).await;
+        }
         Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
         Some(Command::Channel { .. }) => {
             unreachable!("the channel returns before the setup flow starts")

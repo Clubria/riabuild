@@ -598,7 +598,7 @@ crates form a straight line, each depending only on those above it:
 
 | Crate | What | Depends on |
 |---|---|---|
-| `theme` | the Clubria palette, by role, and the depth ladder under it | — |
+| `theme` | the Clubria palette, by role, and the depth ladder under it — expressed in ratatui's `Color`/`Style`/`Modifier`, so the printed line and the drawn frame share one palette | `ratatui-core` |
 | `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
 | `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | ui |
 | `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
@@ -610,6 +610,8 @@ crates form a straight line, each depending only on those above it:
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
+| `harness` | one event stream from three agent harnesses. `claude`, `codex` and `grok` are the per-vendor encoder/decoder pairs; `Fleet` owns the running sessions and the single channel their reader tasks report on | runner |
+| `agents` | the `riabuild agents` window. `app` is what is on screen and how an event changes it (pure); `draw` turns that into ratatui lines and then into a frame | harness, theme, ui |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -1094,6 +1096,59 @@ Apache-2.0 source at `xai-org/grok-build` — which is why the `#[ignore]`d smok
 shell script. Run `cargo test -- --ignored` when the pin moves. Design:
 `../docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
+## The agents window
+
+`riabuild agents` runs Claude Code, Codex and Grok Build sessions in one terminal window.
+`~/.riabuild/bin/agents` is a generated shim that execs it, which is the whole of how the
+feature has its own executable name — a second binary would mean a `[[bin]]`, an install
+line in the Homebrew formula, the deb and the rpm, and another artefact for `release.yml`
+to build, sign and strip.
+
+**The harnesses are driven headless, not embedded.** Each runs in its own structured
+output mode and riabuild draws the result; nothing renders a vendor's own full-screen
+interface in a pane. That is the choice the whole design rests on, and what it buys is
+*state*: screen-scraping three alternate-screen TUIs tells you which pixels changed,
+reading their event streams tells you which agent is blocked, what it is running and what
+it has spent. The cost is that riabuild owns the rendering, which is what `riabuild-agents`
+is.
+
+**The transport differs per harness, and that is data rather than three code paths.**
+Only Claude Code serves more than one turn from one process — `--input-format stream-json`
+reads a JSON user message per turn off stdin and never closes it. `codex exec` and
+`grok -p` each answer once and exit, and continue through `codex exec resume <id>` and
+`--resume <id>`. `Kind::restart` is that difference, and getting it wrong is not subtle: a
+Codex session modelled as persistent shows an agent that dies after every reply.
+
+**Every session is started with that harness's approvals off, in its own spelling.**
+`--permission-mode bypassPermissions` for Claude Code,
+`--dangerously-bypass-approvals-and-sandbox` (plus `--dangerously-bypass-hook-trust`) for
+`codex exec`, `--always-approve` for Grok Build. None is interchangeable — `codex exec`
+does not accept the `--yolo` the launchers pass — and `dontAsk`, which reads like the same
+thing on two of the three, silently *denies* whatever was not pre-approved and presents as
+an agent refusing its own tools. There is no approval round-trip anywhere in
+`riabuild-harness`, and that absence is what makes one event model possible.
+
+**Claude Code's `--bare` is deliberately not passed.** It is the flag that would suppress
+the remaining hook, plugin and MCP discovery, and its own `--help` says why it cannot be
+used here: *"Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via
+`--settings` (OAuth and keychain are never read)"*. Every Claude account riabuild manages
+is an OAuth sign-in, so `--bare` would break all nine. Full prompt-suppression and
+subscription auth are mutually exclusive on that harness; riabuild keeps the accounts.
+
+**Decoders degrade, never fail.** All three wire formats are undocumented or explicitly
+unstable, so an unrecognised frame produces no events rather than an error, and a line
+that is not JSON is dropped — `codex exec` prints `Reading additional input from stdin...`
+on stdout before its first frame. Read **stdout only**: Codex writes `tracing` diagnostics
+to stderr, and merging the two produces a decoder that dies on the first retry a flaky
+connection causes.
+
+What is pinned against a real binary and what is not is recorded at each match arm.
+Claude Code 2.1.235's stream-json is captured verbatim; Codex 0.148.0's *envelope* is too,
+but only its failure path, because no OpenAI or xAI sign-in existed on the machine this
+was written on — so the successful item bodies and every Grok update shape are marked
+`INFERRED` and are the first thing to re-read when a pin moves. Design:
+`../docs/superpowers/specs/2026-08-24-riabuild-agents-design.md`.
+
 ## Colour
 
 Every colour riabuild prints comes from `riabuild-theme`, chosen by **role** — `Ok`, `Busy`,
@@ -1106,6 +1161,26 @@ The palette is Clubria's own, read from clubria.com: `#f74f25` is the logo mark'
 with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *attributes*
 (dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
 terminal theme and muddy on another.
+
+**The types are ratatui's, and the ladder is not.** `Color`, `Style` and `Modifier` are
+re-exported from `ratatui-core` rather than defined here, because riabuild now paints two
+surfaces — `riabuild-ui` prints lines past a terminal it does not own, `riabuild-agents`
+draws whole frames into one it does — and a private `Rgb` would mean converting at that
+boundary, which is a second palette by another name. What ratatui does **not** bring is
+the reason `riabuild-theme` still exists: it has no notion of terminal capability at all.
+Its backends write a `Color::Rgb` out as a 24-bit escape whatever is on the other end, and
+it has no `NO_COLOR`. So a style passes through `Theme::style` (a role) or `Theme::lower`
+(any colour a widget picked) **before** it reaches a frame, and `Theme::paint` — the SGR
+renderer for line-at-a-time output — is riabuild's too, because ratatui has no API that
+renders one styled string.
+
+Two consequences worth keeping. `riabuild-theme` depends on `ratatui-core` and never on
+`ratatui`: it describes colour and draws nothing, and `riabuild-fetch` and
+`riabuild-runner` depend on it. And `Role::legacy` — the sixteen-colour rendering — is a
+**chosen table rather than a nearest-match**, because nearest-match gets it wrong in a way
+that matters: `--green` (`#3ddc84`) is nearer to `Cyan` than to `Green`, and `--orange`
+lands on `Red` beside `Danger`, so "in progress" and "fatal" would become the same colour.
+`nearest_match_is_why_a_roles_sixteen_colour_palette_is_chosen_by_hand` pins that.
 
 **Two roles on one line are siblings, never nested.** `Theme::paint` closes with
 `\x1b[0m`, which resets every attribute rather than the one it opened, so a `Strong`

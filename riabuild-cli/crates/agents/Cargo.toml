@@ -1,0 +1,30 @@
+[package]
+name = "riabuild-agents"
+version = "0.0.0"
+edition.workspace = true
+description = "riabuild agents: every harness's sessions in one window"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ratatui.workspace = true
+riabuild-harness.workspace = true
+riabuild-runner.workspace = true
+riabuild-theme.workspace = true
+riabuild-ui.workspace = true
+# `sync` is the channel the key thread reports on, `macros` is the `select!`
+# that waits on it and on the fleet at the same time, and `time` is the redraw
+# tick a spinner needs. No `process` and no `fs`: this crate draws, and every
+# subprocess it causes is started by `riabuild-harness` through `CommandRunner`.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+riabuild-harness = { workspace = true, features = ["testing"] }
+riabuild-theme = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
