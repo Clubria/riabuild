@@ -201,6 +201,24 @@ impl<'a> Ssh<'a> {
         self.runner.run("ssh", &refs, &options).await
     }
 
+    /// Held, with the remote command's stdin and stdout kept as pipes.
+    ///
+    /// For the two halves of a mosh session tunnelled over TCP, which need a
+    /// connection that outlives the call and a duplex stream to carry the
+    /// tunnel over. Nothing here asks `sshd` for a port forward, and the test
+    /// at the bottom of this file is what keeps it that way: the transport is
+    /// the command's own stdio, exactly as the clipboard channel's is, so it
+    /// works on a server that grants nothing beyond running a command.
+    pub(crate) async fn spawn_piped(
+        mut self,
+        command: &str,
+    ) -> Result<Box<dyn riabuild_runner::PipedChildHandle>> {
+        let args = self.argv(command);
+        let options = self.run_options();
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.runner.spawn_piped("ssh", &refs, &options).await
+    }
+
     /// A handoff: the child gets riabuild's terminal.
     pub(crate) async fn interactive(mut self, command: &str) -> Result<i32> {
         let args = self.argv(command);

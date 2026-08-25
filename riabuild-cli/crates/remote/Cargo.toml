@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+getrandom.workspace = true
 riabuild-api.workspace = true
 riabuild-channel.workspace = true
 riabuild-fetch.workspace = true
@@ -26,7 +27,8 @@ riabuild-ui.workspace = true
 riabuild-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
+udp-over-tcp.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
