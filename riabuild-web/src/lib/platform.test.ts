@@ -81,15 +81,14 @@ describe("install commands", () => {
     expect(dnf.command).toContain("/etc/yum.repos.d/");
   });
 
-  test("Homebrew taps explicitly before installing", () => {
-    // `brew install clubria/tap/riabuild` alone auto-taps Clubria/homebrew-tap,
-    // which is not this repository, and fails with a confusing 404.
+  test("Homebrew installs in one line, with no explicit tap", () => {
+    // `brew install clubria/tap/riabuild` auto-taps Clubria/homebrew-tap, which
+    // is a real repository carrying the formula. A `brew tap` line creeping
+    // back in is the regression worth catching: it would pin developers to a
+    // tap remote pointing at Clubria/riabuild, which is the copy that gets
+    // retired first.
     const brew = INSTALL_CHOICES.find((c) => c.id === "macos")!;
-    expect(brew.command).toContain(
-      "brew tap clubria/tap https://github.com/Clubria/riabuild",
-    );
-    expect(brew.command.indexOf("brew tap")).toBeLessThan(
-      brew.command.indexOf("brew install"),
-    );
+    expect(brew.command).toBe("brew install clubria/tap/riabuild");
+    expect(brew.command).not.toContain("brew tap");
   });
 });

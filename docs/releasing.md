@@ -1,9 +1,9 @@
 # Releasing riabuild
 
 Cutting a release is one command against a clean main. There is nothing to
-bump first — this repository is its own Homebrew tap, its own apt repository,
-and its own dnf repository, and the release workflow can already write to all
-three.
+bump first — this repository is its own apt repository and its own dnf
+repository, the Homebrew tap is `Clubria/homebrew-tap` next door, and the
+release workflow can already write to all three.
 
 ```sh
 git push origin "v$(date -u +%Y.%m.%d)"    # after: git tag "v$(date -u +%Y.%m.%d)"
@@ -11,12 +11,12 @@ git push origin "v$(date -u +%Y.%m.%d)"    # after: git tag "v$(date -u +%Y.%m.%
 
 `.github/workflows/release.yml` then builds both macOS architectures and both
 Linux ones, publishes them as a GitHub release, commits the rendered formula to
-`Formula/riabuild.rb` on main, and rebuilds the apt and dnf repositories on
-GitHub Pages. A developer picks it up with:
+`Formula/riabuild.rb` in `Clubria/homebrew-tap` and again on main here, and
+rebuilds the apt and dnf repositories on GitHub Pages. A developer picks it up
+with:
 
 ```sh
 # macOS
-brew tap clubria/tap https://github.com/Clubria/riabuild   # first time only
 brew install clubria/tap/riabuild
 
 # Debian, Ubuntu
@@ -113,21 +113,40 @@ above every real date, so a development build clears whatever `minCliVersion`
 the server enforces and never talks itself into running `brew upgrade` over the
 binary being worked on.
 
-## This repository is the tap
+## The tap is a separate repository
 
 Homebrew will tap any git repository under a name you choose, provided the
-formulae live in `Formula/`. `brew tap clubria/tap <url>` registers this
-repository under the name `clubria/tap`, so `clubria/tap/riabuild` resolves
-and, importantly, so does the `brew upgrade clubria/tap/riabuild` that
-`update.rs` runs on its own.
+formulae live in `Formula/`. It will also tap one *without* being asked, and
+that is the only reason the tap is not this repository: given
+`clubria/tap/riabuild`, Homebrew derives a repository name from the tap name
+and clones it, and the name it derives is `Clubria/homebrew-tap`. So that
+repository exists, holds nothing but `Formula/riabuild.rb` and a README, and
+install is one line with no `brew tap` in front of it.
 
-The cost is the explicit `brew tap` line. `brew install clubria/tap/riabuild`
-auto-taps only when Homebrew can derive the repository name from the tap name,
-and the name it derives is `Clubria/homebrew-tap`. Collapsing install back to a
-single command means a separate repository with that exact name; nothing else
-about the pipeline would change.
+The tap name is unchanged at `clubria/tap`, which is what makes this cheap:
+`brew upgrade clubria/tap/riabuild` — the command `update.rs` runs on its own
+and the one `convex/http.ts` prints on a `cli_too_old` — resolves exactly as
+before, so no CLI already in the field needed a change.
 
-Both the repository and the release assets are public, which is what makes
+**The formula is written to both repositories on every release**, by the
+`formula` job. The tap gets it first, because that is where a new install reads
+from. The copy here is not vestigial: a laptop provisioned before this change
+ran `brew tap clubria/tap https://github.com/Clubria/riabuild` and has a tap
+remote pointing at *this* repository, and Homebrew has no notion of a tap that
+moved. Dropping `Formula/riabuild.rb` from here would leave those laptops on a
+tap that never changes again — `brew upgrade` keeps exiting 0, finds nothing,
+and riabuild's own self-update reports success while staying on its installed
+version. That is a failure nobody sees, so the dual write stays until no
+developer is on the old remote. To move one, `brew untap clubria/tap` and
+install again.
+
+Pushing to a second repository needs a credential the workflow's own
+`GITHUB_TOKEN` cannot be: it is scoped to this repository alone. The `formula`
+job reads **`HOMEBREW_TAP_TOKEN`**, a fine-grained PAT with `contents: write`
+on `Clubria/homebrew-tap` and nothing else, and fails loudly when it is unset
+rather than leaving the tap silently a release behind.
+
+Both repositories and the release assets are public, which is what makes
 `brew install` work at all: it fetches with plain `curl`, carrying no GitHub
 credentials. Nothing is lost by that — the binary contains no secrets, and org
 membership, secret brokering, and org config are re-verified server-side on
@@ -291,10 +310,12 @@ is not glibc's. Neither is visible without making a real request, so the Linux
 job runs `tls_and_dns_work_on_this_build` — an otherwise-ignored test that
 fetches a real URL over TLS — against the artefact it just built.
 
-**The formula job checks out main, not the tag.** `brew tap` clones the default
-branch and reads nothing else, so a formula committed onto the tag would never
-be seen. It rebases before pushing, because anything merged while the macOS
-build was running would otherwise reject the push.
+**The formula job checks out main, not the tag.** Homebrew clones a tap's
+default branch and reads nothing else, so a formula committed onto the tag
+would never be seen — in either repository. It rebases before pushing here,
+because anything merged while the macOS build was running would otherwise
+reject the push; the tap repository takes nobody else's commits, so its push
+needs no such handling.
 
 **The version is announced, not just published.** The CLI reads what to upgrade
 to from `/api/v1/org/config`, never from GitHub, so a GitHub release nobody has
@@ -330,7 +351,9 @@ already been published.
 | `riabuild --version` says `9999.0.0-dev` | A binary built without `RIABUILD_VERSION` — a local `cargo build`, not a release. |
 | `formula` job fails, release published | Usually a push race on main. Re-run the job; it rebases. |
 | `brew install` reports 404 | The release assets did not upload, or the repository stopped being public. |
-| `brew install` cannot find the formula | The developer skipped `brew tap`, or the formula has not landed on main yet. |
+| `brew install` cannot find the formula | The formula has not landed on `Clubria/homebrew-tap`'s main yet, or that repository stopped being public. |
+| `brew upgrade` finds nothing, on one developer's laptop only | They are still tapped against `Clubria/riabuild` from before the tap moved, and that copy has stopped being written. `brew untap clubria/tap` and install again. |
+| `formula` job fails on "HOMEBREW_TAP_TOKEN is unset" | The secret is missing or its PAT expired. See [The tap is a separate repository](#the-tap-is-a-separate-repository). |
 | `riabuild` installs but is killed on launch | A signing problem — check the `Sign` step ran. |
 | Nobody is offered the new version | The `announce` job was skipped — `CONVEX_DEPLOY_KEY` is unset. |
 | No Linux developer is offered the version | The `pages` job warned and stopped — `PACKAGE_SIGNING_KEY` is unset. See [The signing key](#the-signing-key). |
