@@ -74,6 +74,16 @@ const NO_MOSH_SERVER: i32 = 3;
 /// exactly like a server thinking about it.
 const HANDSHAKE: Duration = Duration::from_secs(20);
 
+/// The bound on the whole of [`ask`] — the line, the probe and the exit status
+/// together.
+///
+/// One bound over all three rather than one each, because what riabuild is
+/// buying here is the guarantee that asking about mosh can never be why a
+/// session did not open. A server that answers nothing at all leaves both the
+/// read *and* the `wait` after it with nothing to resolve, so bounding only the
+/// read would move the hang one line down.
+const DECISION: Duration = Duration::from_secs(25);
+
 /// A line can only be so long before it is not the line riabuild is waiting
 /// for. Nothing legitimate here exceeds forty bytes.
 const LINE_LIMIT: usize = 256;
@@ -125,8 +135,21 @@ pub(crate) async fn ask(
         Err(_) => return Route::Direct,
     };
 
-    let route = match echo_port(child.as_ref()).await {
-        Some(port) => match probe::reaches(&remote.host, port).await {
+    let route = tokio::time::timeout(DECISION, decide(child.as_ref(), &remote.host))
+        .await
+        .unwrap_or(Route::Direct);
+    let _ = child.kill().await;
+    route
+}
+
+/// The decision itself, with the connection already open.
+///
+/// Split from [`ask`] so that one `timeout` covers every step of it — see
+/// [`DECISION`] — and so the branch structure is readable without the ssh
+/// around it.
+async fn decide(child: &dyn PipedChildHandle, host: &str) -> Route {
+    match echo_port(child).await {
+        Some(port) => match probe::reaches(host, port).await {
             true => Route::Direct,
             false => Route::OverTcp,
         },
@@ -137,9 +160,7 @@ pub(crate) async fn ask(
             Ok(output) if output.code == Some(NO_MOSH_SERVER) => Route::NoServer,
             _ => Route::Direct,
         },
-    };
-    let _ = child.kill().await;
-    route
+    }
 }
 
 /// The port `internal udp-echo` bound, from the one line it prints.
@@ -149,7 +170,11 @@ async fn echo_port(child: &dyn PipedChildHandle) -> Option<u16> {
         .await
         .ok()?
         .ok()?;
-    line.trim().strip_prefix(ECHO_PORT_LINE)?.trim().parse().ok()
+    line.trim()
+        .strip_prefix(ECHO_PORT_LINE)?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Reads one `\n`-terminated line, a byte at a time and without a `BufReader`.
@@ -229,7 +254,8 @@ fn tcp_options() -> udp_over_tcp::TcpOptions {
 /// the path a session is about to take.
 async fn bind_in_mosh_range() -> Result<tokio::net::UdpSocket> {
     for port in MOSH_PORTS {
-        if let Ok(socket) = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await
+        if let Ok(socket) =
+            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await
         {
             return Ok(socket);
         }
@@ -244,6 +270,99 @@ async fn bind_in_mosh_range() -> Result<tokio::net::UdpSocket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use riabuild_runner::{FakeRunner, RunOptions};
+    use tokio::io::AsyncWriteExt;
+
+    /// A probe connection and the far end of its stdio, so a test can play the
+    /// server: announce a port, or say nothing and go away.
+    async fn probe(fake: &Arc<FakeRunner>) -> Box<dyn PipedChildHandle> {
+        fake.spawn_piped("ssh", &["build-01"], &RunOptions::default())
+            .await
+            .expect("a probe")
+    }
+
+    /// A UDP port that was free a moment ago and has nothing on it — what a
+    /// blocked network is indistinguishable from, and deliberately so: riabuild
+    /// tunnels either way, because both mean this session will not work.
+    async fn a_silent_port() -> u16 {
+        let taken = tokio::net::UdpSocket::bind(loopback(0))
+            .await
+            .expect("a socket");
+        let port = taken.local_addr().expect("an address").port();
+        drop(taken);
+        port
+    }
+
+    /// The whole point of the module, at the level the decision is made.
+    #[tokio::test]
+    async fn a_datagram_that_does_not_come_back_is_a_session_over_tcp() {
+        let fake = Arc::new(FakeRunner::new());
+        let child = probe(&fake).await;
+        let mut pipes = fake.pipes(0).expect("the far end");
+        let port = a_silent_port().await;
+        pipes
+            .to_riabuild
+            .write_all(format!("{ECHO_PORT_LINE} {port}\n").as_bytes())
+            .await
+            .expect("announces its port");
+
+        assert_eq!(decide(child.as_ref(), "127.0.0.1").await, Route::OverTcp);
+    }
+
+    /// …and one that does come back is the mosh riabuild has always run. The
+    /// tunnel costs roaming, so it is taken only where the direct path is
+    /// *proven* not to work.
+    #[tokio::test]
+    async fn a_datagram_that_comes_back_is_the_mosh_riabuild_always_ran() {
+        let fake = Arc::new(FakeRunner::new());
+        let child = probe(&fake).await;
+        let mut pipes = fake.pipes(0).expect("the far end");
+
+        let echo = tokio::net::UdpSocket::bind(loopback(0))
+            .await
+            .expect("a socket");
+        let port = echo.local_addr().expect("an address").port();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 2048];
+            while let Ok((read, from)) = echo.recv_from(&mut buffer).await {
+                let _ = echo.send_to(&buffer[..read], from).await;
+            }
+        });
+        pipes
+            .to_riabuild
+            .write_all(format!("{ECHO_PORT_LINE} {port}\n").as_bytes())
+            .await
+            .expect("announces its port");
+
+        assert_eq!(decide(child.as_ref(), "127.0.0.1").await, Route::Direct);
+    }
+
+    /// The script's own exit status, which is the only thing that may mean
+    /// "this server has no mosh". A connection that failed exits 255 and a
+    /// command a shell could not run exits 126 or 127, and none of those is
+    /// this.
+    #[tokio::test]
+    async fn a_server_without_mosh_server_says_so_in_its_exit_status() {
+        let fake = Arc::new(FakeRunner::new().spawning("ssh", NO_MOSH_SERVER, ""));
+        let child = probe(&fake).await;
+        assert_eq!(decide(child.as_ref(), "127.0.0.1").await, Route::NoServer);
+    }
+
+    /// Every other way of ending is "could not tell", and riabuild answers that
+    /// with exactly the behaviour it had before any of this existed. A probe
+    /// that failed must never be why a session did not open.
+    #[tokio::test]
+    async fn a_probe_that_failed_is_not_an_answer_about_udp() {
+        for code in [255, 127, 1, 0] {
+            let fake = Arc::new(FakeRunner::new().spawning("ssh", code, ""));
+            let child = probe(&fake).await;
+            assert_eq!(
+                decide(child.as_ref(), "127.0.0.1").await,
+                Route::Direct,
+                "exit {code}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn a_line_is_read_without_swallowing_what_follows_it() {

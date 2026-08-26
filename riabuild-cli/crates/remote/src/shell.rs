@@ -8,26 +8,12 @@
 //! printed one of its own puts it at the top of a fresh mosh screen where
 //! there is nothing above it to separate from.
 
-use super::{NO_TMUX, Remote, askpass, ssh::Ssh};
+use super::{NO_TMUX, Remote, askpass, mosh, ssh::Ssh};
 use anyhow::Result;
 use riabuild_paths::Paths;
 use riabuild_runner::CommandRunner;
 use riabuild_ui::Ui;
 use std::sync::Arc;
-
-async fn has_mosh_server(
-    remote: &Remote,
-    paths: &dyn Paths,
-    runner: &Arc<dyn CommandRunner>,
-    carry: Option<&crate::issued::Working>,
-) -> bool {
-    Ssh::to(remote, paths, runner.clone())
-        .carry(carry)
-        .run("command -v mosh-server")
-        .await
-        .map(|output| output.ok())
-        .unwrap_or(false)
-}
 
 /// Seconds between keepalives on a connection that has gone quiet.
 const ALIVE_INTERVAL: u32 = 20;
@@ -107,16 +93,46 @@ pub async fn run_setup(
     code
 }
 
+/// The developer's shell, by the best route this network allows.
+///
+/// Three of them, and which one is taken is [`mosh::ask`]'s answer rather than
+/// this function's guess. The order below is the order of preference and also
+/// the order of how much has to be true for each to work: plain mosh needs UDP
+/// to reach the server, the tunnel needs only the ssh connection riabuild was
+/// making anyway, and `ssh -t` needs nothing at all.
+///
+/// `binary` is the server's own riabuild with its environment prefix already on
+/// it. Both halves of the tunnel are that binary — see `mosh` — so this is the
+/// one argument the mosh path gained over the one it had.
 pub async fn open(
     remote: &Remote,
     paths: &dyn Paths,
     runner: Arc<dyn CommandRunner>,
     ui: &Ui,
     command: &str,
+    binary: &str,
     carry: Option<&crate::issued::Working>,
 ) -> Result<i32> {
     let local_mosh = runner.which("mosh").is_some();
-    if local_mosh && has_mosh_server(remote, paths, &runner, carry).await {
+    let route = match local_mosh {
+        true => mosh::ask(remote, paths, &runner, binary, carry).await,
+        // Nothing on this laptop can speak mosh, so asking the server about it
+        // would be one connection spent on an answer riabuild cannot use.
+        false => mosh::Route::NoServer,
+    };
+
+    // The tunnel, which is the whole of what this module gained: a network that
+    // drops UDP is a conference guest network or a corporate egress filter, not
+    // a mistake anybody made, and it used to cost the developer nineteen
+    // seconds of silence and then a plain `ssh` with no explanation.
+    if route == mosh::Route::OverTcp {
+        if let Some(code) =
+            mosh::open_over_tcp(remote, paths, runner.clone(), ui, command, binary, carry).await
+        {
+            return Ok(code);
+        }
+        ui.warn("mosh could not be tunnelled over TCP — falling back to ssh.");
+    } else if local_mosh && route == mosh::Route::Direct {
         let ssh = format!(
             "ssh {}",
             Ssh::to(remote, paths, runner.clone())
@@ -218,6 +234,26 @@ mod tests {
         }
     }
 
+    /// The server's own riabuild, env-prefixed, as `connect` builds it.
+    ///
+    /// Only the mosh probe and the two halves of the tunnel append to it, and
+    /// no assertion below depends on its contents — what matters is that the
+    /// value reaching `open` is the one `env_command` produced rather than a
+    /// bare `riabuild` the server's `PATH` would have to resolve.
+    const BINARY: &str = "env 'RIABUILD_ROOT=/home/ada/.riabuild-remote/abc' \
+                          '/home/ada/.riabuild/riabuild/2026.08.26/riabuild'";
+
+    /// A fake whose mosh probe answers "could not tell".
+    ///
+    /// The probe is a held child, so scripting it is `spawning` rather than
+    /// `with`: this one starts, exits 0, and prints no port line — which
+    /// `mosh::ask` reads as [`mosh::Route::Direct`], the answer it gives to
+    /// every question it could not settle. That is the branch every test below
+    /// that expects plain mosh is about.
+    fn cannot_tell() -> FakeRunner {
+        FakeRunner::new().spawning("ssh", 0, "")
+    }
+
     fn ssh_call(fake: &Arc<FakeRunner>) -> String {
         fake.calls()
             .into_iter()
@@ -237,6 +273,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -318,17 +355,14 @@ mod tests {
     async fn mosh_is_used_when_the_server_has_it() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
-                .with("mosh", 0, "", ""),
-        );
+        let fake = Arc::new(cannot_tell().with("ssh", 0, "", "").with("mosh", 0, "", ""));
         open(
             &remote(),
             &paths,
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -352,11 +386,7 @@ mod tests {
     async fn the_login_shell_mosh_starts_is_told_not_to_start_tmux() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
-                .with("mosh", 0, "", ""),
-        );
+        let fake = Arc::new(cannot_tell().with("ssh", 0, "", "").with("mosh", 0, "", ""));
 
         open(
             &remote(),
@@ -364,6 +394,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "env 'RIABUILD_ROOT=/home/dev/.riabuild-remote/abc' riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -388,12 +419,17 @@ mod tests {
         // `which` only knows stubbed programs, so mosh must be stubbed for the
         // laptop-has-mosh branch to be the one under test; the server-side probe
         // is what fails here.
-        let fake = Arc::new(FakeRunner::new().with("mosh", 0, "", "").containing(
-            "command -v mosh-server",
-            1,
-            "",
-            "not found",
-        ));
+        //
+        // Exit 3 is `mosh::NO_MOSH_SERVER` — the one status the probe script
+        // returns for itself, chosen to be distinguishable from ssh's own 255
+        // and from a shell's 126/127, so "this server has no mosh" is never
+        // read off a connection that failed.
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("mosh", 0, "", "")
+                .with("ssh", 0, "", "")
+                .spawning("ssh", 3, "mosh-server: not found"),
+        );
 
         open(
             &remote(),
@@ -401,6 +437,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -427,11 +464,7 @@ mod tests {
     async fn mosh_that_cannot_connect_falls_back_to_ssh() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
-                .with("mosh", 1, "", ""),
-        );
+        let fake = Arc::new(cannot_tell().with("ssh", 0, "", "").with("mosh", 1, "", ""));
 
         open(
             &remote(),
@@ -439,6 +472,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -467,11 +501,7 @@ mod tests {
     async fn a_mosh_session_that_ended_normally_does_not_reopen_over_ssh() {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
-        let fake = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
-                .with("mosh", 0, "", ""),
-        );
+        let fake = Arc::new(cannot_tell().with("ssh", 0, "", "").with("mosh", 0, "", ""));
 
         open(
             &remote(),
@@ -479,6 +509,7 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
@@ -494,7 +525,9 @@ mod tests {
     #[tokio::test]
     async fn no_mosh_on_the_laptop_falls_back_to_ssh_and_says_so() {
         // Distinct from the server-side gap above: here the laptop itself has no
-        // mosh binary at all, so `has_mosh_server` must never even be asked.
+        // mosh binary at all, so the server is never asked about mosh — and
+        // that is now a connection saved rather than a tidiness, because the
+        // probe is a held ssh that binds a UDP port on the far side.
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
         let fake = Arc::new(FakeRunner::new());
@@ -505,21 +538,102 @@ mod tests {
             fake.clone(),
             &Ui::new(true),
             "riabuild shell",
+            BINARY,
             None,
         )
         .await
         .expect("falls back");
 
         assert!(
-            !fake.calls().iter().any(|call| call.contains("mosh-server")),
+            fake.spawns().is_empty(),
             "the laptop has no mosh, so the server was never asked: {:?}",
-            fake.calls()
+            fake.spawns()
         );
         assert!(
             fake.calls()
                 .iter()
                 .any(|call| call.starts_with("ssh") && call.contains("-t")),
             "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// A network that drops UDP takes the tunnel, and never the direct mosh
+    /// that is about to fail.
+    ///
+    /// The probe is driven by hand here because that is the only way to reach
+    /// this branch: the server announces a port, nothing answers on it, and
+    /// `mosh::ask` returns [`mosh::Route::OverTcp`]. This laptop has no
+    /// `mosh-client`, so the tunnel then gives up — which is the *second* thing
+    /// asserted, because a tunnel that cannot start must still leave the
+    /// developer with a shell.
+    #[tokio::test]
+    async fn a_network_that_blocks_udp_never_runs_the_mosh_that_would_fail() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        let fake = Arc::new(
+            FakeRunner::new()
+                .with("mosh", 0, "", "")
+                .with("ssh", 0, "", ""),
+        );
+
+        // A port that was free a moment ago: from the laptop it is
+        // indistinguishable from a firewall dropping the datagram, which is the
+        // point — both mean this session will not work over UDP.
+        let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a socket");
+        let port = silent.local_addr().expect("an address").port();
+        drop(silent);
+
+        // `join!` rather than `spawn`, so the test can keep lending `open` the
+        // borrowed remote, paths and `Ui` it takes. All three have to outlive
+        // the call for exactly that reason.
+        let (server, ui) = (remote(), Ui::new(true));
+        let opening = open(
+            &server,
+            &paths,
+            fake.clone(),
+            &ui,
+            "riabuild shell",
+            BINARY,
+            None,
+        );
+        let answering = async {
+            for _ in 0..100_000 {
+                if let Some(mut pipes) = fake.pipes(0) {
+                    use tokio::io::AsyncWriteExt;
+                    pipes
+                        .to_riabuild
+                        .write_all(format!("RIABUILD-UDP-ECHO {port}\n").as_bytes())
+                        .await
+                        .expect("announces its port");
+                    // Held open: an echo responder does not exit after printing
+                    // its line, and one that closed the pipe would look like a
+                    // server that never had riabuild on it.
+                    std::future::pending::<()>().await;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        // `select!`, not `join!`: the responder is deliberately a future that
+        // never finishes — a real one stays up for the whole probe — so joining
+        // the two would wait for a server that has nothing left to say.
+        tokio::select! {
+            code = opening => { code.expect("falls back to ssh"); }
+            () = answering => unreachable!("the responder outlives the probe"),
+        }
+
+        assert!(
+            !fake.calls().iter().any(|call| call.starts_with("mosh ")),
+            "the direct mosh is the one thing this network cannot carry: {:?}",
+            fake.calls()
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("ssh -t ") && call.contains("riabuild shell")),
+            "a tunnel that could not start must still leave a shell: {:?}",
             fake.calls()
         );
     }
@@ -536,24 +650,36 @@ mod tests {
         let home = tempfile::TempDir::new().expect("tempdir");
         let paths = riabuild_paths::RealPaths::rooted_at(home.path());
 
-        let with_mosh = Arc::new(
-            FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
-                .with("mosh", 0, "", ""),
-        );
+        let with_mosh = Arc::new(cannot_tell().with("ssh", 0, "", "").with("mosh", 0, "", ""));
         let ui = Ui::new(false);
-        open(&remote(), &paths, with_mosh, &ui, "riabuild shell", None)
-            .await
-            .expect("opens");
+        open(
+            &remote(),
+            &paths,
+            with_mosh,
+            &ui,
+            "riabuild shell",
+            BINARY,
+            None,
+        )
+        .await
+        .expect("opens");
         assert_eq!(ui.blanks(), 1, "mosh");
 
         // No mosh on the laptop: a note is printed first, and the gap belongs
         // under it rather than over it.
         let without_mosh = Arc::new(FakeRunner::new().with("ssh", 0, "", ""));
         let ui = Ui::new(false);
-        open(&remote(), &paths, without_mosh, &ui, "riabuild shell", None)
-            .await
-            .expect("falls back");
+        open(
+            &remote(),
+            &paths,
+            without_mosh,
+            &ui,
+            "riabuild shell",
+            BINARY,
+            None,
+        )
+        .await
+        .expect("falls back");
         assert_eq!(ui.blanks(), 1, "ssh");
     }
 

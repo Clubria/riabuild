@@ -378,6 +378,10 @@ pub(super) async fn connect_and_setup(
             // several developers share, is one socket for all of them.
             pump: env_command(&prefix_refs, &binary, &["channel", "pump"]),
             shell: env_command(&prefix_refs, &binary, &["shell"]),
+            // The same prefix once more, with nothing appended: the mosh probe
+            // and the server end of a tunnelled mosh session are both this
+            // binary, so the tunnel needs no second tool installed anywhere.
+            binary: remote_binary.clone(),
             carry,
         })
         .await

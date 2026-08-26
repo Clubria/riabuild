@@ -27,7 +27,18 @@ riabuild-ui.workspace = true
 riabuild-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
+# `io-std` and `macros` are the tunnel's: the server end of a mosh session
+# carried over TCP *is* its own stdio, and both ends `select!` between the two
+# directions of the pump.
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "time",
+] }
 udp-over-tcp.workspace = true
 
 [dev-dependencies]
