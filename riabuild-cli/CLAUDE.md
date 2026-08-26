@@ -218,6 +218,28 @@ is `Ctx::repo`, set by the picker or by `--repo`; a task that reaches for the or
 instead will clone one repository and provision another, on a machine where every test
 still passes because the two are the same value until somebody picks.
 
+**A remote run asks both of its questions on the laptop, before the first `ssh`.** Which
+server, then which repository, back to back — and the answer travels to the server as
+`--repo`, which is the flag that already existed for naming one and which the server's own
+picker already stands aside for. It used to be asked on the far side, by the server's own
+riabuild over `ssh -t`, which put the two halves of one run at opposite ends of a host key,
+an `ssh-copy-id`, an install and a session mint: the developer committed to provisioning a
+machine before being asked what it was for.
+
+Two things hold that up and both are load-bearing. The laptop must **write nothing about
+itself** — `repo::pick::choose` records what it settled on in this machine's `config.json`,
+so `riabuild remote gpu` would otherwise leave the laptop working on whatever the server
+was told to. `repo::pick::offer` is the same question with none of that, and where the
+answer goes instead is `Record.repo`, beside the server in `remotes.json`. And that field
+is not bookkeeping: it is the memory the *server's* picker used to keep, and a laptop that
+always passes `--repo` never lets the server offer it, so pressing Enter would silently
+move a server onto whatever the laptop was doing. Design:
+`../docs/superpowers/specs/2026-08-26-remote-repository-first-design.md`.
+
+Where the checkout *goes* is still asked on the server, by the server, and that is correct
+rather than an omission: `project::choose_dir` is a question about a filesystem this laptop
+cannot see.
+
 **Every prompt has a default.** `Ui::ask` returns `None` when there is no terminal — in
 CI, over a pipe, under `cargo test` — so a question is how riabuild offers a choice, never
 how it obtains a value it cannot otherwise get. A prompt that is the only route to an
@@ -609,7 +631,7 @@ crates form a straight line, each depending only on those above it:
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
-| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
+| `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `repo` is the question straight after it — which repository, asked here rather than on the server, and forwarded as `--repo`; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `harness` | what to run for each agent harness and how to read what it says. `claude`, `codex` and `grok` build one turn's argv and decode that harness's NDJSON. Starts nothing and reads nothing | — |
 | `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure); `draw` turns that into ratatui lines and then into a frame | harness, paths, runner, theme, ui |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |

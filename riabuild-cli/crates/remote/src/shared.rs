@@ -126,6 +126,7 @@ pub fn reconcile(ui: &Ui, store: &mut Store, servers: &[SharedServer]) -> Vec<Re
                 session_expires_at: 0,
                 last_seen_cli_version: String::new(),
                 home: String::new(),
+                repo: String::new(),
                 session_id: String::new(),
                 shared_id: server.id.clone(),
                 fresh: true,

@@ -37,6 +37,7 @@ pub mod install;
 pub mod issued;
 pub mod pick;
 pub mod render;
+pub mod repo;
 pub mod seed;
 pub mod session;
 pub mod shared;
@@ -70,8 +71,13 @@ pub struct Request {
     pub no_shell: bool,
     /// Where the checkout should live *on the server*, not on this laptop.
     pub project: Option<String>,
-    /// `--repo`, forwarded for the server's own riabuild to act on — it is the
-    /// one that puts the picker's question, and the one that clones.
+    /// `--repo`, an answer the developer has already given on the command line.
+    ///
+    /// It is not what reaches the server: `repo::choose_for` resolves this,
+    /// what the laptop last set that server up for, and the question it puts
+    /// before connecting into the one `--repo` the server's own riabuild is run
+    /// with — the flag being both the way in and the way out is why that
+    /// resolution has a name rather than being read off here twice.
     pub repo: Option<String>,
 }
 

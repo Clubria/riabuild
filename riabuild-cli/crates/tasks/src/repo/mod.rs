@@ -9,6 +9,12 @@
 //! runs, because it decides what "the project" means for every task that reads a
 //! checkout — and because a task that asked something on every run would be a
 //! task that is never satisfied.
+//!
+//! Asking and recording are separate for a second caller's sake: `riabuild
+//! remote` puts this question on the laptop *for a server*, where every write
+//! `pick::choose` makes would be about the wrong machine. `pick::offer` is the
+//! box and the question with nothing written down, and `remote::repo` is what
+//! does the recording there instead.
 
 pub mod list;
 pub mod pick;

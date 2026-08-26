@@ -81,6 +81,7 @@ pub fn add(store: &mut Store, remote: &Remote) {
         session_expires_at: 0,
         last_seen_cli_version: String::new(),
         home: String::new(),
+        repo: String::new(),
         session_id: String::new(),
         shared_id: String::new(),
         fresh: false,
@@ -231,14 +232,31 @@ async fn keep_unreadable(path: &std::path::Path, why: &str) {
 }
 
 /// What a successful connect leaves behind: this server moves to the front of
-/// "recently used", and remembers the riabuild version it is now running.
-pub async fn remember(ctx: &Ctx, store: &mut Store, remote: &Remote, version: &str) -> Result<()> {
+/// "recently used", remembers the riabuild version it is now running, and
+/// remembers the repository it was set up for.
+///
+/// `repo` is `None` where this run had nothing to say about it — a `--check`,
+/// or an unattended run on a server this laptop has never chosen for — and a
+/// `None` leaves whatever is recorded alone rather than clearing it. Written
+/// here rather than when the question is answered, because what is worth
+/// remembering is the repository a server was *set up for*: a run that failed
+/// on the way there has left the server on whatever it had before.
+pub async fn remember(
+    ctx: &Ctx,
+    store: &mut Store,
+    remote: &Remote,
+    version: &str,
+    repo: Option<&str>,
+) -> Result<()> {
     // `find_mut`, not a match on the bare `name`: `remote.name` is the display
     // name, so a shared server would otherwise miss its own record and a local
     // server of the same bare name would be stamped instead.
     if let Some(record) = store.find_mut(&remote.name) {
         record.last_used_at = riabuild_paths::config::now_secs();
         record.last_seen_cli_version = version.to_string();
+        if let Some(repo) = repo {
+            record.repo = repo.to_string();
+        }
     }
     persist_one(ctx.paths.as_ref(), store, &remote.name).await
 }

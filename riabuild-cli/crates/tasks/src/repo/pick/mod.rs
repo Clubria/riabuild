@@ -30,6 +30,7 @@ use anyhow::Result;
 use riabuild_api::Repo;
 use riabuild_paths::config::UserConfig;
 use riabuild_ui::Ui;
+use std::collections::BTreeMap;
 
 /// Which repository this run is about, asked if there is anybody to ask.
 ///
@@ -53,6 +54,63 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
         return adopt(ctx, default, &org_default).await;
     }
 
+    let chosen = offer(
+        ctx,
+        Offer {
+            default: &default,
+            org_default: &org_default,
+            known: &ctx.config.repos,
+            on: None,
+        },
+    )
+    .await;
+    adopt(ctx, chosen, &org_default).await
+}
+
+/// Who the question is being put for, and what it may say about their machine.
+///
+/// Named fields rather than four positional arguments, for the reason
+/// `remote::Request` gives: two of these are a `&Repo` and the other two are
+/// about *whose* machine is being asked about, so an argument list of that
+/// shape is one transposition away from asking the wrong question about the
+/// wrong box.
+pub struct Offer<'a> {
+    /// What Enter takes.
+    pub default: &'a Repo,
+    /// The org default, which is the row the box marks as such.
+    pub org_default: &'a Repo,
+    /// The checkouts to mark as already present, and to offer even where the
+    /// listing does not mention them. This machine's own for a local run, and
+    /// **empty** where the answer is for a server: a laptop cannot see what a
+    /// server has cloned, and a row claiming otherwise would be a guess printed
+    /// as a fact.
+    pub known: &'a BTreeMap<String, String>,
+    /// The server this is being asked on behalf of, named in the question when
+    /// it is not this machine — so a developer connecting to `build-01` is not
+    /// asked an unqualified "which repository?" that reads as a question about
+    /// the laptop it is typed on.
+    pub on: Option<&'a str>,
+}
+
+/// The box, the question, and nothing written down.
+///
+/// Split out of [`choose`] because `riabuild remote` puts the same question on
+/// the laptop *for a server*, where every write `adopt` makes would be about the
+/// wrong machine: that answer travels on as `--repo` and is recorded beside the
+/// server in `remotes.json`, and this laptop's own `config.json` has nothing to
+/// do with it.
+///
+/// The caller decides whether there is anybody to ask. Both of them check
+/// before the listing is fetched rather than after, so an unattended run does
+/// not spend a GitHub round trip on a box nobody will see.
+pub async fn offer(ctx: &Ctx, offer: Offer<'_>) -> Repo {
+    let Offer {
+        default,
+        org_default,
+        known,
+        on,
+    } = offer;
+
     let listing = list::fetch(ctx, org_default.owner()).await;
     let entries = match &listing {
         Listing::Repos(entries) => entries.as_slice(),
@@ -73,7 +131,7 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
         }
     };
 
-    let (rows, hidden) = rows_for(entries, &ctx.config.repos, &default, &org_default);
+    let (rows, hidden) = rows_for(entries, known, default, org_default);
     if matches!(&listing, Listing::Repos(entries) if entries.is_empty()) {
         ctx.ui.info(&format!(
             "GitHub lists no repositories you can see in {}.",
@@ -89,17 +147,23 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
         ctx.ui.theme(),
     ));
 
-    let chosen = ask(&ctx.ui, &rows, &default, org_default.owner());
-    adopt(ctx, chosen, &org_default).await
+    ask(&ctx.ui, &rows, default, org_default.owner(), on)
 }
 
 /// The question, and the three attempts it is put in.
-fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str) -> Repo {
+fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str, on: Option<&str>) -> Repo {
     // The default is named inside the question rather than only in the box
     // above it: `Ui::info` returns early under `--quiet` and `Ui::ask` does not,
     // so `riabuild --quiet` puts this question with the box silently dropped.
     // The same reason `remote::pick::settle` names the server in its prompt.
-    let question = format!("Which repository? (press enter for {default})");
+    //
+    // `on` is that same reason one step further out: `riabuild remote` asks this
+    // on the laptop about a server, and the two questions are otherwise
+    // indistinguishable at the one terminal they are both typed into.
+    let question = match on {
+        Some(server) => format!("Which repository on {server}? (press enter for {default})"),
+        None => format!("Which repository? (press enter for {default})"),
+    };
     for _ in 0..ATTEMPTS {
         // `None` is Enter, ^D, or nobody there, and all three mean "the one you
         // offered" — so none of them costs the developer an attempt.
