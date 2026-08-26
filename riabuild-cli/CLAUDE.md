@@ -598,7 +598,7 @@ crates form a straight line, each depending only on those above it:
 
 | Crate | What | Depends on |
 |---|---|---|
-| `theme` | the Clubria palette, by role, and the depth ladder under it | — |
+| `theme` | the Clubria palette, by role, and the depth ladder under it — expressed in ratatui's `Color`/`Style`/`Modifier`, so the printed line and the drawn frame share one palette | `ratatui-core` |
 | `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
 | `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | ui |
 | `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
@@ -610,6 +610,8 @@ crates form a straight line, each depending only on those above it:
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
+| `harness` | what to run for each agent harness and how to read what it says. `claude`, `codex` and `grok` build one turn's argv and decode that harness's NDJSON. Starts nothing and reads nothing | — |
+| `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure); `draw` turns that into ratatui lines and then into a frame | harness, paths, runner, theme, ui |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -1117,6 +1119,107 @@ Apache-2.0 source at `xai-org/grok-build` — which is why the `#[ignore]`d smok
 shell script. Run `cargo test -- --ignored` when the pin moves. Design:
 `../docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
+## The agents window
+
+`riabuild agents` runs Claude Code, Codex and Grok Build sessions in one terminal
+window. `~/.riabuild/bin/agents` is a generated shim that execs it, which is the whole of
+how the feature has its own executable name — a second binary would mean a `[[bin]]`, an
+install line in the Homebrew formula, the deb and the rpm, and another artefact for
+`release.yml` to build, sign and strip.
+
+All three open, always. There is no flag to choose: riabuild installs all three, and a
+session that has not been spoken to has started no process, so two idle panes cost three
+lines on screen.
+
+**The harnesses are driven headless, not embedded.** Each runs in its own structured
+output mode and riabuild draws the result; nothing renders a vendor's own full-screen
+interface in a pane. That is the choice the whole design rests on, and what it buys is
+*state*: screen-scraping three alternate-screen TUIs tells you which pixels changed,
+reading their event streams tells you which agent is blocked, what it is running and what
+it has spent.
+
+**A turn outlives the window that started it, and nothing here owns a running agent.**
+`riabuild agents` starts `riabuild internal agent-turn` *detached* and then only reads
+files. The wrapper holds the session's lock, appends the harness's stdout to the session's
+spool, and writes down the thread id — three things a third-party binary cannot be asked
+to do for itself. So closing the window interrupts nothing, reopening it replays
+everything that happened in between, and a reboot loses the process and never the
+conversation.
+
+Detaching means three things together, and leaving out any one of them looks like it works
+until somebody closes a terminal: `setsid`, so a vanishing terminal's `SIGHUP` reaches its
+old process group and not the turn; stdio nulled, so the child holds no descriptor on the
+tty; and no `kill_on_drop`, which is what every other spawn in `riabuild-runner` sets.
+`CommandRunner::spawn_detached` is the only method that does this and returns no handle —
+deliberately, because a process expected to outlive this one is not something this one can
+honestly claim to be able to wait for or kill.
+
+**Every harness now runs one child per turn, Claude Code included.** It *can* hold a
+session open — `--input-format stream-json` reads a user message per turn off stdin and
+never closes it — and that is exactly what detaching rules out: nobody is left holding the
+write end of a detached child's stdin, so Claude Code reads EOF and exits. So all three are
+started per turn and resumed by id, and the difference between them collapses to how you
+spell resume. What it costs is process warmth, not context: `--resume` reloads the
+conversation from the harness's own store. Verified against 2.1.235 — `claude -p
+--output-format stream-json --verbose --permission-mode bypassPermissions --resume <uuid>
+"…"` answers inside the session that id names.
+
+**Liveness is a lock, never a pid.** Whether a turn is running is answered by trying to
+take `turn.lock`. That is `remote::channel::lease`'s decision for `remote::channel`'s
+reasons — a pid in a file is a claim somebody has to check, a marker outlives its process,
+and `kill -0` on a recycled pid answers about the wrong process — and here it also gets a
+reboot right for free, because the kernel releases an `flock` however the holder died.
+
+**A session is a directory, and the spool is the harness's own bytes.**
+`<root>/agents/<id>/` holds `meta.json` (harness, thread id, profile home, checkout,
+title), `events.ndjson`, `turn.lock`, a `pending/` queue of prompts, and `errors.log`. The
+spool is the raw NDJSON the harness produced, appended across turns, because replaying it
+through the same `Reader` that reads a live turn is what makes a reopened session show what
+was on screen rather than a reconstruction of it. Under `root()` and not `tools_root()`, so
+two developers on one server are invisible to each other.
+
+`errors.log` is the other half of that, and it is not redundant. The spool holds one
+vendor's wire format, so a line riabuild wrote there would decode to nothing — and a
+detached wrapper has no stderr anybody reads. Without it, a harness that will not start is
+a session that sits idle for ever with no explanation.
+
+**The profile is recorded, never recomputed.** riabuild keeps nine sign-ins for each
+harness and a session is only resumable under the one that created it, so `meta.json`
+carries the `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` it was started with. Recompute
+it and a changed primary account points the next turn at a different store, where it finds
+no session and quietly begins a new conversation under the same pane. The *binary* is the
+opposite and is resolved per turn: a versioned path moves with every upgrade.
+
+**Every session is started with that harness's approvals off, in its own spelling.**
+`--permission-mode bypassPermissions` for Claude Code,
+`--dangerously-bypass-approvals-and-sandbox` plus `--dangerously-bypass-hook-trust` for
+`codex exec`, `--always-approve` for Grok Build. None is interchangeable — `codex exec`
+does not accept the `--yolo` the launchers pass — and `dontAsk`, which reads like the same
+thing on two of the three, silently *denies* whatever was not pre-approved and presents as
+an agent refusing its own tools. There is no approval round-trip anywhere in
+`riabuild-harness`, and that absence is what makes one event model possible.
+
+**Claude Code's `--bare` is deliberately not passed.** It is the flag that would suppress
+the remaining hook, plugin and MCP discovery, and its own `--help` says why it cannot be
+used here: *"Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via
+`--settings` (OAuth and keychain are never read)"*. Every Claude account riabuild manages
+is an OAuth sign-in, so `--bare` would break all nine. Full prompt-suppression and
+subscription auth are mutually exclusive on that harness; riabuild keeps the accounts.
+
+**Decoders degrade, never fail.** All three wire formats are undocumented or explicitly
+unstable, so an unrecognised frame produces no events rather than an error, and a line that
+is not JSON is dropped — `codex exec` prints `Reading additional input from stdin...` on
+stdout before its first frame. Read **stdout only**: Codex writes `tracing` diagnostics to
+stderr, and merging the two produces a decoder that dies on the first retry a flaky
+connection causes.
+
+What is pinned against a real binary and what is not is recorded at each match arm.
+Claude Code 2.1.235's stream-json is captured verbatim; Codex 0.148.0's *envelope* is too,
+but only its failure path, because no OpenAI or xAI sign-in existed on the machine this was
+written on — so the successful item bodies and every Grok update shape are marked
+`INFERRED` and are the first thing to re-read when a pin moves. Design:
+`../docs/superpowers/specs/2026-08-24-riabuild-agents-design.md`.
+
 ## Colour
 
 Every colour riabuild prints comes from `riabuild-theme`, chosen by **role** — `Ok`, `Busy`,
@@ -1129,6 +1232,26 @@ The palette is Clubria's own, read from clubria.com: `#f74f25` is the logo mark'
 with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *attributes*
 (dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
 terminal theme and muddy on another.
+
+**The types are ratatui's, and the ladder is not.** `Color`, `Style` and `Modifier` are
+re-exported from `ratatui-core` rather than defined here, because riabuild now paints two
+surfaces — `riabuild-ui` prints lines past a terminal it does not own, `riabuild-agents`
+draws whole frames into one it does — and a private `Rgb` would mean converting at that
+boundary, which is a second palette by another name. What ratatui does **not** bring is
+the reason `riabuild-theme` still exists: it has no notion of terminal capability at all.
+Its backends write a `Color::Rgb` out as a 24-bit escape whatever is on the other end, and
+it has no `NO_COLOR`. So a style passes through `Theme::style` (a role) or `Theme::lower`
+(any colour a widget picked) **before** it reaches a frame, and `Theme::paint` — the SGR
+renderer for line-at-a-time output — is riabuild's too, because ratatui has no API that
+renders one styled string.
+
+Two consequences worth keeping. `riabuild-theme` depends on `ratatui-core` and never on
+`ratatui`: it describes colour and draws nothing, and `riabuild-fetch` and
+`riabuild-runner` depend on it. And `Role::legacy` — the sixteen-colour rendering — is a
+**chosen table rather than a nearest-match**, because nearest-match gets it wrong in a way
+that matters: `--green` (`#3ddc84`) is nearer to `Cyan` than to `Green`, and `--orange`
+lands on `Red` beside `Danger`, so "in progress" and "fatal" would become the same colour.
+`nearest_match_is_why_a_roles_sixteen_colour_palette_is_chosen_by_hand` pins that.
 
 **Two roles on one line are siblings, never nested.** `Theme::paint` closes with
 `\x1b[0m`, which resets every attribute rather than the one it opened, so a `Strong`

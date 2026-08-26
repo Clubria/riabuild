@@ -108,6 +108,21 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ClaudeAction>,
     },
+    /// Run Claude Code, Codex and Grok Build sessions in one window.
+    ///
+    /// All three open, always. riabuild installs all three, and the two that
+    /// answer one turn per process start no process until they are spoken to —
+    /// so there is nothing for a developer to enable, and asking them which to
+    /// enable would be a decision riabuild made them make for no benefit.
+    ///
+    /// Every session is started with that harness's approvals turned off, which
+    /// is what riabuild's own launchers already do — see `Kind::bypass` in
+    /// `riabuild-harness` for the three spellings.
+    Agents {
+        /// The first thing to say, asked of all three at once.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -123,6 +138,27 @@ pub enum InternalAction {
     /// why — like `askpass` — it is one of the commands riabuild does not
     /// print anything else during.
     NgrokToken,
+    /// Run one agent turn.
+    ///
+    /// Started detached by `riabuild agents`, never by a person. It is a
+    /// riabuild process rather than the harness itself because three things have
+    /// to happen around the harness and none of them can be asked of a
+    /// third-party binary: the session's lock has to be *held* for as long as
+    /// the turn runs, its stdout has to be appended to the session's spool, and
+    /// the thread id it announces has to be written down or the next turn starts
+    /// a new conversation.
+    AgentTurn {
+        /// The session, by store id.
+        #[arg(long, value_name = "ID")]
+        session: String,
+
+        /// The file holding this turn's prompt.
+        ///
+        /// A file rather than an argument: argv is world-readable through `ps`,
+        /// and on a shared server `ps` shows other developers' processes.
+        #[arg(long = "prompt-file", value_name = "PATH")]
+        prompt_file: String,
+    },
     /// Answer an `ssh` password prompt. Run by `ssh` itself, via SSH_ASKPASS.
     ///
     /// `trailing_var_arg` because the one argument is `ssh`'s own prompt text

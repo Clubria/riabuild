@@ -22,9 +22,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+riabuild-agents.workspace = true
 riabuild-api.workspace = true
 riabuild-channel.workspace = true
 riabuild-gh-session.workspace = true
+riabuild-harness.workspace = true
 riabuild-keychain.workspace = true
 riabuild-paths.workspace = true
 riabuild-remote.workspace = true

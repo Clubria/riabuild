@@ -226,6 +226,47 @@ impl CommandRunner for RealRunner {
         )?))
     }
 
+    async fn spawn_detached(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<()> {
+        let mut command = RealRunner::for_riabuild(program, args, options);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        // Not set, unlike every other spawn in this file. The child is meant to
+        // outlive the handle, and `kill_on_drop` would end it on the next line.
+        command.kill_on_drop(false);
+
+        // SAFETY: `setsid(2)` is async-signal-safe, and this closure runs in the
+        // forked child between `fork` and `exec` — where only async-signal-safe
+        // calls are permitted. It allocates nothing and touches no lock. Its
+        // only failure is `EPERM`, when the caller already leads a process
+        // group, which means the child is already in a session of its own and
+        // there is nothing to fix; ignoring it is correct rather than lax.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("could not start `{program}`"))?;
+        // Dropping a `tokio::process::Child` without waiting leaves a zombie
+        // until this process exits. `try_wait` in a detached spawn would race
+        // the child's own startup, so the reaping is handed to a task that
+        // simply waits: it costs nothing, and it ends when the child does
+        // whether or not anybody is still watching.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Ok(())
+    }
+
     async fn run_interactive(
         &self,
         program: &str,

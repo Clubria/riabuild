@@ -14,13 +14,14 @@
 
 use crate::cli::{ChannelAction, ClaudeAction, Cli, RemoteAction};
 use anyhow::Result;
+use riabuild_agents as agents;
 use riabuild_channel as channel;
 use riabuild_paths::{Paths, RealPaths};
 use riabuild_remote as remote;
 use riabuild_runner::{CommandRunner, RealRunner};
 use riabuild_tasks::Ctx;
 use riabuild_tasks::{accounts, shims};
-use riabuild_ui::Ui;
+use riabuild_ui::{Failure, Ui};
 use std::sync::Arc;
 
 /// Whether this shell was opened by `riabuild remote`.
@@ -174,6 +175,64 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
         ClaudeAction::New => accounts::command::new(ctx).await,
         ClaudeAction::Delete { number, yes } => accounts::command::delete(ctx, number, yes).await,
         ClaudeAction::Primary { number } => accounts::command::primary(ctx, number).await,
+    }
+}
+
+/// `riabuild agents`
+///
+/// Deliberately not behind `connect`, for the reason `claude` is not: it starts
+/// harnesses riabuild already installed, in a checkout riabuild already cloned,
+/// and talks to no riabuild-web route. A developer on a plane gets the same
+/// window as one at a desk.
+pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
+    let Some(cwd) = ctx.project_dir() else {
+        return Err(Failure::new(
+            "opening the agents window",
+            "Run `riabuild` first, which picks a repository and clones it.",
+        )
+        .detail(
+            "No Clubria checkout is set up on this machine yet, so there is nothing \
+             for an agent to work on.",
+        )
+        .into());
+    };
+
+    let request = agents::Request {
+        // The path a turn is started through. `shims::running_binary` rather
+        // than a bare name, for the reason every generated shim names riabuild
+        // in full: it is the one tool riabuild does not put on `PATH`.
+        riabuild: shims::running_binary()?,
+        cwd,
+        homes: homes(ctx),
+        prompt,
+        theme: ctx.ui.theme(),
+        // The same question `riabuild-ui` already answered for the banner, asked
+        // once and in one place rather than decided again with different rules.
+        unicode: riabuild_ui::glyphs_render(),
+    };
+
+    agents::run(ctx.runner.clone(), ctx.paths.as_ref(), request).await?;
+    Ok(0)
+}
+
+/// Which profile each harness runs under.
+///
+/// The first of riabuild's nine for each, and recorded on every session it
+/// starts. Resume is scoped to the profile that created a session — each tool
+/// keeps its transcripts inside its own home — so a session started under one
+/// and resumed under another finds nothing and quietly begins a new
+/// conversation, with nothing on screen saying so.
+///
+/// Claude's is keyed by the *primary account's* id rather than by position,
+/// because accounts can be deleted and renumbered and a session outlives that.
+/// Codex and Grok have a fixed set of nine, so the number is the name.
+fn homes(ctx: &Ctx) -> agents::Homes {
+    agents::Homes {
+        claude: accounts::id_of(&ctx.config, 1)
+            .ok()
+            .map(|id| ctx.paths.claude_profile_dir(&id)),
+        codex: Some(ctx.paths.codex_profile_dir(1)),
+        grok: Some(ctx.paths.grok_profile_dir(1)),
     }
 }
 

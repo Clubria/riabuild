@@ -212,6 +212,16 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::NgrokToken,
         }) => return internal::ngrok_token(ctx).await,
+        // Not behind `connect`: a turn is the harness riabuild already installed
+        // working in the checkout riabuild already cloned, and it has to keep
+        // running on a laptop that has gone offline since the window opened.
+        Some(Command::Internal {
+            action:
+                cli::InternalAction::AgentTurn {
+                    session,
+                    prompt_file,
+                },
+        }) => return internal::agent_turn(ctx, session, prompt_file).await,
         Some(Command::MoveProject { path }) => {
             return move_project::run(ctx, path.as_deref()).await;
         }
@@ -220,6 +230,11 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         // no network, and a machine nothing has provisioned.
         Some(Command::Claude { action }) => {
             return dispatch::claude(ctx, action.clone()).await;
+        }
+        // Not behind `connect` either, and for the same reason: the harnesses
+        // and the checkout are already on this machine.
+        Some(Command::Agents { prompt }) => {
+            return dispatch::agents(ctx, prompt.clone()).await;
         }
         Some(Command::Reset { .. }) => unreachable!("reset returns before the tree is touched"),
         Some(Command::Channel { .. }) => {

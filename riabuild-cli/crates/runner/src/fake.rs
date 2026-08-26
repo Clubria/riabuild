@@ -207,6 +207,30 @@ impl FakeRunner {
         self
     }
 
+    /// Scripts a piped child that says its piece on stdout and then closes.
+    ///
+    /// Distinct from `spawning`, which scripts an exit code and stderr for a
+    /// child whose stdout nobody reads. An agent turn is the other shape: the
+    /// whole point of it is a stream of NDJSON, and a test of one has to be
+    /// able to hand it that stream without driving the far end of a pipe by
+    /// hand while the code under test is running.
+    ///
+    /// Scripted stdout implies **EOF**: the far end is closed rather than
+    /// handed back through `pipes`, because a reader looping until end-of-file
+    /// would otherwise never finish. A test that wants to write into a live
+    /// child by hand should use `spawning_until_killed` and `pipes` instead.
+    pub fn piping(mut self, invocation: &str, stdout: &str, code: i32) -> Self {
+        self.queue_child(
+            invocation,
+            Ending::Alone(CommandOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }),
+        );
+        self
+    }
+
     /// Scripts a child that stays up until it is killed — the tunnel that came
     /// up fine and then went quiet. Queued alongside `spawning`, so a test can
     /// script a live child, then the one that replaces it after teardown.

@@ -9,6 +9,30 @@
 //! knows how to render itself at every colour depth, so a terminal that cannot
 //! do 24-bit still gets something deliberate rather than nothing — and adding a
 //! colour in one place cannot leave another place on the old palette.
+//!
+//! # Why ratatui's types
+//!
+//! [`Color`], [`Style`] and [`Modifier`] are re-exported from `ratatui-core`
+//! rather than defined here, because riabuild now paints two very different
+//! surfaces and they must not drift apart. `riabuild-ui` prints lines to a
+//! terminal it does not own; `riabuild-agents` draws a full-screen frame it
+//! does. A private `Rgb` would have meant every colour crossing into the TUI
+//! being converted at the boundary, and a converted palette is a second palette
+//! — the exact failure the "by role, never by escape code" rule exists to stop.
+//!
+//! What ratatui does **not** bring is the reason this crate still exists, and
+//! it is the whole of the interesting part. Ratatui has no notion of how much
+//! colour a terminal can render: its backends write [`Color::Rgb`] out as a
+//! 24-bit escape whatever is on the other end, and it has no `NO_COLOR`. So the
+//! ladder below is riabuild's, applied *before* a style reaches ratatui, and
+//! [`Theme::paint`] is riabuild's too — there is no ratatui API that renders one
+//! styled string for a `println!`, because ratatui only ever writes whole
+//! frames. Both halves are tested here.
+//!
+//! This crate deliberately depends on `ratatui-core` and not on `ratatui`. It
+//! is the palette and nothing else, and `riabuild-fetch` and `riabuild-runner`
+//! — which paint lines and never draw a frame — should not acquire a widget set
+//! and a backend by depending on colour.
 
 // `unwrap_used` is denied workspace-wide. In test scaffolding a panic *is* the
 // reporting mechanism for a failed precondition, so unwrapping a fixture is
@@ -27,58 +51,58 @@
 // defined, which is a hole the size of a module rather than of a crate.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
-/// A brand colour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rgb(pub u8, pub u8, pub u8);
+pub use ratatui_core::style::{Color, Modifier, Style};
 
-impl Rgb {
-    /// From the hex the design system publishes, so the constants below can be
-    /// read straight against the site's CSS.
-    pub const fn hex(value: u32) -> Self {
-        Self(
-            ((value >> 16) & 0xff) as u8,
-            ((value >> 8) & 0xff) as u8,
-            (value & 0xff) as u8,
-        )
-    }
+/// The Clubria logo mark's fill. The primary brand colour.
+pub const BRAND: Color = Color::Rgb(0xf7, 0x4f, 0x25);
+/// `--pink`. The far end of the site's accent gradient.
+pub const PINK: Color = Color::Rgb(0xe6, 0x4a, 0xa0);
+/// `--orange`. Brand-adjacent, one step cooler than [`BRAND`].
+pub const ORANGE: Color = Color::Rgb(0xf0, 0x56, 0x3c);
+/// `--green`. Reserved for "this is done".
+pub const GREEN: Color = Color::Rgb(0x3d, 0xdc, 0x84);
 
-    fn distance_to(self, other: Rgb) -> u32 {
-        let d = |a: u8, b: u8| {
-            let delta = a as i32 - b as i32;
-            (delta * delta) as u32
-        };
-        d(self.0, other.0) + d(self.1, other.1) + d(self.2, other.2)
-    }
-
-    fn lerp(self, other: Rgb, numerator: usize, denominator: usize) -> Rgb {
-        let mix = |a: u8, b: u8| {
-            let a = a as usize;
-            let b = b as usize;
-            let value = if b >= a {
-                a + (b - a) * numerator / denominator
-            } else {
-                a - (a - b) * numerator / denominator
-            };
-            value as u8
-        };
-        Rgb(
-            mix(self.0, other.0),
-            mix(self.1, other.1),
-            mix(self.2, other.2),
-        )
+/// The channels of a colour that has them.
+///
+/// [`Color`] is a sum over four different ways of naming a colour and only
+/// [`Color::Rgb`] carries numbers, so every function here that does colour
+/// *arithmetic* — the gradient, the 256-cube search — has to say what it does
+/// about the rest. It returns `None`, and each caller decides: a ramp between
+/// two named colours is not a ramp, and there is no honest answer to invent.
+fn channels(colour: Color) -> Option<(u8, u8, u8)> {
+    match colour {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
     }
 }
 
-/// The Clubria logo mark's fill. The primary brand colour.
-pub const BRAND: Rgb = Rgb::hex(0xf74f25);
-/// `--pink`. The far end of the site's accent gradient.
-pub const PINK: Rgb = Rgb::hex(0xe64aa0);
-/// `--orange`. Brand-adjacent, one step cooler than [`BRAND`].
-pub const ORANGE: Rgb = Rgb::hex(0xf0563c);
-/// `--green`. Reserved for "this is done".
-pub const GREEN: Rgb = Rgb::hex(0x3ddc84);
+fn distance(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
+    let d = |x: u8, y: u8| {
+        let delta = x as i32 - y as i32;
+        (delta * delta) as u32
+    };
+    d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
+}
+
+fn lerp(from: (u8, u8, u8), to: (u8, u8, u8), numerator: usize, denominator: usize) -> Color {
+    let mix = |a: u8, b: u8| {
+        let a = a as usize;
+        let b = b as usize;
+        let value = if b >= a {
+            a + (b - a) * numerator / denominator
+        } else {
+            a - (a - b) * numerator / denominator
+        };
+        value as u8
+    };
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
 
 /// How much colour this terminal can render.
+///
+/// Ratatui has no equivalent and needs one: a `Color::Rgb` handed to any of its
+/// backends is written as a 24-bit escape sequence, on a terminal that may have
+/// told us it can only do sixteen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Depth {
     /// No escapes at all: piped output, `NO_COLOR`, or `TERM=dumb`.
@@ -128,7 +152,15 @@ pub fn depth_for(
 ///
 /// The 256-colour space is a 6×6×6 cube plus a 24-step grey ramp, and the two
 /// overlap badly near grey, so both are tried and the closer one wins.
-pub fn xterm256(colour: Rgb) -> u8 {
+///
+/// A colour with no channels — one of ratatui's sixteen names, or an index
+/// already — has no cube coordinate to look for, so it is returned unchanged
+/// where it is already an index and given up on otherwise.
+pub fn xterm256(colour: Color) -> Option<u8> {
+    if let Color::Indexed(index) = colour {
+        return Some(index);
+    }
+    let rgb = channels(colour)?;
     const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
     let nearest = |value: u8| {
         LEVELS
@@ -138,30 +170,84 @@ pub fn xterm256(colour: Rgb) -> u8 {
             .map(|(index, _)| index)
             .unwrap_or(0)
     };
-    let (r, g, b) = (nearest(colour.0), nearest(colour.1), nearest(colour.2));
-    let cube = Rgb(LEVELS[r], LEVELS[g], LEVELS[b]);
+    let (r, g, b) = (nearest(rgb.0), nearest(rgb.1), nearest(rgb.2));
+    let cube = (LEVELS[r], LEVELS[g], LEVELS[b]);
     let cube_index = 16 + 36 * r + 6 * g + b;
 
-    let average = (colour.0 as u32 + colour.1 as u32 + colour.2 as u32) / 3;
+    let average = (rgb.0 as u32 + rgb.1 as u32 + rgb.2 as u32) / 3;
     let step = (average.saturating_sub(8) / 10).min(23) as usize;
     let level = (8 + 10 * step) as u8;
-    let grey = Rgb(level, level, level);
+    let grey = (level, level, level);
 
-    if grey.distance_to(colour) < cube.distance_to(colour) {
-        (232 + step) as u8
+    if distance(grey, rgb) < distance(cube, rgb) {
+        Some((232 + step) as u8)
     } else {
-        cube_index as u8
+        Some(cube_index as u8)
     }
 }
 
 /// `steps` colours walking from `from` to `to`, inclusive of both ends.
-pub fn ramp(from: Rgb, to: Rgb, steps: usize) -> Vec<Rgb> {
+///
+/// Both ends must carry channels; a ramp between two *named* colours is not a
+/// ramp, and inventing one would put a gradient on screen that no palette
+/// chose. Such a call flattens onto `from`, which is what the caller would have
+/// drawn anyway at a depth too low for a gradient.
+pub fn ramp(from: Color, to: Color, steps: usize) -> Vec<Color> {
+    let (Some(start), Some(end)) = (channels(from), channels(to)) else {
+        return vec![from; steps];
+    };
     match steps {
         0 => Vec::new(),
         1 => vec![from],
         _ => (0..steps)
-            .map(|step| from.lerp(to, step, steps - 1))
+            .map(|step| lerp(start, end, step, steps - 1))
             .collect(),
+    }
+}
+
+/// The sixteen colours every terminal has, with the channel values xterm gives
+/// them, for finding the nearest one to an arbitrary [`Color::Rgb`].
+///
+/// Only the eight non-bright entries are candidates. The bright half is
+/// reachable in SGR only as a colour *or* as bold-plus-colour depending on the
+/// terminal, and riabuild uses bold to mean emphasis — so a downgrade that
+/// picked one would either lose the distinction or spend it.
+const ANSI16: [(Color, (u8, u8, u8)); 8] = [
+    (Color::Black, (0, 0, 0)),
+    (Color::Red, (205, 0, 0)),
+    (Color::Green, (0, 205, 0)),
+    (Color::Yellow, (205, 205, 0)),
+    (Color::Blue, (0, 0, 238)),
+    (Color::Magenta, (205, 0, 205)),
+    (Color::Cyan, (0, 205, 205)),
+    (Color::White, (229, 229, 229)),
+];
+
+/// The nearest of the original eight to `colour`.
+fn nearest_ansi16(colour: Color) -> Color {
+    let Some(rgb) = channels(colour) else {
+        return colour;
+    };
+    ANSI16
+        .iter()
+        .min_by_key(|(_, candidate)| distance(*candidate, rgb))
+        .map(|(named, _)| *named)
+        .unwrap_or(colour)
+}
+
+/// Rewrites one colour for a terminal that cannot render it as specified.
+///
+/// This is the step ratatui has no equivalent of, and the reason a [`Style`]
+/// must pass through [`Theme::style`] before it reaches a frame.
+pub fn lower_colour(colour: Color, depth: Depth) -> Option<Color> {
+    match depth {
+        Depth::None => None,
+        Depth::TrueColor => Some(colour),
+        Depth::Ansi256 => Some(match colour {
+            Color::Rgb(..) => xterm256(colour).map(Color::Indexed).unwrap_or(colour),
+            other => other,
+        }),
+        Depth::Ansi16 => Some(nearest_ansi16(colour)),
     }
 }
 
@@ -185,41 +271,123 @@ pub enum Role {
 }
 
 impl Role {
-    /// The SGR parameters for this role, or `None` for "write it plain".
-    pub fn sgr(self, depth: Depth) -> Option<String> {
-        // Muted and Strong are attributes, not colours. Dim and bold adapt to
-        // whatever background and theme the developer has chosen, which a fixed
-        // grey cannot do — a `#8b8794` "muted" is invisible on a dark theme and
-        // muddy on a light one. They render identically at every depth.
+    /// This role at full fidelity, before any terminal has been consulted.
+    ///
+    /// Muted and Strong are attributes, not colours. Dim and bold adapt to
+    /// whatever background and theme the developer has chosen, which a fixed
+    /// grey cannot do — a `#8b8794` "muted" is invisible on a dark theme and
+    /// muddy on a light one. They carry no `fg` at all, which is what makes
+    /// them render identically at every depth.
+    pub fn style(self) -> Style {
         match self {
-            Role::Muted => return (depth != Depth::None).then(|| "2".to_string()),
-            Role::Strong => return (depth != Depth::None).then(|| "1".to_string()),
-            _ => {}
+            Role::Muted => Style::new().add_modifier(Modifier::DIM),
+            Role::Strong => Style::new().add_modifier(Modifier::BOLD),
+            Role::Brand | Role::Danger => Style::new().fg(BRAND).add_modifier(Modifier::BOLD),
+            Role::Ok => Style::new().fg(GREEN),
+            Role::Busy | Role::Warn => Style::new().fg(ORANGE),
         }
-        let (colour, bold, legacy) = match self {
-            Role::Brand => (BRAND, true, "1;31"),
-            Role::Ok => (GREEN, false, "32"),
-            Role::Busy => (ORANGE, false, "33"),
-            Role::Warn => (ORANGE, false, "33"),
-            Role::Danger => (BRAND, true, "1;31"),
-            Role::Muted | Role::Strong => unreachable!("handled above"),
-        };
+    }
+
+    /// The sixteen-colour rendering, which is chosen rather than computed.
+    ///
+    /// [`nearest_ansi16`] would answer for these, and its answer is worse: the
+    /// brand's `#f74f25` is nearest to `Red` on channel distance, but `Ok`'s
+    /// `#3ddc84` lands on `Green` and `Busy`'s `#f0563c` on `Red` — putting
+    /// "in progress" and "fatal" on the same colour. This table is the palette
+    /// riabuild shipped before the brand colours existed, so nothing regresses
+    /// on a terminal that cannot do better.
+    fn legacy(self) -> Style {
+        match self {
+            Role::Muted => Style::new().add_modifier(Modifier::DIM),
+            Role::Strong => Style::new().add_modifier(Modifier::BOLD),
+            Role::Brand | Role::Danger => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Role::Ok => Style::new().fg(Color::Green),
+            Role::Busy | Role::Warn => Style::new().fg(Color::Yellow),
+        }
+    }
+
+    /// This role as the given terminal should receive it.
+    pub fn at(self, depth: Depth) -> Style {
         match depth {
-            Depth::None => None,
-            Depth::Ansi16 => Some(legacy.to_string()),
-            Depth::Ansi256 => Some(prefix(bold) + &format!("38;5;{}", xterm256(colour))),
-            Depth::TrueColor => {
-                Some(prefix(bold) + &format!("38;2;{};{};{}", colour.0, colour.1, colour.2))
+            Depth::None => Style::new(),
+            Depth::Ansi16 => self.legacy(),
+            _ => {
+                let style = self.style();
+                match style.fg.and_then(|fg| lower_colour(fg, depth)) {
+                    Some(fg) => style.fg(fg),
+                    None => style,
+                }
             }
         }
     }
+
+    /// The SGR parameters for this role, or `None` for "write it plain".
+    pub fn sgr(self, depth: Depth) -> Option<String> {
+        sgr_of(self.at(depth))
+    }
 }
 
-fn prefix(bold: bool) -> String {
-    if bold {
-        "1;".to_string()
-    } else {
-        String::new()
+/// One [`Style`] as SGR parameters, or `None` where it would paint nothing.
+///
+/// Ratatui has no such function — a backend writes styles into a frame through
+/// crossterm's own commands, and never produces a string — so this is riabuild's
+/// and is what lets `riabuild-ui` keep printing ordinary lines while sharing one
+/// palette with the TUI.
+///
+/// Modifiers come first so that a bold colour reads `1;38;2;…`, which is the
+/// order every terminal documents and the order riabuild has always emitted.
+pub fn sgr_of(style: Style) -> Option<String> {
+    let mut params: Vec<String> = Vec::new();
+    if style.add_modifier.contains(Modifier::BOLD) {
+        params.push("1".to_string());
+    }
+    if style.add_modifier.contains(Modifier::DIM) {
+        params.push("2".to_string());
+    }
+    if style.add_modifier.contains(Modifier::ITALIC) {
+        params.push("3".to_string());
+    }
+    if style.add_modifier.contains(Modifier::UNDERLINED) {
+        params.push("4".to_string());
+    }
+    if style.add_modifier.contains(Modifier::REVERSED) {
+        params.push("7".to_string());
+    }
+    if let Some(fg) = style.fg {
+        params.push(sgr_colour(fg, false)?);
+    }
+    if let Some(bg) = style.bg {
+        params.push(sgr_colour(bg, true)?);
+    }
+    (!params.is_empty()).then(|| params.join(";"))
+}
+
+/// One colour as an SGR parameter. `ground` picks foreground or background.
+fn sgr_colour(colour: Color, ground: bool) -> Option<String> {
+    // The named eight are 30–37 in the foreground and 40–47 in the background;
+    // the bright eight are 90–97 and 100–107.
+    let offset = if ground { 10 } else { 0 };
+    let named = |base: u32| Some((base + offset).to_string());
+    match colour {
+        Color::Reset => None,
+        Color::Black => named(30),
+        Color::Red => named(31),
+        Color::Green => named(32),
+        Color::Yellow => named(33),
+        Color::Blue => named(34),
+        Color::Magenta => named(35),
+        Color::Cyan => named(36),
+        Color::Gray => named(37),
+        Color::DarkGray => named(90),
+        Color::LightRed => named(91),
+        Color::LightGreen => named(92),
+        Color::LightYellow => named(93),
+        Color::LightBlue => named(94),
+        Color::LightMagenta => named(95),
+        Color::LightCyan => named(96),
+        Color::White => named(97),
+        Color::Indexed(index) => Some(format!("{}8;5;{index}", 3 + offset / 10)),
+        Color::Rgb(r, g, b) => Some(format!("{}8;2;{r};{g};{b}", 3 + offset / 10)),
     }
 }
 
@@ -265,11 +433,35 @@ impl Theme {
         self.depth != Depth::None
     }
 
-    pub fn paint(self, role: Role, text: &str) -> String {
-        match role.sgr(self.depth) {
-            Some(sgr) => format!("\x1b[{sgr}m{text}\x1b[0m"),
-            None => text.to_string(),
+    /// What this terminal can render, for a caller that has to branch on it.
+    pub fn depth(self) -> Depth {
+        self.depth
+    }
+
+    /// A role's [`Style`], lowered onto this terminal.
+    ///
+    /// This is what a ratatui widget asks for. Ratatui will happily render the
+    /// undegraded [`Role::style`], which is exactly the bug — a `Color::Rgb`
+    /// reaches a sixteen-colour terminal as a 24-bit escape it does not
+    /// understand.
+    pub fn style(self, role: Role) -> Style {
+        role.at(self.depth)
+    }
+
+    /// An arbitrary style lowered onto this terminal, for the colours a widget
+    /// chooses that no role covers — a sparkline, a diff, a session's own hue.
+    pub fn lower(self, style: Style) -> Style {
+        if self.depth == Depth::None {
+            return Style::new();
         }
+        let mut lowered = style;
+        lowered.fg = style.fg.and_then(|fg| lower_colour(fg, self.depth));
+        lowered.bg = style.bg.and_then(|bg| lower_colour(bg, self.depth));
+        lowered
+    }
+
+    pub fn paint(self, role: Role, text: &str) -> String {
+        self.paint_style(role.at(self.depth), text)
     }
 
     /// Paints an exact colour, for the banner gradient.
@@ -277,17 +469,22 @@ impl Theme {
     /// Below 256 colours there is no gradient to be had, so every step
     /// collapses onto the brand — deliberately one flat brand-coloured mark
     /// rather than a banded approximation of a smooth one.
-    pub fn paint_rgb(self, colour: Rgb, text: &str) -> String {
+    pub fn paint_rgb(self, colour: Color, text: &str) -> String {
         match self.depth {
             Depth::None => text.to_string(),
             Depth::Ansi16 => self.paint(Role::Brand, text),
-            Depth::Ansi256 => format!("\x1b[38;5;{}m{text}\x1b[0m", xterm256(colour)),
-            Depth::TrueColor => {
-                format!(
-                    "\x1b[38;2;{};{};{}m{text}\x1b[0m",
-                    colour.0, colour.1, colour.2
-                )
-            }
+            depth => match lower_colour(colour, depth) {
+                Some(lowered) => self.paint_style(Style::new().fg(lowered), text),
+                None => text.to_string(),
+            },
+        }
+    }
+
+    /// Paints an already-lowered style. The one place an escape is written.
+    fn paint_style(self, style: Style, text: &str) -> String {
+        match sgr_of(style) {
+            Some(sgr) => format!("\x1b[{sgr}m{text}\x1b[0m"),
+            None => text.to_string(),
         }
     }
 }
@@ -300,9 +497,9 @@ mod tests {
     fn the_brand_hex_is_the_logo_marks_fill() {
         // clubria.com paints its logo `<g fill="#f74f25">`. If this constant
         // drifts, the CLI stops matching the site it provisions access to.
-        assert_eq!(BRAND, Rgb(0xf7, 0x4f, 0x25));
-        assert_eq!(PINK, Rgb(0xe6, 0x4a, 0xa0));
-        assert_eq!(GREEN, Rgb(0x3d, 0xdc, 0x84));
+        assert_eq!(BRAND, Color::Rgb(0xf7, 0x4f, 0x25));
+        assert_eq!(PINK, Color::Rgb(0xe6, 0x4a, 0xa0));
+        assert_eq!(GREEN, Color::Rgb(0x3d, 0xdc, 0x84));
     }
 
     #[test]
@@ -387,6 +584,7 @@ mod tests {
         for depth in [Depth::Ansi16, Depth::Ansi256, Depth::TrueColor] {
             assert_eq!(Role::Muted.sgr(depth).unwrap(), "2");
             assert_eq!(Role::Strong.sgr(depth).unwrap(), "1");
+            assert_eq!(Role::Muted.at(depth).fg, None, "{depth:?}");
         }
     }
 
@@ -394,16 +592,25 @@ mod tests {
     fn the_brand_maps_onto_a_sensible_256_colour_index() {
         // 203 is the cube's nearest salmon-red. The point of the assertion is
         // that it lands in the cube rather than on the grey ramp.
-        let index = xterm256(BRAND);
+        let index = xterm256(BRAND).unwrap();
         assert!((16..232).contains(&index), "{index}");
-        assert_eq!(xterm256(Rgb(0, 0, 0)), 16);
-        assert_eq!(xterm256(Rgb(255, 255, 255)), 231);
+        assert_eq!(xterm256(Color::Rgb(0, 0, 0)).unwrap(), 16);
+        assert_eq!(xterm256(Color::Rgb(255, 255, 255)).unwrap(), 231);
     }
 
     #[test]
     fn a_mid_grey_lands_on_the_grey_ramp_not_the_cube() {
-        let index = xterm256(Rgb(0x80, 0x80, 0x80));
+        let index = xterm256(Color::Rgb(0x80, 0x80, 0x80)).unwrap();
         assert!((232..=255).contains(&index), "{index}");
+    }
+
+    #[test]
+    fn a_colour_with_no_channels_has_no_cube_coordinate() {
+        // `Color::Red` is a name a terminal resolves, not a value — there is no
+        // honest 256-cube answer for it, and inventing one would be picking a
+        // colour the palette never chose.
+        assert_eq!(xterm256(Color::Red), None);
+        assert_eq!(xterm256(Color::Indexed(42)).unwrap(), 42);
     }
 
     #[test]
@@ -414,8 +621,9 @@ mod tests {
         assert_eq!(steps[5], BRAND);
         // and moves monotonically between them on every channel
         for pair in steps.windows(2) {
-            assert!(pair[1].0 >= pair[0].0, "{pair:?}");
-            assert!(pair[1].2 <= pair[0].2, "{pair:?}");
+            let (a, b) = (channels(pair[0]).unwrap(), channels(pair[1]).unwrap());
+            assert!(b.0 >= a.0, "{pair:?}");
+            assert!(b.2 <= a.2, "{pair:?}");
         }
     }
 
@@ -426,8 +634,104 @@ mod tests {
     }
 
     #[test]
+    fn a_ramp_between_named_colours_is_flat_rather_than_invented() {
+        // There is no arithmetic between two names, and a gradient nobody chose
+        // is worse than no gradient.
+        assert_eq!(ramp(Color::Red, Color::Blue, 3), vec![Color::Red; 3]);
+    }
+
+    #[test]
     fn below_256_colours_the_gradient_collapses_onto_the_brand() {
         let flat = Theme::with_depth(Depth::Ansi16);
         assert_eq!(flat.paint_rgb(PINK, "x"), flat.paint(Role::Brand, "x"));
+    }
+
+    #[test]
+    fn a_widget_style_is_lowered_before_it_reaches_a_frame() {
+        // The whole reason this crate still exists on top of ratatui: ratatui
+        // would write the 24-bit escape to a terminal that cannot read it.
+        let sixteen = Theme::with_depth(Depth::Ansi16);
+        assert_eq!(sixteen.style(Role::Ok).fg, Some(Color::Green));
+
+        let indexed = Theme::with_depth(Depth::Ansi256);
+        assert!(matches!(
+            indexed.style(Role::Ok).fg,
+            Some(Color::Indexed(_))
+        ));
+
+        let full = Theme::with_depth(Depth::TrueColor);
+        assert_eq!(full.style(Role::Ok).fg, Some(GREEN));
+    }
+
+    #[test]
+    fn no_colour_erases_a_style_rather_than_passing_it_through() {
+        // A widget that hardcoded a colour must still respect NO_COLOR, so the
+        // erasure happens here and not at the call site.
+        let plain = Theme::plain();
+        let loud = Style::new().fg(BRAND).bg(PINK);
+        assert_eq!(plain.lower(loud), Style::new());
+        assert_eq!(plain.style(Role::Danger), Style::new());
+    }
+
+    #[test]
+    fn an_arbitrary_widget_colour_walks_the_same_ladder_as_a_role() {
+        let sixteen = Theme::with_depth(Depth::Ansi16);
+        // Backgrounds walk it too — a pane header sets one.
+        assert_eq!(
+            sixteen.lower(Style::new().bg(BRAND)).bg,
+            Some(nearest_ansi16(BRAND))
+        );
+        // Truecolor leaves an arbitrary colour exactly as the widget chose it.
+        let full = Theme::with_depth(Depth::TrueColor);
+        assert_eq!(full.lower(Style::new().fg(PINK)).fg, Some(PINK));
+    }
+
+    #[test]
+    fn nearest_match_is_why_a_roles_sixteen_colour_palette_is_chosen_by_hand() {
+        // `--green` is `#3ddc84`, a mint with far more blue in it than the
+        // original `Green` has: it is nearer to `Cyan` on channel distance, and
+        // `--orange` (#f0563c) is nearest to `Red` — which is also where
+        // `Danger` lands. Left to arithmetic, "done" would go cyan and "in
+        // progress" would become indistinguishable from "fatal".
+        //
+        // So `Role::legacy` is a table, and this test is the reason standing in
+        // the file rather than only in the comment above it.
+        assert_eq!(nearest_ansi16(GREEN), Color::Cyan);
+        assert_eq!(nearest_ansi16(ORANGE), Color::Red);
+        assert_eq!(nearest_ansi16(BRAND), Color::Red);
+
+        assert_eq!(Role::Ok.at(Depth::Ansi16).fg, Some(Color::Green));
+        assert_eq!(Role::Busy.at(Depth::Ansi16).fg, Some(Color::Yellow));
+        assert_ne!(
+            Role::Busy.at(Depth::Ansi16).fg,
+            Role::Danger.at(Depth::Ansi16).fg
+        );
+    }
+
+    #[test]
+    fn a_background_renders_in_the_forties_not_the_thirties() {
+        assert_eq!(sgr_of(Style::new().bg(Color::Red)).unwrap(), "41");
+        assert_eq!(
+            sgr_of(Style::new().bg(Color::Rgb(1, 2, 3))).unwrap(),
+            "48;2;1;2;3"
+        );
+        assert_eq!(
+            sgr_of(Style::new().bg(Color::Indexed(9))).unwrap(),
+            "48;5;9"
+        );
+    }
+
+    #[test]
+    fn modifiers_precede_the_colour_they_apply_to() {
+        // Every terminal documents this order, and riabuild has always emitted
+        // it. A reversed pair renders on some terminals and not others.
+        let style = Style::new().fg(BRAND).add_modifier(Modifier::BOLD);
+        assert_eq!(sgr_of(style).unwrap(), "1;38;2;247;79;37");
+    }
+
+    #[test]
+    fn an_empty_style_paints_nothing_at_all() {
+        assert_eq!(sgr_of(Style::new()), None);
+        assert_eq!(sgr_of(Style::new().fg(Color::Reset)), None);
     }
 }

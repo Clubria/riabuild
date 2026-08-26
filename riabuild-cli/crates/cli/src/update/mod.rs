@@ -94,7 +94,11 @@ pub fn applies_to(command: Option<&Command>) -> bool {
             | Command::Shell
             | Command::MoveProject { .. }
             | Command::Remote { .. }
-            | Command::Claude { .. },
+            | Command::Claude { .. }
+            // Its stdout is a page a person reads, so the update runs — and it
+            // runs before the alternate screen is entered, because
+            // `keep_current` is the first thing `run_inner` does.
+            | Command::Agents { .. },
         ) => true,
         Some(
             Command::Internal { .. }

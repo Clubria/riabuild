@@ -15,3 +15,11 @@ workspace = true
 # cannot: a dependency crate is never compiled with `cfg(test)`, so the
 # renderings a downstream test pins would not exist.
 testing = []
+
+[dependencies]
+# `Color`, `Style` and `Modifier` — the vocabulary the TUI and the line-at-a-time
+# output now share, so a colour cannot be converted at that boundary and quietly
+# become a second palette. Deliberately `ratatui-core` and not `ratatui`: this
+# crate describes colour and never renders a frame, and `riabuild-fetch` and
+# `riabuild-runner` depend on it.
+ratatui-core.workspace = true

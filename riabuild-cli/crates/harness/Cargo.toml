@@ -1,0 +1,27 @@
+[package]
+name = "riabuild-harness"
+version = "0.0.0"
+edition.workspace = true
+description = "What to run for each agent harness, and how to read what it says"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# The canned transcripts, so `riabuild-agents` can test its rendering against
+# bytes three real binaries produced. Behind a feature rather than
+# `#[cfg(test)]` because a dependency crate is never compiled with `cfg(test)`.
+testing = []
+
+[dependencies]
+# The only dependency, and deliberately so. This crate builds argv and decodes
+# lines — it starts nothing, reads nothing and awaits nothing, which is what
+# lets three undocumented wire formats be tested against captured bytes rather
+# than against three signed-in vendor accounts. Spawning belongs to
+# `riabuild-runner`, and where a turn's output is written belongs to
+# `riabuild-agents`.
+serde_json.workspace = true
