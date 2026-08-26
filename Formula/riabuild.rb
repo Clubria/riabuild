@@ -1,9 +1,13 @@
-# Template for the formula this repository serves as a Homebrew tap.
+# Template for the formula riabuild is installed by on macOS.
 #
 # `.github/workflows/release.yml` substitutes the at-sign-delimited placeholders
-# below and commits the result to `Formula/riabuild.rb` on main, which is where
-# `brew tap` looks. Edit this file, never `Formula/riabuild.rb` — the next
-# release overwrites that one.
+# below and commits the result to `Formula/riabuild.rb` in two repositories:
+# `Clubria/homebrew-tap`, which is the one `brew install clubria/tap/riabuild`
+# reaches for on its own, and this one, which is where the laptops that ran the
+# old explicit `brew tap` against this repository still upgrade from.
+#
+# Edit this file, never either rendered `Formula/riabuild.rb` — the next release
+# overwrites both.
 #
 # The workflow rejects a rendered formula that still contains a placeholder, so
 # this comment deliberately describes their shape rather than spelling one out.

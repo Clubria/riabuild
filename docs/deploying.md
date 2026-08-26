@@ -237,16 +237,22 @@ do not already have. `.github/workflows/release.yml` builds both macOS architect
 on a `v<version>` tag, publishes them as a GitHub release, and commits the rendered
 formula to `Formula/riabuild.rb` on main. **`docs/releasing.md` is the runbook.**
 
-This repository serves as its own tap, so there is no second repository and no extra
-token — the workflow's own `GITHUB_TOKEN` can write here. Developers install with:
+The tap is `Clubria/homebrew-tap`, a repository holding only the formula, named
+exactly what Homebrew guesses from the tap name `clubria/tap` so that install needs
+no `brew tap` line:
 
 ```sh
-brew tap clubria/tap https://github.com/Clubria/riabuild
 brew install clubria/tap/riabuild
 ```
 
-The repository and its release assets must stay **public**: `brew` fetches both with
-plain `curl` and no credentials. The binary holds no secrets, and every gate is
+That is a second repository, so it needs a credential the workflow's own
+`GITHUB_TOKEN` is not: set **`HOMEBREW_TAP_TOKEN`** on this repository to a
+fine-grained PAT with `contents: write` on `Clubria/homebrew-tap` and no other
+permission or repository. The release workflow fails the `formula` job when it is
+missing, rather than publishing a release the tap never learns about.
+
+Both repositories and the release assets must stay **public**: `brew` clones and
+fetches with no credentials. The binary holds no secrets, and every gate is
 re-verified server-side, so this costs nothing.
 
 After each release, set the version fields from the dashboard's lead panel. Both are

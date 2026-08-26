@@ -19,7 +19,6 @@ the block for your platform; all three are here.
 **macOS**
 
 ```sh
-brew tap clubria/tap https://github.com/Clubria/riabuild
 brew install clubria/tap/riabuild
 ```
 
@@ -48,11 +47,14 @@ dashboard and upgrades through whichever package manager installed it — asking
 first on Linux, where that needs sudo. A copy no package manager owns is never
 sudoed over; it prints the command instead.
 
-This repository *is* all three repositories. The formula is `Formula/riabuild.rb`,
-written by the release workflow; the apt and dnf indexes are rebuilt onto GitHub
-Pages on every release. The explicit `brew tap` line is what the macOS install
-needs: Homebrew only auto-taps `clubria/tap` when it can guess the repository
-name, and it guesses `Clubria/homebrew-tap`.
+This repository is the apt and the dnf repository: their indexes are rebuilt onto
+GitHub Pages on every release. The Homebrew tap is
+[`Clubria/homebrew-tap`](https://github.com/Clubria/homebrew-tap), a separate
+repository holding nothing but the formula, because that is the name Homebrew
+guesses from the tap name `clubria/tap` — which is what lets `brew install`
+tap it without being told to. The release workflow writes the formula to both
+that repository and `Formula/riabuild.rb` here; see
+[docs/releasing.md](docs/releasing.md#the-tap-is-a-separate-repository).
 
 The Linux binaries are statically linked against musl, so there is no
 distribution or glibc requirement beyond what the packages declare.
@@ -69,7 +71,7 @@ distribution or glibc requirement beyond what the packages declare.
 | `packaging/rpm/` | the `.rpm` spec template and the dnf `.repo` file |
 | `packaging/pages/` | the landing page for the apt and dnf repositories |
 | `packaging/ngrok/`, `packaging/grok/` | the mirror scripts that republish the two tools whose projects publish no digest |
-| `Formula/riabuild.rb` | the rendered formula `brew tap` reads — generated, do not edit |
+| `Formula/riabuild.rb` | the rendered formula, kept for laptops still tapped against this repository — generated, do not edit; the copy `brew install` reads is in `Clubria/homebrew-tap` |
 | `docs/superpowers/specs/` | design specs |
 | `docs/superpowers/plans/` | the implementation plans those specs were built from — history, not instructions |
 | `docs/deploying.md` | putting it on the domain |

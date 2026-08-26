@@ -27,7 +27,7 @@ anything structural.
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `e2e/` | the CLI and the backend tested together — `run.sh` on macOS, and `remote/` driving `riabuild remote` against a real Debian container. `e2e/README.md` |
 | `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies; `ngrok/` and `grok/` hold the mirror scripts for the two tools nobody publishes a digest for |
-| `Formula/riabuild.rb` | the rendered formula `brew tap` reads — written by the release workflow, never by hand |
+| `Formula/riabuild.rb` | the rendered formula — written by the release workflow, never by hand. The copy `brew install` reads lives in `Clubria/homebrew-tap`; this one serves laptops tapped here before the tap moved |
 | `docs/superpowers/specs/` | design specs |
 | `docs/superpowers/plans/` | the implementation plans those specs were built from. History: read one to find out why something is the way it is, never as instructions for what to do now |
 | `docs/releasing.md` | cutting a CLI release |

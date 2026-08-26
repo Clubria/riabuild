@@ -23,11 +23,11 @@ export const INSTALL_CHOICES: InstallChoice[] = [
     id: "macos",
     label: "homebrew",
     audience: "macOS, Apple silicon or Intel.",
-    // The explicit `brew tap` line is part of the install, not decoration:
-    // Homebrew auto-taps `clubria/tap` only when it can derive the repository
-    // name, and the name it derives is Clubria/homebrew-tap.
-    command: `brew tap clubria/tap https://github.com/Clubria/riabuild
-brew install clubria/tap/riabuild`,
+    // One line, and it stays one line: Homebrew derives the repository name
+    // Clubria/homebrew-tap from the tap name `clubria/tap`, that repository
+    // exists and carries the formula, so the tap is cloned on first install
+    // without an explicit `brew tap`.
+    command: "brew install clubria/tap/riabuild",
   },
   {
     id: "apt",

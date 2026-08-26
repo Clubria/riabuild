@@ -549,9 +549,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      # The release is triggered by a tag, but the formula has to land on the
-      # default branch: `brew tap` clones that and reads nothing else. Checking
-      # out main rather than the tag is what makes the push below meaningful.
+      # The release is triggered by a tag, but the formula has to land on a
+      # default branch: Homebrew clones a tap's and reads nothing else. Checking
+      # out main rather than the tag is what makes the pushes below meaningful.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
@@ -618,6 +618,60 @@ jobs:
 
           cat Formula/riabuild.rb
 
+      # `Clubria/homebrew-tap` is what `brew install clubria/tap/riabuild`
+      # reaches for without being asked. Homebrew derives a repository name from
+      # the tap name `clubria/tap` and the name it derives is
+      # `Clubria/homebrew-tap`, which is the entire reason that repository
+      # exists and the entire reason the install instructions no longer carry a
+      # `brew tap` line.
+      #
+      # It is pushed *before* the commit to this repository because it is now
+      # the channel a new laptop installs from: if only one of the two can
+      # land, it should be that one.
+      - name: Publish the formula to the tap repository
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A missing token would otherwise leave the tap serving the previous
+          # release indefinitely, with this job still green — the failure mode
+          # is a release nobody can install, reported as a success.
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is unset — Clubria/homebrew-tap would keep serving the previous release."
+            exit 1
+          fi
+
+          # Cloned anonymously and pushed with the token supplied on the command
+          # line, so no credential is written into the clone's .git/config.
+          git clone --depth 1 https://github.com/Clubria/homebrew-tap.git "$RUNNER_TEMP/tap"
+
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          cp Formula/riabuild.rb "$RUNNER_TEMP/tap/Formula/riabuild.rb"
+
+          git -C "$RUNNER_TEMP/tap" config user.name "github-actions[bot]"
+          git -C "$RUNNER_TEMP/tap" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git -C "$RUNNER_TEMP/tap" add Formula/riabuild.rb
+          if git -C "$RUNNER_TEMP/tap" diff --cached --quiet; then
+            echo "Tap already at $VERSION; nothing to push."
+            exit 0
+          fi
+
+          git -C "$RUNNER_TEMP/tap" commit \
+            -m "riabuild $VERSION" \
+            -m "Written by Clubria/riabuild .github/workflows/release.yml. Edit packaging/homebrew/riabuild.rb there, never this file."
+
+          git -C "$RUNNER_TEMP/tap" push \
+            "https://x-access-token:${TAP_TOKEN}@github.com/Clubria/homebrew-tap.git" HEAD:main
+
+      # The copy in this repository is kept in step with the tap rather than
+      # retired with it. A laptop that ran the old explicit
+      # `brew tap clubria/tap https://github.com/Clubria/riabuild` has a git
+      # remote pointing here, and `brew upgrade` against a tap that stopped
+      # changing keeps reporting success while never finding a new version.
+      # Dropping this step is safe only once no developer is on that remote.
       - name: Commit the formula to main
         env:
           VERSION: ${{ needs.version.outputs.version }}
