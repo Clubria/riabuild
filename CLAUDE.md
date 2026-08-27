@@ -165,6 +165,23 @@ set up cannot be the first thing a developer runs, and a green CI job bought tha
 one every developer on a stock server pays for silently. See
 `riabuild-cli/crates/fetch/src/download/assets.rs`.
 
+**And `udp-over-tcp` is the tool riabuild does not install at all, because there is nothing
+to install.** Mullvad's crate is what carries a mosh session over TCP when the developer's
+network blocks UDP, and it publishes **no releases and no binaries** — it is `publish =
+false`, so no artifact exists anywhere for a digest to describe. Both obedient-looking
+answers are worse than the rule they would satisfy: mirroring bytes nobody published, or
+downloading a floating build nobody verified. So it is a **rev-pinned git dependency
+compiled into the binary** — a constant in this repository, moving only in a release, and
+what runs on a laptop is what a maintainer reviewed.
+
+That also removes the far end of the problem rather than restating it. Both halves of the
+tunnel are riabuild itself, and the server's copy is already at the matching version, so
+there is no second tool to ask a server's admin for and no protocol to negotiate between
+two ends that ship together. Do not read this as a licence to vendor the next thing that
+is inconvenient to mirror: the test it passed is that upstream publishes nothing to pin,
+which is a fact about that project and not a preference of ours. See
+`docs/superpowers/specs/2026-08-25-mosh-over-tcp-design.md`.
+
 **Secrets are brokered, never stored.** riabuild-web holds the Infisical org credential
 and mints short-lived access tokens on demand. No long-lived Infisical credential is ever
 written to a developer's machine. Infisical service tokens are deprecated — use machine

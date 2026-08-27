@@ -186,6 +186,48 @@ tar = { version = "0.4", default-features = false }
 # because no portable async file API exists, so the process still has threads.
 tokio = { version = "1", default-features = false }
 tempfile = "3"
+# Mullvad's udp-over-tcp, as a library rather than as the two binaries it also
+# builds.
+#
+# `riabuild remote` opens a mosh session, and mosh is UDP. On a network that
+# lets no UDP out — a conference guest network, a corporate egress filter, a
+# hotel — that session cannot come up at all, and the only thing riabuild could
+# do about it was wait out `mosh-client`'s nineteen seconds of silence and hand
+# over a plain `ssh`. This crate is what lets the session ride a TCP stream
+# instead: each datagram framed with a 16-bit big-endian length and unpacked
+# back into datagrams at the far end. See
+# `docs/superpowers/specs/2026-08-25-mosh-over-tcp-design.md`.
+#
+# **A git dependency, which nothing else in this workspace is.** That is not a
+# preference, and the alternative was tried first. `CLAUDE.md`'s rule for a tool
+# riabuild installs is to pin a version and verify it against a published
+# digest, and where a project publishes none — ngrok, Grok Build — to republish
+# the artifact riabuild verified. Neither is available here:
+# mullvad/udp-over-tcp has **no releases at all**, ships no binary for any
+# platform, and is `publish = false`, so it is not on crates.io either. There is
+# nothing to download and nothing to mirror. The only artifact that exists is
+# the source.
+#
+# Given that, compiling it *into* riabuild is the smaller claim than building
+# the two binaries in a mirror script and pinning digests against them. Those
+# digests would describe riabuild's own build output rather than bytes anyone
+# upstream published — precisely what `packaging/grok/mirror.sh` refuses to do —
+# and they would need an install task, a version floor, and a second install on
+# the far end of every tunnel. As a library it is one `rev` in `Cargo.lock`,
+# checked by cargo on every build, compiled into the signed binary that both
+# ends of the tunnel already run.
+#
+# The `rev` is the commit tagged `v0.4.0`, named as a sha rather than as the tag
+# because a tag can be moved and a commit cannot. Bumping it is a code change.
+#
+# What it costs, said out loud: this crate names tokio with
+# `features = ["rt-multi-thread", "macros", …]`, features unify across the
+# graph, and so the multi-threaded scheduler is compiled in where the comment on
+# `tokio` below says it is not. Nothing riabuild writes builds one — `main` is
+# `#[tokio::main(flavor = "current_thread")]`, and `ci.yml` greps for the two
+# spellings that would change that — but the guarantee is now a checked
+# convention rather than an absent feature.
+udp-over-tcp = { git = "https://github.com/mullvad/udp-over-tcp", rev = "458100e8abfa51c54c076b523096d694691600b9", default-features = false }
 # `deflate-flate2`, not `deflate`. The plain `deflate` alias is two decisions
 # in a trench coat: it adds zopfli — an encoder that spends orders of magnitude
 # more CPU to save a few percent, for archives riabuild only ever writes in its

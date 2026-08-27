@@ -87,6 +87,14 @@ pub struct Plan<'a> {
     pub pump: String,
     /// The env-prefixed `riabuild shell` this session is really here for.
     pub shell: String,
+    /// The server's own riabuild with the same environment prefix and no
+    /// arguments — `env 'K=V'… '/abs/path/riabuild'`.
+    ///
+    /// What the mosh probe and the server end of a TCP-tunnelled mosh session
+    /// are appended to. It is here rather than derived from [`Plan::shell`]
+    /// because the prefix is the caller's to build, and a second spelling of it
+    /// is a second thing to get wrong.
+    pub binary: String,
     /// An issued identity riabuild is carrying because its own key cannot sign
     /// in to this server — see `identity::ssh_options`. `None` on every
     /// ordinary server.
@@ -109,6 +117,7 @@ pub async fn open_shell(plan: Plan<'_>) -> Result<i32> {
         plan.runner.clone(),
         plan.ui,
         &plan.shell,
+        &plan.binary,
         plan.carry,
     )
     .await;
@@ -323,6 +332,7 @@ mod tests {
             remote_socket,
             pump: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild channel pump".into(),
             shell: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild shell".into(),
+            binary: "env 'RIABUILD_CHANNEL_SOCKET=/x' riabuild".into(),
         }
     }
 

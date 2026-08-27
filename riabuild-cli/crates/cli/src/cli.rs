@@ -169,6 +169,24 @@ pub enum InternalAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
+    /// Bind a UDP port in mosh's range, print it, and echo what arrives.
+    ///
+    /// The server's half of "will a mosh session work from this network". Its
+    /// stdout carries one protocol line and nothing else, which is why — like
+    /// `askpass` — it is dispatched before the banner and the API client
+    /// exist.
+    UdpEcho,
+    /// Carry a mosh session's datagrams between this process's stdio and a
+    /// local `mosh-server`.
+    ///
+    /// The server end of the tunnel riabuild opens when UDP cannot reach this
+    /// machine. After one ready line its **stdout is the wire**, so nothing
+    /// else may ever print on it.
+    MoshTcp2Udp {
+        /// The loopback UDP port `mosh-server` is listening on, from the
+        /// `MOSH CONNECT` line the laptop already read.
+        port: u16,
+    },
 }
 
 /// `host_key::fingerprint_of` (Task 15) only ever extracts a token starting

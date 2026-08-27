@@ -35,6 +35,7 @@ pub mod host_key;
 pub mod identity;
 pub mod install;
 pub mod issued;
+pub mod mosh;
 pub mod pick;
 pub mod render;
 pub mod repo;

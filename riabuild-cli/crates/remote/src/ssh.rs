@@ -201,6 +201,24 @@ impl<'a> Ssh<'a> {
         self.runner.run("ssh", &refs, &options).await
     }
 
+    /// Held, with the remote command's stdin and stdout kept as pipes.
+    ///
+    /// For the two halves of a mosh session tunnelled over TCP, which need a
+    /// connection that outlives the call and a duplex stream to carry the
+    /// tunnel over. Nothing here asks `sshd` for a port forward, and the test
+    /// at the bottom of this file is what keeps it that way: the transport is
+    /// the command's own stdio, exactly as the clipboard channel's is, so it
+    /// works on a server that grants nothing beyond running a command.
+    pub(crate) async fn spawn_piped(
+        mut self,
+        command: &str,
+    ) -> Result<Box<dyn riabuild_runner::PipedChildHandle>> {
+        let args = self.argv(command);
+        let options = self.run_options();
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.runner.spawn_piped("ssh", &refs, &options).await
+    }
+
     /// A handoff: the child gets riabuild's terminal.
     pub(crate) async fn interactive(mut self, command: &str) -> Result<i32> {
         let args = self.argv(command);
@@ -250,6 +268,11 @@ mod tests {
             public_key_path: "/run/riabuild/k1.pub".into(),
         }
     }
+
+    /// The server's own riabuild, env-prefixed, as `connect` builds it — what
+    /// the mosh probe and the far end of a tunnelled session are appended to.
+    const REMOTE_BINARY: &str = "env 'RIABUILD_ROOT=/home/ada/.riabuild-remote/abc' \
+                                 '/home/ada/.riabuild/riabuild/2026.08.26/riabuild'";
 
     /// A real riabuild key line, for the one site that parses what it installs.
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQMfwG+m0AkDbU6a0vxE5ktTNTso5LskpebOKYF2VHP riabuild 9544e195 ada@build-01:22";
@@ -343,13 +366,18 @@ mod tests {
         );
     }
 
+    /// The one probe that asks a server two questions on one connection: is
+    /// `mosh-server` here, and does a datagram from this laptop reach it. It is
+    /// a *held* child rather than a captured run, because the second question
+    /// is answered while the far side is still up.
     #[tokio::test]
-    async fn the_mosh_probe_asks_the_server_for_mosh_server() {
+    async fn the_mosh_probe_asks_about_mosh_server_and_udp_at_once() {
         let f = Fixture::new();
         let runner = Arc::new(
             FakeRunner::new()
                 .with("ssh", 1, "", "")
-                .with("mosh", 0, "", ""),
+                .with("mosh", 0, "", "")
+                .spawning("ssh", 0, ""),
         );
         crate::shell::open(
             &remote(),
@@ -357,19 +385,27 @@ mod tests {
             runner.clone(),
             &Ui::new(true),
             "riabuild shell",
+            REMOTE_BINARY,
             None,
         )
         .await
         .expect("falls back");
         assert_eq!(
             runner
-                .calls()
+                .spawns()
                 .into_iter()
                 .find(|call| call.contains("mosh-server"))
                 .expect("a probe"),
             format!(
-                "ssh {} ada@build-01.fly.dev command -v mosh-server",
-                f.base(true)
+                "ssh {} ada@build-01.fly.dev {}",
+                f.base(true),
+                // Written out rather than built from `REMOTE_BINARY`, because
+                // the quoting *is* what this pins: the prefix arrives already
+                // single-quoted and is quoted again by `shell_command`, so
+                // every one of its quotes has to survive as `'\''` — a script
+                // that lost one would run `exec env` with nothing after it and
+                // the probe would look like a server without mosh.
+                r"/bin/sh -c 'command -v mosh-server >/dev/null 2>&1 || exit 3; exec env '\''RIABUILD_ROOT=/home/ada/.riabuild-remote/abc'\'' '\''/home/ada/.riabuild/riabuild/2026.08.26/riabuild'\'' internal udp-echo'"
             )
         );
     }
@@ -444,6 +480,7 @@ mod tests {
             runner.clone(),
             &Ui::new(true),
             "riabuild shell",
+            REMOTE_BINARY,
             None,
         )
         .await
@@ -469,7 +506,10 @@ mod tests {
         let f = Fixture::new();
         let runner = Arc::new(
             FakeRunner::new()
-                .with("ssh", 0, "/usr/bin/mosh-server\n", "")
+                .with("ssh", 0, "", "")
+                // The probe exits with no port line, which `mosh::ask` reads as
+                // "could not tell" — the answer that keeps the plain mosh path.
+                .spawning("ssh", 0, "")
                 .with("mosh", 0, "", ""),
         );
         crate::shell::open(
@@ -478,6 +518,7 @@ mod tests {
             runner.clone(),
             &Ui::new(true),
             "riabuild shell",
+            REMOTE_BINARY,
             None,
         )
         .await

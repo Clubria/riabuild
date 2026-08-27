@@ -109,6 +109,21 @@ async fn run(cli: Cli) -> Result<i32> {
         return internal::askpass(paths.as_ref(), runner, &prompt.join(" ")).await;
     }
 
+    // Dispatched here for the sharpest version of the same reason again: these
+    // two are the server's half of a mosh session, and their stdout is a
+    // *protocol* — one line, and after it, for `mosh-tcp2udp`, the session's
+    // own framed datagrams. A banner on that stream is not an untidy line, it
+    // is a corrupted session. Neither reads the tree, so neither needs a `Ctx`.
+    if let Some(Command::Internal { action }) = &cli.command {
+        match action {
+            cli::InternalAction::UdpEcho => return riabuild_remote::mosh::udp_echo().await,
+            cli::InternalAction::MoshTcp2Udp { port } => {
+                return riabuild_remote::mosh::tcp2udp(*port).await;
+            }
+            _ => {}
+        }
+    }
+
     // Dispatched before anything creates or reads the tree. riabuild must not
     // recreate the directory it is about to remove, and a reset must not depend
     // on a config or state file that may be the reason it was asked for.
@@ -241,8 +256,11 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             unreachable!("the channel returns before the setup flow starts")
         }
         Some(Command::Internal {
-            action: cli::InternalAction::Askpass { .. },
-        }) => unreachable!("askpass answers before a Ctx is ever built"),
+            action:
+                cli::InternalAction::Askpass { .. }
+                | cli::InternalAction::UdpEcho
+                | cli::InternalAction::MoshTcp2Udp { .. },
+        }) => unreachable!("the stdout-is-a-payload subcommands answer before a Ctx is built"),
         Some(Command::Status) | None => {}
     }
 
