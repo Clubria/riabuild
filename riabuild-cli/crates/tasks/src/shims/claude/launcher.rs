@@ -708,9 +708,18 @@ mod tests {
         use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
 
         let home = tempfile::TempDir::new().unwrap();
-        let project = home.path().join("riabuild");
-        let other = home.path().join("payments");
-        let elsewhere = home.path().join("elsewhere");
+        // Canonicalized before anything is built on it: macOS's `$TMPDIR`
+        // lives under `/var`, itself a symlink to `/private/var`, and a shell
+        // reports `$PWD` from `getcwd()` — the canonical path — at startup.
+        // Matching that against the symlinked literal this crate's own
+        // `TempDir` would otherwise hand out fails the very check this test
+        // exists to prove, for a reason that has nothing to do with the
+        // launcher: every checkout `riabuild` actually manages lives under a
+        // developer's home directory, which is not itself a symlink.
+        let root = tokio::fs::canonicalize(home.path()).await.unwrap();
+        let project = root.join("riabuild");
+        let other = root.join("payments");
+        let elsewhere = root.join("elsewhere");
         for dir in [&project, &other, &elsewhere] {
             tokio::fs::create_dir_all(dir).await.unwrap();
         }
