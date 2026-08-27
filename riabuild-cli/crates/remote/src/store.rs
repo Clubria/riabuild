@@ -45,6 +45,19 @@ pub struct Record {
     /// construction, so every literal in this file names it explicitly.
     #[serde(default)]
     pub home: String,
+    /// The repository this laptop last set this server up for, as an
+    /// `owner/repo` slug — what Enter takes the next time `remote::repo` puts
+    /// the question, before the connection is made.
+    ///
+    /// It is a *memory of a question's answer* and never an authorization:
+    /// what the developer may work on is GitHub's to say, asked through their
+    /// own `gh` every time the box is drawn. Empty until a run settles on one,
+    /// which is every `remotes.json` written before this field existed
+    /// (`#[serde(default)]`, as above) — and an empty value asks rather than
+    /// assumes, so a server this laptop set up under an older riabuild is
+    /// offered whatever the laptop is working on rather than a wrong guess.
+    #[serde(default)]
+    pub repo: String,
     /// The `cliSessions` row id behind this server's own session, from
     /// `auth::Session::session_id`. Empty until `remote::session::ensure`
     /// mints a session for the first time (or for a `remotes.json` written
@@ -253,6 +266,7 @@ pub fn record_for(remote: &super::Remote) -> Record {
         session_expires_at: 0,
         last_seen_cli_version: String::new(),
         home: String::new(),
+        repo: String::new(),
         session_id: String::new(),
         shared_id: String::new(),
         fresh: false,
@@ -292,6 +306,56 @@ mod tests {
             port: 22,
             user: "ada".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_successful_connect_remembers_the_repository_it_set_the_server_up_for() {
+        // What the next run's question offers. It used to be the server's own
+        // memory, and it moved here with the question.
+        let (ctx, _home) =
+            riabuild_tasks::testing::ctx_with(riabuild_runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+        add(&mut store, &remote());
+
+        remember(
+            &ctx,
+            &mut store,
+            &remote(),
+            "2026.08.26",
+            Some("Clubria/payments"),
+        )
+        .await
+        .expect("records the connect");
+
+        let reloaded = Store::load(ctx.paths.as_ref()).await;
+        assert_eq!(reloaded.remotes[0].repo, "Clubria/payments");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nothing_to_say_about_the_repository_leaves_the_recorded_one_alone() {
+        // `--check`, and an unattended run: neither has chosen anything, and
+        // clearing the memory would make the next question start from scratch
+        // on a server that was set up perfectly well.
+        let (ctx, _home) =
+            riabuild_tasks::testing::ctx_with(riabuild_runner::FakeRunner::new()).await;
+        let mut store = Store::default();
+        add(&mut store, &remote());
+        remember(
+            &ctx,
+            &mut store,
+            &remote(),
+            "2026.08.26",
+            Some("Clubria/payments"),
+        )
+        .await
+        .expect("records the connect");
+
+        remember(&ctx, &mut store, &remote(), "2026.08.26", None)
+            .await
+            .expect("records the connect");
+
+        let reloaded = Store::load(ctx.paths.as_ref()).await;
+        assert_eq!(reloaded.remotes[0].repo, "Clubria/payments");
     }
 
     /// One server the developer added, and one of the team's, deliberately
@@ -904,6 +968,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
             fresh: false,
@@ -935,6 +1000,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
             fresh: false,
@@ -955,6 +1021,7 @@ mod tests {
             session_expires_at: 0,
             last_seen_cli_version: "2026.08.06".into(),
             home: "/home/ada".into(),
+            repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
             fresh: false,

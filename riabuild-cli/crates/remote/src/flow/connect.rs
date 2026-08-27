@@ -14,7 +14,7 @@
 
 use crate::{
     Remote, Request, askpass, authorise, channel, env_command, env_prefix, host_key, identity,
-    install, issued, resolve_home, seed, session, shell, ssh_once, store,
+    install, issued, repo, resolve_home, seed, session, shell, ssh_once, store,
 };
 use anyhow::{Result, anyhow};
 use riabuild_paths::Paths;
@@ -63,6 +63,31 @@ async fn retire_superseded_identity(
     }
 }
 
+/// What the server's own riabuild is run with, once the two questions this
+/// laptop puts have been answered.
+///
+/// Pure, and separate from the sequence it sits in the middle of, because that
+/// sequence needs a real server to exercise and this is the one part of it a
+/// test can hold to account. `--repo` in particular no longer comes straight
+/// off the command line: it is what `repo::choose_for` settled on, and a
+/// resolved value that quietly failed to reach the argv would compile, connect,
+/// provision, and leave the server on the repository it already had.
+fn setup_args(request: &Request, repo: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["--no-shell".to_string()];
+    if request.quiet {
+        args.push("--quiet".to_string());
+    }
+    if let Some(repo) = repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    if let Some(project) = &request.project {
+        args.push("--project".to_string());
+        args.push(project.clone());
+    }
+    args
+}
+
 /// Everything from "which server" onward: reachable once `ctx.member` and
 /// `ctx.org` already hold their answers, which is what makes it testable
 /// against a `FakeRunner` without a real riabuild-web to `connect` against —
@@ -75,6 +100,14 @@ pub(super) async fn connect_and_setup(
 ) -> Result<i32> {
     let accept_host_key = request.accept_host_key.as_deref();
     let remote = store::choose(ctx, store, request.target.clone()).await?;
+    // Directly after the server, and before the first `ssh`: both of the
+    // questions a remote run puts are now asked here, back to back, while the
+    // developer is still at the prompt they started at. The repository used to
+    // be asked by the server's own riabuild once the connection was up, which
+    // meant waiting out a host key, a key check, an install and a session mint
+    // to be asked something that could have been settled in the same breath as
+    // "which server". It travels on as `--repo` below.
+    let repo = repo::choose_for(ctx, request, store, &remote).await;
     let member = ctx
         .member
         .clone()
@@ -326,18 +359,7 @@ pub(super) async fn connect_and_setup(
         .await?;
 
         ctx.ui.heading(&format!("Checking {}", remote.name));
-        let mut args: Vec<String> = vec!["--no-shell".to_string()];
-        if request.quiet {
-            args.push("--quiet".to_string());
-        }
-        if let Some(repo) = &request.repo {
-            args.push("--repo".to_string());
-            args.push(repo.clone());
-        }
-        if let Some(project) = &request.project {
-            args.push("--project".to_string());
-            args.push(project.clone());
-        }
+        let args = setup_args(request, repo.as_deref());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let setup = env_command(&prefix_refs, &binary, &arg_refs);
         // `ssh -t`, never mosh. mosh does not propagate the remote command's exit
@@ -357,7 +379,11 @@ pub(super) async fn connect_and_setup(
             return Ok(code);
         }
 
-        store::remember(ctx, store, &remote, &version).await?;
+        // With the repository among what a successful connect leaves behind, so
+        // the next `riabuild remote gpu` offers what this one settled on rather
+        // than asking from scratch — the memory the server's own picker used to
+        // keep, moved to the machine that now puts the question.
+        store::remember(ctx, store, &remote, &version, repo.as_deref()).await?;
         if request.no_shell {
             return Ok(0);
         }
@@ -471,6 +497,60 @@ mod tests {
         )
         .await
         .expect("write pub");
+    }
+
+    #[test]
+    fn the_repository_this_laptop_settled_on_is_what_the_server_is_run_with() {
+        // The whole point of asking before connecting: the answer has to reach
+        // the server's own riabuild, which is the one that clones. `--repo` is
+        // also what makes that riabuild's own picker stand aside, so a value
+        // that failed to arrive would not error — it would ask again, over the
+        // ssh the developer has already waited for.
+        let args = setup_args(&Request::default(), Some("Clubria/payments"));
+
+        assert_eq!(
+            args,
+            vec!["--no-shell", "--repo", "Clubria/payments"],
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_nothing_to_say_about_the_repository_leaves_the_question_to_the_server() {
+        // `--check`, and an unattended run on a server this laptop has never
+        // chosen for. Passing an empty `--repo` would be riabuild answering a
+        // question nobody put to it.
+        let args = setup_args(&Request::default(), None);
+
+        assert_eq!(args, vec!["--no-shell"], "{args:?}");
+    }
+
+    #[test]
+    fn the_other_forwarded_flags_are_unchanged_by_the_repository_moving() {
+        let request = Request {
+            quiet: true,
+            project: Some("~/work".to_string()),
+            // Read past, deliberately: by this point `repo::choose_for` has
+            // already resolved `--repo` into the value beside it, and reading
+            // both would be two sources for one answer.
+            repo: Some("Clubria/ignored".to_string()),
+            ..Request::default()
+        };
+
+        let args = setup_args(&request, Some("Clubria/payments"));
+
+        assert_eq!(
+            args,
+            vec![
+                "--no-shell",
+                "--quiet",
+                "--repo",
+                "Clubria/payments",
+                "--project",
+                "~/work"
+            ],
+            "{args:?}"
+        );
     }
 
     const GOOD_FINGERPRINT: &str = "SHA256:qKqvBpVv3sVJ0m9j2sZq8s0Xh3P1r2s3t4u5v6w7x8Y";

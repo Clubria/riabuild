@@ -219,8 +219,16 @@ untouched — they already rely on it for `choose_dir`.
 to a server exactly as `--project` is: one field on `remote::Request`, two lines in
 `remote::flow::connect`.
 
-Remote mode asks once, on the server. `riabuild remote` runs the server's own `riabuild`,
-so the question appears there over `ssh -t`, and the laptop adds no second one.
+~~Remote mode asks once, on the server. `riabuild remote` runs the server's own
+`riabuild`, so the question appears there over `ssh -t`, and the laptop adds no second
+one.~~ **Superseded on 2026-08-26.** It still asks once, and the laptop still adds no
+second question — but the one question is put *here*, directly after "which server" and
+before the first `ssh`, and travels to the server as `--repo`. Asking on the far side
+meant the developer committed to a host key, an `ssh-copy-id`, an install and a session
+mint before being asked what the box was for. See
+`2026-08-26-remote-repository-first-design.md`, which also covers the state that had to
+move with the question: the server's own picker remembered the server's last repository,
+and a laptop that always passes `--repo` never lets it.
 
 The answer is settled by a pure function, so every rule is testable without a test process
 ever reading real stdin — the split `remote::pick` documents:
