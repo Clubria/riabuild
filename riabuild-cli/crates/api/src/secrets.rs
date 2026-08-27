@@ -1,8 +1,13 @@
 //! Brokered Infisical credentials.
 //!
-//! The token returned here is short-lived and is never written down. It is piped
-//! into `infisical export` through stdin — not passed as an argument, where `ps`
-//! would show it to every process on the machine.
+//! The token returned here is short-lived and is never written down. It reaches
+//! `infisical` in that one process's **environment** — not as an argument, where
+//! `ps` would show it to every account on the machine.
+//!
+//! Two callers ask for one, and they are the same request from either side:
+//! `tasks::env_local`, which writes `.env.<environment>` on every run, and
+//! `internal::infisical`, which is what `~/.riabuild/bin/infisical` runs when a
+//! developer types the command themselves. Neither leaves anything behind.
 
 use crate::ApiClient;
 use anyhow::Result;

@@ -50,6 +50,29 @@ for sh in zsh bash; do
   fi
 done
 
+# The developer's own `infisical`, which is the other half of the secrets story
+# stage 11 checks. There riabuild pulled `.env.dev`; here a person types the
+# command themselves, and it has to work without anything ever having logged
+# infisical in — `~/.riabuild/bin/infisical` hands the invocation back to
+# riabuild, which brokers a credential for that one command.
+#
+# Asserted through the shell rather than by running the shim directly, because
+# what is being tested is that `infisical` typed by a person reaches it at all:
+# a missing shim, or a `PATH` some rcfile reordered, both present as the
+# machine's own infisical answering, signed in to nothing.
+#
+# The marker is the stub's, so it cannot be satisfied by the `.env.dev` sitting
+# in the checkout: the value has to have come back over HTTP on this call.
+for sh in zsh bash; do
+  if command -v "$sh" >/dev/null 2>&1; then
+    INFISICAL_OUT="$(printf 'infisical export --silent\nexit\n' \
+      | SHELL="$(command -v "$sh")" riabuild shell 2>&1 || true)"
+    check_contains "$sh: a developer's own infisical is signed in" \
+      "$INFISICAL_OUT" "brokered-through-riabuild"
+    break
+  fi
+done
+
 # Losing this silently destroys a developer's prompt, aliases and history, which
 # reads as "riabuild broke my shell".
 if [ -f "$RIA_HOME/shell/zsh/.zshrc" ]; then

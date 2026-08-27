@@ -15,10 +15,14 @@
 //! against a digest — is a property of `Release` and of this file, and a new
 //! owned tool gets it by being a row rather than by remembering to.
 //!
-//! **The rows are not all the same, and the differences are data.** ngrok's
-//! entry in `bin/` is not an `exec` line: it fetches the team's authtoken from
+//! **The rows are not all the same, and the differences are data.** Two entries
+//! in `bin/` are not `exec` lines. ngrok's fetches the team's authtoken from
 //! riabuild-web on every invocation and hands it over in the environment, which
-//! is the whole reason that token lands on no filesystem. Grok Build's is nine
+//! is the whole reason that token lands on no filesystem; infisical's routes
+//! the developer's own command back through riabuild, which brokers a
+//! short-lived credential for it and hands that over the same way — so
+//! `infisical export` in a riabuild shell works without anything ever logging
+//! infisical in. Grok Build's is nine
 //! numbered launchers its own task writes, so its row asks for none. And two
 //! tools have work around the download that is genuinely theirs: `github_cli`
 //! signs the developer in and asks GitHub about their membership, `grok_cli`
@@ -47,10 +51,12 @@ pub(crate) struct Shim {
     pub name: &'static str,
     /// Renders it, given riabuild's own binary and the tool's versioned path.
     ///
-    /// A function rather than a flag because the one interesting shim —
-    /// ngrok's — is a credential-carrying script and not an `exec` line, and
-    /// flattening that into "an exec shim, plus a special case" is how the
-    /// authtoken ends up somewhere it can be read twice.
+    /// A function rather than a flag because two of these are not `exec` lines
+    /// at all: ngrok's fetches the team's authtoken per invocation, and
+    /// infisical's routes the developer's own command back through riabuild so
+    /// a brokered credential can be minted for it. Flattening either into "an
+    /// exec shim, plus a special case" is how a credential ends up somewhere it
+    /// can be read twice.
     pub render: fn(riabuild: &Path, binary: &Path) -> String,
     /// What a developer loses while it is missing, in their words.
     pub without_it: &'static str,
@@ -203,8 +209,9 @@ impl OwnedTool {
 
     /// What the shim should contain right now.
     ///
-    /// riabuild's own path is handed to every render, though only ngrok's uses
-    /// it. That costs nothing a run does not already pay: `running_binary` is
+    /// riabuild's own path is handed to every render, though only ngrok's and
+    /// infisical's use it — the two that carry a credential to the tool they
+    /// start. That costs nothing a run does not already pay: `running_binary` is
     /// `current_exe`, and `provision::write_launchers_with` asks it once per
     /// run regardless — a machine that cannot answer has no shims at all, which
     /// is exactly what it should fail as.

@@ -1,11 +1,21 @@
 //! `riabuild internal ...` — the hidden subcommands riabuild invokes on itself
 //! over SSH. Not for people.
 //!
-//! Both concern the per-session GitHub credential on a server: `gh-sweep`
-//! clears what a session that died without cleaning up left behind, and
-//! `seed-github` takes the token the laptop pipes over and hands it to `gh`.
-//! The marker mechanics they sit on are in `gh_session`; the laptop side
+//! Two of them concern the per-session GitHub credential on a server:
+//! `gh-sweep` clears what a session that died without cleaning up left behind,
+//! and `seed-github` takes the token the laptop pipes over and hands it to
+//! `gh`. The marker mechanics they sit on are in `gh_session`; the laptop side
 //! that invokes them is in `remote/`.
+//!
+//! Two more are run by generated shims on every invocation of the tool they
+//! stand in front of, so that a credential riabuild-web holds reaches that tool
+//! and no filesystem: `ngrok-token` prints the team's authtoken for
+//! `~/.riabuild/bin/ngrok`, and `infisical` *is* `~/.riabuild/bin/infisical` —
+//! it brokers an Infisical credential for one command and starts infisical with
+//! it. Both must keep their stdout clean, and for the same reason: one is read
+//! as the value, and the other is the developer's `infisical export > .env`.
+
+pub(crate) mod infisical;
 
 use anyhow::Result;
 use riabuild_gh_session as gh_session;

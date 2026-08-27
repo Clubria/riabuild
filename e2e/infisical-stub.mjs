@@ -6,6 +6,11 @@
  *   riabuild-web  POST /api/v1/auth/universal-auth/login   (convex/infisical.ts)
  *   infisical CLI GET  /api/v4/secrets                     (tasks/env_local.rs)
  *
+ * The second one arrives twice over a run, from the two ends of the same
+ * brokering: once because riabuild pulled `.env.<environment>`, and once in
+ * stage 13 because a developer typed `infisical export` in the environment
+ * shell and `~/.riabuild/bin/infisical` brokered a credential for it.
+ *
  * Everything between those two calls — brokering, the short-lived token, the
  * environment-not-arguments handoff, writing and git-ignoring one
  * `.env.<environment>` per environment the developer may see — is

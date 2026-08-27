@@ -138,6 +138,21 @@ pub enum InternalAction {
     /// why — like `askpass` — it is one of the commands riabuild does not
     /// print anything else during.
     NgrokToken,
+    /// Run infisical with a credential brokered for this one command.
+    ///
+    /// Hidden: run by the generated `~/.riabuild/bin/infisical`, which is what
+    /// the developer's shell finds when they type `infisical`. Everything after
+    /// the subcommand is infisical's, untouched.
+    ///
+    /// `trailing_var_arg` and `allow_hyphen_values` for `askpass`'s reason,
+    /// with the roles reversed: these arguments are not riabuild's to parse at
+    /// all. `infisical export --env=dev` has to reach infisical exactly as
+    /// typed, and a clap that took an interest in `--env` would fail the
+    /// invocation over a flag riabuild has no opinion about.
+    Infisical {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run one agent turn.
     ///
     /// Started detached by `riabuild agents`, never by a person. It is a
@@ -582,6 +597,47 @@ mod tests {
 
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("internal"), "{help}");
+    }
+
+    /// The developer's own infisical command reaches infisical exactly as
+    /// typed.
+    ///
+    /// Every one of these would be a parse error, or worse a silently rewritten
+    /// invocation, if the arguments were riabuild's to read: `--env` is not a
+    /// riabuild flag, `--` is meaningful to `infisical run`, and `--project` is
+    /// a riabuild global that must not be claimed out of the middle of somebody
+    /// else's command line.
+    #[test]
+    fn an_infisical_invocation_is_passed_through_untouched() {
+        for typed in [
+            vec!["export", "--env=dev"],
+            vec!["run", "--", "pnpm", "dev", "--project", "web"],
+            vec!["--version"],
+        ] {
+            let mut argv = vec!["riabuild", "internal", "infisical"];
+            argv.extend(typed.iter().copied());
+            let parsed = Cli::parse_from(argv);
+            let Some(Command::Internal {
+                action: InternalAction::Infisical { args },
+            }) = parsed.command
+            else {
+                panic!("{typed:?} did not parse as an infisical passthrough");
+            };
+            assert_eq!(args, typed, "{typed:?}");
+        }
+    }
+
+    /// And a bare `infisical`, which is the shim run with no arguments at all.
+    #[test]
+    fn an_infisical_invocation_with_no_arguments_parses() {
+        let parsed = Cli::parse_from(["riabuild", "internal", "infisical"]);
+        let Some(Command::Internal {
+            action: InternalAction::Infisical { args },
+        }) = parsed.command
+        else {
+            panic!("a bare infisical did not parse");
+        };
+        assert!(args.is_empty(), "{args:?}");
     }
 
     #[test]
