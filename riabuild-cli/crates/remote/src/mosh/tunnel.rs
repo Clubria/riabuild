@@ -84,52 +84,28 @@ pub(crate) async fn open(
     // Held for the length of the session: this ssh *is* the tunnel.
     let child = Ssh::to(remote, paths, runner.clone())
         .carry(carry)
-        .spawn_piped(&format!("{binary} internal mosh-tcp2udp {}", session.port))
+        .spawn_piped(&format!(
+            "{binary} internal {} {}",
+            super::TCP2UDP,
+            session.port
+        ))
         .await
         .ok()?;
-    let mut server = match tunnel_stdio(child.as_ref()) {
+    let stdio = match tunnel_stdio(child.as_ref()) {
         Some(halves) => halves,
         None => {
             let _ = child.kill().await;
             return None;
         }
     };
-    if tokio::time::timeout(super::HANDSHAKE, read_line(&mut server.0))
-        .await
-        .ok()?
-        .ok()?
-        .trim()
-        != TUNNEL_READY_LINE
-    {
-        let _ = child.kill().await;
-        return None;
-    }
-
-    // Bound before `Udp2Tcp` is built, because `Udp2Tcp` connects to this
-    // address rather than being handed a socket, and a listener that is not up
-    // yet is a connection refused rather than a retry.
-    let listener = TcpListener::bind(loopback(0)).await.ok()?;
-    let joining = listener.local_addr().ok()?;
-    let udp2tcp = udp_over_tcp::Udp2Tcp::new(loopback(0), joining, tcp_options())
-        .await
-        .ok()?;
-    let local = udp2tcp.local_udp_addr().ok()?.port();
-
-    // Two tasks, both of which run for the length of the session. `Udp2Tcp`
-    // does not connect until the first datagram arrives, so the accept below
-    // waits until `mosh-client` speaks — which is after the handoff.
-    let (mut incoming, mut outgoing) = (server.0, server.1);
-    let joining_tcp = tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        let (from_server, to_server) = stream.into_split();
-        tokio::select! {
-            _ = pump(&mut incoming, to_server) => {}
-            _ = pump(from_server, &mut outgoing) => {}
+    let joined = match join(stdio.0, stdio.1).await {
+        Some(joined) => joined,
+        None => {
+            let _ = child.kill().await;
+            return None;
         }
-    });
-    let forwarding = tokio::spawn(async move { udp2tcp.run().await });
+    };
+    let local = joined.port;
 
     warn(ui, remote);
     ui.blank();
@@ -150,11 +126,10 @@ pub(crate) async fn open(
         )
         .await;
 
-    // The order matters only in that all three happen: the ssh child holds the
+    // The order matters only in that both happen: the ssh child holds the
     // server's `tcp2udp`, and a task left running holds a half of the stdio it
     // would otherwise have closed.
-    forwarding.abort();
-    joining_tcp.abort();
+    joined.stop();
     let _ = child.kill().await;
 
     // Any non-zero code is the tunnel's failure rather than the developer's,
@@ -165,6 +140,81 @@ pub(crate) async fn open(
         Ok(0) => Some(0),
         _ => None,
     }
+}
+
+/// The laptop's end of a tunnel whose far end has said it is ready.
+pub(super) struct Joined {
+    /// The loopback UDP port `mosh-client` is pointed at.
+    pub(super) port: u16,
+    /// Both run for the length of the session: one carries the ssh stdio to
+    /// and from the local `TcpStream`, the other is `Udp2Tcp` itself.
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl Joined {
+    /// Ends both directions. A task left running holds a half of the stdio it
+    /// would otherwise have closed.
+    pub(super) fn stop(self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Joins a far end's stdio to a local UDP socket `mosh-client` can be pointed
+/// at, once that far end has announced itself.
+///
+/// Takes the stream rather than the ssh child so that the whole of the laptop's
+/// side can be driven by a test against the real server side in
+/// `serve::serve` — see the end-to-end test in `mosh.rs`. Everything above this
+/// needs a server, an account and a `mosh-server`; none of what is below does,
+/// and this is the part that was wrong.
+pub(super) async fn join<R, W>(mut incoming: R, mut outgoing: W) -> Option<Joined>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    if tokio::time::timeout(super::HANDSHAKE, read_line(&mut incoming))
+        .await
+        .ok()?
+        .ok()?
+        .trim()
+        != TUNNEL_READY_LINE
+    {
+        return None;
+    }
+
+    // Bound before `Udp2Tcp` is built, because `Udp2Tcp` connects to this
+    // address rather than being handed a socket, and a listener that is not up
+    // yet is a connection refused rather than a retry.
+    let listener = TcpListener::bind(loopback(0)).await.ok()?;
+    let joining = listener.local_addr().ok()?;
+    let udp2tcp = udp_over_tcp::Udp2Tcp::new(loopback(0), joining, tcp_options())
+        .await
+        .ok()?;
+    let port = udp2tcp.local_udp_addr().ok()?.port();
+
+    // `Udp2Tcp` does not connect until the first datagram arrives, so the
+    // accept below waits until `mosh-client` speaks — which is after the
+    // handoff.
+    let pumping = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (from_server, to_server) = stream.into_split();
+        tokio::select! {
+            _ = pump(&mut incoming, to_server) => {}
+            _ = pump(from_server, &mut outgoing) => {}
+        }
+    });
+    let forwarding = tokio::spawn(async move {
+        let _ = udp2tcp.run().await;
+    });
+
+    Some(Joined {
+        port,
+        tasks: [pumping, forwarding],
+    })
 }
 
 /// What `mosh-server` answered with.
