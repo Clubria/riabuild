@@ -319,23 +319,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_environment_marks_the_session_but_pins_no_account() {
-        // The launchers each set CLAUDE_CONFIG_DIR themselves. Exporting it too
-        // would go stale the moment `riabuild claude primary` reorders the
-        // list, and would send any claude started outside a launcher to a
-        // Clubria account with no org settings layered.
+    async fn the_environment_names_every_harness_config_directory() {
+        // The launchers set these too, and still overrule what is here. What
+        // this covers is every harness reached by another route — an absolute
+        // path, an editor extension, a hook that reads the variable to find the
+        // config it edits — which without it silently falls back to the one
+        // directory riabuild does not manage.
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
-        ctx.config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
+        let id = "11111111-2222-4333-8444-555555555555";
+        ctx.config.claude_accounts = vec![id.into()];
         let env = environment_with(&ctx, None);
 
         assert!(
             env.iter()
                 .any(|(key, value)| key == "RIABUILD_SHELL" && value == "1")
         );
+        for (key, expected) in [
+            ("CLAUDE_CONFIG_DIR", ctx.paths.claude_profile_dir(id)),
+            ("CODEX_HOME", ctx.paths.codex_profile_dir(1)),
+            ("GROK_HOME", ctx.paths.grok_profile_dir(1)),
+        ] {
+            let expected = expected.to_string_lossy().into_owned();
+            assert!(
+                env.iter()
+                    .any(|(name, value)| name == key && value == &expected),
+                "{key} is not {expected}: {env:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_environment_names_the_primary_claude_account() {
+        // The account the unnumbered `claude` launcher runs, so a harness
+        // started outside a launcher lands where the developer's own `claude`
+        // would have.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let first = "11111111-2222-4333-8444-555555555555";
+        let second = "22222222-3333-4444-8555-666666666666";
+        ctx.config.claude_accounts = vec![first.into(), second.into()];
+
+        let value = environment_with(&ctx, None)
+            .into_iter()
+            .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert!(value.ends_with(first), "{value}");
+    }
+
+    #[tokio::test]
+    async fn the_environment_names_no_claude_account_where_there_are_none() {
+        // A machine that has never signed in has no `claude` launcher either,
+        // so there is nothing here to be consistent with — and naming a
+        // directory riabuild never made would point Claude Code at one nothing
+        // has layered the org settings over.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.claude_accounts.clear();
+        let env = environment_with(&ctx, None);
+
         assert!(
             !env.iter().any(|(key, _)| key == "CLAUDE_CONFIG_DIR"),
             "{env:?}"
         );
+        // The other two are a fixed set of nine that both tasks create on every
+        // run, so they are named whatever the sign-in state is.
+        assert!(env.iter().any(|(key, _)| key == "CODEX_HOME"), "{env:?}");
+        assert!(env.iter().any(|(key, _)| key == "GROK_HOME"), "{env:?}");
+    }
+
+    #[tokio::test]
+    async fn a_named_harness_home_beats_the_default() {
+        // `ctx.env` is how a caller says which profile a shell is for. Derived
+        // values go in ahead of it so that stays true.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.claude_accounts = vec!["11111111-2222-4333-8444-555555555555".into()];
+        ctx.env
+            .push(("CLAUDE_CONFIG_DIR".to_string(), "/elsewhere".to_string()));
+
+        let env = environment_with(&ctx, None);
+        let last = env
+            .iter()
+            .rfind(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            .unwrap();
+        assert_eq!(last.1, "/elsewhere", "{env:?}");
     }
 
     fn one_account() -> Vec<crate::accounts::status::Account> {

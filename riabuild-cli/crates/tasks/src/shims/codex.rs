@@ -51,11 +51,14 @@ const YOLO_LONG: &str = "--dangerously-bypass-approvals-and-sandbox";
 /// make changing one silently change the other.
 pub const PROFILES: usize = 9;
 
-/// The launcher, which is the only thing that names `CODEX_HOME`.
+/// The launcher, which is what decides which profile a `codex` gets.
 ///
-/// Not exported into the environment shell, for the reason `CLAUDE_CONFIG_DIR`
-/// is not: an exported value follows every `codex` a developer starts by any
-/// route, including one they deliberately ran from outside riabuild's tree.
+/// The environment shell exports a `CODEX_HOME` of its own — profile 1, the one
+/// this same file writes the unnumbered `codex` for — so that a Codex reached
+/// by any route other than a launcher still lands in riabuild's tree rather
+/// than in `~/.codex`. This line is what keeps the nine apart regardless: it
+/// `export`s over whatever was inherited, so `codex-3` is profile 3 inside the
+/// environment shell and outside it alike. See `shell::environment`.
 pub fn launcher_script(codex_home: &Path, codex: &str, bin_dir: &Path) -> String {
     format!(
         r#"#!/bin/sh

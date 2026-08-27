@@ -1692,6 +1692,7 @@ dependencies = [
  "riabuild-api",
  "riabuild-channel",
  "riabuild-fetch",
+ "riabuild-harness",
  "riabuild-keychain",
  "riabuild-paths",
  "riabuild-runner",

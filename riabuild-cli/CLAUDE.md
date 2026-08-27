@@ -902,13 +902,29 @@ counting the tests would make writing more of them look like a problem.
 A developer has an ordered list of up to nine Claude Code accounts, each a
 `~/.riabuild/claude/<uuid>/` config directory with its own sign-in, and each reached by its
 own generated launcher: `claude` runs the primary, `claude-1` … `claude-N` run a particular
-one. The launchers are the only thing that names a config directory — `CLAUDE_CONFIG_DIR` is
-deliberately **not** exported into the environment shell, so a `claude` started outside a
-launcher cannot land in an account by accident, and one exported value cannot quietly make
-all nine share a directory. `riabuild claude list|new|delete|primary` manages the list,
-every environment shell opens with the account box, and the org's Claude settings, the
+one. The launcher is what makes a *numbered* `claude` a particular account, and it keeps
+that job whatever it inherits: it `export`s its own `CLAUDE_CONFIG_DIR` over the
+environment's. `riabuild claude list|new|delete|primary` manages the list, every
+environment shell opens with the account box, and the org's Claude settings, the
 checkout's trust, and the plugins the checkout declares apply to every account, never just
 the first.
+
+**The environment shell names a config directory for each harness anyway** —
+`CLAUDE_CONFIG_DIR` at account 1, `CODEX_HOME` and `GROK_HOME` at profile 1, the same
+three the unnumbered launchers run. This was withheld for a long time on the reasoning
+that the launchers already set them and one exported value would make all nine share a
+directory. The second half was never true — each launcher exports over what it inherited,
+so `claude-2` is still account 2 — and what the first half bought was an *unset* variable
+everywhere a harness is reached by any route other than a launcher: an absolute path out
+of `~/.riabuild/<tool>/<version>/`, an editor extension that found the binary itself, a
+hook or MCP server that reads the variable to find the config it is meant to edit, a
+script a developer wrote. Unset is not "no opinion"; it is `~/.claude`, `~/.codex` and
+`~/.grok` — the three directories riabuild does not manage. So the default is stated
+rather than left to a fallback nobody chose. A shell holds what it opened with, so
+`riabuild claude primary` reordering the list leaves an open shell naming the account that
+*was* primary; its launchers are rewritten and stay right, and the next shell agrees with
+them again. `shell::environment`'s `harness_homes` is the one place this is decided, and a
+value already in `ctx.env` still wins over it.
 
 **Three things riabuild wants cannot be settings, and each has its own home.**
 `hasTrustDialogAccepted`, `hasCompletedOnboarding` and `defaultToAgentsView` are all

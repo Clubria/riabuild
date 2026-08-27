@@ -37,6 +37,10 @@ getrandom.workspace = true
 riabuild-api.workspace = true
 riabuild-channel.workspace = true
 riabuild-fetch.workspace = true
+# `Kind::home_env` — the one spelling of CLAUDE_CONFIG_DIR / CODEX_HOME /
+# GROK_HOME, shared with `riabuild agents` so the environment shell and a
+# session cannot come to name a profile by two different variables.
+riabuild-harness.workspace = true
 riabuild-keychain.workspace = true
 riabuild-paths.workspace = true
 riabuild-runner.workspace = true

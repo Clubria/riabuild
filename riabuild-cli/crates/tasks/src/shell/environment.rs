@@ -6,6 +6,7 @@
 //! environment, and prepending to `PATH` is the most common line in one.
 
 use crate::Ctx;
+use riabuild_harness::Kind;
 
 /// riabuild's own directories, in the order they have to lead `PATH`.
 pub fn riabuild_path_dirs(ctx: &Ctx) -> Vec<String> {
@@ -127,11 +128,70 @@ pub(super) fn environment_with(ctx: &Ctx, inherited: Option<&str>) -> Vec<(Strin
         ("PATH".to_string(), path_with_riabuild(ctx, &current_path)),
         ("RIABUILD_SHELL".to_string(), "1".to_string()),
     ];
+    // Ahead of `ctx.env`, so anything a caller set by name keeps the last word
+    // over the default derived here — `riabuild remote` starting a shell for a
+    // particular profile, and every test that names one.
+    env.extend(harness_homes(ctx));
     env.extend(ctx.env.iter().cloned());
     if let Some(browser) = browser_for(ctx, &env, inherited) {
         env.push(("BROWSER".to_string(), browser));
     }
     env
+}
+
+/// The config directory each harness reads, pointed at the profile riabuild
+/// owns: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`.
+///
+/// These were withheld for most of riabuild's life, on the reasoning that the
+/// launchers in `bin/` already set them and one exported value would quietly
+/// make all nine profiles share a directory. The first half is still true and
+/// the second never was: each launcher `export`s its own profile's value over
+/// whatever it inherited, so `claude-2`, `codex-3` and `grok-9` are unaffected
+/// by anything here. What withholding them actually bought was an *unset*
+/// variable everywhere a harness is reached by any route other than the
+/// launcher — an absolute path out of `~/.riabuild/<tool>/<version>/`, an
+/// editor extension that found the binary itself, a hook or MCP server that
+/// reads the variable to find the config it is meant to edit, a script a
+/// developer wrote. Unset does not mean *no opinion*; it means each of those
+/// silently uses `~/.claude`, `~/.codex` or `~/.grok` — the three directories
+/// riabuild does not manage, holding the developer's own sign-ins and none of
+/// the org's settings. So the default is now stated rather than left to a
+/// fallback nobody chose.
+///
+/// The primary profile in each case, which is the one the unnumbered launcher
+/// runs: `claude` is account 1, `codex` and `grok` are profile 1. A shell holds
+/// the value it opened with, so `riabuild claude primary` reordering the list
+/// leaves an already-open shell naming the account that *was* primary — the
+/// launchers there are rewritten and stay right, and the next shell agrees with
+/// them again.
+///
+/// Claude's is conditional because its accounts are created by riabuild's own
+/// sign-in flow and the list can be empty; there is no `claude` launcher on
+/// such a machine either, so there is nothing here to be consistent with.
+/// Codex's and Grok's are unconditional because their nine profiles are a fixed
+/// set both tasks create on every run.
+fn harness_homes(ctx: &Ctx) -> Vec<(String, String)> {
+    Kind::ALL
+        .into_iter()
+        .filter_map(|kind| Some((kind.home_env().to_string(), profile_home(ctx, kind)?)))
+        .collect()
+}
+
+/// The directory `harness_homes` names for one harness, or `None` where this
+/// machine has no profile to name.
+///
+/// A `match` over [`Kind`] rather than three pushes, so a fourth harness cannot
+/// be added to `riabuild-harness` and silently miss the environment shell: it
+/// stops compiling here until somebody says where its profile lives.
+fn profile_home(ctx: &Ctx, kind: Kind) -> Option<String> {
+    let dir = match kind {
+        Kind::Claude => ctx
+            .paths
+            .claude_profile_dir(ctx.config.claude_accounts.first()?),
+        Kind::Codex => ctx.paths.codex_profile_dir(1),
+        Kind::Grok => ctx.paths.grok_profile_dir(1),
+    };
+    Some(dir.to_string_lossy().into_owned())
 }
 
 /// `$BROWSER`, but only for a session that has a laptop to open links on.

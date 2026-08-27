@@ -79,13 +79,15 @@ const BYPASS: &str = "bypassPermissions";
 /// launcher.
 const PERMISSION_MODE: &str = "--permission-mode";
 
-/// The launcher, which is the only thing that names `GROK_HOME`.
+/// The launcher, which is what decides which profile a `grok` gets.
 ///
-/// Not exported into the environment shell, for the reason `CLAUDE_CONFIG_DIR`
-/// and `CODEX_HOME` are not: an exported value follows every `grok` a developer
-/// starts by any route, including one they deliberately ran from outside
-/// riabuild's tree — and one exported value would quietly make all nine
-/// profiles share a directory.
+/// The environment shell exports a `GROK_HOME` of its own — profile 1, the one
+/// this same file writes the unnumbered `grok` for — so that a Grok Build
+/// reached by any route other than a launcher still lands in riabuild's tree
+/// rather than in `~/.grok`, a directory it would otherwise create on the spot.
+/// This line is what keeps the nine apart regardless: it `export`s over
+/// whatever was inherited, so `grok-3` is profile 3 inside the environment
+/// shell and outside it alike. See `shell::environment`.
 pub fn launcher_script(grok_home: &Path, grok: &str, bin_dir: &Path) -> String {
     format!(
         r#"#!/bin/sh

@@ -14,11 +14,18 @@ ENV_OUT="$(riabuild env 2>&1)"
 check_contains "PATH gets riabuild's bin directory" "$ENV_OUT" "$RIA_HOME/bin"
 check_contains "PATH gets riabuild's Node" "$ENV_OUT" "$RIA_HOME/node/$NODE_VERSION/bin"
 check_contains "the shell is marked as riabuild's" "$ENV_OUT" "RIABUILD_SHELL='1'"
-# Deliberately absent. The launchers in ~/.riabuild/bin each set their own
-# account's CLAUDE_CONFIG_DIR; an exported one would override every launcher at
-# once and quietly make all nine accounts share a config directory. One
-# mechanism, not two.
-check_missing "the environment pins no single account" "$ENV_OUT" "CLAUDE_CONFIG_DIR"
+# Each harness's config directory, named rather than left to a fallback. Unset,
+# every Claude Code, Codex and Grok Build reached by any route other than a
+# launcher — an absolute path, an editor extension, a hook that reads the
+# variable to find the config it edits — uses ~/.claude, ~/.codex or ~/.grok,
+# the three directories riabuild does not manage. The numbered launchers still
+# export their own over this one, which is what keeps the nine apart.
+check_contains "the environment names Claude Code's config directory" "$ENV_OUT" \
+  "CLAUDE_CONFIG_DIR='$RIA_HOME/claude/$CLAUDE_ACCOUNT'"
+check_contains "the environment names Codex's config directory" "$ENV_OUT" \
+  "CODEX_HOME='$RIA_HOME/codex/1'"
+check_contains "the environment names Grok Build's config directory" "$ENV_OUT" \
+  "GROK_HOME='$RIA_HOME/grok/1'"
 
 # `riabuild shell` spawns the developer's real shell. Feeding it a command on
 # stdin runs the actual handoff — rcfile generation, ZDOTDIR, PATH — rather than
