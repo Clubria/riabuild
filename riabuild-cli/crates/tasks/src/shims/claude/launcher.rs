@@ -1,8 +1,8 @@
 //! What one Claude Code launcher says.
 //!
 //! ```sh
-//! # a bare, interactive `claude` — opens on the agents view, scoped to the
-//! # checkout this machine was set up for
+//! # a bare, interactive `claude` — opens on the agents view, scoped to
+//! # whichever checkout the developer is standing in
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
 //!   --settings ~/.riabuild/org-settings.json \
 //!   --allow-dangerously-skip-permissions \
@@ -85,7 +85,7 @@
 //! test: Claude Code exposes no non-interactive clipboard command to assert
 //! against. Re-read them by hand when the pinned Claude Code version moves.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Moves the per-machine half of the system prompt into the first user message.
 ///
@@ -157,7 +157,8 @@ const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 /// pins beside the other two. Verified against 2.1.235.
 const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 
-/// Scopes the agents view to the checkout this machine was set up for.
+/// Scopes the agents view to the checkout the developer is actually standing
+/// in — never to one fixed repository for the whole machine.
 ///
 /// A **subcommand** option of `agents`, and only of `agents`: `claude --cwd
 /// <path> mcp list` is "error: unknown option '--cwd'". So it cannot join
@@ -170,8 +171,8 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// is what the `--help` line says and all it says — *and* it becomes the
 /// working directory the view reports and dispatches from. A developer who runs
 /// `claude` from their home directory used to get a view listing every session
-/// on the machine, from every checkout; now they get the repository riabuild
-/// set this machine up for, wherever they were standing.
+/// on the machine, from every checkout; now they get whichever repository is
+/// under them, or the one riabuild set this machine up for by default.
 ///
 /// It does **not** override a developer who is already somewhere more specific.
 /// Claude Code keeps the process's own working directory when that directory is
@@ -182,10 +183,26 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// developer who is nowhere near their work back to it, and leaves one who is
 /// standing in it alone.
 ///
-/// Passed only where the checkout is on disk. A path that is not there does not
-/// fail — the view opens on an empty list naming a directory nobody has — and
-/// that is precisely the failure worth not shipping: a `claude` whose view is
-/// pinned to a ghost is worse than one that behaves like it did last week.
+/// **Which repository "it" is has to be resolved per launch, not baked in
+/// once.** A machine that knows two checkouts — `riabuild` and a second
+/// repository picked later — used to get one `--cwd` for both, chosen by
+/// whichever repository `riabuild` was last run against: a developer typing
+/// `claude` from inside `riabuild` was moved to the *other* checkout, because
+/// the floor above only keeps you where you stand when you are already inside
+/// the one path the launcher knows. That is not "leaves one who is standing in
+/// it alone" — it is "alone" for exactly one checkout, and a wall for every
+/// other one riabuild has ever cloned. So the launcher script itself picks:
+/// `case "$PWD"` walks every checkout `riabuild` knows about (`build_agents_view`
+/// generates one arm per entry in `UserConfig::repos`) and takes whichever one
+/// contains the working directory, falling back to the run's default repository
+/// only when none of them do. Every developer with one repository sees exactly
+/// today's behaviour — one arm, one fallback that agrees with it.
+///
+/// Passed only where the resolved checkout is on disk. A path that is not there
+/// does not fail — the view opens on an empty list naming a directory nobody
+/// has — and that is precisely the failure worth not shipping: a `claude`
+/// whose view is pinned to a ghost is worse than one that behaves like it did
+/// last week.
 ///
 /// Verified against Claude Code 2.1.235, including the thing that would have
 /// sunk it: an option after the `agents` positional does not push the launch
@@ -195,36 +212,80 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// version moves.
 const VIEW_CWD: &str = "--cwd";
 
+/// The branch of the launcher that opens the agents view, scoped to whichever
+/// checkout `$PWD` turns out to be under when the script actually runs.
+///
+/// One `case` arm per entry in `checkouts`, most specific (longest path)
+/// first, so a checkout nested inside another — unusual, but not something the
+/// generator may assume away — matches the inner one rather than the outer.
+/// The pattern for each is `"{path}"|"{path}"/*`: the first alternative is an
+/// exact match (`$PWD` is the checkout root itself), the second is quoted
+/// literal followed by an *unquoted* `/*`, which is what makes it a prefix
+/// match on every subdirectory and worktree beneath it rather than a glob over
+/// the checkout's own contents. Determined entirely at shell runtime — nothing
+/// here can know where a script's caller will `cd` from before that caller
+/// exists.
+///
+/// The `*` arm is `default`: what a developer standing nowhere riabuild has a
+/// checkout for still gets pulled back to, exactly as the single-repository
+/// launcher always did. Two spellings of the branch rather than one with an
+/// interpolated argument, for the same reason `launcher_script` used to give
+/// for its own single-path version: `${{x:+--cwd "$x"}}` would split a path
+/// containing a space back into two arguments, and `/Users/Ada Smith/Clubria`
+/// is an ordinary macOS home.
+///
+/// `checkouts` empty and `default` `None` together is the one case with
+/// nothing to match against at all — every machine before its first clone —
+/// and it is spelled as the plain `agents` line the launcher always wrote
+/// rather than a `case` with only a `*` arm, so a machine that has never
+/// chosen a repository sees exactly the script it always has.
+fn build_agents_view(checkouts: &[PathBuf], default: Option<&Path>) -> String {
+    if checkouts.is_empty() && default.is_none() {
+        return format!("  set -- {ALLOW_BYPASS} agents");
+    }
+    let mut arms = String::new();
+    for checkout in checkouts {
+        let path = checkout.display();
+        arms.push_str(&format!(
+            "      \"{path}\"|\"{path}\"/*) project=\"{path}\" ;;\n"
+        ));
+    }
+    arms.push_str(&match default {
+        Some(default) => format!("      *) project=\"{}\" ;;\n", default.display()),
+        None => "      *) project=\"\" ;;\n".to_string(),
+    });
+    format!(
+        r#"  project=""
+  case "$PWD" in
+{arms}  esac
+  if [ -n "$project" ] && [ -d "$project" ]; then
+    set -- {bypass} agents {cwd} "$project"
+  else
+    set -- {bypass} agents
+  fi"#,
+        bypass = ALLOW_BYPASS,
+        cwd = VIEW_CWD,
+    )
+}
+
 /// One account's launcher: `claude`, or `claude-<n>`.
 ///
-/// `project` is the checkout of the repository this run is about, or `None` on
-/// a machine that has not got one yet — which is every machine before its first
-/// clone, and the reason this is an `Option` rather than a path with a
-/// convention for "nowhere".
+/// `checkouts` is every repository this machine knows a path for —
+/// `UserConfig::repos`, in the order the case statement should try them — and
+/// `default` is the checkout of the repository the *current* run is about,
+/// used only when the developer's `$PWD` matches none of `checkouts`. Both are
+/// commonly the same single path, which is what a machine with one repository
+/// looks like; `default` is `None` only where there is no checkout at all yet
+/// to fall back to — every machine before its first clone.
 pub fn launcher_script(
     config_dir: &Path,
     claude: &str,
     org_settings: &Path,
     bin_dir: &Path,
-    project: Option<&Path>,
+    checkouts: &[PathBuf],
+    default: Option<&Path>,
 ) -> String {
-    // Two spellings of one branch rather than one spelling with an interpolated
-    // argument: `${{x:+--cwd "$x"}}` would split a path containing a space back
-    // into two arguments, and `/Users/Ada Smith/Clubria/...` is an ordinary
-    // macOS home rather than a hypothetical one.
-    let agents_view = match project {
-        Some(project) => format!(
-            r#"  if [ -d "{project}" ]; then
-    set -- {bypass} agents {cwd} "{project}"
-  else
-    set -- {bypass} agents
-  fi"#,
-            project = project.display(),
-            bypass = ALLOW_BYPASS,
-            cwd = VIEW_CWD,
-        ),
-        None => format!("  set -- {ALLOW_BYPASS} agents"),
-    };
+    let agents_view = build_agents_view(checkouts, default);
     format!(
         r#"#!/bin/sh
 # Generated by riabuild. Edits here are overwritten.
@@ -335,23 +396,29 @@ fi
 #              switch here is the difference between a developer turning the
 #              view off and a developer losing the `claude` command.
 #
-# The view opens on the checkout this machine was set up for, which is what
-# `--cwd` is doing below. It is an option of the `agents` subcommand and of
-# nothing else — `claude --cwd <path> mcp list` is "unknown option" — so it sits
-# after the positional, and the other branch cannot have it. Unlike {flag}, an
-# option in that position does not cost the view: the launch still opens on it,
-# still with {bypass} in force. Verified against Claude Code 2.1.235.
+# The view opens on whichever checkout the developer is standing in, which is
+# what `--cwd` is doing below. It is an option of the `agents` subcommand and
+# of nothing else — `claude --cwd <path> mcp list` is "unknown option" — so it
+# sits after the positional, and the other branch cannot have it. Unlike
+# {flag}, an option in that position does not cost the view: the launch still
+# opens on it, still with {bypass} in force. Verified against Claude Code
+# 2.1.235.
 #
 # It is a floor rather than a move. Claude Code keeps the working directory the
 # process already has when that directory is *inside* the one named here, so
 # `claude` from a subdirectory or from a `.claude/worktrees/` worktree still
 # opens where the developer stands; it is the `claude` typed in a home
-# directory, or in some unrelated tree, that lands on the repository instead of
+# directory, or in some unrelated tree, that lands on a repository instead of
 # on a list of every session on the machine.
 #
-# Only where the checkout is on disk. A path that is gone opens a view onto an
-# empty list naming a directory nobody has, which is worse than the view this
-# launcher opened before the flag existed.
+# Which repository is decided just above, not baked into this script once:
+# `$PWD` is matched against every checkout riabuild knows a path for, and only
+# a developer standing nowhere any of them falls back to this run's default —
+# so working in a second checkout no longer pulls `claude` away from the first
+# one riabuild set this machine up for. Only where the resolved checkout is on
+# disk. A path that is gone opens a view onto an empty list naming a directory
+# nobody has, which is worse than the view this launcher opened before the
+# flag existed.
 if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]; then
 {agents_view}
 else
@@ -378,17 +445,26 @@ mod tests {
     /// The checkout the fixture launcher opens its agents view on.
     const PROJECT: &str = "/Users/ada/Clubria/ai-builders-hub";
 
+    /// A second checkout, for the tests about a machine that knows more than
+    /// one — the shape that used to lose `--cwd` for every repository but the
+    /// last one `riabuild` was run against.
+    const OTHER_PROJECT: &str = "/Users/ada/Clubria/payments";
+
+    /// The fixture most tests want: one known checkout, which is also the
+    /// run's default — what a machine with a single repository looks like,
+    /// and indistinguishable from the pre-multi-repository launcher.
     fn script() -> String {
-        script_for(Some(Path::new(PROJECT)))
+        script_for(&[PathBuf::from(PROJECT)], Some(Path::new(PROJECT)))
     }
 
-    fn script_for(project: Option<&Path>) -> String {
+    fn script_for(checkouts: &[PathBuf], default: Option<&Path>) -> String {
         launcher_script(
             Path::new("/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"),
             "/Users/ada/.riabuild/node/22.23.1/bin/claude",
             Path::new("/Users/ada/.riabuild/org-settings.json"),
             Path::new("/Users/ada/.riabuild/bin"),
-            project,
+            checkouts,
+            default,
         )
     }
 
@@ -558,17 +634,147 @@ mod tests {
         let script = script();
         assert!(
             script.contains(&format!(
-                r#"set -- {ALLOW_BYPASS} agents {VIEW_CWD} "{PROJECT}""#
+                r#"set -- {ALLOW_BYPASS} agents {VIEW_CWD} "$project""#
             )),
             "{script}"
         );
-        // Quoted, and the assertion above would pass on an unquoted path too
-        // if the fixture had no space in it. `/Users/Ada Smith/…` is an
-        // ordinary macOS home, and unquoted it reaches Claude Code as two
-        // arguments — the second of which is not an option at all.
+        // The path itself lives in the `case` arm that resolves `$project`,
+        // not on the exec line — `$PWD` decides which checkout that variable
+        // names, so the literal path can only be asserted there.
         assert!(
-            script.contains(&format!(r#"{VIEW_CWD} "{PROJECT}""#)),
+            script.contains(&format!(
+                r#""{PROJECT}"|"{PROJECT}"/*) project="{PROJECT}" ;;"#
+            )),
             "{script}"
+        );
+    }
+
+    /// A machine that knows a second repository still opens `--cwd` on the
+    /// first one — the regression this module exists to close. Before
+    /// `build_agents_view`, `--cwd` named whichever repository `riabuild` was
+    /// *last run against*, machine-wide, so a developer standing in `PROJECT`
+    /// while `OTHER_PROJECT` was the more recent run was moved off their own
+    /// checkout the moment they typed `claude`.
+    #[test]
+    fn a_second_known_checkout_gets_its_own_case_arm_rather_than_replacing_the_first() {
+        let script = script_for(
+            &[PathBuf::from(PROJECT), PathBuf::from(OTHER_PROJECT)],
+            Some(Path::new(OTHER_PROJECT)),
+        );
+        assert!(
+            script.contains(&format!(
+                r#""{PROJECT}"|"{PROJECT}"/*) project="{PROJECT}" ;;"#
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                r#""{OTHER_PROJECT}"|"{OTHER_PROJECT}"/*) project="{OTHER_PROJECT}" ;;"#
+            )),
+            "{script}"
+        );
+        // The default — the repository this run is about — is what a
+        // developer standing in neither checkout still falls back to.
+        assert!(
+            script.contains(&format!(r#"*) project="{OTHER_PROJECT}" ;;"#)),
+            "{script}"
+        );
+        // Exactly one exec line reaches Claude Code with `--cwd`; which path
+        // fills `$project` is a runtime question this script can no longer
+        // answer by reading its own text — `checkout_matching_pwd_wins_over_
+        // the_run_default` proves that half by actually running it.
+        assert!(
+            script.contains(&format!(r#"agents {VIEW_CWD} "$project""#)),
+            "{script}"
+        );
+    }
+
+    /// Runs the generated `case "$PWD" in …` block for real, from three
+    /// different working directories, and reads back which checkout it
+    /// resolved to. The text assertions above prove the right literals are in
+    /// the right place; this is what proves the shell actually picks the one
+    /// `$PWD` is under rather than always falling through to the run's
+    /// default — the one property no substring match can stand in for, and
+    /// the exact bug report this module exists to close: standing in a known
+    /// checkout that happens not to be the most recently active repository
+    /// must still resolve to itself.
+    ///
+    /// Run directly rather than through the full launcher, because the case
+    /// block sits inside the interactive branch and `cargo test` gives a
+    /// child no terminal — see `a_launch_with_no_terminal_never_picks_up_the_
+    /// agents_view`'s own doc comment for why that half is untestable here.
+    #[tokio::test]
+    async fn checkout_matching_pwd_wins_over_the_run_default() {
+        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
+
+        let home = tempfile::TempDir::new().unwrap();
+        // Canonicalized before anything is built on it: macOS's `$TMPDIR`
+        // lives under `/var`, itself a symlink to `/private/var`, and a shell
+        // reports `$PWD` from `getcwd()` — the canonical path — at startup.
+        // Matching that against the symlinked literal this crate's own
+        // `TempDir` would otherwise hand out fails the very check this test
+        // exists to prove, for a reason that has nothing to do with the
+        // launcher: every checkout `riabuild` actually manages lives under a
+        // developer's home directory, which is not itself a symlink.
+        let root = tokio::fs::canonicalize(home.path()).await.unwrap();
+        let project = root.join("riabuild");
+        let other = root.join("payments");
+        let elsewhere = root.join("elsewhere");
+        for dir in [&project, &other, &elsewhere] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+        }
+        // A `.claude/worktrees/` worktree, or any ordinary subdirectory — the
+        // floor `VIEW_CWD`'s own doc comment describes must survive matching
+        // by `$PWD`, not just by "is this exactly the checkout root".
+        let worktree = project.join(".claude/worktrees/wt");
+        tokio::fs::create_dir_all(&worktree).await.unwrap();
+
+        // `other` is the run's default — the case a developer standing in
+        // `project` must NOT fall back to.
+        let case_block = build_agents_view(&[project.clone(), other.clone()], Some(&other));
+        let resolver = home.path().join("resolve.sh");
+        tokio::fs::write(
+            &resolver,
+            format!("#!/bin/sh\n{case_block}\nprintf '%s' \"$project\"\n"),
+        )
+        .await
+        .unwrap();
+        make_executable(&resolver).await.unwrap();
+
+        let runner = RealRunner;
+        let resolved_from = |dir: std::path::PathBuf| {
+            let resolver = resolver.to_string_lossy().into_owned();
+            let runner = &runner;
+            async move {
+                runner
+                    .run(
+                        &resolver,
+                        &[],
+                        &RunOptions {
+                            cwd: Some(dir),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("resolve.sh ran")
+                    .stdout
+            }
+        };
+
+        assert_eq!(
+            resolved_from(project.clone()).await,
+            project.to_string_lossy(),
+            "standing in a known checkout must resolve to itself, not to the run's default"
+        );
+        assert_eq!(
+            resolved_from(worktree).await,
+            project.to_string_lossy(),
+            "a worktree beneath a known checkout must still resolve to it"
+        );
+        assert_eq!(
+            resolved_from(elsewhere).await,
+            other.to_string_lossy(),
+            "standing in neither known checkout must fall back to the run's default"
         );
     }
 
@@ -602,7 +808,7 @@ mod tests {
         // Every machine before its first clone. There is no path to name, and
         // naming one anyway — the default the picker would offer, say — would
         // point the view at a directory nobody has cloned into yet.
-        let script = script_for(None);
+        let script = script_for(&[], None);
         assert!(
             script.contains(&format!("set -- {ALLOW_BYPASS} agents\n")),
             "{script}"
@@ -615,9 +821,10 @@ mod tests {
                 assert!(!line.contains(VIEW_CWD), "{line}");
             }
         }
-        // And no `-d` test either — there is no checkout to look for, so the
-        // branch is the single line it has always been.
-        assert!(!script.contains("if [ -d "), "{script}");
+        // No `case "$PWD"` and no `-d` test either — there is nothing to
+        // match against, so the branch is the single line it has always been.
+        assert!(!script.contains(r#"case "$PWD""#), "{script}");
+        assert!(!script.contains("[ -d "), "{script}");
     }
 
     #[test]
@@ -626,10 +833,12 @@ mod tests {
         // between two riabuild runs. Claude Code does not refuse a `--cwd` that
         // is not there — it opens the view on an empty list naming a directory
         // nobody has, which is a worse `claude` than the one this launcher
-        // wrote before the flag existed.
+        // wrote before the flag existed. The guard is shared across every
+        // resolved checkout now, rather than written once per project, because
+        // which path fills `$project` is no longer known until the script runs.
         let script = script();
         assert!(
-            script.contains(&format!(r#"if [ -d "{PROJECT}" ]; then"#)),
+            script.contains(r#"if [ -n "$project" ] && [ -d "$project" ]; then"#),
             "{script}"
         );
         assert!(
@@ -706,6 +915,7 @@ mod tests {
             &claude.to_string_lossy(),
             &settings,
             &home.path().join("bin"),
+            std::slice::from_ref(&project),
             Some(&project),
         );
         tokio::fs::write(&launcher, &script).await.unwrap();
@@ -913,6 +1123,7 @@ mod tests {
             "claude",
             Path::new("/Users/ada/.riabuild/org-settings.json"),
             Path::new("/Users/ada/.riabuild/bin"),
+            &[PathBuf::from(PROJECT)],
             Some(Path::new(PROJECT)),
         );
         assert!(script.contains(r#"case "$claude_binary" in"#), "{script}");

@@ -966,7 +966,7 @@ answer no longer applies through the launcher, so `CLAUDE_CODE_DISABLE_AGENT_VIE
 their way out and the launcher honours it — without that guard a disabled view would not
 degrade to a session, it would exit 1 and take the `claude` command with it.
 
-**`--cwd` opens that view on the checkout, and it is the one flag only the bare line can
+**`--cwd` opens that view on a checkout, and it is the one flag only the bare line can
 carry.** It belongs to the `agents` *subcommand* rather than to `claude` — `claude --cwd
 <path> mcp list` is "unknown option" — so it sits after the positional, and a copy of it on
 the branch that forwards a developer's own arguments would not scope anything: it would
@@ -983,11 +983,33 @@ directory used to open a list of every session on the machine from every checkou
 is a **floor rather than a move**, because Claude Code keeps the process's own working
 directory when that directory is inside the one named here — so `claude` from
 `<checkout>/riabuild-cli`, or from a `.claude/worktrees/` worktree under it, still opens
-where the developer stands. Passed only where the checkout is on disk: a path that is gone
-does not error, it opens a view onto an empty list naming a directory nobody has, which is
-worse than the view the launcher wrote before the flag existed. Verified against 2.1.235 and
-pinned by `the_view_cwd_is_an_agents_option_and_only_an_agents_option`, which asserts both
-halves — accepted after the positional, rejected before it.
+where the developer stands. Passed only where the resolved checkout is on disk: a path
+that is gone does not error, it opens a view onto an empty list naming a directory nobody
+has, which is worse than the view the launcher wrote before the flag existed. Verified
+against 2.1.235 and pinned by `the_view_cwd_is_an_agents_option_and_only_an_agents_option`,
+which asserts both halves — accepted after the positional, rejected before it.
+
+**Which checkout is resolved per launch, by `$PWD`, never baked into the launcher as one
+repository for the whole machine.** `UserConfig::repos` holds every checkout this machine
+knows about, keyed by `owner/repo`, and `shims::claude::known_checkouts` hands the whole
+map to `launcher_script` — not just `Ctx::project_dir`'s answer for the run that happened
+to generate the script. `build_agents_view` turns that into one `case "$PWD" in …` arm per
+checkout, longest path first, with the run's own default as the `*` fallback for a
+developer standing in neither. The floor above still holds per arm — `"$path"|"$path"/*`
+matches the checkout root and everything beneath it — so which repository "it" resolves to
+is a question the *generated shell script* answers at the moment `claude` runs, not one the
+Rust code can answer once and freeze into the file.
+
+This is what makes a developer who works in two Clubria checkouts — `riabuild` and, say, a
+product repository, each in its own terminal — get `--cwd` right in both, rather than in
+whichever repository `riabuild` was *most recently run against*. Before
+`known_checkouts`/`build_agents_view` existed, `--cwd` was one path, chosen by
+`Ctx::project_dir` at the moment the launcher was last written: a developer standing in
+`riabuild` was moved to the other checkout the instant a `riabuild` run against it
+regenerated the script, because the floor only keeps you where you stand when the single
+path the launcher knows is the one you are in. Design:
+`../docs/superpowers/specs/2026-08-18-repository-picker-design.md`'s "Out of scope" line
+ruling this out is superseded — see the addendum at its foot.
 
 **Trust is the only gate Claude Code puts in front of a checkout's settings, and the
 plugins ride on it.** `hasTrustDialogAccepted` — keyed by the checkout's *git root*, which

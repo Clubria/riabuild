@@ -11,7 +11,7 @@ pub use launcher::launcher_script;
 use super::write_script;
 use crate::Ctx;
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub async fn write_all(ctx: &Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
@@ -20,12 +20,12 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     let claude = ctx.claude();
     let settings = ctx.paths.org_settings_file();
     let ids = &ctx.config.claude_accounts;
-    // The checkout the agents view opens on. Read here rather than inside the
-    // loop because every account's launcher gets the same one: which repository
-    // this machine is set up for is a fact about the machine, not about a
-    // sign-in. `None` on a machine with no checkout yet, and the launcher then
-    // opens the view exactly as it did before the flag existed.
-    let project = ctx.project_dir();
+    // Every checkout this machine knows a path for, plus this run's own
+    // default — what `--cwd` falls back to when a developer is standing in
+    // neither. Read here rather than inside the loop because every account's
+    // launcher gets the same list: which repositories this machine knows
+    // about is a fact about the machine, not about a sign-in.
+    let (checkouts, default) = known_checkouts(ctx);
 
     // Landed by rename, like every other file riabuild generates. Launcher
     // content is deterministic given the account list, so two concurrent
@@ -38,7 +38,8 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
             &claude,
             &settings,
             &bin,
-            project.as_deref(),
+            &checkouts,
+            default.as_deref(),
         );
         write_script(&bin, &format!("claude-{}", index + 1), &script).await?;
         if index == 0 {
@@ -48,6 +49,41 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
 
     prune(&bin, ids.len()).await?;
     Ok(())
+}
+
+/// Every checkout `UserConfig::repos` knows a path for — the whole reason
+/// `--cwd` can be scoped per checkout instead of to one repository for the
+/// whole machine — plus this run's own default (`Ctx::project_dir`), added if
+/// it is not already among them. The default is what a machine that has never
+/// used the picker falls back to, through `project_dir`'s own reading of
+/// `legacy_checkout`.
+///
+/// Sorted longest-path-first so a checkout nested inside another — unusual,
+/// but not something the launcher may assume away — matches the more specific
+/// one; deduplicated so a repository that is also the default is not tested
+/// twice for no reason.
+fn known_checkouts(ctx: &Ctx) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let default = ctx.project_dir();
+    let home = ctx.paths.home();
+    let mut checkouts: Vec<PathBuf> = ctx
+        .config
+        .repos
+        .values()
+        .map(|path| riabuild_paths::expand_tilde(path, &home))
+        .collect();
+    if let Some(default) = &default
+        && !checkouts.contains(default)
+    {
+        checkouts.push(default.clone());
+    }
+    checkouts.sort_by(|a, b| {
+        b.as_os_str()
+            .len()
+            .cmp(&a.as_os_str().len())
+            .then_with(|| a.cmp(b))
+    });
+    checkouts.dedup();
+    (checkouts, default)
 }
 
 /// Removes launchers that no longer name an account.
@@ -81,7 +117,109 @@ mod tests {
     use super::*;
     use crate::accounts;
     use crate::testing::ctx_with;
+    use riabuild_api::Repo;
     use riabuild_runner::FakeRunner;
+
+    /// `known_checkouts` is what turns `UserConfig::repos` — a machine's whole
+    /// map of checkouts — into the list `build_agents_view` matches `$PWD`
+    /// against, so this is the seam where a second repository either does or
+    /// does not get a `--cwd` of its own.
+    #[tokio::test]
+    async fn known_checkouts_carries_every_repo_this_machine_has_cloned() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.repos.insert(
+            "Clubria/riabuild".into(),
+            "/home/ada/Clubria/riabuild".into(),
+        );
+        ctx.config.repos.insert(
+            "Clubria/clubria-tenants".into(),
+            "/home/ada/Clubria/clubria-tenants".into(),
+        );
+        ctx.repo = Some(Repo::parse("Clubria/clubria-tenants").unwrap());
+
+        let (checkouts, default) = known_checkouts(&ctx);
+
+        assert_eq!(
+            default.as_deref(),
+            Some(std::path::Path::new("/home/ada/Clubria/clubria-tenants")),
+            "the run's own default is the active repository, unchanged"
+        );
+        // Both checkouts present — the fix. Before it, only whichever
+        // repository this run happened to be about reached the launcher.
+        for path in [
+            "/home/ada/Clubria/riabuild",
+            "/home/ada/Clubria/clubria-tenants",
+        ] {
+            assert!(
+                checkouts.contains(&std::path::PathBuf::from(path)),
+                "{checkouts:?} is missing {path}"
+            );
+        }
+        assert_eq!(
+            checkouts.len(),
+            2,
+            "the default must not be duplicated: {checkouts:?}"
+        );
+    }
+
+    /// A repository this machine knows about, but which is not the run's
+    /// default, must not be dropped — the exact map entry the bug report's
+    /// `clubria-tenants` checkout would have been.
+    #[tokio::test]
+    async fn known_checkouts_keeps_a_repository_that_is_not_the_default() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.repos.insert(
+            "Clubria/riabuild".into(),
+            "/home/ada/Clubria/riabuild".into(),
+        );
+        ctx.repo = Some(Repo::parse("Clubria/ai-builders-hub").unwrap());
+        ctx.config.repos.insert(
+            "Clubria/ai-builders-hub".into(),
+            "/home/ada/Clubria/ai-builders-hub".into(),
+        );
+
+        let (checkouts, _default) = known_checkouts(&ctx);
+
+        assert!(
+            checkouts.contains(&std::path::PathBuf::from("/home/ada/Clubria/riabuild")),
+            "{checkouts:?}"
+        );
+    }
+
+    /// A second repository this machine knows must reach the generated
+    /// launcher script as its own `case` arm — the end-to-end proof that
+    /// `write_all` wires `known_checkouts` all the way through, not just that
+    /// the helper itself computes the right list.
+    #[tokio::test]
+    async fn a_second_known_repository_gets_its_own_cwd_arm_in_the_written_launcher() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.claude_accounts = vec![accounts::new_id()];
+        ctx.config.repos.insert(
+            "Clubria/riabuild".into(),
+            "/home/ada/Clubria/riabuild".into(),
+        );
+        ctx.config.repos.insert(
+            "Clubria/clubria-tenants".into(),
+            "/home/ada/Clubria/clubria-tenants".into(),
+        );
+        ctx.repo = Some(Repo::parse("Clubria/clubria-tenants").unwrap());
+
+        write_all(&ctx).await.unwrap();
+
+        let script = tokio::fs::read_to_string(ctx.paths.bin_dir().join("claude"))
+            .await
+            .unwrap();
+        assert!(
+            script.contains(r#""/home/ada/Clubria/riabuild"|"/home/ada/Clubria/riabuild"/*)"#),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                r#""/home/ada/Clubria/clubria-tenants"|"/home/ada/Clubria/clubria-tenants"/*)"#
+            ),
+            "{script}"
+        );
+    }
 
     #[tokio::test]
     async fn every_account_gets_a_launcher_and_the_first_gets_two() {

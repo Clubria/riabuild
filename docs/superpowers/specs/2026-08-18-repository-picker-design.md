@@ -311,4 +311,38 @@ permissions for.
 No lead-curated repository list — the dashboard names the default and nothing more. No
 per-repository secret environments. No `riabuild repo` subcommand: the every-run prompt
 *is* the switch, and a command to do the same thing is a second way to learn the same
-idea. No working on two repositories in one shell.
+idea. ~~No working on two repositories in one shell.~~ **Superseded on 2026-08-27** — see
+the addendum below.
+
+## Addendum: `--cwd` stopped being one repository for the whole machine
+
+**Date:** 2026-08-27
+
+The line above was true of everything *except* the Claude Code launcher, and that
+exception is what a developer working in two checkouts actually hit. `active_repo` still
+decides what a bare `riabuild` provisions and what `status`/`env`/`shell` report — that
+part of "single-repository-per-run" stands — but `shims::claude::write_all` was reading
+`Ctx::project_dir()` once per run and baking the answer into `--cwd` for all nine account
+launchers, machine-wide, until the next run overwrote it. A developer with `riabuild` and
+a second Clubria repository each checked out and each open in its own terminal would run
+`riabuild` in one, and the *other* one's `claude` would silently start pulling them into
+the first the moment `--cwd`'s floor (`VIEW_CWD` in `riabuild-cli/CLAUDE.md`) stopped
+recognising where they stood as "inside" the one path the launcher still knew.
+
+The fix does not touch `active_repo` or the picker; it stops the launcher from needing a
+single answer at all. `UserConfig::repos` already recorded every checkout this machine
+had cloned — that map existed from the day this spec shipped, for the picker's own box —
+and nothing before this addendum read more than one entry from it into the launcher.
+`shims::claude::known_checkouts` now hands the whole map to
+`shims::claude::launcher::launcher_script`, which resolves `--cwd` at *shell runtime*: one
+`case "$PWD" in …` arm per known checkout, and the run's own default (`project_dir()`,
+unchanged) as the fallback for a developer standing in neither. Which checkout "it" means
+is therefore a question the generated script answers when `claude` runs, not one riabuild
+can answer once and freeze into a file that outlives the run that wrote it.
+
+Nothing here is a route to running one `riabuild` provisioning pass against two
+repositories at once, or to a shared environment shell that straddles both — that half of
+the sentence still holds. What changed is narrower and was also the part that bit in
+practice: the one artifact riabuild writes that outlives a single run and is read on every
+subsequent `claude` invocation now looks at every checkout it knows about instead of the
+one most recently active.
