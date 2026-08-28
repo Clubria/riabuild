@@ -31,6 +31,19 @@ mod bind;
 mod keepalive;
 mod relay;
 
+/// The words the pump uses when it finds the channel socket already served,
+/// and the words the laptop's supervisor recognises them by.
+///
+/// **A constant rather than two string literals, because the two ends of one
+/// sentence used to drift apart in silence.** The pump writes this to stderr
+/// and exits; the supervisor reads it off the `ssh` it started and turns it
+/// into a *standby*, not a failure. Matched by substring, so the path and the
+/// prose around it are free to change — but the phrase itself is a wire format
+/// between two copies of riabuild that may be one release apart, and editing it
+/// without editing both sides turns a shared channel back into the false alarm
+/// this constant exists to prevent.
+pub const ALREADY_SERVED: &str = "already serving the clipboard channel";
+
 use bind::bind;
 use keepalive::keepalive;
 use relay::relay;
@@ -506,8 +519,15 @@ mod tests {
 
         let error = bind(&socket).await.expect_err("should refuse");
         assert!(
-            error.to_string().contains("already serving"),
+            error.to_string().contains(ALREADY_SERVED),
             "{error} should name the other session"
+        );
+        // In the exact words the laptop's supervisor matches on, because that
+        // is what turns this refusal into a standby instead of a "paste is off"
+        // banner painted over a channel that is working perfectly.
+        assert!(
+            !error.to_string().contains("Close the other"),
+            "a developer's own second window must never be told to close one: {error}"
         );
         serving.abort();
     }

@@ -38,16 +38,21 @@ use std::sync::Arc;
 
 /// Keeps the channel up until asked to stop.
 ///
-/// Returns the failure that ended it, or `None` when it ended because it was
-/// told to. A returned failure has already been shown to the developer; it
-/// comes back as well so the caller can put it in a banner, and so this loop's
-/// hard-stop path is something a test can assert on rather than something it
-/// has to scrape off stderr.
+/// Returns [`Outcome`] — which of the three ways this loop ends. A returned
+/// failure has already been shown to the developer; it comes back as well so
+/// the caller can put it in a banner, and so this loop's hard-stop path is
+/// something a test can assert on rather than something it has to scrape off
+/// stderr.
 ///
-/// Takes an owned `Ui` because it outlives the call that started it: this runs
+/// Takes a shared `Ui` because it outlives the call that started it: this runs
 /// as a background task beside the developer's shell, so borrowing the caller's
 /// printer would tie the channel's lifetime to a stack frame that returned long
-/// ago. `agent` is shared rather than owned for the mirror reason — one agent
+/// ago. Shared rather than *owned* because `hold` calls this more than once —
+/// a session that finds the socket already served hands its lease back and asks
+/// again — and `Ui` is not `Clone`: it carries the pending-status-line counter
+/// every printer on this laptop has to agree about, so a second `Ui::new` would
+/// be a second opinion about what is on the screen right now. `agent` is shared
+/// for the mirror reason — one agent
 /// answers every connection this loop builds, and rebuilding it per attempt
 /// would re-detect the laptop's clipboard tooling on every network blip.
 /// `bar` is the line the channel speaks on while a full-screen shell owns the
@@ -58,10 +63,10 @@ pub async fn supervise(
     runner: Arc<dyn CommandRunner>,
     tunnel: Tunnel,
     agent: Arc<Agent>,
-    ui: Ui,
+    ui: Arc<Ui>,
     stop: Stop,
     bar: Arc<StatusBar>,
-) -> Option<Failure> {
+) -> Outcome {
     let mut signal = stop.signal();
     // Consecutive failures, and therefore the position in the backoff schedule.
     // Reset by a connection that reached the pump at all, so a laptop that
@@ -82,7 +87,7 @@ pub async fn supervise(
     loop {
         let asked = *signal.borrow_and_update();
         if asked {
-            return None;
+            return Outcome::Stopped;
         }
 
         let args = ssh_args(&tunnel);
@@ -98,7 +103,7 @@ pub async fn supervise(
                 // An ssh that will not start at all does not start on the next
                 // attempt either, so this is the same wall `diagnose` keeps the
                 // loop off: retrying it is an infinite loop, not resilience.
-                return Some(report(
+                return Outcome::Wall(report(
                     &ui,
                     &bar,
                     Failure::new(
@@ -117,7 +122,7 @@ pub async fn supervise(
             // alternative is a supervisor that rebuilds a channel carrying
             // nothing, forever, with nothing on screen saying why.
             let _ = child.kill().await;
-            return Some(report(
+            return Outcome::Wall(report(
                 &ui,
                 &bar,
                 Failure::new(
@@ -159,7 +164,7 @@ pub async fn supervise(
         };
 
         match ended {
-            Ended::Stopped => return None,
+            Ended::Stopped => return Outcome::Stopped,
             // riabuild lost track of the ssh it started. Whatever the io error
             // says, it is a fact about *this laptop's* `wait`, never about the
             // server — so it is not shown to `diagnose`, whose every match
@@ -171,8 +176,24 @@ pub async fn supervise(
                 }
             }
             Ended::Exited(stderr) => {
+                // Asked before `diagnose`, and answered without a word to
+                // anybody. This is a sibling terminal's pump holding the
+                // socket, which is not a failure in any sense: the channel is
+                // up, and the shims in *this* session's shell are already
+                // pasting through it. Retrying is what would be wrong — it is
+                // an `ssh` and an authentication against the server every few
+                // seconds for as long as two windows are open — so the loop
+                // ends and `hold` gives the lease back and stands by, which is
+                // the state this session should have been in all along.
+                //
+                // It used to fall through to the paragraph below, be counted as
+                // an unrecognised wall, and after four attempts paint "paste is
+                // off" across the bottom of a terminal where paste worked.
+                if stderr.contains(crate::pump::ALREADY_SERVED) {
+                    return Outcome::AlreadyServed;
+                }
                 if let Some(failure) = diagnose(&stderr) {
-                    return Some(report(&ui, &bar, failure));
+                    return Outcome::Wall(report(&ui, &bar, failure));
                 }
                 // A failure `diagnose` does not recognise, repeated, with the
                 // channel never once having come up. That is a wall too — simply
@@ -213,7 +234,42 @@ pub async fn supervise(
 
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
-            () = stopped(&mut signal) => return None,
+            () = stopped(&mut signal) => return Outcome::Stopped,
+        }
+    }
+}
+
+/// How the supervisor stopped supervising.
+///
+/// Three answers where there were two, and the third is the one this design
+/// was missing. `Option<Failure>` could say "it was told to stop" and "it hit a
+/// wall" and nothing else, so a session that found the channel *already up*
+/// had no way to report the good news: it was counted as an unrecognised
+/// failure, retried on the backoff schedule, and announced to the developer as
+/// a channel that could not reach the server.
+pub enum Outcome {
+    /// [`Stop::stop`] was called — the developer's shell exited.
+    Stopped,
+    /// Something retrying cannot fix, already shown to the developer. Handed
+    /// back so the caller can hold it in a banner and so a test can assert on
+    /// it rather than scraping stderr.
+    Wall(Failure),
+    /// Another of this laptop's sessions to this server is serving the channel.
+    ///
+    /// The good outcome, and silent on purpose. Paste in this session's shell
+    /// works — it is the same socket on the same server — so there is nothing
+    /// to report and nothing to do but hand the lease back and stand by.
+    AlreadyServed,
+}
+
+impl Outcome {
+    /// The failure that ended it, when one did. The shape most callers and
+    /// every test want, and the reason widening the return type cost almost
+    /// nothing at the call sites.
+    pub fn wall(self) -> Option<Failure> {
+        match self {
+            Outcome::Wall(failure) => Some(failure),
+            Outcome::Stopped | Outcome::AlreadyServed => None,
         }
     }
 }
@@ -283,7 +339,7 @@ mod tests {
             fake.clone(),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             stop.clone(),
             Arc::new(StatusBar::disabled()),
         ));
@@ -294,7 +350,7 @@ mod tests {
         assert!(!spawned.contains("-R"), "{spawned}");
 
         stop.stop();
-        assert!(supervising.await.expect("join").is_none());
+        assert!(matches!(supervising.await.expect("join"), Outcome::Stopped));
     }
 
     /// A stop must end the loop *and* kill the connection: an ssh left behind
@@ -307,7 +363,7 @@ mod tests {
             fake.clone(),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             stop.clone(),
             Arc::new(StatusBar::disabled()),
         ));
@@ -315,7 +371,7 @@ mod tests {
         until_spawns(&fake, 1).await;
         stop.stop();
 
-        assert!(supervising.await.expect("join").is_none());
+        assert!(matches!(supervising.await.expect("join"), Outcome::Stopped));
         assert_eq!(
             fake.killed().len(),
             1,
@@ -338,14 +394,104 @@ mod tests {
             fake.clone(),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             stop.clone(),
             Arc::new(StatusBar::disabled()),
         ));
 
         until_spawns(&fake, 2).await;
         stop.stop();
-        assert!(supervising.await.expect("join").is_none());
+        assert!(matches!(supervising.await.expect("join"), Outcome::Stopped));
+    }
+
+    /// A sibling terminal's pump holding the socket is a **working channel**,
+    /// and the supervisor must answer it without a word to anybody.
+    ///
+    /// The bug this pins, in the words a developer read: *"Clipboard channel —
+    /// another session on this server is still holding the channel · paste is
+    /// off"*, painted across the bottom of a terminal in which paste worked
+    /// perfectly. One person with two windows into one server — which is what
+    /// remote mode is for — hit it every time the second window opened while
+    /// the first still held its own lease.
+    ///
+    /// Every clause below is one of the four things that were wrong:
+    ///
+    /// - it is not a `Wall`, because nothing failed;
+    /// - it is not retried, because retrying is an `ssh` and an authentication
+    ///   against somebody's `sshd` every few seconds for the length of two
+    ///   shells;
+    /// - it says nothing at all, on the bar or anywhere else, because the only
+    ///   true sentence about it is "paste works";
+    /// - and it is decided *before* `diagnose`, which is what stopped it being
+    ///   counted as an unrecognised failure and announced as a server riabuild
+    ///   could not reach — the one thing that was definitely not happening.
+    #[tokio::test(start_paused = true)]
+    async fn a_sibling_serving_the_socket_is_never_reported_as_a_failure() {
+        let refused = format!(
+            "riabuild stopped: another riabuild session is {} at \
+             /home/ada/.riabuild-remote/abc/channel.sock",
+            crate::pump::ALREADY_SERVED
+        );
+        let fake = Arc::new(FakeRunner::new().spawning("ssh", 1, &refused));
+        let ui = Arc::new(Ui::new(false));
+        let bar = Arc::new(StatusBar::disabled());
+
+        let outcome = supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Arc::clone(&ui),
+            Stop::new(),
+            Arc::clone(&bar),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Outcome::AlreadyServed),
+            "a socket a sibling is serving is a standby, not a wall"
+        );
+        assert_eq!(
+            fake.spawns().len(),
+            1,
+            "a channel that is up must not be reconnected to on a backoff schedule: {:?}",
+            fake.spawns()
+        );
+        assert!(
+            ui.warned().is_empty(),
+            "nothing may be said about a channel that is working: {:?}",
+            ui.warned()
+        );
+    }
+
+    /// …and the old riabuild on the far side is still understood.
+    ///
+    /// The two ends of a channel can be a release apart — the server's copy is
+    /// upgraded by a `riabuild remote` run, so a laptop that upgraded first
+    /// talks to a pump that has not. Its refusal was worded differently
+    /// ("another riabuild is already serving the clipboard channel at …"), and
+    /// [`ALREADY_SERVED`](crate::pump::ALREADY_SERVED) is the substring both
+    /// spellings share, which is why the match is on a phrase rather than on
+    /// the whole sentence.
+    #[tokio::test(start_paused = true)]
+    async fn an_older_pumps_wording_for_the_same_answer_is_understood_too() {
+        let fake = Arc::new(FakeRunner::new().spawning(
+            "ssh",
+            1,
+            "riabuild stopped: another riabuild is already serving the clipboard channel at /x",
+        ));
+
+        let outcome = supervise(
+            fake.clone(),
+            tunnel(),
+            agent(),
+            Arc::new(Ui::new(true)),
+            Stop::new(),
+            Arc::new(StatusBar::disabled()),
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::AlreadyServed));
+        assert_eq!(fake.spawns().len(), 1);
     }
 
     /// A server with no pump is a wall: every attempt fails identically, so the
@@ -359,12 +505,12 @@ mod tests {
             fake.clone(),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             Stop::new(),
             Arc::new(StatusBar::disabled()),
         ));
 
-        let failure = supervising.await.expect("join").expect("a failure");
+        let failure = supervising.await.expect("join").wall().expect("a failure");
         assert!(failure.to_string().contains("pump"), "{failure}");
         assert_eq!(fake.spawns().len(), 1, "it must not retry a wall");
     }
@@ -490,7 +636,7 @@ mod tests {
             runner.clone(),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             stop.clone(),
             Arc::new(StatusBar::disabled()),
         ));
@@ -514,7 +660,7 @@ mod tests {
 
         stop.stop();
         assert!(
-            supervising.await.expect("join").is_none(),
+            matches!(supervising.await.expect("join"), Outcome::Stopped),
             "losing track of a child is not a failure to report"
         );
     }
@@ -577,11 +723,12 @@ mod tests {
             Arc::new(NoRunner),
             tunnel(),
             agent(),
-            Ui::new(true),
+            Arc::new(Ui::new(true)),
             Stop::new(),
             Arc::new(StatusBar::disabled()),
         )
         .await
+        .wall()
         .expect("a failure");
         assert!(
             failure.to_string().contains("clipboard channel"),

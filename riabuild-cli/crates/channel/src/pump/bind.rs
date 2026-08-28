@@ -27,15 +27,25 @@ const LIVENESS_PROBE: Duration = Duration::from_secs(2);
 /// that *does* answer belongs to a pump that is still serving, and taking it
 /// would silently cut that session's paste. Connecting is the only way to tell
 /// them apart — the file looks identical either way.
+///
+/// **Refusing is the ordinary outcome, not the exceptional one.** One developer
+/// with three terminals into one server is the case remote mode is *for*, and
+/// all three of them run this. Exactly one binds; the other two are told the
+/// channel is already up and stand by for it. The message says so in those
+/// words — it used to tell the developer to close their own other window, which
+/// is advice to break a working session in order to fix one that was never
+/// broken.
 pub(super) async fn bind(socket: &Path) -> Result<UnixListener> {
     if socket.exists() {
         if answers(socket).await {
             return Err(Failure::new(
                 format!(
-                    "another riabuild is already serving the clipboard channel at {}",
+                    "another riabuild session is {} at {}",
+                    super::ALREADY_SERVED,
                     socket.display()
                 ),
-                "Close the other riabuild session on this server, or wait for it to finish.",
+                "Nothing to do — paste in this shell already goes through it. This session \
+                 stands by, and takes the channel over if the one serving it ends.",
             )
             .into());
         }

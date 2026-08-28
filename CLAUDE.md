@@ -198,6 +198,32 @@ down anywhere, and a shim that *rewrites* a command the developer was explicit a
 `--env` they typed wins, always. See
 `docs/superpowers/specs/2026-08-27-infisical-session-login-design.md`.
 
+**One person, one server, many windows — that is the shape of a working day, not a corner
+case.** A developer with a shell in one terminal, Claude Code in a second and a `tail -f`
+in a third is the intended usage of `riabuild remote`. Write every answer about "a second
+connection to this server" for *that* first, and only then for two people sharing a Unix
+account.
+
+Getting it the other way round cost real bugs, all of the same shape: a clipboard channel
+that announced **"paste is off"** in a terminal where paste worked, because it had no way
+to say "somebody I know is already serving this"; two windows unlinking each other's
+`ssh-agent` socket and deleting the directory the other was serving from; two windows
+minting two server sessions, leaving a live 90-day session `remote forget` could never
+name; and a `remote forget` that revoked a session and unauthorised a key while another of
+this laptop's terminals sat in a shell all of that was holding up. None of them can happen
+to one window, and none of them was reachable by any test that imagined only one.
+
+**Nothing in that relaxes a boundary.** A colleague is still a stranger: the channel socket
+is still refused rather than taken when another account owns it or a symlink stands where
+it should be, the pump still refuses a socket a live pump is serving rather than binding
+over it, and the provisioning lock is still per developer rather than per box — a
+machine-wide one would let one developer block another under the account they share. What
+changed is what riabuild *does with* a refusal it caused itself. Where two of this laptop's
+windows can collide, the answer is an `flock`, because the kernel releases one however the
+process ends; never a pid file and a `kill -0`, which says "still there" about a recycled
+pid, and never an age cap, because a remote session outliving a day is normal. See
+`docs/superpowers/specs/2026-08-28-many-windows-one-server-design.md`.
+
 **A shared server shares an address, never a credential.** Leads enter the team's
 servers in the dashboard and every developer's CLI reads them from
 `GET /api/v1/remotes/shared` on every run — hostname, port, username, and nothing else.

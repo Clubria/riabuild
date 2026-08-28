@@ -261,4 +261,28 @@ pub trait Paths: Send + Sync {
     fn remote_session_file(&self, hash: &str) -> PathBuf {
         self.root().join("remote-sessions").join(hash)
     }
+    /// Which of this laptop's windows gets to decide whether a server needs a
+    /// new riabuild session.
+    ///
+    /// One person opening two terminals into one server is the ordinary way
+    /// remote mode is used, and `session::ensure` is a read (*is the saved
+    /// token still good?*) and a write (*mint one*) with a network round trip
+    /// in between. Run twice at once against a server whose token has expired,
+    /// both windows mint — and the second one's `session_id` overwrites the
+    /// first's on the record, which leaves a live 90-day session on riabuild-web
+    /// that no `riabuild remote forget` can ever name. That is the one state
+    /// `session.rs` says out loud it must never produce.
+    ///
+    /// A lock of its own rather than `state_lock_file`, which the store's own
+    /// `persist_one` takes from inside this one: `std` is explicit that a
+    /// second lock taken by a process already holding one is unspecified.
+    /// Sibling of [`remote_session_file`](Paths::remote_session_file) and not
+    /// that file itself, for the reason
+    /// [`state_lock_file`](Paths::state_lock_file) sets out — a lock on a file
+    /// something renames over is a lock on an inode the next writer never sees.
+    fn remote_session_lock_file(&self, hash: &str) -> PathBuf {
+        self.root()
+            .join("remote-sessions")
+            .join(format!("{hash}.lock"))
+    }
 }

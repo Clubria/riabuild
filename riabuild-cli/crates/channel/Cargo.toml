@@ -42,6 +42,11 @@ tokio = { workspace = true, features = [
 
 [dev-dependencies]
 riabuild-runner = { workspace = true, features = ["testing"] }
+# For `Ui::warned`. The supervisor's whole job is deciding what to say and when,
+# and "it said nothing" — which is the right answer for a channel a sibling
+# terminal is already serving — is a claim no test can make without the
+# recorders. `riabuild-remote` turns it on for the same reason.
+riabuild-ui = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # `test-util` is what lets the supervisor's suite advance a paused clock
 # instead of waiting on it: its ping interval is thirty seconds and its

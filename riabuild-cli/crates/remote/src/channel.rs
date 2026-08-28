@@ -252,7 +252,7 @@ async fn try_start(plan: &Plan<'_>) -> Result<(Started, bool)> {
             env: askpass::ssh_env(plan.remote, plan.paths),
         },
         agent,
-        ui: Ui::new(plan.quiet),
+        ui: Arc::new(Ui::new(plan.quiet)),
         stop: stop.clone(),
         bar: line.bar(),
     }));

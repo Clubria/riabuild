@@ -511,6 +511,19 @@ live and be refused — so the others *stand by*, asking every five seconds whet
 has fallen free, for as long as their shells are open. When the session serving the channel
 ends, the next one takes it over and the developer's paste comes back with nothing typed.
 
+**The lease is an optimisation and the server's socket is the authority.** The two answer
+different questions and only one of them can be wrong about nothing: the lease is keyed by
+the login target *as typed*, and the socket by what the server actually is. They come apart
+on every handoff (the standing-by window takes the lease before the old pump has finished
+dying) and whenever two saved records point at one machine (`build-01.fly.dev` in one
+terminal, `10.0.0.5` in another — two hashes, two leases, one socket). So a session that
+takes the lease and *then* finds the socket already served is not in an error state and
+never was: it hands the lease back and stands by, exactly as though it had never won it,
+and says nothing, because the answer it just got proves the channel is up. Retrying that
+is an `ssh` and an authentication against somebody's `sshd` every few seconds for as long
+as two windows are open. See `2026-08-28-many-windows-one-server-design.md`, which is where
+this sentence was learned the hard way.
+
 The lease is an `flock` on `~/.riabuild/channel-sessions/<hash>/owner.lock`, which is the
 whole reason the sentence above can be relied on. It is the kernel's, not a file's
 contents, so it is released when the holding process exits — cleanly, on a `SIGKILL`, or

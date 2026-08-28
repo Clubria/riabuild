@@ -14,7 +14,7 @@
 
 use crate::{
     Remote, Request, askpass, authorise, channel, env_command, env_prefix, host_key, identity,
-    install, issued, repo, resolve_home, seed, session, shell, ssh_once, store,
+    install, issued, repo, resolve_home, seed, session, shell, ssh_once, store, windows,
 };
 use anyhow::{Result, anyhow};
 use riabuild_paths::Paths;
@@ -187,6 +187,17 @@ pub(super) async fn connect_and_setup(
     // `issued`'s module doc.
     let mut issued = issued::Issued::new();
     let mut carried: Option<issued::Working> = None;
+    // This window, in the count of this laptop's windows into this server —
+    // held from here until every return below, which includes the developer's
+    // whole shell. What reads it is `remote forget`, which used to revoke a
+    // session, pull riabuild's key out of `authorized_keys` and `rm -rf` a
+    // namespace that another of this laptop's terminals was sitting in, with
+    // nothing anywhere able to say so. See `windows`.
+    //
+    // Bound and never `?`d: a laptop that cannot write the marker still gets
+    // its shell. The cost of that is a `forget` that cannot warn, which is
+    // exactly where riabuild already was.
+    let _window = windows::join(ctx.paths.as_ref(), &remote).await;
     // One exit from here on, so there is exactly one place the agent is
     // stopped.
     //
