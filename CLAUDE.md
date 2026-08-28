@@ -187,6 +187,17 @@ and mints short-lived access tokens on demand. No long-lived Infisical credentia
 written to a developer's machine. Infisical service tokens are deprecated — use machine
 identities with universal auth.
 
+**That applies to the developer's own `infisical` too, which is why it is a shim rather
+than a login.** riabuild pulled `.env.dev` on every run while the CLI beside it had never
+been signed in, and the obvious repair — `infisical login` — is the one thing the sentence
+above forbids: it stores a credential on the laptop. So `~/.riabuild/bin/infisical` hands
+the whole invocation back to riabuild, which brokers a credential for that one command,
+passes it in the child's environment, and fills in the team's environment and secret path
+where the developer named neither. Two things it must never become: a credential written
+down anywhere, and a shim that *rewrites* a command the developer was explicit about — a
+`--env` they typed wins, always. See
+`docs/superpowers/specs/2026-08-27-infisical-session-login-design.md`.
+
 **A shared server shares an address, never a credential.** Leads enter the team's
 servers in the dashboard and every developer's CLI reads them from
 `GET /api/v1/remotes/shared` on every run — hostname, port, username, and nothing else.

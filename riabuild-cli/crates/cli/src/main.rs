@@ -227,6 +227,13 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::NgrokToken,
         }) => return internal::ngrok_token(ctx).await,
+        // Behind `connect`, but softly and inside itself: an invocation that
+        // needs no credential — `infisical --version`, `infisical scan` — must
+        // not wait on the network first, and one that cannot get a credential
+        // still hands the developer their command rather than a riabuild error.
+        Some(Command::Internal {
+            action: cli::InternalAction::Infisical { args },
+        }) => return internal::infisical::run(ctx, args).await,
         // Not behind `connect`: a turn is the harness riabuild already installed
         // working in the checkout riabuild already cloned, and it has to keep
         // running on a laptop that has gone offline since the window opened.

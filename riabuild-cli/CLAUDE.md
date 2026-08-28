@@ -277,8 +277,11 @@ token the server was holding. A first run is a reason to *ask* `check()`, never 
 to skip it.
 
 **No secrets in `~/.riabuild/`.** The riabuild session token goes in the Keychain via
-`riabuild-keychain`. Infisical tokens are short-lived, brokered per use, and piped straight into
-`infisical export` — never written down.
+`riabuild-keychain`. Infisical tokens are short-lived, brokered per use, and handed to
+`infisical` in that one process's environment — never written down. That holds for the
+developer's own `infisical` as well as for `env_local`'s: `~/.riabuild/bin/infisical` is
+not an `exec` line but a hand-back to `riabuild internal infisical`, which brokers one
+credential per command. `infisical login` is what this exists instead of.
 
 A riabuild-managed **server** is the one exception: it may hold its own session
 token at `<namespace>/session.token`, mode 0600. It has no keyring, the token is
@@ -458,9 +461,11 @@ tree under `~/.riabuild/<tool>/<version>/` and putting something on the develope
 are properties of the table rather than of whoever wrote the task. They used to be four
 copies of those steps, and copies drift: only ngrok checked its own shim, so a deleted
 `bin/gh` reported a satisfied machine while the shell went on finding whatever `gh` the
-laptop already had. Where rows differ they differ as **data** — ngrok's shim is a script
-that fetches the team's authtoken per invocation rather than an `exec` line, which is the
-whole reason that token lands on no filesystem.
+laptop already had. Where rows differ they differ as **data** — two of the shims are not
+`exec` lines. ngrok's fetches the team's authtoken per invocation, which is the whole
+reason that token lands on no filesystem; infisical's hands the developer's command back
+to `riabuild internal infisical`, which brokers a short-lived credential for it, for the
+same reason and one more: `infisical login` would write one down.
 
 `infisical` and `ngrok` are nothing but a row, so the row *is* the task. `github_cli` and
 `grok_cli` compose a row and keep their own `Task`, because signing the developer in and
