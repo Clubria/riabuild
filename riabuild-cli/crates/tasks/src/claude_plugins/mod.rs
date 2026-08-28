@@ -33,7 +33,7 @@ mod declared;
 use cli::{ask, install, names};
 use declared::declared_in;
 
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_ui::Failure;
@@ -60,6 +60,14 @@ impl Task for ClaudePlugins {
         // checkout whose settings say what to install. A checkout moved by
         // `project` is re-read at its new path, which is what that edge buys.
         &["claude_accounts", "project"]
+    }
+
+    /// The per-account `.claude.json`. Not through `claude_config::edit` like
+    /// its three siblings — `claude plugin install` writes it, from inside a
+    /// `claude` pointed at the profile directory by `CLAUDE_CONFIG_DIR`. The
+    /// resource is the file, not the function that reaches it.
+    fn writes(&self) -> &[Resource] {
+        &["claude_config"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {

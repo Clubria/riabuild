@@ -23,6 +23,10 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 mod art;
+/// A `Ui` that records instead of printing, so the tasks of one dependency
+/// wave can run at the same time and still report one at a time.
+mod buffer;
+use buffer::{Recorded, Sink};
 // Re-exported because "can this terminal draw the block glyphs?" now has a
 // second caller — `riabuild agents` picks its marks by the same answer. The
 // module stays private: the mark and the banner are this crate's to draw, and
@@ -74,6 +78,13 @@ pub struct Ui {
     /// colour riabuild prints comes from here, so there is one place to change
     /// the scheme and no way for a call site to invent its own.
     theme: Theme,
+    /// The terminal, or a list of calls waiting to be replayed onto it.
+    ///
+    /// Every printing method below reads this *first*, ahead of `quiet` and
+    /// ahead of the status-line bookkeeping, so a buffered `Ui` reaches none of
+    /// it: what `quiet` silences and what covers what are decided once, by the
+    /// real `Ui`, at replay. See `buffer`.
+    sink: Sink,
     quiet: bool,
     /// Whether there is a developer on the other end to answer a question.
     ///
@@ -131,17 +142,18 @@ pub struct Ui {
     noted: std::sync::Mutex<Vec<String>>,
 }
 
-/// Locks one of the recorders above, and never panics doing it.
+/// Locks one of the recorders above — or a buffered `Ui`'s list of pending
+/// calls — and never panics doing it.
 ///
 /// The recorders are `testing`-gated but they are *not* test code: they are
 /// compiled into the lib target of every crate that turns the feature on, so
-/// `unwrap_used` applies to them like any other production line. A poisoned
-/// mutex here means a test panicked while holding one — it has already failed,
-/// and a `PoisonError` raised on top of it would replace the assertion message
-/// with one about locking. `into_inner` takes the data anyway, which is safe
-/// for a `Vec<String>` of things riabuild printed: there is no invariant a
-/// half-finished `push` could have broken.
-#[cfg(any(test, feature = "testing"))]
+/// `unwrap_used` applies to them like any other production line. The buffer in
+/// `Sink::Buffer` is not gated at all. A poisoned mutex here means a task
+/// panicked while holding one — the run has already failed, and a
+/// `PoisonError` raised on top of it would replace the real message with one
+/// about locking. `into_inner` takes the data anyway, which is safe for a list
+/// of things riabuild printed: there is no invariant a half-finished `push`
+/// could have broken.
 pub(crate) fn recorded<T>(cell: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -156,6 +168,7 @@ impl Ui {
     pub fn new(quiet: bool) -> Self {
         Self {
             theme: Theme::detect(tty::can_paint()),
+            sink: Sink::Terminal,
             interactive: tty::attended(),
             quiet,
             pending: AtomicUsize::new(0),
@@ -213,6 +226,63 @@ impl Ui {
     pub fn assume_prompts_work(mut self, yes: bool) -> Self {
         self.interactive = yes;
         self
+    }
+
+    /// A `Ui` for one task of a concurrent wave: it records, and prints
+    /// nothing until [`Ui::flush_into`] replays it.
+    ///
+    /// `theme` and `width` are *copied* rather than re-detected. Both are
+    /// measured once at startup on purpose — a window resized mid-run would
+    /// otherwise leave one run's output laid out at two widths — and a fork
+    /// that measured for itself would be exactly that bug, arriving once per
+    /// task instead of once per resize.
+    ///
+    /// `interactive` is false whatever the real terminal says, because it is
+    /// the honest answer: a question this `Ui` asked would be recorded rather
+    /// than printed, and the developer would be answering a prompt they had
+    /// not been shown. A task that needs them declares `Task::interactive()`
+    /// and never reaches this.
+    #[must_use]
+    pub fn buffered(&self) -> Ui {
+        Ui {
+            theme: self.theme,
+            sink: Sink::Buffer(std::sync::Mutex::new(Vec::new())),
+            quiet: self.quiet,
+            interactive: false,
+            width: self.width,
+            // The rest is a fresh `Ui`'s: the status-line counter and, under
+            // `testing`, the recorders. Every field this fork actually carries
+            // is named above it.
+            ..Self::new(self.quiet)
+        }
+    }
+
+    /// Replays everything this `Ui` recorded onto `target`, in order, and
+    /// empties it.
+    ///
+    /// A no-op on a `Ui` that prints, so the caller does not have to know which
+    /// kind it holds.
+    pub fn flush_into(&self, target: &Ui) {
+        let Sink::Buffer(lines) = &self.sink else {
+            return;
+        };
+        for line in std::mem::take(&mut *recorded(lines)) {
+            line.replay(target);
+        }
+    }
+
+    /// Records `line` if this `Ui` buffers, and answers whether it did.
+    ///
+    /// Every printing method calls this before doing anything else, and returns
+    /// on `true`.
+    fn record(&self, line: Recorded) -> bool {
+        match &self.sink {
+            Sink::Terminal => false,
+            Sink::Buffer(lines) => {
+                recorded(lines).push(line);
+                true
+            }
+        }
     }
 
     /// Claims the pending status line, so it is only covered once.

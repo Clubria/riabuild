@@ -18,7 +18,7 @@
 //! does not own, not a template.
 
 use super::claude_config::{self, Stored};
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_paths::contract_tilde;
@@ -95,6 +95,12 @@ impl Task for ClaudeTrust {
         // moved by `project` has to be re-trusted at its new path, which is what
         // this edge buys.
         &["claude_accounts", "project"]
+    }
+
+    /// The per-account `.claude.json`, which three sibling tasks in this wave
+    /// also write. See `Task::writes`.
+    fn writes(&self) -> &[Resource] {
+        &["claude_config"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {

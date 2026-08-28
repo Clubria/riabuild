@@ -80,6 +80,14 @@ pub struct Request {
     /// with — the flag being both the way in and the way out is why that
     /// resolution has a name rather than being read off here twice.
     pub repo: Option<String>,
+    /// `--jobs`, carried to the server's own riabuild rather than applied here.
+    ///
+    /// This laptop's remote flow runs no setup tasks — the server's riabuild
+    /// does — so the flag would otherwise be accepted on the command line and
+    /// change nothing about the machine it was typed for. It is the escape
+    /// hatch for telling a concurrency problem apart from a task's own, and a
+    /// server is where that is worth doing.
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -294,6 +294,7 @@ pub fn remote_request(
         no_shell: cli.no_shell,
         project: cli.project.clone(),
         repo: cli.repo.clone(),
+        jobs: cli.jobs,
     }
 }
 
@@ -331,6 +332,7 @@ mod tests {
                 no_shell: false,
                 project: None,
                 repo: None,
+                jobs: None,
             },
         )
         .await

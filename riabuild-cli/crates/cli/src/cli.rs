@@ -42,6 +42,29 @@ pub struct Cli {
     /// Set the machine up but do not open the environment shell.
     #[arg(long, global = true)]
     pub no_shell: bool,
+
+    /// How many setup tasks to run at the same time. Left out, as many as the
+    /// dependency graph allows.
+    ///
+    /// riabuild runs the tasks that do not depend on each other together —
+    /// four tool downloads with their sockets open at once, rather than four
+    /// downloads one after another — and reports them one at a time in the
+    /// order it always did. `--jobs 1` runs them one at a time as well, which
+    /// is the escape hatch if a machine behaves differently under load, and
+    /// the way to tell a concurrency problem apart from a task's own.
+    #[arg(long, global = true, value_name = "N", value_parser = at_least_one)]
+    pub jobs: Option<usize>,
+}
+
+/// Rejects `--jobs 0`, which otherwise reads as "run nothing" and silently
+/// means "run everything": `wave::steps` clamps it, and a flag whose stated
+/// value is not the one used is worse than one that refuses.
+fn at_least_one(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("--jobs must be at least 1".to_string()),
+        Ok(jobs) => Ok(jobs),
+        Err(_) => Err(format!("`{value}` is not a whole number of jobs")),
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]

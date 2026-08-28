@@ -85,6 +85,10 @@ fn setup_args(request: &Request, repo: Option<&str>) -> Vec<String> {
         args.push("--project".to_string());
         args.push(project.clone());
     }
+    if let Some(jobs) = request.jobs {
+        args.push("--jobs".to_string());
+        args.push(jobs.to_string());
+    }
     args
 }
 
@@ -517,6 +521,24 @@ mod tests {
             vec!["--no-shell", "--repo", "Clubria/payments"],
             "{args:?}"
         );
+    }
+
+    /// `--jobs` is the one forwarded flag that changes nothing on this laptop:
+    /// the remote flow runs no setup tasks, the server's own riabuild does. A
+    /// flag accepted here and dropped on the way would be an escape hatch that
+    /// silently opens onto nothing — and the machine it is worth using on is a
+    /// server, where a concurrency problem is hardest to tell apart from a
+    /// task's own.
+    #[test]
+    fn the_jobs_bound_is_carried_to_the_riabuild_that_runs_the_tasks() {
+        let request = Request {
+            jobs: Some(1),
+            ..Request::default()
+        };
+
+        let args = setup_args(&request, None);
+
+        assert_eq!(args, vec!["--no-shell", "--jobs", "1"], "{args:?}");
     }
 
     #[test]

@@ -52,7 +52,7 @@
 //! writes the boolean only when somebody changes it.
 
 use super::claude_config::{self, Stored};
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_ui::Failure;
@@ -81,6 +81,12 @@ impl Task for ClaudeAgentsView {
         // per account. Deliberately *not* `project`, for the same reason
         // `claude_onboarding` is not: nothing here needs a checkout.
         &["claude_accounts"]
+    }
+
+    /// The per-account `.claude.json`, which three sibling tasks in this wave
+    /// also write. See `Task::writes`.
+    fn writes(&self) -> &[Resource] {
+        &["claude_config"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {

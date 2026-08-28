@@ -87,6 +87,14 @@ impl Task for GithubCli {
         &[]
     }
 
+    /// `gh auth login --web` under a pty riabuild owns: a device code, a
+    /// browser, and `sign_in` reading `ui.interactive()` before it starts.
+    /// Only on a machine that is not signed in yet — but see `Task::
+    /// interactive`, which is declared for the run that needs it.
+    fn interactive(&self) -> bool {
+        true
+    }
+
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
         // The binary, its version and the shim in `bin/` — the whole of what
         // riabuild owning a tool means, and the same three questions every

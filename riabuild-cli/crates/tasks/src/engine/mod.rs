@@ -1,21 +1,57 @@
-//! The task runner: topological order, then check → apply → re-check.
+//! The task runner: dependency waves, then check → apply → re-check.
 //!
-//! The order is `order`, the check → apply → re-check decision for one task
-//! is `status`, and what a run remembers about the tasks it could not finish
-//! is `carried`. What is here is the loop that drives the three.
+//! The order is `order`, the cut of one wave into the steps a developer watches
+//! it take is `wave`, one task's turn is `attempt`, the concurrency underneath
+//! a step is `concurrent`, and what a run remembers about the tasks it could
+//! not finish is `carried`. What is here is the loop that drives the five.
+//!
+//! ## Why a wave runs at once
+//!
+//! `topological_order` has always returned *waves* — sets of tasks whose
+//! dependencies are all satisfied by earlier waves — and this loop used to
+//! flatten them away and run one task at a time. A cold run therefore spent
+//! most of its wall clock waiting on downloads it could have been doing at the
+//! same time: `gh`, `infisical`, `ngrok` and Grok Build have no edges between
+//! them and no edges into them.
+//!
+//! Two things had to be true before a wave could run concurrently, and neither
+//! is a property of the graph:
+//!
+//! - **A terminal has one cursor.** `Ui::working` leaves a status line on the
+//!   row for `Ui::applied` to cover with `\r`, so a second task printing
+//!   between them covers its own line and the first never resolves. So every
+//!   task in a concurrent group prints into a `Ui::buffered`, and the group is
+//!   replayed in declaration order once it finishes. What a developer reads is
+//!   what the sequential engine produced — which is the reason a concurrent
+//!   step reports in the order it was *given* rather than the order it
+//!   finished.
+//! - **`depends_on()` declares ordering, not exclusion.** Sequential execution
+//!   gave every task the machine to itself, so two tasks writing one file with
+//!   no edge between them was invisible and free. `Task::writes` is where that
+//!   is declared now, and `wave::steps` is what keeps two tasks naming the same
+//!   resource out of one group.
+//!
+//! A task that needs the developer — a device code, a browser, a question —
+//! declares `Task::interactive()` and is run alone against the run's own `Ui`,
+//! in its declared position. A prompt recorded instead of printed is a prompt
+//! nobody can answer.
 
+mod attempt;
 mod carried;
+mod concurrent;
 mod order;
 mod status;
+mod wave;
 
 pub use order::topological_order;
 pub use status::status_for;
 
+use attempt::Attempt;
 use carried::Carried;
+use wave::Step;
 
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Task, TaskId};
 use anyhow::Result;
-use riabuild_ui::Failure;
 use std::collections::HashSet;
 
 #[derive(Debug, Default)]
@@ -27,6 +63,28 @@ pub struct Outcome {
     /// Tasks riabuild never attempted, because something they depend on
     /// failed.
     pub skipped: Vec<TaskId>,
+}
+
+/// How much of a wave riabuild will do at once.
+///
+/// Its own type rather than a field on `Ctx` because it is the engine's
+/// business and no task's: `Ctx` is "everything a task is allowed to touch",
+/// and a task that branched on how many of its siblings were running would be
+/// a task with an undeclared dependency on one of them.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// The most tasks riabuild runs at the same time. `1` is the sequential
+    /// engine, exactly.
+    pub jobs: usize,
+}
+
+impl Default for Limits {
+    /// Everything a wave allows. The graph is the bound that matters — the
+    /// widest wave riabuild has is six — and a smaller number here would be a
+    /// second, invisible one.
+    fn default() -> Self {
+        Self { jobs: usize::MAX }
+    }
 }
 
 /// The whole run, and its verdict, kept apart.
@@ -42,125 +100,119 @@ pub struct Outcome {
 ///
 /// The verdict is unchanged and still has to be propagated: `provision` returns
 /// it after the landing above, so the exit status is what it always was.
-pub async fn run_all_with_outcome(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> (Outcome, Result<()>) {
+pub async fn run_all_with_outcome(
+    tasks: &[Box<dyn Task>],
+    ctx: &mut Ctx,
+    limits: Limits,
+) -> (Outcome, Result<()>) {
     let mut outcome = Outcome::default();
-    let verdict = run_into(tasks, ctx, &mut outcome).await;
+    let verdict = run_into(tasks, ctx, &mut outcome, limits).await;
     (outcome, verdict)
 }
 
 /// The `?`-shaped spelling, for callers with nothing to do with a partial run.
 pub async fn run_all(tasks: &[Box<dyn Task>], ctx: &mut Ctx) -> Result<Outcome> {
-    let (outcome, verdict) = run_all_with_outcome(tasks, ctx).await;
+    let (outcome, verdict) = run_all_with_outcome(tasks, ctx, Limits::default()).await;
     verdict.map(|()| outcome)
 }
 
-async fn run_into(tasks: &[Box<dyn Task>], ctx: &mut Ctx, outcome: &mut Outcome) -> Result<()> {
-    let order = topological_order(tasks)?;
+async fn run_into(
+    tasks: &[Box<dyn Task>],
+    ctx: &mut Ctx,
+    outcome: &mut Outcome,
+    limits: Limits,
+) -> Result<()> {
+    let waves = topological_order(tasks)?;
     let mut applied: HashSet<TaskId> = HashSet::new();
     let mut carried = Carried::default();
 
-    for position in order.into_iter().flatten() {
-        let task = tasks[position].as_ref();
+    for positions in waves {
+        // Settled before anything in the wave runs, and safe to settle there:
+        // a dependency is always in a strictly earlier wave, so nothing about
+        // to run can block anything else about to run.
+        let alone = wave::run_alone(tasks, &positions, |task| carried.blocker(task));
 
-        // Before anything is asked of the machine. A `check()` behind a failed
-        // prerequisite would report drift its own `apply()` could not repair,
-        // and an `apply()` would work against a state nothing established.
-        if let Some(blocker) = carried.blocker(task) {
-            carried.skipped(task, blocker, ctx, outcome);
-            continue;
-        }
+        // Held back until the wave is over rather than inserted as each task
+        // finishes. Nothing in a wave depends on anything else in it, so no
+        // `status_for` in this wave can want these — and a set that grew
+        // mid-wave would make a concurrent run's answers depend on which
+        // download finished first.
+        let mut ran: Vec<TaskId> = Vec::new();
 
-        let status = match status_for(task, ctx, &applied).await {
-            Ok(status) => status,
-            // A `check()` that errors is not the same as one that says work is
-            // needed — it is a question riabuild could not put to the machine
-            // at all — but it is the same *kind* of failure to a run: nothing
-            // downstream of it can be trusted, and everything beside it still
-            // can.
-            Err(error) => {
-                carried.failed(task, error, ctx, outcome);
-                continue;
-            }
-        };
-
-        let reason = match status {
-            Status::Satisfied => {
-                ctx.ui.satisfied(task.title());
-                // Record a task that was already in shape the first time
-                // riabuild saw this machine. Nothing was applied, but a
-                // recordless task is invisible to the `version()` escape
-                // hatch — the forced rerun for drift `check()` cannot observe
-                // — so leaving it unrecorded would quietly exempt a server
-                // from every future version bump.
-                //
-                // Never under `--check`, which reports and changes nothing —
-                // and `state.json` is part of "nothing". The macOS end-to-end
-                // suite caught this: a dry run that recorded `repo_status`
-                // left the machine different from how it found it, which is
-                // the one thing a dry run may not do.
-                if !ctx.dry_run && !ctx.state.tasks.contains_key(task.id()) {
-                    let (id, version) = (task.id(), task.version());
-                    ctx.update_state(|state| {
-                        state.mark_satisfied(id, version, "already_satisfied")
-                    })
-                    .await?;
+        for step in wave::steps(tasks, &positions, &alone, limits.jobs) {
+            match step {
+                Step::Alone(position) => {
+                    let task = tasks[position].as_ref();
+                    // Before anything is asked of the machine. A `check()`
+                    // behind a failed prerequisite would report drift its own
+                    // `apply()` could not repair, and an `apply()` would work
+                    // against a state nothing established.
+                    if let Some(blocker) = carried.blocker(task) {
+                        carried.skipped(task, blocker, ctx, outcome);
+                        continue;
+                    }
+                    let done = attempt::run(task, ctx, &applied).await;
+                    settle(task, done, ctx, &mut carried, outcome, &mut ran)?;
                 }
-                outcome.satisfied.push(task.id());
-                continue;
-            }
-            Status::Needs(reason) => reason,
-        };
+                Step::Together(group) => {
+                    // One `Ctx` each, because `apply()` takes `&mut Ctx` and
+                    // two of those cannot exist at once. See `Ctx::fork`.
+                    let mut forks: Vec<Ctx> = group.iter().map(|_| ctx.fork()).collect();
+                    let running: Vec<_> = group
+                        .iter()
+                        .zip(forks.iter_mut())
+                        .map(|(&position, fork)| {
+                            attempt::run(tasks[position].as_ref(), fork, &applied)
+                        })
+                        .collect();
+                    let done = concurrent::join_in_order(running).await;
 
-        if ctx.dry_run {
-            ctx.ui.warn(&format!(
-                "{} would run — {}",
-                task.title(),
-                reason.describe()
-            ));
-            // Recorded as applied *for this run's purposes* as well as
-            // reported. A real run would apply this task, and applying it is
-            // what makes every dependent re-run — so a dry run that left the
-            // set empty answered a different question than the one asked: on a
-            // machine missing Node it reported the tasks behind `toolchain`
-            // satisfied, when a real run would have re-run every one of them.
-            applied.insert(task.id());
-            outcome.applied.push(task.id());
-            continue;
+                    // In declaration order, on the run's own `Ctx`: absorbing a
+                    // fork is what puts its output on the screen, so this loop
+                    // is the whole of what makes a concurrent wave read like a
+                    // sequential one.
+                    //
+                    // A fatal error is kept rather than returned from inside
+                    // here. Every task in this group has already *run* — the
+                    // work is done and on the machine — so leaving on the first
+                    // one would throw away the report of tasks that finished,
+                    // which is the thing `run_all_with_outcome` exists to
+                    // stop happening one level up.
+                    let mut fatal: Option<anyhow::Error> = None;
+                    for ((position, fork), done) in group.into_iter().zip(forks).zip(done) {
+                        ctx.absorb(fork);
+                        if let Err(error) = settle(
+                            tasks[position].as_ref(),
+                            done,
+                            ctx,
+                            &mut carried,
+                            outcome,
+                            &mut ran,
+                        ) {
+                            fatal.get_or_insert(error);
+                        }
+                    }
+
+                    // The forks wrote `config.json` and `state.json` under the
+                    // file lock, each re-reading inside it, so the disk holds
+                    // every edit and this run's snapshots hold only some of
+                    // them. The file is the authority; take it back — and take
+                    // it back *per step*, so the step after this one sees what
+                    // this one wrote exactly as it did when the engine ran one
+                    // task at a time. Within a group is the one place a task
+                    // cannot see a sibling's write, and that is sound for the
+                    // reason the group exists: nothing in it depends on
+                    // anything else in it.
+                    ctx.reload().await;
+
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                }
+            }
         }
 
-        ctx.ui.working(task.title(), &reason.describe());
-        if let Err(error) = task.apply(ctx).await {
-            carried.failed(task, error, ctx, outcome);
-            continue;
-        }
-
-        // The whole point: never record a success we have not verified.
-        match task.check(ctx).await {
-            Ok(Status::Satisfied) => {}
-            Ok(Status::Needs(still)) => {
-                let error = Failure::new(
-                    format!("{} (it did not take effect)", task.title()),
-                    "Run `riabuild` again; if it keeps failing, send this message to your team lead.",
-                )
-                .detail(format!(
-                    "after setting it up, riabuild re-checked and found: {}",
-                    still.describe()
-                ));
-                carried.failed(task, error.into(), ctx, outcome);
-                continue;
-            }
-            Err(error) => {
-                carried.failed(task, error, ctx, outcome);
-                continue;
-            }
-        }
-
-        ctx.ui.applied(task.title());
-        let tag = reason.tag();
-        ctx.update_state(|state| state.mark_satisfied(task.id(), task.version(), &tag))
-            .await?;
-        applied.insert(task.id());
-        outcome.applied.push(task.id());
+        applied.extend(ran);
     }
 
     // Not a redundant no-op write: `State::load` drops records for tasks
@@ -179,13 +231,45 @@ async fn run_into(tasks: &[Box<dyn Task>], ctx: &mut Ctx, outcome: &mut Outcome)
     carried.into_result()
 }
 
+/// What one finished attempt means to the run.
+///
+/// Every line of it touches state shared by the whole wave — `Carried`, the
+/// `Outcome`, the applied set, and the run's own `Ui` — which is exactly why it
+/// is here and not in `attempt`: this runs one task at a time, in declaration
+/// order, however many of them ran at once.
+fn settle(
+    task: &dyn Task,
+    done: Attempt,
+    ctx: &Ctx,
+    carried: &mut Carried,
+    outcome: &mut Outcome,
+    ran: &mut Vec<TaskId>,
+) -> Result<()> {
+    match done {
+        Attempt::Satisfied => outcome.satisfied.push(task.id()),
+        Attempt::Ran => {
+            ran.push(task.id());
+            outcome.applied.push(task.id());
+        }
+        Attempt::Failed(error) => carried.failed(task, error, ctx, outcome),
+        // riabuild can no longer remember what it has done, so there is nothing
+        // honest left to do with the rest of the run.
+        Attempt::Fatal(error) => return Err(error),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // No longer reachable through `super::*`: the run loop hands `Status`
+    // straight to `attempt`, and only the fakes below still name it.
     use crate::registry;
     use crate::testing::test_ctx;
+    use crate::{Resource, Status};
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use riabuild_ui::Failure;
     use std::sync::{Arc, Mutex};
 
     struct Fake {
@@ -197,6 +281,50 @@ mod tests {
         applies: Arc<Mutex<u32>>,
         /// What `apply()` fails with, when it is meant to.
         fails: Option<&'static str>,
+        interactive: bool,
+        writes: Vec<Resource>,
+        /// A rendezvous `apply()` waits at. Every task sharing one has to be
+        /// inside `apply()` at the same time for any of them to leave, so a
+        /// test that finishes proves they overlapped and one that hangs proves
+        /// they did not.
+        gate: Option<Arc<Gate>>,
+        /// Where `apply()` writes that it started and that it finished, for the
+        /// tests that care whether two tasks were inside at once.
+        journal: Option<Arc<Mutex<Vec<String>>>>,
+        /// How long `apply()` takes, so a test can make the task declared first
+        /// the one that finishes last.
+        delay_ms: u64,
+        /// Whether `apply()` says something the developer would read. `warn`
+        /// rather than `note` because `Ui::note` is silent under `--quiet` and
+        /// `test_ctx` is quiet, and what these tests are about is the order
+        /// lines reach the terminal.
+        announces: bool,
+    }
+
+    /// A meeting point for the tasks of one wave.
+    ///
+    /// `yield_now` rather than a channel or a `tokio::sync::Barrier`: this has
+    /// to work on a current-thread runtime with no `sync` feature turned on,
+    /// which is the runtime riabuild actually has.
+    struct Gate {
+        arrived: Mutex<u32>,
+        needed: u32,
+    }
+
+    impl Gate {
+        fn holding(needed: u32) -> Arc<Self> {
+            Arc::new(Self {
+                arrived: Mutex::new(0),
+                needed,
+            })
+        }
+
+        async fn meet(&self) {
+            *self.arrived.lock().unwrap() += 1;
+            while *self.arrived.lock().unwrap() < self.needed {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     impl Fake {
@@ -208,7 +336,45 @@ mod tests {
                 checks: Mutex::new(checks),
                 applies: Arc::new(Mutex::new(0)),
                 fails: None,
+                interactive: false,
+                writes: Vec::new(),
+                gate: None,
+                journal: None,
+                delay_ms: 0,
+                announces: false,
             }
+        }
+
+        /// A task that needs to run, and that says so on the way through.
+        fn runs(id: TaskId) -> Self {
+            let mut task = Self::new(id, vec![], vec![Status::needs("not set up")]);
+            task.announces = true;
+            task
+        }
+
+        fn at(mut self, gate: &Arc<Gate>) -> Self {
+            self.gate = Some(Arc::clone(gate));
+            self
+        }
+
+        fn logging(mut self, journal: &Arc<Mutex<Vec<String>>>) -> Self {
+            self.journal = Some(Arc::clone(journal));
+            self
+        }
+
+        fn writing(mut self, resource: Resource) -> Self {
+            self.writes = vec![resource];
+            self
+        }
+
+        fn taking(mut self, delay_ms: u64) -> Self {
+            self.delay_ms = delay_ms;
+            self
+        }
+
+        fn needing_the_developer(mut self) -> Self {
+            self.interactive = true;
+            self
         }
 
         /// A task that needs to run and cannot: the browser sign-in nobody
@@ -234,6 +400,12 @@ mod tests {
         fn depends_on(&self) -> &[TaskId] {
             &self.deps
         }
+        fn interactive(&self) -> bool {
+            self.interactive
+        }
+        fn writes(&self) -> &[Resource] {
+            &self.writes
+        }
         async fn check(&self, _ctx: &Ctx) -> Result<Status> {
             let mut checks = self.checks.lock().unwrap();
             if checks.is_empty() {
@@ -241,8 +413,26 @@ mod tests {
             }
             Ok(checks.remove(0))
         }
-        async fn apply(&self, _ctx: &mut Ctx) -> Result<()> {
+        async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
             *self.applies.lock().unwrap() += 1;
+            if let Some(journal) = &self.journal {
+                journal.lock().unwrap().push(format!("enter {}", self.id));
+            }
+            // Said from inside `apply()`, which is where a real task prints. On
+            // a forked `Ctx` this reaches a buffer, and the order it comes back
+            // out in is what these tests are about.
+            if self.announces {
+                ctx.ui.warn(&format!("{} ran", self.id));
+            }
+            if let Some(gate) = &self.gate {
+                gate.meet().await;
+            }
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            if let Some(journal) = &self.journal {
+                journal.lock().unwrap().push(format!("leave {}", self.id));
+            }
             match self.fails {
                 Some(why) => Err(anyhow!("{why}")),
                 None => Ok(()),
@@ -587,5 +777,331 @@ mod tests {
         run_all(&tasks, &mut ctx).await.unwrap();
         assert_eq!(*applies.lock().unwrap(), 0);
         assert!(!ctx.state.tasks.contains_key("a"));
+    }
+
+    /// How long a test waits before calling a rendezvous a deadlock.
+    ///
+    /// Generous on purpose: these tests prove *whether* two tasks overlapped,
+    /// never how quickly, so the only thing a tight bound could add is a
+    /// failure on a loaded CI runner.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The whole point of the change. Three independent tasks that each wait
+    /// for the other two to have started: sequentially the first one blocks for
+    /// ever, concurrently all three go through.
+    #[tokio::test]
+    async fn the_independent_tasks_of_one_wave_run_at_the_same_time() {
+        let (mut ctx, _home) = test_ctx().await;
+        let gate = Gate::holding(3);
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::runs("a").at(&gate)),
+            Box::new(Fake::runs("b").at(&gate)),
+            Box::new(Fake::runs("c").at(&gate)),
+        ];
+
+        let outcome = tokio::time::timeout(PATIENCE, run_all(&tasks, &mut ctx))
+            .await
+            .expect("a wave of independent tasks must not run one at a time")
+            .unwrap();
+
+        assert_eq!(outcome.applied, vec!["a", "b", "c"]);
+    }
+
+    /// And what the developer reads is still one task at a time, in the order
+    /// the registry declares them — not the order the downloads happened to
+    /// finish in.
+    ///
+    /// `a` is the slowest and is declared first, so a run that reported as it
+    /// finished would say `c`, `b`, `a`.
+    #[tokio::test]
+    async fn a_wave_reports_in_declaration_order_however_it_finishes() {
+        let (mut ctx, _home) = test_ctx().await;
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::runs("a").taking(60)),
+            Box::new(Fake::runs("b").taking(30)),
+            Box::new(Fake::runs("c").taking(1)),
+        ];
+
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
+
+        assert_eq!(outcome.applied, vec!["a", "b", "c"]);
+        // The lines each task printed from inside `apply()`, which took a
+        // buffered `Ui` and came back out through `Ctx::absorb`.
+        assert_eq!(ctx.ui.warned(), vec!["a ran", "b ran", "c ran"]);
+    }
+
+    /// `Task::writes` is what keeps two tasks out of one file, and this is the
+    /// shape of the bug it exists for: `claude_trust`, `claude_onboarding` and
+    /// `claude_agents_view` are independent, land in one wave, and each
+    /// read-modify-writes the same `.claude.json`.
+    ///
+    /// The journal is checked for *nesting* rather than for a fixed sequence: a
+    /// second task entering before the first has left is the lost update,
+    /// whichever order they went in.
+    #[tokio::test]
+    async fn two_tasks_that_write_the_same_thing_never_overlap() {
+        let (mut ctx, _home) = test_ctx().await;
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(
+                Fake::runs("trust")
+                    .writing("claude_config")
+                    .logging(&journal)
+                    .taking(20),
+            ),
+            Box::new(
+                Fake::runs("onboarding")
+                    .writing("claude_config")
+                    .logging(&journal)
+                    .taking(1),
+            ),
+            // Declares nothing, so it is free to run beside them.
+            Box::new(Fake::runs("elsewhere").logging(&journal)),
+        ];
+
+        run_all(&tasks, &mut ctx).await.unwrap();
+
+        let journal = journal.lock().unwrap().clone();
+        assert!(
+            !overlaps(&journal, "trust", "onboarding"),
+            "two writers of one file were inside at once: {journal:?}"
+        );
+    }
+
+    /// Whether `one` and `other` were ever inside `apply()` at the same time.
+    fn overlaps(journal: &[String], one: &str, other: &str) -> bool {
+        let mut inside: Vec<&str> = Vec::new();
+        for line in journal {
+            let Some((event, who)) = line.split_once(' ') else {
+                continue;
+            };
+            if who != one && who != other {
+                continue;
+            }
+            match event {
+                "enter" => {
+                    if !inside.is_empty() {
+                        return true;
+                    }
+                    inside.push(who);
+                }
+                _ => inside.retain(|held| *held != who),
+            }
+        }
+        false
+    }
+
+    /// `--jobs 1` is the escape hatch, and it has to be the engine riabuild had
+    /// before this: one task at a time, whatever the graph allows.
+    #[tokio::test]
+    async fn jobs_of_one_runs_one_task_at_a_time() {
+        let (mut ctx, _home) = test_ctx().await;
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::runs("a").logging(&journal).taking(20)),
+            Box::new(Fake::runs("b").logging(&journal).taking(1)),
+        ];
+
+        let (outcome, verdict) = run_all_with_outcome(&tasks, &mut ctx, Limits { jobs: 1 }).await;
+        verdict.unwrap();
+
+        assert_eq!(outcome.applied, vec!["a", "b"]);
+        assert_eq!(
+            journal.lock().unwrap().clone(),
+            vec!["enter a", "leave a", "enter b", "leave b"]
+        );
+    }
+
+    /// A task that needs the developer gets the run's own `Ui`, which is the
+    /// only one that can put a question to anybody. Everything beside it gets a
+    /// fork, which reports `interactive() == false` because a prompt it
+    /// recorded would never be seen.
+    ///
+    /// This is the invariant behind `Task::interactive`, and the reason a task
+    /// that reaches for `ui.ask()` has to declare it.
+    #[tokio::test]
+    async fn only_an_interactive_task_is_handed_a_ui_that_can_ask() {
+        struct Asks {
+            id: TaskId,
+            interactive: bool,
+            saw: Arc<Mutex<Option<bool>>>,
+        }
+
+        #[async_trait]
+        impl Task for Asks {
+            fn id(&self) -> TaskId {
+                self.id
+            }
+            fn title(&self) -> &str {
+                self.id
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn depends_on(&self) -> &[TaskId] {
+                &[]
+            }
+            fn interactive(&self) -> bool {
+                self.interactive
+            }
+            async fn check(&self, _ctx: &Ctx) -> Result<Status> {
+                Ok(match *self.saw.lock().unwrap() {
+                    Some(_) => Status::Satisfied,
+                    None => Status::needs("not asked yet"),
+                })
+            }
+            async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
+                *self.saw.lock().unwrap() = Some(ctx.ui.interactive());
+                Ok(())
+            }
+        }
+
+        let (mut ctx, _home) = test_ctx().await;
+        ctx.ui = ctx.ui.assume_prompts_work(true);
+        let (needs_it, does_not) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Asks {
+                id: "asks",
+                interactive: true,
+                saw: Arc::clone(&needs_it),
+            }),
+            Box::new(Asks {
+                id: "quiet",
+                interactive: false,
+                saw: Arc::clone(&does_not),
+            }),
+        ];
+
+        run_all(&tasks, &mut ctx).await.unwrap();
+
+        assert_eq!(
+            *needs_it.lock().unwrap(),
+            Some(true),
+            "a prompt must reach the terminal"
+        );
+        assert_eq!(
+            *does_not.lock().unwrap(),
+            Some(false),
+            "a buffered Ui must not claim it can ask"
+        );
+    }
+
+    /// An interactive task is run where it was declared, not hoisted to the
+    /// front of its wave — so the ladder reads the same as it always did.
+    #[tokio::test]
+    async fn an_interactive_task_keeps_its_place_in_the_wave() {
+        let (mut ctx, _home) = test_ctx().await;
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::runs("first").logging(&journal)),
+            Box::new(Fake::runs("asks").needing_the_developer().logging(&journal)),
+            Box::new(Fake::runs("last").logging(&journal)),
+        ];
+
+        let outcome = run_all(&tasks, &mut ctx).await.unwrap();
+
+        assert_eq!(outcome.applied, vec!["first", "asks", "last"]);
+        assert_eq!(ctx.ui.warned(), vec!["first ran", "asks ran", "last ran"]);
+        // And it really did run alone: nothing else was inside while it was.
+        let journal = journal.lock().unwrap().clone();
+        assert!(!overlaps(&journal, "first", "asks"), "{journal:?}");
+        assert!(!overlaps(&journal, "asks", "last"), "{journal:?}");
+    }
+
+    /// A task that fails in a concurrent group still stops only its own
+    /// dependents, and the tasks beside it still finish — the property the
+    /// sequential engine had, now that "beside it" means "at the same time as
+    /// it".
+    #[tokio::test]
+    async fn a_failure_in_a_concurrent_group_does_not_take_its_neighbours_down() {
+        let (mut ctx, _home) = test_ctx().await;
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Fake::failing("a", vec![], "the download timed out")),
+            Box::new(Fake::runs("b")),
+            Box::new(Fake::new(
+                "c",
+                vec!["a"],
+                vec![Status::needs("waiting on a")],
+            )),
+        ];
+
+        let error = run_all(&tasks, &mut ctx).await.unwrap_err();
+
+        assert!(
+            format!("{error}").contains("the download timed out"),
+            "{error}"
+        );
+        assert!(ctx.state.tasks.contains_key("b"), "{:?}", ctx.state.tasks);
+        assert!(!ctx.state.tasks.contains_key("c"), "{:?}", ctx.state.tasks);
+    }
+
+    /// The checklist the registry has to keep, in the one place a reader of
+    /// `Task::interactive` will look for it.
+    ///
+    /// A pin rather than a proof — nothing can derive "this task will open a
+    /// browser" from the code — so it is written as the four tasks that do,
+    /// named. A fifth arriving without a line here is the failure mode, and the
+    /// skill file says so where a task is written.
+    #[test]
+    fn the_tasks_that_need_the_developer_say_so() {
+        let registry = registry();
+        let asking: Vec<TaskId> = registry
+            .iter()
+            .filter(|task| task.interactive())
+            .map(|task| task.id())
+            .collect();
+
+        assert_eq!(
+            asking,
+            vec!["login", "github_cli", "project", "claude_accounts"],
+            "every task that prints a device code, hands over a pty or asks a \
+             question belongs here — see Task::interactive"
+        );
+    }
+
+    /// And the other half: everything that writes a per-account `.claude.json`
+    /// names it, so no two of them are ever in one group.
+    #[test]
+    fn every_writer_of_the_claude_config_declares_it() {
+        let registry = registry();
+        let writers: Vec<TaskId> = registry
+            .iter()
+            .filter(|task| task.writes().contains(&"claude_config"))
+            .map(|task| task.id())
+            .collect();
+
+        assert_eq!(
+            writers,
+            vec![
+                "claude_trust",
+                "claude_onboarding",
+                "claude_agents_view",
+                "claude_plugins"
+            ],
+        );
+    }
+
+    /// The four of them are independent, so they land in one wave — which is
+    /// what makes the declaration above load-bearing rather than decorative.
+    #[test]
+    fn those_writers_really_do_share_a_wave() {
+        let registry = registry();
+        let waves = topological_order(&registry).expect("registry must be a DAG");
+        let holding = waves
+            .iter()
+            .find(|wave| {
+                wave.iter()
+                    .any(|&position| registry[position].id() == "claude_trust")
+            })
+            .expect("claude_trust is in some wave");
+
+        for id in ["claude_onboarding", "claude_agents_view", "claude_plugins"] {
+            assert!(
+                holding
+                    .iter()
+                    .any(|&position| registry[position].id() == id),
+                "{id} shares claude_trust's wave"
+            );
+        }
     }
 }

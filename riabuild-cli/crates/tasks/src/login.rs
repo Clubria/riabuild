@@ -35,6 +35,12 @@ impl Task for Login {
         &[]
     }
 
+    /// The device-code flow prints a code and waits for a browser on another
+    /// machine. A code nobody has been shown is a run that hangs for ever.
+    fn interactive(&self) -> bool {
+        true
+    }
+
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
         // `ctx.member` is populated at startup by asking the server who we are,
         // so this checks a live session rather than the presence of a file.

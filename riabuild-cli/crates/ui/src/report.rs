@@ -11,6 +11,7 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 
 use crate::Ui;
+use crate::buffer::{OwnedDetail, Recorded};
 use crate::wrap::Detail;
 
 /// Spaces needed for `line` to cover a status line `previous` columns wide.
@@ -41,6 +42,9 @@ fn value_line(theme: Theme, text: &str, value: &str) -> String {
 impl Ui {
     /// The mark, the wordmark, and what this invocation is about to work on.
     pub fn banner(&self, org: &str) {
+        if self.record(Recorded::Banner(org.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -57,6 +61,9 @@ impl Ui {
     }
 
     pub fn heading(&self, text: &str) {
+        if self.record(Recorded::Heading(text.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -65,6 +72,9 @@ impl Ui {
 
     /// A task that needed nothing.
     pub fn satisfied(&self, title: &str) {
+        if self.record(Recorded::Satisfied(title.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -77,6 +87,9 @@ impl Ui {
 
     /// A task about to run, with the reason it is running.
     pub fn working(&self, title: &str, reason: &str) {
+        if self.record(Recorded::Working(title.to_string(), reason.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -95,6 +108,9 @@ impl Ui {
     }
 
     pub fn applied(&self, title: &str) {
+        if self.record(Recorded::Applied(title.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -126,6 +142,9 @@ impl Ui {
     /// like is a blank line missing or doubled, never one with the wrong text
     /// in it.
     pub fn blank(&self) {
+        if self.record(Recorded::Blank) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -143,6 +162,9 @@ impl Ui {
     }
 
     pub fn note(&self, text: &str) {
+        if self.record(Recorded::Note(text.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -173,6 +195,9 @@ impl Ui {
     /// code would read as an error message on exactly the terminals — an old
     /// server over SSH — where this flow is the entire interface.
     pub fn note_value(&self, text: &str, value: &str) {
+        if self.record(Recorded::NoteValue(text.to_string(), value.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -184,6 +209,9 @@ impl Ui {
     }
 
     pub fn warn(&self, text: &str) {
+        if self.record(Recorded::Warn(text.to_string())) {
+            return;
+        }
         // Deliberately not gated on `quiet`, and on stderr: a warning is what
         // riabuild says in place of stopping, so it is the one line a run
         // asked to be silent still has to produce.
@@ -221,6 +249,13 @@ impl Ui {
     /// stderr with the explanation — a warning is the one thing `--quiet` does
     /// not silence.
     pub fn unresolved(&self, title: &str, outcome: &str, detail: &[Detail]) {
+        if self.record(Recorded::Unresolved {
+            title: title.to_string(),
+            outcome: outcome.to_string(),
+            detail: detail.iter().map(OwnedDetail::of).collect(),
+        }) {
+            return;
+        }
         // Recorded as one warning, not as a title and some lines: a test
         // asserting that a downgraded path told the developer what happened
         // should not have to know how the block was split up to print it.
@@ -252,6 +287,9 @@ impl Ui {
     }
 
     pub fn info(&self, text: &str) {
+        if self.record(Recorded::Info(text.to_string())) {
+            return;
+        }
         if self.quiet {
             return;
         }

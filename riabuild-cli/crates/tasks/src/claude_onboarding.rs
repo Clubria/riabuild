@@ -25,7 +25,7 @@
 //! answer in the one place the org's answer cannot override.
 
 use super::claude_config::{self, Stored};
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_ui::Failure;
@@ -58,6 +58,12 @@ impl Task for ClaudeOnboarding {
         // needs a checkout, and a developer whose checkout has not landed yet
         // should still get a Claude Code that opens without interviewing them.
         &["claude_accounts"]
+    }
+
+    /// The per-account `.claude.json`, which three sibling tasks in this wave
+    /// also write. See `Task::writes`.
+    fn writes(&self) -> &[Resource] {
+        &["claude_config"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {

@@ -82,6 +82,14 @@ impl Task for Project {
         &["github_cli"]
     }
 
+    /// First setup for a repository shows the path riabuild would use and
+    /// takes Enter for yes — `directory::ask`, one of the two decisions
+    /// riabuild offers rather than imposes. A question that is recorded
+    /// instead of printed is one the developer never gets to answer.
+    fn interactive(&self) -> bool {
+        true
+    }
+
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
         let Some(dir) = ctx.project_dir() else {
             return Ok(Status::needs("no project directory chosen yet"));

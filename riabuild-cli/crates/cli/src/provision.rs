@@ -39,7 +39,11 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
 
     ctx.ui.heading("Checking this machine");
     let registry = tasks::registry();
-    let (outcome, ran) = engine::run_all_with_outcome(&registry, ctx).await;
+    let limits = match cli.jobs {
+        Some(jobs) => engine::Limits { jobs },
+        None => engine::Limits::default(),
+    };
+    let (outcome, ran) = engine::run_all_with_outcome(&registry, ctx, limits).await;
     let finished = after_the_tasks(ctx, &outcome, ran).await;
 
     // Released here, before every return below it and before `open_shell` above
@@ -240,6 +244,7 @@ mod tests {
     /// `ask_which_repository`.
     fn cli_with(check: bool, repo: Option<&str>) -> Cli {
         Cli {
+            jobs: None,
             command: None,
             project: None,
             repo: repo.map(str::to_string),

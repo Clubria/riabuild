@@ -98,6 +98,79 @@ impl Ctx {
         }
     }
 
+    /// A private `Ctx` for one task of a concurrent wave.
+    ///
+    /// `apply()` takes `&mut Ctx` and two of those cannot exist at once, which
+    /// is the whole of what stood between this engine and running a wave
+    /// concurrently. A fork sidesteps it rather than weakening it: each task
+    /// gets its own, and [`Ctx::absorb`] merges the result back in declaration
+    /// order. Tasks are untouched — the signature they are written against is
+    /// the one they still get.
+    ///
+    /// What a fork carries:
+    ///
+    /// - **`ui`** is [`Ui::buffered`], so nothing this task prints reaches the
+    ///   terminal until its turn.
+    /// - **`config` and `state`** are this run's snapshots, cloned. They were
+    ///   already snapshots rather than the authority — every write goes through
+    ///   `update_config`/`update_state`, which re-read *inside* the file lock —
+    ///   so two forks writing cannot lose each other's edit. What a fork does
+    ///   not see is a *sibling's* write landing mid-wave, and that is sound for
+    ///   the reason the wave exists: same-wave tasks have no declared edge, and
+    ///   a task that needs to see another's write is a task with a missing
+    ///   `depends_on()`.
+    /// - **`notes`** starts empty, so `absorb` appends exactly what this task
+    ///   added rather than a second copy of the run's.
+    ///
+    /// And what it must not carry back, which is why only non-interactive tasks
+    /// are ever forked: `org`, `member` and the token inside `api` are set by
+    /// `login` alone. `ApiClient::set_token` writes a plain field, so a clone
+    /// does not share it — a forked `login` would sign in and throw the session
+    /// away. `login` declares `Task::interactive()` and runs against the run's
+    /// own `Ctx`, so the case never arises; the assertion in
+    /// `engine::wave::tests` is what keeps it that way.
+    pub(crate) fn fork(&self) -> Ctx {
+        Ctx {
+            paths: Arc::clone(&self.paths),
+            runner: Arc::clone(&self.runner),
+            keychain: Arc::clone(&self.keychain),
+            api: self.api.clone(),
+            ui: self.ui.buffered(),
+            config: self.config.clone(),
+            state: self.state.clone(),
+            org: self.org.clone(),
+            repo: self.repo.clone(),
+            member: self.member.clone(),
+            server: self.server.clone(),
+            cli_version: self.cli_version.clone(),
+            env: self.env.clone(),
+            notes: Vec::new(),
+            dry_run: self.dry_run,
+        }
+    }
+
+    /// Takes back what one forked task produced: its output, then its notes.
+    ///
+    /// Called in declaration order, which is what makes a concurrent wave read
+    /// exactly like the sequential one that came before it.
+    ///
+    /// `config` and `state` are deliberately *not* merged here. Both were
+    /// written to disk under the lock by whichever forks wrote them, and
+    /// picking one fork's snapshot would discard another's; the run reloads
+    /// both from disk once the wave is over, where the file is the authority it
+    /// always was.
+    pub(crate) fn absorb(&mut self, fork: Ctx) {
+        fork.ui.flush_into(&self.ui);
+        self.notes.extend(fork.notes);
+    }
+
+    /// Re-reads the two files a wave's tasks may have written, so the run's
+    /// snapshots are the machine's again.
+    pub(crate) async fn reload(&mut self) {
+        self.config = UserConfig::load(self.paths.as_ref()).await;
+        self.state = State::load(self.paths.as_ref()).await;
+    }
+
     pub fn org(&self) -> Result<&OrgConfig> {
         self.org
             .as_ref()
