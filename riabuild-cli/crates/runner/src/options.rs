@@ -53,6 +53,19 @@ pub struct RunOptions {
     /// the developer's own directory is the right answer, so `None` inherits.
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Variables taken **off** the child's environment, rather than given a
+    /// value on it.
+    ///
+    /// Setting one to the empty string is not the same thing and is sometimes
+    /// much worse: `SSH_CONNECTION=""` still reads as set to anything that
+    /// tests with `-n`, and `NGROK_AUTHTOKEN=""` reads to ngrok as *not
+    /// authenticated* and overrides a token the developer configured for
+    /// themselves. The Claude Code launcher is the caller that forced this —
+    /// its shell ancestor cleared `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`
+    /// with `unset`, which has no spelling in a list of key/value pairs.
+    ///
+    /// Applied after [`env`](Self::env), so a name in both is removed.
+    pub env_remove: Vec<String>,
     /// Fed to the child's stdin. Used to pipe brokered secrets without them ever
     /// appearing in a process argument list, where `ps` would show them — and on
     /// a shared server `ps` shows other developers' processes — and to hand a
@@ -106,6 +119,7 @@ impl Default for RunOptions {
         Self {
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             stdin: None,
             subdued: None,
             timeout: Some(DEFAULT_TIMEOUT),

@@ -20,6 +20,7 @@ impl FakeRunner {
         self.recorded.lock().unwrap().push(Recorded {
             invocation: invocation.clone(),
             env: options.env.clone(),
+            env_removed: options.env_remove.clone(),
             stdin: options.stdin.clone(),
             subdued: options.subdued.is_some(),
         });

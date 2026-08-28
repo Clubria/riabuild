@@ -1,6 +1,6 @@
-//! What one Claude Code launcher says.
+//! What one Claude Code launcher does.
 //!
-//! ```sh
+//! ```text
 //! # a bare, interactive `claude` — opens on the agents view, scoped to
 //! # whichever checkout the developer is standing in
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
@@ -14,6 +14,11 @@
 //!   --exclude-dynamic-system-prompt-sections \
 //!   --allow-dangerously-skip-permissions "$@"
 //! ```
+//!
+//! Both used to be built by a ninety-line `sh` script in `~/.riabuild/bin`.
+//! They are built by [`handoff`] now, and the launcher on disk is one `exec`
+//! naming `riabuild internal launch claude` — see `shims::launch` for why, and
+//! for the table of which shell test became which function.
 //!
 //! `--settings` layers over the account's own settings, so org policy is always
 //! current, removals take effect, and developer edits survive. Nothing is merged
@@ -29,7 +34,7 @@
 //! and that key decides which mode a session *starts* in; whether the mode stays
 //! *reachable* from the Shift+Tab cycle is a second question with no settings key
 //! at all. The flag is what riabuild can say about it, and it covers the machines
-//! the settings key cannot reach — including one whose launcher execs without
+//! the settings key cannot reach — including one whose launch carries no
 //! `--settings` because the org settings have never been fetched. See
 //! `ALLOW_BYPASS`.
 //!
@@ -65,7 +70,7 @@
 //! Which also means `defaultToAgentsView` — the global-config key
 //! `claude_agents_view` writes — has never decided anything here, and cannot:
 //! Claude Code reads it only when the raw argv holds nothing but debug flags,
-//! and every launcher riabuild has ever written passed `--settings`. The task
+//! and every launch riabuild has ever built passed `--settings`. The task
 //! still writes it, for a developer who runs Claude Code from outside
 //! `~/.riabuild/bin`; the launcher is what makes the view happen for everyone
 //! else, and it does so unconditionally. See `claude_agents_view`.
@@ -77,15 +82,17 @@
 //! surface as a test failure, not as broken laptops. They need a real Claude Code
 //! install, so run them with `cargo test -- --ignored` before every version bump.
 //!
-//! The launchers also clear `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`, and
-//! claim `WAYLAND_DISPLAY` on a machine with no display, which together are what
-//! make the clipboard shims below reachable — see the comments in
-//! `launcher_script`. Both are undocumented behaviour, read out of the shipped
+//! The launcher also clears `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`, and
+//! claims `WAYLAND_DISPLAY` on a machine with no display, which together are what
+//! make the clipboard shims beside it reachable — see the comments in
+//! [`handoff`]. Both are undocumented behaviour, read out of the shipped
 //! binary rather than promised anywhere, and neither can be pinned by a smoke
 //! test: Claude Code exposes no non-interactive clipboard command to assert
 //! against. Re-read them by hand when the pinned Claude Code version moves.
 
 use std::path::{Path, PathBuf};
+
+use super::super::launch::{self, Handoff, Harness, Plan, World};
 
 /// Moves the per-machine half of the system prompt into the first user message.
 ///
@@ -104,7 +111,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Passed on every launch that carries arguments, which is safe on two counts.
 /// It arrived in Claude Code 2.1.98, well below the 2.1.223 floor
-/// `claude_accounts` already enforces and repairs, so no launcher will meet a
+/// `claude_accounts` already enforces and repairs, so no launch will meet a
 /// binary that rejects it — and it is a global option, accepted ahead of a
 /// subcommand exactly as `--settings` is, so `claude-2 auth login` still works.
 ///
@@ -114,7 +121,7 @@ use std::path::{Path, PathBuf};
 /// after Claude Code strips the options it recognises, and this flag is not one
 /// of them — so the pair does not open a view with a longer prompt, it opens
 /// the background-agents subcommand and exits. See the module header.
-const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
+pub(super) const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 
 /// Keeps bypass-permissions in the Shift+Tab cycle, without making it the mode.
 ///
@@ -135,13 +142,13 @@ const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 /// is refused, the mode is not merely off: it is unreachable for the whole
 /// session, and the developer's Shift+Tab silently has one fewer stop on it.
 ///
-/// Three such machines are ordinary rather than hypothetical. A launcher whose
-/// `if [ -f ]` finds no `org-settings.json` execs with **no `--settings` at all**,
-/// which is every laptop before its first successful fetch. A laptop holding a
-/// cached copy written before the key existed serves settings with no permission
-/// mode in them — the failure `org.backfillClaudeDefaults` was written for, which
-/// repairs the *server's* row and can do nothing about a file already on disk. And
-/// under `CLAUDE_CODE_REMOTE` Claude Code rejects `bypassPermissions` from settings
+/// Three such machines are ordinary rather than hypothetical. A launch that finds
+/// no `org-settings.json` carries **no `--settings` at all**, which is every
+/// laptop before its first successful fetch. A laptop holding a cached copy
+/// written before the key existed serves settings with no permission mode in them
+/// — the failure `org.backfillClaudeDefaults` was written for, which repairs the
+/// *server's* row and can do nothing about a file already on disk. And under
+/// `CLAUDE_CODE_REMOTE` Claude Code rejects `bypassPermissions` from settings
 /// outright, allowing only `acceptEdits`, `plan`, `default` and `auto`.
 ///
 /// Strictly weaker than the settings key beside it, which is why it is safe to
@@ -152,13 +159,12 @@ const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
 ///
 /// Passed unconditionally on the same two counts as `STATIC_SYSTEM_PROMPT`. It is
 /// in Claude Code by 2.1.143, below the 2.1.223 floor `claude_accounts` enforces
-/// and repairs, so no launcher will meet a binary that rejects it; and it is a
+/// and repairs, so no launch will meet a binary that rejects it; and it is a
 /// global option accepted ahead of a subcommand, which `settings_flag_survives_a_subcommand`
 /// pins beside the other two. Verified against 2.1.235.
-const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
+pub(super) const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 
-/// Scopes the agents view to the checkout the developer is actually standing
-/// in — never to one fixed repository for the whole machine.
+/// Scopes the agents view to the checkout the developer is standing in.
 ///
 /// A **subcommand** option of `agents`, and only of `agents`: `claude --cwd
 /// <path> mcp list` is "error: unknown option '--cwd'". So it cannot join
@@ -171,8 +177,8 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// is what the `--help` line says and all it says — *and* it becomes the
 /// working directory the view reports and dispatches from. A developer who runs
 /// `claude` from their home directory used to get a view listing every session
-/// on the machine, from every checkout; now they get whichever repository is
-/// under them, or the one riabuild set this machine up for by default.
+/// on the machine, from every checkout; now they get the repository they are
+/// working in, wherever they were standing.
 ///
 /// It does **not** override a developer who is already somewhere more specific.
 /// Claude Code keeps the process's own working directory when that directory is
@@ -191,12 +197,10 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// the floor above only keeps you where you stand when you are already inside
 /// the one path the launcher knows. That is not "leaves one who is standing in
 /// it alone" — it is "alone" for exactly one checkout, and a wall for every
-/// other one riabuild has ever cloned. So the launcher script itself picks:
-/// `case "$PWD"` walks every checkout `riabuild` knows about (`build_agents_view`
-/// generates one arm per entry in `UserConfig::repos`) and takes whichever one
-/// contains the working directory, falling back to the run's default repository
-/// only when none of them do. Every developer with one repository sees exactly
-/// today's behaviour — one arm, one fallback that agrees with it.
+/// other one riabuild has ever cloned. So [`checkout_for`] picks, per launch,
+/// from every checkout in `UserConfig::repos`, and falls back to the run's
+/// default repository only when the developer is standing in none of them.
+/// Every developer with one repository sees exactly today's behaviour.
 ///
 /// Passed only where the resolved checkout is on disk. A path that is not there
 /// does not fail — the view opens on an empty list naming a directory nobody
@@ -210,74 +214,187 @@ const ALLOW_BYPASS: &str = "--allow-dangerously-skip-permissions";
 /// `STATIC_SYSTEM_PROMPT` ahead of it does. `ALLOW_BYPASS` still lands, too —
 /// the view comes up with bypass on its footer. Re-read it when the pinned
 /// version moves.
-const VIEW_CWD: &str = "--cwd";
+pub(super) const VIEW_CWD: &str = "--cwd";
 
-/// The branch of the launcher that opens the agents view, scoped to whichever
-/// checkout `$PWD` turns out to be under when the script actually runs.
+/// The name the launcher claims a display under on a machine that has none.
 ///
-/// One `case` arm per entry in `checkouts`, most specific (longest path)
-/// first, so a checkout nested inside another — unusual, but not something the
-/// generator may assume away — matches the inner one rather than the outer.
-/// The pattern for each is `"{path}"|"{path}"/*`: the first alternative is an
-/// exact match (`$PWD` is the checkout root itself), the second is quoted
-/// literal followed by an *unquoted* `/*`, which is what makes it a prefix
-/// match on every subdirectory and worktree beneath it rather than a glob over
-/// the checkout's own contents. Determined entirely at shell runtime — nothing
-/// here can know where a script's caller will `cd` from before that caller
-/// exists.
+/// Not a compositor anyone can connect to, and not meant to be: it says who
+/// claimed it, to whoever runs `env` and wonders.
+const CHANNEL_DISPLAY: &str = "riabuild-channel";
+
+/// Claude Code answers "am I over SSH?" from these three and nothing else.
 ///
-/// The `*` arm is `default`: what a developer standing nowhere riabuild has a
-/// checkout for still gets pulled back to, exactly as the single-repository
-/// launcher always did. Two spellings of the branch rather than one with an
-/// interpolated argument, for the same reason `launcher_script` used to give
-/// for its own single-path version: `${{x:+--cwd "$x"}}` would split a path
-/// containing a space back into two arguments, and `/Users/Ada Smith/Clubria`
-/// is an ordinary macOS home.
+/// Over SSH it skips the native copy and returns `""` from every paste *without
+/// running anything* — so the `xclip`/`wl-paste` shims in the same `bin/` are
+/// never reached, and the channel they front is dead code. Clearing the three
+/// makes Claude Code probe for a clipboard tool, find riabuild's shim first on
+/// `PATH`, and reach the laptop.
 ///
-/// `checkouts` empty and `default` `None` together is the one case with
-/// nothing to match against at all — every machine before its first clone —
-/// and it is spelled as the plain `agents` line the launcher always wrote
-/// rather than a `case` with only a `*` arm, so a machine that has never
-/// chosen a repository sees exactly the script it always has.
-fn build_agents_view(checkouts: &[PathBuf], default: Option<&Path>) -> String {
-    if checkouts.is_empty() && default.is_none() {
-        return format!("  set -- {ALLOW_BYPASS} agents");
+/// Verified against Claude Code 2.1.224: only `SSH_CONNECTION` reaches the
+/// clipboard path, but all three feed the terminal-type probe, so a session that
+/// cleared one and kept the others would still report itself as `ssh-session`.
+/// They are also on Claude Code's own environment allowlist, so a relaunched or
+/// child session inherits whatever this leaves — clearing them here covers the
+/// whole tree.
+///
+/// `SSH_AUTH_SOCK` is deliberately **not** among them: it is agent forwarding,
+/// not session detection, and dropping it breaks `git push` over SSH.
+const SSH_DETECTION: &[&str] = &["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"];
+
+/// Which checkout the agents view opens on, given where the developer is
+/// standing.
+///
+/// The Rust spelling of the launcher's `case "$PWD" in "$c"|"$c"/*) …`, and it
+/// is a better one in a way that matters: `starts_with` on a [`Path`] compares
+/// whole components, so a developer standing in `~/Clubria/payments-legacy` is
+/// not matched by a checkout at `~/Clubria/payments`. The shell pattern got that
+/// right too, but only because of where the `/` sits in it — a detail one
+/// careless edit away from silently pulling every neighbouring directory into a
+/// checkout it has nothing to do with.
+///
+/// `checkouts` is expected **longest first**, which is `known_checkouts`'s job:
+/// a checkout nested inside another is unusual, but not something this may
+/// assume away, and the first match wins.
+///
+/// The fallback is `default` — the repository this run is about — which is what
+/// a developer standing nowhere riabuild has a checkout for gets pulled back to,
+/// exactly as the single-repository launcher always did. `None` from both is the
+/// one case with nothing to match at all: every machine before its first clone,
+/// where the view opens unscoped rather than on a path nobody has cloned into.
+pub fn checkout_for<'a>(
+    cwd: &Path,
+    checkouts: &'a [PathBuf],
+    default: Option<&'a Path>,
+) -> Option<&'a Path> {
+    checkouts
+        .iter()
+        .find(|checkout| cwd.starts_with(checkout))
+        .map(PathBuf::as_path)
+        .or(default)
+}
+
+/// One Claude Code launch, decided.
+///
+/// Takes the [`Handoff`] `launch::handoff` has already put the profile
+/// directory and (where the recorded binary has moved) the stripped `PATH` on,
+/// and adds everything that is Claude Code's own.
+pub(in crate::shims) fn handoff(handoff: Handoff, plan: &Plan, world: &World) -> Handoff {
+    let handoff = handoff.unset(SSH_DETECTION.iter().copied());
+
+    // Clearing those three is necessary and *not* sufficient, because reading
+    // and writing the clipboard are not gated on the same thing. Reading is a
+    // plain subprocess Claude Code runs whatever the environment says. Writing
+    // goes through a Linux probe that asks for a display before it will look
+    // for a tool at all — `WAYLAND_DISPLAY` before `wl-copy`, `DISPLAY` before
+    // `xclip` — and a headless server has neither. It then records "no
+    // clipboard tool here" and every copy leaves as an OSC 52 escape alone, so
+    // the `wl-copy`/`xclip` shims beside this launcher are never run and the
+    // channel carries pastes but no copies. Read out of Claude Code 2.1.232;
+    // re-read it when the pinned version moves.
+    //
+    // Claimed only where riabuild's own `wl-copy` is what the probe will find,
+    // and only on a machine that genuinely has no display of its own — so a
+    // Linux laptop with a real session keeps the clipboard it already had.
+    let headless = world.wayland_display.is_none() && world.x11_display.is_none();
+    let handoff = match world.wl_copy_present && headless {
+        true => handoff.env("WAYLAND_DISPLAY", CHANNEL_DISPLAY),
+        false => handoff,
+    };
+
+    let mut args = Vec::new();
+    // `--settings` first, and only where the file is there. Every machine
+    // before its first successful fetch launches without it rather than
+    // pointing Claude Code at a file that does not exist.
+    if let (true, Some(settings)) = (world.settings_present, &plan.settings) {
+        args.push("--settings".to_string());
+        args.push(settings.to_string_lossy().into_owned());
     }
-    let mut arms = String::new();
-    for checkout in checkouts {
-        let path = checkout.display();
-        arms.push_str(&format!(
-            "      \"{path}\"|\"{path}\"/*) project=\"{path}\" ;;\n"
-        ));
+    args.extend(argument_line(plan, world));
+    handoff.with_args(args)
+}
+
+/// Which of the two lines this launch is, and what is on it.
+///
+/// Three guards decide, and each is load-bearing:
+///
+/// - **no arguments.** A developer who typed something asked for that, not for
+///   the view, and `agents` would land in front of their own first word.
+/// - **a terminal on both stdin and stdout.** `echo "fix the build" | claude`
+///   is a session with a prompt on stdin. Claude Code's positional route does
+///   not test the terminal itself, so without this the prompt is swallowed and
+///   the view opens over it. Claude Code applies the same pair on its own route.
+/// - **`CLAUDE_CODE_DISABLE_AGENT_VIEW` unset.** Claude Code's documented off
+///   switch. With the view disabled, `claude agents` does not fall back to a
+///   session — it prints "'claude agents' is disabled …" and exits 1. Honouring
+///   the switch here is the difference between a developer turning the view off
+///   and a developer losing the `claude` command.
+fn argument_line(plan: &Plan, world: &World) -> Vec<String> {
+    let bare_and_interactive = plan.args.is_empty()
+        && world.stdin_is_tty
+        && world.stdout_is_tty
+        && !world.agents_view_disabled;
+
+    if !bare_and_interactive {
+        // Every other launch — `claude -p`, `claude --resume`, `claude "some
+        // prompt"`, `claude-2 auth login`. The two flags go ahead of the
+        // developer's own arguments, because behind them they would land after
+        // a line Claude Code's parser has already consumed.
+        let mut line = vec![STATIC_SYSTEM_PROMPT.to_string(), ALLOW_BYPASS.to_string()];
+        line.extend(plan.args.iter().cloned());
+        return line;
     }
-    arms.push_str(&match default {
-        Some(default) => format!("      *) project=\"{}\" ;;\n", default.display()),
-        None => "      *) project=\"\" ;;\n".to_string(),
-    });
-    format!(
-        r#"  project=""
-  case "$PWD" in
-{arms}  esac
-  if [ -n "$project" ] && [ -d "$project" ]; then
-    set -- {bypass} agents {cwd} "$project"
-  else
-    set -- {bypass} agents
-  fi"#,
-        bypass = ALLOW_BYPASS,
-        cwd = VIEW_CWD,
-    )
+
+    // `ALLOW_BYPASS` rides along on this line too, and that is not decoration:
+    // Claude Code folds it into the dispatch defaults the view hands to every
+    // session it starts, so dropping it here would take bypass-permissions out
+    // of the Shift+Tab cycle for exactly the launch most developers make.
+    // `STATIC_SYSTEM_PROMPT` cannot come with it — see the module header.
+    let mut line = vec![ALLOW_BYPASS.to_string(), "agents".to_string()];
+    if let Some(checkout) = checkout_for(
+        &world.cwd,
+        &plan.checkouts,
+        plan.default_checkout.as_deref(),
+    ) && world.selected_checkout_exists
+    {
+        line.push(VIEW_CWD.to_string());
+        line.push(checkout.to_string_lossy().into_owned());
+    }
+    line
+}
+
+/// The plan one account's launcher records.
+pub fn plan(
+    config_dir: &Path,
+    claude: &str,
+    org_settings: &Path,
+    bin_dir: &Path,
+    checkouts: &[PathBuf],
+    default: Option<&Path>,
+) -> Plan {
+    Plan {
+        settings: Some(org_settings.to_path_buf()),
+        checkouts: checkouts.to_vec(),
+        default_checkout: default.map(Path::to_path_buf),
+        ..Plan::new(
+            Harness::Claude,
+            config_dir.to_path_buf(),
+            claude.to_string(),
+            bin_dir.to_path_buf(),
+        )
+    }
 }
 
 /// One account's launcher: `claude`, or `claude-<n>`.
 ///
 /// `checkouts` is every repository this machine knows a path for —
-/// `UserConfig::repos`, in the order the case statement should try them — and
-/// `default` is the checkout of the repository the *current* run is about,
-/// used only when the developer's `$PWD` matches none of `checkouts`. Both are
-/// commonly the same single path, which is what a machine with one repository
-/// looks like; `default` is `None` only where there is no checkout at all yet
-/// to fall back to — every machine before its first clone.
+/// `UserConfig::repos`, longest first — and `default` is the checkout of the
+/// repository the *current* run is about, used only when the developer's
+/// working directory is under none of `checkouts`. Both are commonly the same
+/// single path, which is what a machine with one repository looks like;
+/// `default` is `None` only where there is no checkout at all yet to fall back
+/// to — every machine before its first clone.
 pub fn launcher_script(
+    riabuild: &Path,
     config_dir: &Path,
     claude: &str,
     org_settings: &Path,
@@ -285,162 +402,23 @@ pub fn launcher_script(
     checkouts: &[PathBuf],
     default: Option<&Path>,
 ) -> String {
-    let agents_view = build_agents_view(checkouts, default);
-    format!(
-        r#"#!/bin/sh
-# Generated by riabuild. Edits here are overwritten.
-#
-# Launches Claude Code with one account's config directory and the team's
-# settings layered on top. --settings wins over the account's own settings,
-# which is how org policy stays current without riabuild ever editing
-# settings.json.
-set -e
-# Claude Code treats "am I over SSH?" as "my clipboard is not the user's
-# clipboard", and answers it from these three variables alone. Over SSH it skips
-# the native copy and returns "" from every paste *without running anything* — so
-# the xclip/wl-paste shims in this same bin/ are never reached, and the channel
-# they front is dead code. Clearing the three makes Claude Code probe for a
-# clipboard tool, find riabuild's shim first on PATH, and reach the laptop.
-#
-# Verified against Claude Code 2.1.224: only SSH_CONNECTION reaches the clipboard
-# path, but all three feed the terminal-type probe, so a session that cleared one
-# and kept the others would still report itself as "ssh-session". They are also
-# on Claude Code's own environment allowlist, so a relaunched or child session
-# inherits whatever this script leaves — clearing them here covers the whole tree.
-#
-# SSH_AUTH_SOCK is deliberately NOT cleared: it is agent forwarding, not session
-# detection, and dropping it breaks `git push` over SSH.
-unset SSH_CONNECTION SSH_CLIENT SSH_TTY
-# Clearing those three is necessary and *not* sufficient, because reading and
-# writing the clipboard are not gated on the same thing. Reading is a plain
-# subprocess Claude Code runs whatever the environment says. Writing goes
-# through a Linux probe that asks for a display before it will look for a tool
-# at all — $WAYLAND_DISPLAY before wl-copy, $DISPLAY before xclip — and a
-# headless server has neither. It then records "no clipboard tool here" and
-# every copy leaves as an OSC 52 escape alone, so the wl-copy/xclip shims in
-# this same bin/ are never run and the channel carries pastes but no copies.
-# Read out of Claude Code 2.1.232; re-read it when the pinned version moves.
-#
-# Claimed only where riabuild's own wl-copy is what the probe will find, and
-# only on a machine that genuinely has no display of its own — so a Linux
-# laptop with a real session keeps the clipboard it already had. The name is
-# not a compositor anyone can connect to and is not meant to be: it says who
-# claimed it, to whoever runs `env` and wonders.
-if [ -x "{bin_dir}/wl-copy" ] && [ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; then
-  WAYLAND_DISPLAY=riabuild-channel
-  export WAYLAND_DISPLAY
-fi
-CLAUDE_CONFIG_DIR="{config_dir}"
-export CLAUDE_CONFIG_DIR
-claude_binary="{claude}"
-case "$claude_binary" in
-  /*) ;;
-  # A non-absolute path (no Node pinned yet) can't be trusted with the -x
-  # test below: a same-named executable in the current directory would pass
-  # it, skip the PATH strip, and exec a bare name that PATH search resolves
-  # straight back to this script. Treat it as no path at all.
-  *) claude_binary="" ;;
-esac
-if [ ! -x "$claude_binary" ]; then
-  # The recorded binary is gone: a `claude update` that migrated to a native
-  # install, or a Node version change since the last run. Fall back to PATH
-  # with riabuild's own bin/ removed — without that this script finds itself,
-  # because bin/ comes first inside the environment shell.
-  PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "{bin_dir}" | paste -sd: -)
-  export PATH
-  claude_binary=claude
-fi
-# Which view Claude Code opens on. Clubria's answer is the agents view, and the
-# bare `agents` positional is the only route to it that a launcher can take.
-#
-# The obvious route is the `defaultToAgentsView` key in the account's
-# `.claude.json`, which `claude_agents_view` writes. It cannot work from here.
-# Claude Code consults that key only when *every* token on the command line is a
-# debug flag — it tests the raw argv, before its own option parsing — so the
-# `--settings` two lines below is on its own enough to rule the agents view out.
-# Every launcher riabuild has ever written passed `--settings`, so that key has
-# never once decided what a Clubria developer's `claude` opened on.
-#
-# The positional is checked differently: `--settings` and its value are taken
-# off the line first, and only what remains has to be empty. So this is the one
-# spelling that carries org policy *and* opens the view. It also ignores
-# `defaultToAgentsView` entirely, which is what "always" means here.
-#
-# {flag} has to come off the line to do it, and {bypass} does not. Which flags
-# are stripped is not guessable from the names: --settings goes with its value,
-# {bypass} is folded into the dispatch defaults the view hands to the sessions it
-# starts, and {flag} is left where it lies. Leaving {flag} on makes the remainder
-# non-empty and the view is refused; worse, `agents` then reaches the ordinary
-# parser, where it is the *background-agents* subcommand, and `claude` would
-# print a list of background agents and exit instead of opening a session.
-#
-# Nothing is lost by dropping it on this path that was not lost already: {flag}
-# is not among the ones Claude Code carries into a session dispatched from the
-# agents view either, so a bare launch could not have kept it whichever way this
-# was written. Every other launch — `claude -p`, `claude --resume`, `claude
-# "some prompt"`, `claude-2 auth login` — still gets it, unchanged.
-#
-# Read out of Claude Code 2.1.235; re-read it when the pinned version moves.
-#
-# Three guards, each load-bearing:
-#
-#   $# -eq 0   a developer who typed arguments asked for something other than
-#              the view, and `agents` would collide with their own first word.
-#   -t 0 -t 1  `echo "fix the build" | claude` is a session with a prompt on
-#              stdin. The positional route does not test the terminal itself,
-#              so without this the prompt is swallowed and the view opens over
-#              it. Claude Code applies the same pair on its own route.
-#   the env var  Claude Code's documented off switch. With the view disabled,
-#              `claude agents` does not fall back to a session — it prints
-#              "'claude agents' is disabled …" and exits 1. Honouring the
-#              switch here is the difference between a developer turning the
-#              view off and a developer losing the `claude` command.
-#
-# The view opens on whichever checkout the developer is standing in, which is
-# what `--cwd` is doing below. It is an option of the `agents` subcommand and
-# of nothing else — `claude --cwd <path> mcp list` is "unknown option" — so it
-# sits after the positional, and the other branch cannot have it. Unlike
-# {flag}, an option in that position does not cost the view: the launch still
-# opens on it, still with {bypass} in force. Verified against Claude Code
-# 2.1.235.
-#
-# It is a floor rather than a move. Claude Code keeps the working directory the
-# process already has when that directory is *inside* the one named here, so
-# `claude` from a subdirectory or from a `.claude/worktrees/` worktree still
-# opens where the developer stands; it is the `claude` typed in a home
-# directory, or in some unrelated tree, that lands on a repository instead of
-# on a list of every session on the machine.
-#
-# Which repository is decided just above, not baked into this script once:
-# `$PWD` is matched against every checkout riabuild knows a path for, and only
-# a developer standing nowhere any of them falls back to this run's default —
-# so working in a second checkout no longer pulls `claude` away from the first
-# one riabuild set this machine up for. Only where the resolved checkout is on
-# disk. A path that is gone opens a view onto an empty list naming a directory
-# nobody has, which is worse than the view this launcher opened before the
-# flag existed.
-if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]; then
-{agents_view}
-else
-  set -- {flag} {bypass} "$@"
-fi
-if [ -f "{settings}" ]; then
-  exec "$claude_binary" --settings "{settings}" "$@"
-fi
-exec "$claude_binary" "$@"
-"#,
-        config_dir = config_dir.display(),
-        bin_dir = bin_dir.display(),
-        settings = org_settings.display(),
-        flag = STATIC_SYSTEM_PROMPT,
-        bypass = ALLOW_BYPASS,
+    launch::script(
+        riabuild,
+        &plan(
+            config_dir,
+            claude,
+            org_settings,
+            bin_dir,
+            checkouts,
+            default,
+        ),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use riabuild_fetch::archive::make_executable;
+    use crate::shims::launch::handoff as launch_handoff;
 
     /// The checkout the fixture launcher opens its agents view on.
     const PROJECT: &str = "/Users/ada/Clubria/ai-builders-hub";
@@ -450,69 +428,111 @@ mod tests {
     /// last one `riabuild` was run against.
     const OTHER_PROJECT: &str = "/Users/ada/Clubria/payments";
 
+    const CONFIG_DIR: &str = "/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555";
+    const BINARY: &str = "/Users/ada/.riabuild/node/22.23.1/bin/claude";
+    const SETTINGS: &str = "/Users/ada/.riabuild/org-settings.json";
+    const BIN_DIR: &str = "/Users/ada/.riabuild/bin";
+
     /// The fixture most tests want: one known checkout, which is also the
-    /// run's default — what a machine with a single repository looks like,
-    /// and indistinguishable from the pre-multi-repository launcher.
-    fn script() -> String {
-        script_for(&[PathBuf::from(PROJECT)], Some(Path::new(PROJECT)))
+    /// run's default — what a machine with a single repository looks like.
+    fn fixture() -> Plan {
+        plan_for(&[PathBuf::from(PROJECT)], Some(Path::new(PROJECT)))
     }
 
-    fn script_for(checkouts: &[PathBuf], default: Option<&Path>) -> String {
-        launcher_script(
-            Path::new("/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"),
-            "/Users/ada/.riabuild/node/22.23.1/bin/claude",
-            Path::new("/Users/ada/.riabuild/org-settings.json"),
-            Path::new("/Users/ada/.riabuild/bin"),
+    fn plan_for(checkouts: &[PathBuf], default: Option<&Path>) -> Plan {
+        plan(
+            Path::new(CONFIG_DIR),
+            BINARY,
+            Path::new(SETTINGS),
+            Path::new(BIN_DIR),
             checkouts,
             default,
         )
     }
 
+    /// A laptop with everything in place: the binary is there, the settings
+    /// have been fetched, and the developer is sitting at a terminal in their
+    /// checkout.
+    fn laptop() -> World {
+        World {
+            binary_is_executable: true,
+            settings_present: true,
+            stdin_is_tty: true,
+            stdout_is_tty: true,
+            cwd: PathBuf::from(PROJECT),
+            selected_checkout_exists: true,
+            path: format!("{BIN_DIR}:/usr/local/bin:/usr/bin"),
+            ..Default::default()
+        }
+    }
+
+    /// A launch that carries the developer's own arguments.
+    fn carrying(args: &[&str]) -> Plan {
+        Plan {
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            ..fixture()
+        }
+    }
+
+    fn value(handoff: &Handoff, key: &str) -> Option<String> {
+        handoff
+            .env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    }
+
     #[test]
     fn the_launcher_sets_the_account_and_layers_org_settings() {
-        let script = script();
-        assert!(script.starts_with("#!/bin/sh"));
-        assert!(script.contains(
-            r#"CLAUDE_CONFIG_DIR="/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555""#
-        ));
-        assert!(script.contains(r#"--settings "/Users/ada/.riabuild/org-settings.json""#));
-        // Arguments must reach claude, or `claude-2 --resume` silently loses
-        // them — and `claude-2 auth login`, which the account box tells the
-        // developer to run, would do nothing at all.
-        assert!(script.contains(r#""$@""#));
-        // A dropped `export` would leave every account sharing the default
-        // config directory — all nine collapsing into one — with the rest of
-        // this test still green.
-        assert!(script.contains("export CLAUDE_CONFIG_DIR"));
+        let handoff = launch_handoff(&fixture(), &laptop());
+        assert_eq!(
+            value(&handoff, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some(CONFIG_DIR)
+        );
+        assert_eq!(handoff.args.first().map(String::as_str), Some("--settings"));
+        assert_eq!(handoff.args.get(1).map(String::as_str), Some(SETTINGS));
+    }
+
+    /// Arguments must reach `claude`, or `claude-2 --resume` silently loses
+    /// them — and `claude-2 auth login`, which the account box tells the
+    /// developer to run, would do nothing at all.
+    #[test]
+    fn a_developers_own_arguments_reach_claude_in_order() {
+        let handoff = launch_handoff(&carrying(&["-p", "fix the build"]), &laptop());
+        assert_eq!(
+            handoff.args,
+            vec![
+                "--settings",
+                SETTINGS,
+                STATIC_SYSTEM_PROMPT,
+                ALLOW_BYPASS,
+                "-p",
+                "fix the build",
+            ]
+        );
     }
 
     #[test]
     fn the_launcher_clears_the_ssh_detection_variables() {
-        let script = script();
-        // Assert on the `unset` lines themselves, not on the script text: the
-        // comment above them names SSH_AUTH_SOCK to explain why it is spared,
-        // so a substring search over the whole script proves nothing.
-        let unsets: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("unset "))
-            .collect();
         // Claude Code answers "am I over SSH?" from these three and nothing
         // else. Leave any of them set and every paste returns "" without a
         // subprocess, so the xclip/wl-paste shims beside this launcher are
         // never invoked and the channel behind them is unreachable.
         //
         // Agent forwarding is not session detection: a fourth name here, or
-        // SSH_AUTH_SOCK joining this line, breaks `git push` over SSH.
+        // SSH_AUTH_SOCK joining this list, breaks `git push` over SSH.
+        let handoff = launch_handoff(&fixture(), &laptop());
         assert_eq!(
-            unsets,
-            ["unset SSH_CONNECTION SSH_CLIENT SSH_TTY"],
-            "{script}"
+            handoff.env_remove,
+            vec!["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         );
-        // A clear that lands after the exec never runs.
-        let unset = script.find("unset SSH_CONNECTION").unwrap();
-        let exec = script.find("exec ").unwrap();
-        assert!(unset < exec, "unset must precede every exec:\n{script}");
+        // Removed, not blanked. `SSH_CONNECTION=""` is still set to anything
+        // testing for presence, which is the whole reason `env_remove` exists.
+        assert!(
+            !handoff.env.iter().any(|(key, _)| key.starts_with("SSH_")),
+            "{:?}",
+            handoff.env
+        );
     }
 
     /// Clearing the SSH variables is half of reaching the clipboard shims, and
@@ -523,72 +543,114 @@ mod tests {
     /// never run.
     #[test]
     fn the_launcher_claims_a_display_so_copies_reach_the_shims() {
-        let script = script();
-        assert!(
-            script.contains("WAYLAND_DISPLAY=riabuild-channel"),
-            "{script}"
+        let server = World {
+            wl_copy_present: true,
+            ..laptop()
+        };
+        let handoff = launch_handoff(&fixture(), &server);
+        assert_eq!(
+            value(&handoff, "WAYLAND_DISPLAY").as_deref(),
+            Some(CHANNEL_DISPLAY)
         );
-        assert!(script.contains("export WAYLAND_DISPLAY"), "{script}");
-
-        // Guarded three ways, and each guard is load-bearing. Without the
-        // `-x` test a laptop that never wrote the shims would claim a display
-        // it has no tool for; without the two `-z` tests riabuild would take a
-        // real X11 or Wayland session away from a Linux developer working at
-        // their own desk, and their copies would go to a channel that is not
-        // there instead of to the clipboard in front of them.
-        assert!(
-            script.contains(r#"[ -x "/Users/ada/.riabuild/bin/wl-copy" ]"#),
-            "{script}"
-        );
-        assert!(script.contains(r#"[ -z "$WAYLAND_DISPLAY" ]"#), "{script}");
-        assert!(script.contains(r#"[ -z "$DISPLAY" ]"#), "{script}");
-
-        // A claim that lands after the exec never runs.
-        let claim = script.find("WAYLAND_DISPLAY=riabuild-channel").unwrap();
-        assert!(claim < script.find("exec ").unwrap(), "{script}");
     }
 
+    /// Each guard on the display claim, and what dropping it would cost.
     #[test]
-    fn the_launcher_can_never_exec_itself() {
-        // `~/.riabuild/bin` is first on PATH, so a script called `claude` that
-        // runs `exec claude` finds itself and forks until the shell dies.
-        let script = script();
-        assert!(!script.contains("exec claude"), "{script}");
-        assert!(
-            script.contains(r#"claude_binary="/Users/ada/.riabuild/node/22.23.1/bin/claude""#),
-            "{script}"
-        );
-        assert!(script.contains(r#"exec "$claude_binary""#), "{script}");
+    fn a_machine_with_a_display_of_its_own_keeps_the_clipboard_it_already_had() {
+        // Without the two display tests riabuild would take a real X11 or
+        // Wayland session away from a Linux developer working at their own
+        // desk, and their copies would go to a channel that is not there
+        // instead of to the clipboard in front of them.
+        for existing in [
+            World {
+                wl_copy_present: true,
+                wayland_display: Some("wayland-0".into()),
+                ..laptop()
+            },
+            World {
+                wl_copy_present: true,
+                x11_display: Some(":0".into()),
+                ..laptop()
+            },
+            // And without the `wl-copy` test a laptop that never wrote the
+            // shims would claim a display it has no tool for.
+            World {
+                wl_copy_present: false,
+                ..laptop()
+            },
+        ] {
+            let handoff = launch_handoff(&fixture(), &existing);
+            assert_eq!(value(&handoff, "WAYLAND_DISPLAY"), None);
+        }
     }
 
+    /// `~/.riabuild/bin` is first on `PATH`, so a launcher called `claude` that
+    /// falls back to a bare `claude` finds itself and forks until the shell
+    /// dies. The strip is what stops that, and it happens on the one branch
+    /// that has no absolute path left to use.
     #[test]
     fn a_binary_that_moved_is_found_without_riabuilds_own_bin() {
         // `claude update` can migrate to a native install, which leaves the
         // recorded path dangling until the next `riabuild`. A dead `claude`
         // command reads as Claude Code being uninstalled.
-        let script = script();
-        assert!(
-            script.contains(r#"if [ ! -x "$claude_binary" ]"#),
-            "{script}"
+        let moved = World {
+            binary_is_executable: false,
+            ..laptop()
+        };
+        let handoff = launch_handoff(&fixture(), &moved);
+        assert_eq!(handoff.program, "claude");
+        assert_eq!(
+            value(&handoff, "PATH").as_deref(),
+            Some("/usr/local/bin:/usr/bin")
         );
-        assert!(
-            script.contains(r#"grep -vxF "/Users/ada/.riabuild/bin""#),
-            "{script}"
+    }
+
+    #[test]
+    fn the_recorded_binary_is_what_runs_where_it_is_still_there() {
+        let handoff = launch_handoff(&fixture(), &laptop());
+        assert_eq!(handoff.program, BINARY);
+        // No `PATH` is touched on this branch: there is nothing to strip, and
+        // rewriting it anyway would change how the harness's own children
+        // resolve commands for no reason.
+        assert_eq!(value(&handoff, "PATH"), None);
+    }
+
+    /// `Ctx::claude()` returns the bare name "claude" before a Node version is
+    /// pinned, and an executable test on a bare name is resolved against the
+    /// *working directory* — a same-named executable in an untrusted checkout
+    /// would pass it, skip the strip, and be started in place of Claude Code.
+    #[test]
+    fn a_bare_binary_name_is_never_taken_for_the_recorded_one() {
+        let plan = Plan {
+            binary: "claude".to_string(),
+            ..fixture()
+        };
+        let handoff = launch_handoff(&plan, &laptop());
+        assert_eq!(handoff.program, "claude");
+        assert_eq!(
+            value(&handoff, "PATH").as_deref(),
+            Some("/usr/local/bin:/usr/bin"),
+            "the strip must happen even though the executable test passed"
         );
-        // `tr '\n' ':'` would leave a trailing colon, and an empty PATH entry
-        // means the current directory.
-        assert!(script.contains("paste -sd: -"), "{script}");
     }
 
     #[test]
     fn the_launcher_still_works_before_settings_have_been_fetched() {
-        let script = script();
-        assert!(script.contains(r#"if [ -f "/Users/ada/.riabuild/org-settings.json" ]"#));
-        // The unconditional exec after the `if` is what runs on every machine
-        // that has not fetched settings yet. Losing it would still satisfy
-        // `the_launcher_can_never_exec_itself` (which only checks the exec
-        // inside the `if`) while the launcher silently exited 0 doing nothing.
-        assert!(script.contains(r#"exec "$claude_binary" "$@""#), "{script}");
+        let unfetched = World {
+            settings_present: false,
+            ..laptop()
+        };
+        let handoff = launch_handoff(&carrying(&["--resume"]), &unfetched);
+        assert!(
+            !handoff.args.iter().any(|arg| arg == "--settings"),
+            "{:?}",
+            handoff.args
+        );
+        // And the launch still happens, with the developer's arguments intact.
+        assert_eq!(
+            handoff.args,
+            vec![STATIC_SYSTEM_PROMPT, ALLOW_BYPASS, "--resume"]
+        );
     }
 
     /// A bare, interactive `claude` opens on the agents view — always, and
@@ -600,385 +662,18 @@ mod tests {
     /// this one is tested after the options it recognises have been taken off.
     #[test]
     fn a_bare_interactive_launch_opens_the_agents_view() {
-        let script = script();
-        // `ALLOW_BYPASS` rides along, and that is not decoration. Claude Code
-        // folds it into the dispatch defaults the view hands to every session
-        // it starts, so dropping it here would take bypass-permissions out of
-        // the Shift+Tab cycle for exactly the launch most developers make —
-        // the one thing `every_exec_keeps_bypass_permissions_reachable_from_
-        // the_cycle` was written to prevent, reintroduced one branch over.
-        assert!(
-            script.contains(&format!("set -- {ALLOW_BYPASS} agents")),
-            "{script}"
-        );
-
-        // Ahead of every exec, or it decides nothing. Matched on whole lines
-        // rather than with `find`, because the comments above the PATH strip
-        // talk about exec'ing a bare name and a substring search finds those
-        // first — which would make this pass on a script that never runs the
-        // branch at all.
-        let line_of = |wanted: &str| {
-            script
-                .lines()
-                .position(|line| line.trim_start().starts_with(wanted))
-                .unwrap_or_else(|| panic!("no line starts with {wanted:?}:\n{script}"))
-        };
-        assert!(line_of("set -- ") < line_of("exec "), "{script}");
-    }
-
-    #[test]
-    fn the_agents_view_opens_on_the_checkout() {
-        // The feature. Without it a `claude` typed anywhere but the checkout
-        // opens a view listing every session on the machine, from every
-        // directory the developer has ever worked in.
-        let script = script();
-        assert!(
-            script.contains(&format!(
-                r#"set -- {ALLOW_BYPASS} agents {VIEW_CWD} "$project""#
-            )),
-            "{script}"
-        );
-        // The path itself lives in the `case` arm that resolves `$project`,
-        // not on the exec line — `$PWD` decides which checkout that variable
-        // names, so the literal path can only be asserted there.
-        assert!(
-            script.contains(&format!(
-                r#""{PROJECT}"|"{PROJECT}"/*) project="{PROJECT}" ;;"#
-            )),
-            "{script}"
-        );
-    }
-
-    /// A machine that knows a second repository still opens `--cwd` on the
-    /// first one — the regression this module exists to close. Before
-    /// `build_agents_view`, `--cwd` named whichever repository `riabuild` was
-    /// *last run against*, machine-wide, so a developer standing in `PROJECT`
-    /// while `OTHER_PROJECT` was the more recent run was moved off their own
-    /// checkout the moment they typed `claude`.
-    #[test]
-    fn a_second_known_checkout_gets_its_own_case_arm_rather_than_replacing_the_first() {
-        let script = script_for(
-            &[PathBuf::from(PROJECT), PathBuf::from(OTHER_PROJECT)],
-            Some(Path::new(OTHER_PROJECT)),
-        );
-        assert!(
-            script.contains(&format!(
-                r#""{PROJECT}"|"{PROJECT}"/*) project="{PROJECT}" ;;"#
-            )),
-            "{script}"
-        );
-        assert!(
-            script.contains(&format!(
-                r#""{OTHER_PROJECT}"|"{OTHER_PROJECT}"/*) project="{OTHER_PROJECT}" ;;"#
-            )),
-            "{script}"
-        );
-        // The default — the repository this run is about — is what a
-        // developer standing in neither checkout still falls back to.
-        assert!(
-            script.contains(&format!(r#"*) project="{OTHER_PROJECT}" ;;"#)),
-            "{script}"
-        );
-        // Exactly one exec line reaches Claude Code with `--cwd`; which path
-        // fills `$project` is a runtime question this script can no longer
-        // answer by reading its own text — `checkout_matching_pwd_wins_over_
-        // the_run_default` proves that half by actually running it.
-        assert!(
-            script.contains(&format!(r#"agents {VIEW_CWD} "$project""#)),
-            "{script}"
-        );
-    }
-
-    /// Runs the generated `case "$PWD" in …` block for real, from three
-    /// different working directories, and reads back which checkout it
-    /// resolved to. The text assertions above prove the right literals are in
-    /// the right place; this is what proves the shell actually picks the one
-    /// `$PWD` is under rather than always falling through to the run's
-    /// default — the one property no substring match can stand in for, and
-    /// the exact bug report this module exists to close: standing in a known
-    /// checkout that happens not to be the most recently active repository
-    /// must still resolve to itself.
-    ///
-    /// Run directly rather than through the full launcher, because the case
-    /// block sits inside the interactive branch and `cargo test` gives a
-    /// child no terminal — see `a_launch_with_no_terminal_never_picks_up_the_
-    /// agents_view`'s own doc comment for why that half is untestable here.
-    #[tokio::test]
-    async fn checkout_matching_pwd_wins_over_the_run_default() {
-        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
-
-        let home = tempfile::TempDir::new().unwrap();
-        // Canonicalized before anything is built on it: macOS's `$TMPDIR`
-        // lives under `/var`, itself a symlink to `/private/var`, and a shell
-        // reports `$PWD` from `getcwd()` — the canonical path — at startup.
-        // Matching that against the symlinked literal this crate's own
-        // `TempDir` would otherwise hand out fails the very check this test
-        // exists to prove, for a reason that has nothing to do with the
-        // launcher: every checkout `riabuild` actually manages lives under a
-        // developer's home directory, which is not itself a symlink.
-        let root = tokio::fs::canonicalize(home.path()).await.unwrap();
-        let project = root.join("riabuild");
-        let other = root.join("payments");
-        let elsewhere = root.join("elsewhere");
-        for dir in [&project, &other, &elsewhere] {
-            tokio::fs::create_dir_all(dir).await.unwrap();
-        }
-        // A `.claude/worktrees/` worktree, or any ordinary subdirectory — the
-        // floor `VIEW_CWD`'s own doc comment describes must survive matching
-        // by `$PWD`, not just by "is this exactly the checkout root".
-        let worktree = project.join(".claude/worktrees/wt");
-        tokio::fs::create_dir_all(&worktree).await.unwrap();
-
-        // `other` is the run's default — the case a developer standing in
-        // `project` must NOT fall back to.
-        let case_block = build_agents_view(&[project.clone(), other.clone()], Some(&other));
-        let resolver = home.path().join("resolve.sh");
-        tokio::fs::write(
-            &resolver,
-            format!("#!/bin/sh\n{case_block}\nprintf '%s' \"$project\"\n"),
-        )
-        .await
-        .unwrap();
-        make_executable(&resolver).await.unwrap();
-
-        let runner = RealRunner;
-        let resolved_from = |dir: std::path::PathBuf| {
-            let resolver = resolver.to_string_lossy().into_owned();
-            let runner = &runner;
-            async move {
-                runner
-                    .run(
-                        &resolver,
-                        &[],
-                        &RunOptions {
-                            cwd: Some(dir),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .expect("resolve.sh ran")
-                    .stdout
-            }
-        };
-
+        let handoff = launch_handoff(&fixture(), &laptop());
         assert_eq!(
-            resolved_from(project.clone()).await,
-            project.to_string_lossy(),
-            "standing in a known checkout must resolve to itself, not to the run's default"
+            handoff.args,
+            vec![
+                "--settings",
+                SETTINGS,
+                ALLOW_BYPASS,
+                "agents",
+                VIEW_CWD,
+                PROJECT,
+            ]
         );
-        assert_eq!(
-            resolved_from(worktree).await,
-            project.to_string_lossy(),
-            "a worktree beneath a known checkout must still resolve to it"
-        );
-        assert_eq!(
-            resolved_from(elsewhere).await,
-            other.to_string_lossy(),
-            "standing in neither known checkout must fall back to the run's default"
-        );
-    }
-
-    #[test]
-    fn the_view_cwd_never_reaches_a_launch_that_carries_arguments() {
-        // `--cwd` belongs to the `agents` subcommand and to nothing else:
-        // `claude --cwd <path> mcp list` is "error: unknown option '--cwd'".
-        // So a copy of it on the other branch would not scope anything — it
-        // would break every `claude -p`, `claude --resume` and `claude auth
-        // login` on every laptop at once, in Claude Code's own parser.
-        let script = script();
-        for line in script.lines().map(str::trim) {
-            if !line.starts_with("set -- ") && !line.starts_with("exec ") {
-                continue;
-            }
-            let Some(cwd) = line.find(VIEW_CWD) else {
-                continue;
-            };
-            let agents = line
-                .find(" agents")
-                .unwrap_or_else(|| panic!("{VIEW_CWD} on a line with no agents view:\n{line}"));
-            assert!(
-                agents < cwd,
-                "{VIEW_CWD} is ahead of the positional:\n{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_machine_with_no_checkout_yet_opens_the_view_as_it_always_did() {
-        // Every machine before its first clone. There is no path to name, and
-        // naming one anyway — the default the picker would offer, say — would
-        // point the view at a directory nobody has cloned into yet.
-        let script = script_for(&[], None);
-        assert!(
-            script.contains(&format!("set -- {ALLOW_BYPASS} agents\n")),
-            "{script}"
-        );
-        // On the lines that run, not in the whole file: the comment above the
-        // branch names the flag, and a whole-script search would fail on a
-        // launcher that never passes it.
-        for line in script.lines().map(str::trim) {
-            if line.starts_with("set -- ") || line.starts_with("exec ") {
-                assert!(!line.contains(VIEW_CWD), "{line}");
-            }
-        }
-        // No `case "$PWD"` and no `-d` test either — there is nothing to
-        // match against, so the branch is the single line it has always been.
-        assert!(!script.contains(r#"case "$PWD""#), "{script}");
-        assert!(!script.contains("[ -d "), "{script}");
-    }
-
-    #[test]
-    fn a_checkout_that_is_gone_opens_the_view_as_it_always_did() {
-        // A developer who deleted or renamed their checkout by hand, in the gap
-        // between two riabuild runs. Claude Code does not refuse a `--cwd` that
-        // is not there — it opens the view on an empty list naming a directory
-        // nobody has, which is a worse `claude` than the one this launcher
-        // wrote before the flag existed. The guard is shared across every
-        // resolved checkout now, rather than written once per project, because
-        // which path fills `$project` is no longer known until the script runs.
-        let script = script();
-        assert!(
-            script.contains(r#"if [ -n "$project" ] && [ -d "$project" ]; then"#),
-            "{script}"
-        );
-        assert!(
-            script.contains(&format!("  else\n    set -- {ALLOW_BYPASS} agents\n  fi")),
-            "{script}"
-        );
-    }
-
-    /// Each guard on the agents-view branch, and what dropping it would cost.
-    #[test]
-    fn the_agents_view_is_guarded_three_ways() {
-        let script = script();
-
-        // A developer who typed something asked for that, not for the view —
-        // and `agents` would land in front of their own first word.
-        assert!(script.contains("[ $# -eq 0 ]"), "{script}");
-
-        // `echo "fix the build" | claude` is a session with a prompt on stdin.
-        // Claude Code's positional route does not test the terminal itself, so
-        // without these two the prompt is swallowed and the view opens over it.
-        assert!(script.contains("[ -t 0 ]"), "{script}");
-        assert!(script.contains("[ -t 1 ]"), "{script}");
-
-        // Claude Code's own off switch. With the view disabled, `claude agents`
-        // does not fall back to a session — it writes "'claude agents' is
-        // disabled …" to stderr and exits 1. Ignoring it here would turn a
-        // developer who turned the view off into a developer with no working
-        // `claude` at all.
-        assert!(
-            script.contains(r#"[ -z "$CLAUDE_CODE_DISABLE_AGENT_VIEW" ]"#),
-            "{script}"
-        );
-    }
-
-    /// The guards, run as shell rather than read as text.
-    ///
-    /// `cargo test` gives a child no terminal, so this is a real
-    /// non-interactive launch — the shape `echo "fix the build" | claude`, a CI
-    /// job and `claude -p` all arrive in. None of them may pick up `agents`:
-    /// the positional would swallow a prompt waiting on stdin, and Claude
-    /// Code's own route does not test the terminal, so this script is the only
-    /// thing standing between a piped prompt and a view opening over it.
-    ///
-    /// Executed instead of asserted on, because every way of getting this wrong
-    /// reads identically in the source: a `set --` that drops `"$@"`, a guard
-    /// that is true when it should be false, an `-eq` that should be `-gt`.
-    /// The interactive half cannot be reached from here — it needs a terminal
-    /// on both descriptors — which is what
-    /// `the_agents_token_is_still_the_agents_entry_point` and a bare `claude`
-    /// on a laptop are for.
-    #[tokio::test]
-    async fn a_launch_with_no_terminal_never_picks_up_the_agents_view() {
-        use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
-
-        let home = tempfile::TempDir::new().unwrap();
-        // A stand-in for Claude Code that reports the line it was given.
-        let claude = home.path().join("claude");
-        tokio::fs::write(
-            &claude,
-            "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done\n",
-        )
-        .await
-        .unwrap();
-        make_executable(&claude).await.unwrap();
-
-        let settings = home.path().join("org-settings.json");
-        tokio::fs::write(&settings, "{}").await.unwrap();
-
-        let launcher = home.path().join("launcher");
-        let project = home.path().join("checkout");
-        tokio::fs::create_dir_all(&project).await.unwrap();
-        let script = launcher_script(
-            &home.path().join("profile"),
-            &claude.to_string_lossy(),
-            &settings,
-            &home.path().join("bin"),
-            std::slice::from_ref(&project),
-            Some(&project),
-        );
-        tokio::fs::write(&launcher, &script).await.unwrap();
-        make_executable(&launcher).await.unwrap();
-
-        let runner = RealRunner;
-        let run = |args: Vec<String>| {
-            let launcher = launcher.to_string_lossy().into_owned();
-            let runner = &runner;
-            async move {
-                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                let output = runner
-                    .run(&launcher, &borrowed, &RunOptions::default())
-                    .await
-                    .expect("the launcher ran");
-                assert!(output.ok(), "{output:?}");
-                output
-                    .stdout
-                    .lines()
-                    .map(str::to_owned)
-                    .collect::<Vec<String>>()
-            }
-        };
-
-        // No arguments, no terminal. This is the case the guards exist for:
-        // without `-t 0`/`-t 1` it would take the agents branch.
-        let bare = run(Vec::new()).await;
-        assert!(!bare.iter().any(|arg| arg == "agents"), "{bare:?}");
-        assert!(
-            bare.iter().any(|arg| arg == STATIC_SYSTEM_PROMPT),
-            "{bare:?}"
-        );
-        assert_eq!(
-            bare.first().map(String::as_str),
-            Some("--settings"),
-            "{bare:?}"
-        );
-
-        // And a launch that carries arguments keeps every one of them, in
-        // order, after the flag — `claude-2 auth login` and `claude --resume`
-        // both depend on it.
-        let carried = run(vec!["-p".into(), "fix the build".into()]).await;
-        assert!(!carried.iter().any(|arg| arg == "agents"), "{carried:?}");
-        assert_eq!(
-            carried.last().map(String::as_str),
-            Some("fix the build"),
-            "{carried:?}"
-        );
-        let flag = carried
-            .iter()
-            .position(|arg| arg == STATIC_SYSTEM_PROMPT)
-            .unwrap_or_else(|| panic!("{carried:?}"));
-        let prompt = carried.iter().position(|arg| arg == "-p").unwrap();
-        assert!(flag < prompt, "{carried:?}");
-
-        // Neither launch may carry `--cwd`: it is an option of the `agents`
-        // subcommand, and on either of these lines Claude Code's own parser
-        // stops with "unknown option". Asserted on the arguments the launcher
-        // really produced rather than on its text, because this is the failure
-        // that takes `claude -p` away from every laptop at once.
-        for args in [&bare, &carried] {
-            assert!(!args.iter().any(|arg| arg == VIEW_CWD), "{args:?}");
-        }
     }
 
     /// The pair that must never share a line.
@@ -991,143 +686,297 @@ mod tests {
     /// background agents and exit instead of opening a session.
     #[test]
     fn the_agents_view_and_the_static_prompt_flag_never_share_a_line() {
-        let script = script();
-        for line in script.lines().map(str::trim) {
-            if !line.starts_with("exec ") && !line.starts_with("set -- ") {
-                continue;
-            }
+        // Every shape of launch there is, so a fourth one added later is
+        // covered on the day it is written.
+        for (plan, world) in [
+            (fixture(), laptop()),
+            (
+                fixture(),
+                World {
+                    selected_checkout_exists: false,
+                    ..laptop()
+                },
+            ),
+            (plan_for(&[], None), laptop()),
+            (carrying(&["-p", "hello"]), laptop()),
+            (
+                fixture(),
+                World {
+                    stdin_is_tty: false,
+                    ..laptop()
+                },
+            ),
+        ] {
+            let args = launch_handoff(&plan, &world).args;
             assert!(
-                !(line.contains(" agents") && line.contains(STATIC_SYSTEM_PROMPT)),
-                "the agents view and the static-prompt flag share a line:\n{line}"
+                !(args.iter().any(|arg| arg == "agents")
+                    && args.iter().any(|arg| arg == STATIC_SYSTEM_PROMPT)),
+                "{args:?}"
             );
         }
     }
 
-    #[test]
-    fn every_launch_that_carries_arguments_moves_the_per_machine_sections_out() {
-        // Asserted in two halves, because the argument line is now decided in
-        // one place and forwarded by two execs that are reached under opposite
-        // conditions — the first on a machine that has fetched the org
-        // settings, the second on one that has not. A flag reaching only one of
-        // them would be a cache that half the team shares and the other half
-        // does not, with nothing to see in either terminal.
-        let script = script();
-
-        // Half one: exactly one line carries a developer's own arguments, and
-        // it carries the flag ahead of `"$@"` — so those arguments still reach
-        // Claude Code as arguments, rather than landing after a flag that has
-        // already consumed the line.
-        //
-        // Counted rather than asserted at three, which is what the agents view
-        // now spells itself in — one line with `--cwd` and one without, chosen
-        // by whether the checkout is on disk. Both of those are the *same*
-        // branch as far as this test is concerned: neither may carry the flag,
-        // and a fourth spelling of the view would not make this assertion
-        // wrong.
-        let built: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("set -- "))
-            .collect();
-        assert_eq!(
-            built.iter().filter(|line| line.contains(r#""$@""#)).count(),
-            1,
-            "{script}"
-        );
-        assert_eq!(
-            built
-                .iter()
-                .filter(|line| line.contains(STATIC_SYSTEM_PROMPT))
-                .count(),
-            1,
-            "{script}"
-        );
-        let carried = built
-            .iter()
-            .find(|line| line.contains(STATIC_SYSTEM_PROMPT))
-            .unwrap_or_else(|| panic!("no branch carries the flag:\n{script}"));
-        assert!(
-            carried.find(STATIC_SYSTEM_PROMPT) < carried.find(r#""$@""#),
-            "{carried}"
-        );
-
-        // Half two: both execs forward whatever that branch built, so neither
-        // drops the line it was handed.
-        let execs: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("exec "))
-            .collect();
-        assert_eq!(execs.len(), 2, "{script}");
-        for exec in execs {
-            assert!(exec.ends_with(r#""$@""#), "{exec}");
-        }
-    }
-
+    /// Asserted on *every* shape of launch, because the machine that matters
+    /// most is the one a spot check would not distinguish: a laptop that has
+    /// not fetched `org-settings.json` launches with no `--settings` at all, so
+    /// `permissions.defaultMode` reaches it by no route whatsoever and this
+    /// flag is the only thing keeping the mode in its Shift+Tab cycle. Losing
+    /// it is invisible — the launcher starts, Claude Code starts, and the cycle
+    /// silently has one fewer stop on it.
     #[test]
     fn every_branch_keeps_bypass_permissions_reachable_from_the_cycle() {
-        // Asserted on *every* branch that builds an argument line, because the
-        // machine that matters most is the one an assertion on the script text
-        // would not distinguish: a laptop that has not fetched
-        // `org-settings.json` execs with no `--settings` at all, so
-        // `permissions.defaultMode` reaches it by no route whatsoever and this
-        // flag is the only thing keeping the mode in its Shift+Tab cycle.
-        // Losing it is invisible — the launcher starts, Claude Code starts, and
-        // the cycle silently has one fewer stop on it.
-        //
-        // The agents branch is included on purpose. Unlike the static-prompt
-        // flag, this one is stripped before the `agents` positional is tested
-        // *and* carried into the sessions the view dispatches, so it belongs on
-        // both lines and there is no reason to drop it from either.
-        //
-        // Three lines rather than two, because the view spells itself twice —
-        // with `--cwd` and without, chosen by whether the checkout is on disk.
-        // That is exactly why this loops over every line it finds instead of
-        // checking the two it expects: a branch added later is covered the day
-        // it is written, and the machine with no checkout is the one that would
-        // otherwise have been left out.
-        let script = script();
-        let built: Vec<&str> = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("set -- "))
-            .collect();
-        assert_eq!(built.len(), 3, "{script}");
-        for line in built {
-            assert!(line.contains(ALLOW_BYPASS), "{line}");
+        for (plan, world) in [
+            (fixture(), laptop()),
+            (
+                fixture(),
+                World {
+                    selected_checkout_exists: false,
+                    ..laptop()
+                },
+            ),
+            (plan_for(&[], None), laptop()),
+            (carrying(&["auth", "login"]), laptop()),
+            (
+                carrying(&["-p", "hello"]),
+                World {
+                    settings_present: false,
+                    ..laptop()
+                },
+            ),
+            (
+                fixture(),
+                World {
+                    agents_view_disabled: true,
+                    ..laptop()
+                },
+            ),
+        ] {
+            let args = launch_handoff(&plan, &world).args;
+            assert!(args.iter().any(|arg| arg == ALLOW_BYPASS), "{args:?}");
         }
+    }
 
-        // And on the branch that forwards a developer's own arguments, ahead of
-        // `"$@"` — behind it the flag would land after a line that has already
-        // been consumed.
-        let carried = script
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("set -- ") && line.contains(r#""$@""#))
-            .unwrap_or_else(|| panic!("{script}"));
-        assert!(
-            carried.find(ALLOW_BYPASS) < carried.find(r#""$@""#),
-            "{carried}"
+    /// On the branch that forwards a developer's own arguments, both flags go
+    /// ahead of them — behind, they would land after a line Claude Code's
+    /// parser has already consumed.
+    #[test]
+    fn the_launchers_own_flags_come_before_the_developers_arguments() {
+        let args = launch_handoff(&carrying(&["mcp", "list"]), &laptop()).args;
+        let position = |wanted: &str| args.iter().position(|arg| arg == wanted);
+        assert!(position(STATIC_SYSTEM_PROMPT) < position("mcp"), "{args:?}");
+        assert!(position(ALLOW_BYPASS) < position("mcp"), "{args:?}");
+    }
+
+    #[test]
+    fn the_agents_view_opens_on_the_checkout() {
+        // The feature. Without it a `claude` typed anywhere but the checkout
+        // opens a view listing every session on the machine, from every
+        // directory the developer has ever worked in.
+        let args = launch_handoff(&fixture(), &laptop()).args;
+        let cwd = args.iter().position(|arg| arg == VIEW_CWD).expect("--cwd");
+        let agents = args.iter().position(|arg| arg == "agents").expect("agents");
+        assert!(agents < cwd, "{args:?}");
+        assert_eq!(args.get(cwd + 1).map(String::as_str), Some(PROJECT));
+    }
+
+    /// A machine that knows a second repository still opens `--cwd` on the one
+    /// the developer is standing in — the regression this resolution exists to
+    /// close. Before it, `--cwd` named whichever repository `riabuild` was
+    /// *last run against*, machine-wide, so a developer standing in `PROJECT`
+    /// while `OTHER_PROJECT` was the more recent run was moved off their own
+    /// checkout the moment they typed `claude`.
+    #[test]
+    fn the_checkout_matching_the_working_directory_wins_over_the_run_default() {
+        let plan = plan_for(
+            &[PathBuf::from(OTHER_PROJECT), PathBuf::from(PROJECT)],
+            // The run's default is the *other* repository — the case a
+            // developer standing in `PROJECT` must not fall back to.
+            Some(Path::new(OTHER_PROJECT)),
+        );
+        let args = launch_handoff(&plan, &laptop()).args;
+        assert!(args.iter().any(|arg| arg == PROJECT), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == OTHER_PROJECT), "{args:?}");
+    }
+
+    /// The floor `VIEW_CWD`'s own doc comment describes: a subdirectory or a
+    /// `.claude/worktrees/` worktree beneath a checkout still resolves to it,
+    /// not merely a working directory that *is* the checkout root.
+    #[test]
+    fn a_worktree_beneath_a_checkout_still_resolves_to_that_checkout() {
+        let checkouts = [PathBuf::from(OTHER_PROJECT), PathBuf::from(PROJECT)];
+        assert_eq!(
+            checkout_for(
+                Path::new("/Users/ada/Clubria/ai-builders-hub/.claude/worktrees/wt"),
+                &checkouts,
+                Some(Path::new(OTHER_PROJECT)),
+            ),
+            Some(Path::new(PROJECT))
+        );
+    }
+
+    /// Standing in neither known checkout falls back to the run's default.
+    #[test]
+    fn standing_in_neither_checkout_falls_back_to_the_run_default() {
+        let checkouts = [PathBuf::from(OTHER_PROJECT), PathBuf::from(PROJECT)];
+        assert_eq!(
+            checkout_for(
+                Path::new("/Users/ada/somewhere-else"),
+                &checkouts,
+                Some(Path::new(OTHER_PROJECT)),
+            ),
+            Some(Path::new(OTHER_PROJECT))
+        );
+    }
+
+    /// A neighbour whose path merely *starts with* a checkout's is not inside
+    /// it. `starts_with` on a `Path` compares whole components, which is the
+    /// half of this the shell `case` got right only by where its `/` sat.
+    #[test]
+    fn a_sibling_directory_with_a_shared_prefix_is_not_inside_the_checkout() {
+        let checkouts = [PathBuf::from(OTHER_PROJECT)];
+        assert_eq!(
+            checkout_for(
+                Path::new("/Users/ada/Clubria/payments-legacy/src"),
+                &checkouts,
+                None,
+            ),
+            None
         );
     }
 
     #[test]
-    fn a_bare_binary_name_cannot_be_used_to_exec_itself() {
-        // `Ctx::claude()` returns the bare name "claude" before a Node
-        // version is pinned. `[ ! -x "claude" ]` is a cwd-relative test — a
-        // same-named executable in an untrusted checkout would pass it, skip
-        // the PATH strip, and `exec "claude"` would search PATH straight back
-        // to this same script.
+    fn the_view_cwd_never_reaches_a_launch_that_carries_arguments() {
+        // `--cwd` belongs to the `agents` subcommand and to nothing else:
+        // `claude --cwd <path> mcp list` is "error: unknown option '--cwd'".
+        // So a copy of it on the other branch would not scope anything — it
+        // would break every `claude -p`, `claude --resume` and `claude auth
+        // login` on every laptop at once, in Claude Code's own parser.
+        for plan in [carrying(&["-p", "hello"]), carrying(&["auth", "login"])] {
+            let args = launch_handoff(&plan, &laptop()).args;
+            assert!(!args.iter().any(|arg| arg == VIEW_CWD), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_checkout_yet_opens_the_view_as_it_always_did() {
+        // Every machine before its first clone. There is no path to name, and
+        // naming one anyway — the default the picker would offer, say — would
+        // point the view at a directory nobody has cloned into yet.
+        let args = launch_handoff(&plan_for(&[], None), &laptop()).args;
+        assert_eq!(args, vec!["--settings", SETTINGS, ALLOW_BYPASS, "agents"]);
+    }
+
+    #[test]
+    fn a_checkout_that_is_gone_opens_the_view_as_it_always_did() {
+        // A developer who deleted or renamed their checkout by hand, in the gap
+        // between two riabuild runs. Claude Code does not refuse a `--cwd` that
+        // is not there — it opens the view on an empty list naming a directory
+        // nobody has, which is a worse `claude` than the one this launcher
+        // gave before the flag existed.
+        let gone = World {
+            selected_checkout_exists: false,
+            ..laptop()
+        };
+        let args = launch_handoff(&fixture(), &gone).args;
+        assert_eq!(args, vec!["--settings", SETTINGS, ALLOW_BYPASS, "agents"]);
+    }
+
+    /// Each guard on the agents-view branch, and what dropping it would cost.
+    ///
+    /// Asserted by *taking each one away in turn*, which is the thing the old
+    /// text assertions on the generated shell could not do: an `-eq` that
+    /// should have been `-gt`, a guard true where it should be false, and a
+    /// `set --` that dropped `"$@"` all read identically in a script.
+    #[test]
+    fn the_agents_view_is_guarded_three_ways() {
+        let took_the_view = |plan: &Plan, world: &World| {
+            launch_handoff(plan, world)
+                .args
+                .iter()
+                .any(|arg| arg == "agents")
+        };
+        assert!(took_the_view(&fixture(), &laptop()));
+
+        // A developer who typed something asked for that, not for the view —
+        // and `agents` would land in front of their own first word.
+        assert!(!took_the_view(&carrying(&["--resume"]), &laptop()));
+
+        // `echo "fix the build" | claude` is a session with a prompt on stdin.
+        // Claude Code's positional route does not test the terminal itself, so
+        // without these two the prompt is swallowed and the view opens over it.
+        assert!(!took_the_view(
+            &fixture(),
+            &World {
+                stdin_is_tty: false,
+                ..laptop()
+            }
+        ));
+        assert!(!took_the_view(
+            &fixture(),
+            &World {
+                stdout_is_tty: false,
+                ..laptop()
+            }
+        ));
+
+        // Claude Code's own off switch. With the view disabled, `claude agents`
+        // does not fall back to a session — it writes "'claude agents' is
+        // disabled …" to stderr and exits 1. Ignoring it here would turn a
+        // developer who turned the view off into a developer with no working
+        // `claude` at all.
+        assert!(!took_the_view(
+            &fixture(),
+            &World {
+                agents_view_disabled: true,
+                ..laptop()
+            }
+        ));
+    }
+
+    /// A non-interactive launch is the shape `echo "fix the build" | claude`, a
+    /// CI job and `claude -p` all arrive in — and it must still be a working
+    /// `claude`, with the developer's arguments and the launcher's flags on it.
+    #[test]
+    fn a_launch_with_no_terminal_is_still_a_complete_launch() {
+        let piped = World {
+            stdin_is_tty: false,
+            ..laptop()
+        };
+        let args = launch_handoff(&fixture(), &piped).args;
+        assert_eq!(
+            args,
+            vec!["--settings", SETTINGS, STATIC_SYSTEM_PROMPT, ALLOW_BYPASS,]
+        );
+    }
+
+    /// The launcher on disk is one `exec` and carries the values riabuild
+    /// resolved — which is what `claude_accounts::check` compares against, so a
+    /// launcher naming last week's Node or a deleted account is still drift.
+    #[test]
+    fn the_generated_launcher_names_every_value_it_was_written_with() {
         let script = launcher_script(
-            Path::new("/Users/ada/.riabuild/claude/11111111-2222-4333-8444-555555555555"),
-            "claude",
-            Path::new("/Users/ada/.riabuild/org-settings.json"),
-            Path::new("/Users/ada/.riabuild/bin"),
-            &[PathBuf::from(PROJECT)],
+            Path::new("/opt/riabuild/2026.08.27/riabuild"),
+            Path::new(CONFIG_DIR),
+            BINARY,
+            Path::new(SETTINGS),
+            Path::new(BIN_DIR),
+            &[PathBuf::from(PROJECT), PathBuf::from(OTHER_PROJECT)],
             Some(Path::new(PROJECT)),
         );
-        assert!(script.contains(r#"case "$claude_binary" in"#), "{script}");
-        assert!(script.contains(r#"*) claude_binary="" ;;"#), "{script}");
+        for value in [
+            CONFIG_DIR,
+            BINARY,
+            SETTINGS,
+            BIN_DIR,
+            PROJECT,
+            OTHER_PROJECT,
+        ] {
+            assert!(script.contains(value), "{value} missing from {script}");
+        }
+        assert!(
+            script.contains("/opt/riabuild/2026.08.27/riabuild"),
+            "{script}"
+        );
     }
 
     /// Pins the undocumented `CLAUDE_CONFIG_DIR` behaviour against a real
@@ -1323,7 +1172,7 @@ mod tests {
     /// command — is what broke.
     ///
     /// Deliberately `#[ignore]`d: only a real `claude` can say whether its
-    /// argument parser still allows this, and the shims are generated on the
+    /// argument parser still allows this, and the launchers are built on the
     /// assumption that it does.
     #[tokio::test]
     #[ignore = "needs a real Claude Code install; records that the launcher's global flags are accepted ahead of a subcommand, which every launcher assumes"]

@@ -176,6 +176,27 @@ impl CommandRunner for FakeRunner {
         Ok(Box::new(child))
     }
 
+    /// Records the hand-over and returns, which is the whole reason the
+    /// launchers are testable at all.
+    ///
+    /// The real one does not come back: it is `execvp(2)`, so a test that drove
+    /// it would replace the test binary with Claude Code. Recording it instead
+    /// makes "what would this launcher have started, with what arguments and
+    /// what environment?" an ordinary assertion — the question the generated
+    /// shell scripts could only be asked by running them.
+    async fn exec_replacing(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
+        self.record(program, args, options);
+        Ok(self
+            .resolve(program, args, options)
+            .and_then(|output| output.code)
+            .unwrap_or(0))
+    }
+
     async fn run_interactive(
         &self,
         program: &str,

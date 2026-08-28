@@ -201,7 +201,15 @@ async fn launcher_drift(ctx: &Ctx, name: &str) -> Option<String> {
             return Some(format!("{} could not be read: {error}", path.display()));
         }
     };
+    // A launcher naming a riabuild this process cannot locate would be drift
+    // nothing could repair, so a failure here is reported as a launcher riabuild
+    // cannot vouch for rather than swallowed into "no drift".
+    let riabuild = match shims::running_binary() {
+        Ok(riabuild) => riabuild,
+        Err(error) => return Some(format!("{error:#}")),
+    };
     let wanted = shims::codex::launcher_script(
+        &riabuild,
         &ctx.paths.codex_profile_dir(shims::codex::profile_of(name)),
         &ctx.codex(),
         &ctx.paths.bin_dir(),
@@ -489,7 +497,7 @@ mod tests {
 
     /// The regression that would make nine launchers worthless.
     ///
-    /// Nine scripts that all export the same `CODEX_HOME` look right in every
+    /// Nine launchers that all name the same `CODEX_HOME` look right in every
     /// other test — they are present, executable, carry `--yolo`, and run — and
     /// yet every one of them opens the same account. Codex keeps sign-ins apart
     /// per `CODEX_HOME` and by nothing else, so *distinct* is the whole feature.
@@ -503,10 +511,10 @@ mod tests {
                     .await
                     .unwrap();
             let home = ctx.paths.codex_profile_dir(profile);
-            let line = format!("CODEX_HOME=\"{}\"", home.display());
+            let named = format!("--home '{}'", home.display());
             assert!(
-                script.contains(&line),
-                "codex-{profile} does not pin {line}"
+                script.contains(&named),
+                "codex-{profile} does not name {named}"
             );
             homes.insert(home);
         }

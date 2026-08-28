@@ -86,13 +86,19 @@ task still costs is the shell — that much is unchanged, and a failed `project`
 task costs it the same way.
 
 That has one consequence for the `CLAUDE_CONFIG_DIR` assertion, which is
-otherwise easy to get backwards. The launcher `export`s its own account's
+otherwise easy to get backwards. The launcher sets its own account's
 `CLAUDE_CONFIG_DIR` over whatever the caller set, so it can never be the thing
 that answers "does Claude Code still honour the variable" — it answers "does the
 launcher still set it". The suite therefore reads the binary the launcher names
 and puts the question to *that*, and asserts the launcher's half separately, as
-the `CLAUDE_CONFIG_DIR=` line in the generated `claude-1`. Both halves together
+the `--home '…'` on the generated `claude-1`'s exec line. Both halves together
 are the isolation; either one alone reads as a pass on a machine that has lost it.
+
+The launcher's half is a `--home` rather than a `CLAUDE_CONFIG_DIR=` line because
+every file riabuild puts in `~/.riabuild/bin` is now one `exec` of riabuild
+itself, carrying the values it resolved and no logic at all — see
+`docs/superpowers/specs/2026-08-28-launchers-in-rust-design.md`. The variable
+still reaches Claude Code; the process that sets it is riabuild rather than `sh`.
 
 The other thing the missing sign-in reaches is the `applied=[]` idempotency
 invariant, and that is substituted rather than lost.

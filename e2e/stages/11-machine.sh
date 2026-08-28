@@ -35,17 +35,27 @@ check_contains "git asks riabuild's own gh for github.com credentials" \
 # stays true — an aborted apply ends the run, so a task behind the one browser
 # round trip would never run on the machine that most needs it to.
 check "the codex launcher is there" test -x "$RIA_HOME/bin/codex"
-check_contains "the codex launcher adds --yolo" \
-  "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "--yolo"
+# `--yolo` is added by `shims::codex::handoff` rather than written into this
+# file — every launcher in bin/ is one `exec` of riabuild and carries no logic,
+# so what a landed file can prove is that it goes through the code that adds it.
+# Which flag that code adds is pinned by the unit tests beside it.
+check_contains "the codex launcher goes through riabuild's own launcher" \
+  "$(cat "$RIA_HOME/bin/codex" 2>/dev/null || echo '')" "internal launch codex"
 
-# ngrok is installed but never authenticated on disk: the launcher fetches the
-# team's authtoken on every invocation and puts it in that one process's
-# environment. A token written into ngrok.yml, an rcfile, or this script would
-# be the thing the whole design exists to avoid, so the assertion is about what
-# is *absent* as much as what is there.
+# ngrok is installed but never authenticated on disk: the token is fetched on
+# every invocation, by the process that goes on to *become* ngrok, and put in
+# that one process's environment. A token written into ngrok.yml, an rcfile, or
+# this script would be the thing the whole design exists to avoid, so the
+# assertion is about what is *absent* as much as what is there.
 check "the ngrok launcher is there" test -x "$RIA_HOME/bin/ngrok"
 check_contains "the ngrok launcher fetches the token per invocation" \
-  "$(cat "$RIA_HOME/bin/ngrok" 2>/dev/null || echo '')" "internal ngrok-token"
+  "$(cat "$RIA_HOME/bin/ngrok" 2>/dev/null || echo '')" "internal ngrok"
+# And never writes it down, or reads it back off a pipe into a shell variable.
+if grep -q 'NGROK_AUTHTOKEN' "$RIA_HOME/bin/ngrok" 2>/dev/null; then
+  fail "the ngrok launcher names NGROK_AUTHTOKEN — the token must never be in this file"
+else
+  pass "the ngrok launcher holds no authtoken of any kind"
+fi
 # Against `$E2E_HOME`, and against every path ngrok itself would choose.
 #
 # This read `$HOME` until 2026-08-21, and `$HOME` is the *runner's* home:
@@ -78,10 +88,10 @@ CODEX_HOMES=""
 for n in 1 2 3 4 5 6 7 8 9; do
   check "codex profile $n has a config directory" test -d "$RIA_HOME/codex/$n"
   check "the codex-$n launcher is there" test -x "$RIA_HOME/bin/codex-$n"
-  check_contains "codex-$n pins its own CODEX_HOME" \
+  check_contains "codex-$n names its own CODEX_HOME" \
     "$(cat "$RIA_HOME/bin/codex-$n" 2>/dev/null || echo '')" \
-    "CODEX_HOME=\"$RIA_HOME/codex/$n\""
-  CODEX_HOMES="$CODEX_HOMES$(sed -n 's/^CODEX_HOME="\(.*\)"$/\1/p' \
+    "--home '$RIA_HOME/codex/$n'"
+  CODEX_HOMES="$CODEX_HOMES$(sed -n "s/.*--home '\([^']*\)'.*/\1/p" \
     "$RIA_HOME/bin/codex-$n" 2>/dev/null | head -1)
 "
 done
@@ -108,10 +118,11 @@ check "the grok launcher is there" test -x "$RIA_HOME/bin/grok"
 
 # The whole point of the wrapper. `bypassPermissions` and not `dontAsk`, which
 # reads like the same thing and silently *denies* every tool that is not
-# pre-approved — a session that looks permissive and does nothing.
-check_contains "the grok launcher bypasses permissions" \
-  "$(cat "$RIA_HOME/bin/grok" 2>/dev/null || echo '')" \
-  "--permission-mode bypassPermissions"
+# pre-approved — a session that looks permissive and does nothing. The flag is
+# added by `shims::grok::handoff`, not written into this file, so what a landed
+# launcher proves is that it goes through the code that adds it.
+check_contains "the grok launcher goes through riabuild's own launcher" \
+  "$(cat "$RIA_HOME/bin/grok" 2>/dev/null || echo '')" "internal launch grok"
 
 # riabuild downloads the binary itself and never runs xAI's installer, which is a
 # competing provisioner: it writes ~/.grok/bin, symlinks into /usr/local/bin, and
@@ -129,13 +140,12 @@ GROK_HOMES=""
 for n in 1 2 3 4 5 6 7 8 9; do
   check "grok profile $n has a config directory" test -d "$RIA_HOME/grok/$n"
   check "the grok-$n launcher is there" test -x "$RIA_HOME/bin/grok-$n"
-  check_contains "grok-$n pins its own GROK_HOME" \
+  check_contains "grok-$n names its own GROK_HOME" \
     "$(cat "$RIA_HOME/bin/grok-$n" 2>/dev/null || echo '')" \
-    "GROK_HOME=\"$RIA_HOME/grok/$n\""
-  check_contains "grok-$n bypasses permissions" \
-    "$(cat "$RIA_HOME/bin/grok-$n" 2>/dev/null || echo '')" \
-    "--permission-mode bypassPermissions"
-  GROK_HOMES="$GROK_HOMES$(sed -n 's/^GROK_HOME="\(.*\)"$/\1/p' \
+    "--home '$RIA_HOME/grok/$n'"
+  check_contains "grok-$n goes through riabuild's own launcher" \
+    "$(cat "$RIA_HOME/bin/grok-$n" 2>/dev/null || echo '')" "internal launch grok"
+  GROK_HOMES="$GROK_HOMES$(sed -n "s/.*--home '\([^']*\)'.*/\1/p" \
     "$RIA_HOME/bin/grok-$n" 2>/dev/null | head -1)
 "
 done
@@ -240,9 +250,9 @@ check "the first account's launcher is executable" test -x "$RIA_HOME/bin/claude
 # directory, and Claude Code keeps sign-ins apart by that directory and nothing
 # else. Nine launchers sharing one would be nine names for a single account, and
 # every other assertion here would still pass.
-check_contains "the claude launcher pins account 1's config directory" \
+check_contains "the claude launcher names account 1's config directory" \
   "$(cat "$RIA_HOME/bin/claude-1" 2>/dev/null || echo '')" \
-  "CLAUDE_CONFIG_DIR=\"$RIA_HOME/claude/$CLAUDE_ACCOUNT\""
+  "--home '$RIA_HOME/claude/$CLAUDE_ACCOUNT'"
 
 # `claude` and `claude-1` are one account under two names, the shape `codex` and
 # `grok` already have.

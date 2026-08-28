@@ -635,7 +635,7 @@ crates form a straight line, each depending only on those above it:
 | `api` | the riabuild-web client: sessions, org configuration, brokered secrets | runner, ui |
 | `gh-session` | where the GitHub config dir goes, how it is created safely against a co-tenant, and how long it lives | paths, runner, ui |
 | `channel` | the laptop channel: clipboard and browser over an SSH exec session. `mux` frames many shim connections onto one pipe, `pump` is the server end that binds the socket and relays, `agent::pipe` is the laptop end; `socket` decides where that socket lives and refuses one that is not ours; `supervisor` keeps the connection up | gh-session, paths, runner, ui |
-| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation), `scope` (laptop vs. server) | all of the above |
+| `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation, and `launch` — what those one-line launchers do, in Rust), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `repo` is the question straight after it — which repository, asked here rather than on the server, and forwarded as `--repo`; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `harness` | what to run for each agent harness and how to read what it says. `claude`, `codex` and `grok` build one turn's argv and decode that harness's NDJSON. Starts nothing and reads nothing | — |
 | `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure); `draw` turns that into ratatui lines and then into a frame | harness, paths, runner, theme, ui |
@@ -673,6 +673,47 @@ laptop. Its parent is created **at** mode 0700 rather than created and then chmo
 it never exists at the umask even briefly, and a path that is a symlink or owned by
 another uid is refused rather than removed: unlinking is how you take over someone
 else's channel, not how you recover from a stale one.
+
+**Nothing riabuild writes into `$PATH` contains logic. Every generated script in
+`~/.riabuild/bin` is a shebang, some comments, and exactly one `exec`.** The decisions
+those files used to make — which harness binary, which `PATH`, which profile, which flags,
+which checkout the agents view opens on, whether the developer already named an approval
+policy — are `riabuild_tasks::shims::launch` and the three `handoff` functions beside it,
+reached through `riabuild internal launch <harness>`.
+
+This is an architectural rule, not a tidying preference, and the reason is what shell *is*:
+a language with no type checker, no test that runs in CI without spawning a subprocess, and
+a parser that turns a mistake into a **different working program** rather than into an
+error. The `claude` launcher alone was ninety lines of it, and its own comments record the
+class of bug it kept nearly reintroducing — a `PATH` strip whose `grep -vxF` loses `-x` and
+empties a developer's `PATH` of everything under their home; a path with a space in it
+splitting back into two arguments after `${x:+--cwd "$x"}`; a `set --` branch leaving on a
+flag that turns `claude` into the background-agents *listing*. Each was prevented by a
+comment, which is a rule enforced by whoever reads it next.
+
+Three properties are kept rather than traded away. The resolved values are **still in the
+file**, on the exec line, so `check()` comparing a launcher against what riabuild would
+write now still catches one naming last week's Node or a deleted account — moving them into
+riabuild's own state would make every launcher byte-identical and that comparison
+worthless. riabuild is **still named in full**, per the rule below. And it is **still an
+`exec`**: `CommandRunner::exec_replacing` is `execvp(2)`, so the developer's shell waits on
+one process, `Ctrl+C` reaches the harness, and `jobs` shows what they started. Spawning
+instead would park a riabuild between the terminal and the session for its whole life.
+
+`launch` is dispatched in `main::run` **before a `Ctx` exists**, beside `askpass` and
+`channel`, and that placement is load-bearing: it runs every time a developer types
+`claude`, and the shell script it replaces read no config, opened no socket and printed
+nothing. `every_generated_script_is_a_single_exec` is the gate on the shape, and
+`every_generated_launcher_parses_back_into_the_plan_that_wrote_it` is the gate on the seam
+— `riabuild-tasks` writes those files and has no parser, `crates/cli` parses them and has
+no generator, so a flag renamed on one side compiles perfectly and fails on a laptop.
+
+`internal ngrok` is the same move where it matters most. That shim was the one piece of
+shell in `bin/` that handled a **secret**: `NGROK_AUTHTOKEN=$("…/riabuild" internal
+ngrok-token)`, a command substitution whose stdout was a credential, into a shell variable,
+in a process that then went on to `exec`. The token is now fetched by the process that
+*becomes* ngrok. `internal ngrok-token` stays only because a shim written by an older
+riabuild is still on disk until the next provisioning run rewrites it.
 
 **A generated shim names the riabuild binary in full, never `riabuild`.** riabuild is the
 one tool riabuild does not put on `PATH`: it lives at
@@ -997,18 +1038,24 @@ which asserts both halves — accepted after the positional, rejected before it.
 **Which checkout is resolved per launch, by `$PWD`, never baked into the launcher as one
 repository for the whole machine.** `UserConfig::repos` holds every checkout this machine
 knows about, keyed by `owner/repo`, and `shims::claude::known_checkouts` hands the whole
-map to `launcher_script` — not just `Ctx::project_dir`'s answer for the run that happened
-to generate the script. `build_agents_view` turns that into one `case "$PWD" in …` arm per
-checkout, longest path first, with the run's own default as the `*` fallback for a
-developer standing in neither. The floor above still holds per arm — `"$path"|"$path"/*`
-matches the checkout root and everything beneath it — so which repository "it" resolves to
-is a question the *generated shell script* answers at the moment `claude` runs, not one the
-Rust code can answer once and freeze into the file.
+map to the launcher — not just `Ctx::project_dir`'s answer for the run that happened to
+generate it. Each becomes a `--checkout` on the launcher's exec line, longest path first,
+with the run's own default as `--default-checkout` for a developer standing in neither,
+and `shims::claude::checkout_for` picks between them **at launch time**. The floor above
+still holds per checkout — `Path::starts_with` matches the checkout root and everything
+beneath it — so which repository "it" resolves to is a question answered at the moment
+`claude` runs, not one the Rust code can answer once and freeze into the file.
+
+`checkout_for` used to be a `case "$PWD" in "$path"|"$path"/*)` block in the generated
+shell script, and moving it into Rust is strictly better in a way worth naming: the shell
+pattern was right only because of where the `/` sat in it, so `~/Clubria/payments` did not
+swallow `~/Clubria/payments-legacy` by one character's grace. `Path::starts_with` compares
+whole components and cannot get that wrong.
 
 This is what makes a developer who works in two Clubria checkouts — `riabuild` and, say, a
 product repository, each in its own terminal — get `--cwd` right in both, rather than in
 whichever repository `riabuild` was *most recently run against*. Before
-`known_checkouts`/`build_agents_view` existed, `--cwd` was one path, chosen by
+`known_checkouts`/`checkout_for` existed, `--cwd` was one path, chosen by
 `Ctx::project_dir` at the moment the launcher was last written: a developer standing in
 `riabuild` was moved to the other checkout the instant a `riabuild` run against it
 regenerated the script, because the floor only keeps you where you stand when the single
@@ -1078,10 +1125,11 @@ same thing again. That is the `apply()`-did-not-take-effect hard error, on every
 forever, on a machine where Codex is installed and working. Shipped in #91 and fixed after
 the first server ran it.
 
-`the_launcher_starts_codex_where_the_machine_has_no_node` is the gate, and it runs the
-generated script under a Node-less `PATH` rather than asserting on its text: a
-`PATH="$codex_node_bin:$PATH"` exported on the wrong branch, too late, or with a variable
-that expanded to nothing all read identically in the source.
+`the_launcher_carries_riabuilds_own_node` is the gate, and it asserts on the environment
+`shims::codex::handoff` decides — which is now the whole answer. It used to have to *run*
+the generated script under a Node-less `PATH`, because a `PATH="$codex_node_bin:$PATH"`
+exported on the wrong branch, too late, or with a variable that expanded to nothing all
+read identically in the shell source. None of those three failures has a spelling in Rust.
 
 **`CODEX_HOME` has to exist, not merely be named.** Codex refuses to start against a
 directory that is not there — `Error finding codex home` — rather than creating one. So all
@@ -1099,12 +1147,15 @@ to type — fail in the parser, naming a flag they never typed. The launcher sca
 arguments and stands aside where the developer expressed an approval policy.
 
 All of those are undocumented, read out of Codex 0.147.0, which is why `MIN_VERSION` names
-that version and why the two `#[ignore]`d smoke tests run the generated launcher itself
-rather than asserting on the text of a shell script. Run `cargo test -- --ignored` when the
-floor moves. One trap they encode: `codex login status` reports on **stderr**, so a test
-that reads stdout gets an empty string and fails for the wrong reason.
+that version and why the two `#[ignore]`d smoke tests run a **real Codex** with the
+arguments and environment `handoff` decides. They drive `handoff` rather than the generated
+launcher deliberately: what is under test there is Codex, not riabuild's `exec` line, and
+running the launcher would need a built riabuild binary to exec into while asking the same
+question one process further away. Run `cargo test -- --ignored` when the floor moves. One
+trap they encode: `codex login status` reports on **stderr**, so a test that reads stdout
+gets an empty string and fails for the wrong reason.
 
-The Claude launcher's `unset SSH_CONNECTION SSH_CLIENT SSH_TTY` and its `WAYLAND_DISPLAY`
+The Claude launcher's clearing of `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY` and its `WAYLAND_DISPLAY`
 claim are deliberately **not** copied into it. Both are workarounds for behaviour read out
 of the Claude Code binary; neither is a fact about Codex, and asserting them here would be
 inventing an upstream behaviour rather than accommodating one.
@@ -1120,10 +1171,11 @@ Read as a diff against the Codex section above — the shape is deliberately the
 the four places it differs are the interesting ones.
 
 **It is a static binary, not a Node script.** The Linux build is a `static-pie` ELF, so
-neither the `--version` probe nor the generated launcher needs riabuild's Node on `PATH`,
-and `depends_on()` is empty rather than naming `toolchain`. Do not copy Codex's
-`PATH="$codex_node_bin:$PATH"` here on the grounds that it looks symmetrical: it would be
-carrying a Node for nobody. This is also why `Ctx::grok()` is an `owned_tool` like
+neither the `--version` probe nor the launcher needs riabuild's Node on `PATH`, and
+`depends_on()` is empty rather than naming `toolchain`. Do not copy the `PATH` line
+`shims::codex::handoff` puts in front of the Node directory here on the grounds that it
+looks symmetrical: it would be carrying a Node for nobody, and
+`the_launcher_carries_no_node_and_no_claude_workarounds` fails if it appears. This is also why `Ctx::grok()` is an `owned_tool` like
 `ctx.gh()` — always an absolute versioned path — rather than the Node-relative path with a
 bare-name fallback that `Ctx::claude()` and `Ctx::codex()` return.
 
@@ -1164,8 +1216,9 @@ and quietly breaks the `claude` launcher and the clipboard shims beside it.
 
 All of the above is undocumented, read out of Grok Build 1.0.5 — the shipped binary and the
 Apache-2.0 source at `xai-org/grok-build` — which is why the `#[ignore]`d smoke tests in
-`shims::grok` run the generated launcher itself rather than asserting on the text of a
-shell script. Run `cargo test -- --ignored` when the pin moves. Design:
+`shims::grok` run a **real Grok Build** with the arguments `shims::grok::handoff` decides,
+for the reason the Codex pair above gives. Run `cargo test -- --ignored` when the pin
+moves. Design:
 `../docs/superpowers/specs/2026-08-21-grok-build-design.md`.
 
 ## The agents window

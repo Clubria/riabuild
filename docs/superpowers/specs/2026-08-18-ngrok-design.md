@@ -122,6 +122,15 @@ uid that owns the process.
 and `seed-github`: invoked by a generated shim, never by a person. It authenticates with
 the session in the keychain and prints the token on stdout.
 
+> **Superseded, 2026-08-28.** The shim is now `exec '…/riabuild' internal ngrok --binary
+> '…/ngrok' -- "$@"`, and the token is fetched by the process that goes on to *become*
+> ngrok. Every guarantee above is kept and one is strengthened: the credential is no
+> longer read off a pipe into a shell variable, so "print nothing else on stdout" stops
+> being a rule `internal ngrok-token` had to keep on the shim's behalf. `internal
+> ngrok-token` still exists, because a shim written by an older riabuild stays on disk
+> until the next provisioning run rewrites it. See
+> `2026-08-28-launchers-in-rust-design.md`.
+
 ### Why not export it when the environment shell starts
 
 `shell::ShellLaunch` already carries environment pairs, so riabuild could fetch the token

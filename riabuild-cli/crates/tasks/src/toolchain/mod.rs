@@ -552,11 +552,7 @@ mod tests {
             "{node:?} {entry:?}"
         );
         assert!(
-            shim.contains(&format!(
-                "exec \"{}\" \"{}\"",
-                node.display(),
-                entry.display()
-            )),
+            shim.contains(&format!("exec '{}' '{}'", node.display(), entry.display())),
             "the shim has to name both in full: {shim}"
         );
         // Neither half may be a bare name, and no shebang may go looking for
