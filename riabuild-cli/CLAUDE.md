@@ -201,6 +201,12 @@ reactor thread and never `block_in_place` — that one needs `rt-multi-thread`, 
 current-thread runtime is not, and it borrows a worker rather than leaving it to the
 dedicated pool.
 
+**And so does the CPU work over a whole download** — unpacking an archive, and taking the
+sha256 or sha512 that says it is the right bytes. Neither is a syscall tokio is missing;
+both are simply long enough to matter, because a wave of tasks now runs concurrently and
+whatever holds the reactor holds all of them. See `archive::off_the_reactor` and
+`download::sha256_of`.
+
 Note that `tokio::fs` is `std::fs` on a blocking threadpool: no portable async file API
 exists. "Current-thread" describes the reactor, not the process, and the binary does have
 threads. Closures cannot be async, so `and_then`/`unwrap_or_else` chains around IO have to
@@ -278,16 +284,35 @@ one `.claude.json` — with `claude_plugins` writing it through a `claude` besid
 invisible and free, and is neither now. Adding edges between them would have written an
 ordering nobody means into the graph and said nothing about the next pair.
 
-What needed no change is the state: `ctx.update_config` and `ctx.update_state` already took
-the lock and re-read inside it, for the two-terminals case, so concurrent writers inside one
-process cannot lose each other's edit either. A fork carries neither identity nor the API
-token — `ApiClient::set_token` writes a plain field, so a clone does not share it — which is
-why `login` is `interactive()` and never forked.
+What needed no change is riabuild's own state: `ctx.update_config` and `ctx.update_state`
+already took the lock and re-read inside it, for the two-terminals case, so concurrent
+writers inside one process cannot lose each other's edit either. A fork carries neither
+identity nor the API token — `ApiClient::set_token` writes a plain field, so a clone does
+not share it — which is why `login` is `interactive()` and never forked.
+
+**`.claude.json` is the one that did.** `claude_config::edit` now holds
+`claude_config_lock_file(id)` across the read *and* the write, because
+`config::write_atomic` was answering a different question: it makes each write whole, and a
+lost update is two writes that were each perfectly whole. Two riabuilds that both read
+before either wrote left one key on the floor, and a key on the floor is the developer
+meeting the trust dialog on their next launch with `check()` reporting satisfied — each
+task only inspects its own key, so the file the *other* one wrote looks right to it. Note
+what the lock cannot reach: `claude_plugins` writes this file by running `claude`, which
+knows nothing about it.
 
 `join_in_order` is riabuild's own, not `futures-util`'s: the same argument `filelock` makes
 for `std::fs::File::try_lock` over `fs2`. It is not a thread pool — the runtime is still
 current-thread, so what overlaps is *waiting*, and work that does not yield still holds the
 reactor.
+
+Which is why **hashing a download goes to the blocking pool**, the same way unpacking one
+already did. `download::sha256_of` and `sha512_of` take the buffer, hand it to
+`spawn_blocking`, and give it back with its digest; `archive::extract_single_file` was the
+last unpack still inline and is not any more. A `ring::digest` over a 130 MB Node tarball
+is the exact shape of the sentence above — pure CPU, no await in it anywhere — so under the
+sequential runner it cost nothing and in a wave it stops every download running beside it.
+The synchronous `sha256_hex` stays for the small inputs; the test for which to reach for is
+not "is this a digest" but "did this arrive over the network".
 
 **`apply()` must be safe to run twice.** Tasks re-run whenever a dependency changes, a
 version bumps, or a check fails. There is no "already done" branch to rely on.

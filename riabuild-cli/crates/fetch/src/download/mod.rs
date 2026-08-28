@@ -39,7 +39,8 @@ pub use assets::{
     rust_target,
 };
 pub use digest::{
-    digest_for, digest_from_any, npm_integrity, npm_integrity_digest, sha256_hex, sha512,
+    digest_for, digest_from_any, npm_integrity, npm_integrity_digest, npm_integrity_of, sha256_hex,
+    sha256_of, sha512, sha512_of,
 };
 
 use crate::{CHECK_THE_NETWORK, Failure, TELL_YOUR_LEAD, UPSTREAM_MOVED};

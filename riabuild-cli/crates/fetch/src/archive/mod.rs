@@ -2,9 +2,12 @@
 //!
 //! Split out of `download.rs`, which fetches and verifies: by the time anything
 //! here runs, the bytes have already been checked against a published digest.
-//! Nothing in this file is async. Extraction is CPU work over an in-memory
+//! None of the *unpacking* is async. Extraction is CPU work over an in-memory
 //! buffer written through the synchronous `tar` and `zip` crates, so wrapping
-//! the directory calls around it in `tokio::fs` would be theatre.
+//! the directory calls around it in `tokio::fs` would be theatre. What the
+//! `async` functions here do instead is hand the whole synchronous job to the
+//! blocking pool — see [`off_the_reactor`], which is the only reason any
+//! signature in this file has an `await` on it.
 //!
 //! Two shapes are needed, because upstream projects disagree about both:
 //!
@@ -23,12 +26,10 @@
 mod kind;
 mod member;
 
-// Re-exported so a caller keeps naming `archive::Kind` and
-// `archive::extract_single_file`. Which file each lives in is this module's
-// business, and a caller that had to know would have to be edited the next
-// time one moves.
+// Re-exported so a caller keeps naming `archive::Kind`. Which file each answer
+// lives in is this module's business, and a caller that had to know would have
+// to be edited the next time one moves.
 pub use kind::Kind;
-pub use member::extract_single_file;
 
 use crate::{Failure, UPSTREAM_MOVED};
 use anyhow::Result;
@@ -124,6 +125,19 @@ pub async fn extract_member(
     destination: PathBuf,
 ) -> Result<()> {
     off_the_reactor(move || extract_member_blocking(&bytes, kind, member, &destination)).await
+}
+
+/// One named member of a gzipped tarball, returned in memory rather than
+/// written anywhere — `member::single_file` is where who wants that, and why,
+/// is written down.
+///
+/// The last unpacking riabuild did on the reactor thread. It is a gzip inflate
+/// and a tar walk over a whole release tarball, which is the same CPU work
+/// [`off_the_reactor`] exists for; it was only ever inline because it hands
+/// back bytes instead of writing a tree, and that is a fact about the
+/// *destination* rather than about the work.
+pub async fn extract_single_file(bytes: Vec<u8>, name: &'static str) -> Result<Vec<u8>> {
+    off_the_reactor(move || member::single_file(&bytes, name)).await
 }
 
 /// The body, on the blocking pool.
@@ -505,7 +519,9 @@ mod tests {
             )
             .await
             .expect_err("member"),
-            extract_single_file(b"not a gzip stream", "riabuild").expect_err("single file"),
+            extract_single_file(b"not a gzip stream".to_vec(), "riabuild")
+                .await
+                .expect_err("single file"),
             safe_join(home.path(), Path::new("../../etc/profile")).expect_err("traversal"),
         ];
         for error in errors {

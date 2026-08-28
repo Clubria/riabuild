@@ -81,6 +81,52 @@ pub fn sha512(bytes: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// Takes a digest over a whole download on the blocking pool, and hands the
+/// buffer back with it.
+///
+/// Hashing is the one step between "the bytes arrived" and "the bytes are the
+/// ones upstream published", and it is pure CPU over as much as 130 MB. That
+/// used to be free because nothing ran beside it. A dependency wave runs
+/// concurrently now, so it is not: `../../../../CLAUDE.md` says of
+/// `join_in_order` that "what overlaps is *waiting*, and work that does not
+/// yield still holds the reactor", and a `ring::digest` over a Node tarball is
+/// precisely the work it was warning about — every other download in the wave
+/// stops while it runs.
+///
+/// The buffer goes in and comes back out rather than being borrowed, because a
+/// blocking task outlives the future that spawned it as far as the borrow
+/// checker is concerned. Moving a `Vec` in and out copies nothing.
+///
+/// `spawn_blocking` and not `block_in_place`, for [`archive`](crate::archive)'s
+/// reason: the runtime is current-thread, where `block_in_place` is not
+/// available. A `JoinError` can only be the hash panicking — nothing cancels
+/// it — which is a bug in riabuild rather than something a developer can act
+/// on, so it travels as the `anyhow` chain it is rather than wearing a
+/// `Failure`'s remedy.
+async fn hashed<T: Send + 'static>(bytes: Vec<u8>, hash: fn(&[u8]) -> T) -> Result<(Vec<u8>, T)> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let digest = hash(&bytes);
+        (bytes, digest)
+    })
+    .await?)
+}
+
+/// [`sha256_hex`] over a whole download, off the reactor thread.
+///
+/// The synchronous form stays, and is the right one for the small inputs that
+/// also want a sha256 — a channel key, a test fixture — where the hop to the
+/// blocking pool would cost more than the hash. The test for which to reach for
+/// is not "is this a digest" but "did this arrive over the network".
+pub async fn sha256_of(bytes: Vec<u8>) -> Result<(Vec<u8>, String)> {
+    hashed(bytes, sha256_hex).await
+}
+
+/// [`sha512`] over a whole download, off the reactor thread. The sibling of
+/// [`sha256_of`], for the one publisher that records its digest in sha512.
+pub async fn sha512_of(bytes: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
+    hashed(bytes, sha512).await
+}
+
 /// The `sha512-<base64>` string npm would publish as `dist.integrity` for
 /// these bytes.
 ///
@@ -88,10 +134,20 @@ pub fn sha512(bytes: &[u8]) -> Vec<u8> {
 /// comparison in the caller, so that a base64 spelling npm changes one day
 /// cannot present as tampering.
 pub fn npm_integrity(bytes: &[u8]) -> String {
+    npm_integrity_of(&sha512(bytes))
+}
+
+/// The same string, for a digest that has already been taken.
+///
+/// Split from [`npm_integrity`] for the mismatch path, which has the sha512 in
+/// hand and used to re-hash the buffer to spell it: a second pass over a 30 MB
+/// tarball, on the reactor, purely to write a sentence. What a mismatch is
+/// *decided* by is still the byte comparison in the caller.
+pub fn npm_integrity_of(digest: &[u8]) -> String {
     use base64::Engine as _;
     format!(
         "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(sha512(bytes))
+        base64::engine::general_purpose::STANDARD.encode(digest)
     )
 }
 
@@ -195,6 +251,62 @@ cccc3333  node-v22.23.1-darwin-arm64.tar.xz
         ] {
             assert_eq!(npm_integrity_digest(other), None, "{other}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_download_comes_back_with_its_digest_and_all_of_its_bytes() {
+        // The buffer is handed to the blocking pool and back, and every caller
+        // still needs it afterwards — the download is only verified so that it
+        // can be unpacked. Losing or truncating it here would install nothing
+        // on a machine that reported success.
+        let bytes = b"node-v22.23.1-linux-x64.tar.gz, near enough".to_vec();
+        let (returned, digest) = sha256_of(bytes.clone()).await.expect("hash");
+        assert_eq!(returned, bytes);
+        assert_eq!(digest, sha256_hex(&bytes));
+
+        let (returned, digest) = sha512_of(bytes.clone()).await.expect("hash");
+        assert_eq!(returned, bytes);
+        assert_eq!(digest, sha512(&bytes));
+        assert_eq!(npm_integrity_of(&digest), npm_integrity(&bytes));
+    }
+
+    /// A hash that parks until something on the reactor thread releases it.
+    ///
+    /// Used by exactly one test. The statics are how a `fn` pointer — which
+    /// cannot capture — reaches a rendezvous.
+    static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn parks_until_released(bytes: &[u8]) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        REACHED.store(true, SeqCst);
+        while !RELEASED.load(SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        bytes.len()
+    }
+
+    #[tokio::test]
+    async fn a_digest_is_taken_off_the_reactor_thread() {
+        // The property, asserted rather than assumed: hashing a download must
+        // not hold the one thread every other task in the wave is running on.
+        //
+        // This **hangs for ever** if `hashed` ever stops using the blocking
+        // pool. The hash parks until a future on the reactor releases it, and
+        // that future can only be polled if the reactor is free — so a hash
+        // taken inline is a deadlock, which is the only shape that tells the
+        // two apart deterministically. A timing assertion would pass on a fast
+        // machine either way.
+        use std::sync::atomic::Ordering::SeqCst;
+        let hashing = hashed(b"a whole download".to_vec(), parks_until_released);
+        let releasing = async {
+            while !REACHED.load(SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            RELEASED.store(true, SeqCst);
+        };
+        let (hashed, ()) = tokio::join!(hashing, releasing);
+        assert_eq!(hashed.expect("the hash finished").1, 16);
     }
 
     #[test]

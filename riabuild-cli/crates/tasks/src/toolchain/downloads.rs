@@ -44,7 +44,9 @@ impl Downloads for RealDownloads {
         })?;
 
         let bytes = download::fetch_bytes(&download::node_tarball_url(version, &platform)).await?;
-        let actual = download::sha256_hex(&bytes);
+        // Off the reactor: this is the largest buffer riabuild hashes, and
+        // `toolchain` shares its wave with `repo_status` and `env_local`.
+        let (bytes, actual) = download::sha256_of(bytes).await?;
         if actual != expected {
             // Never unpack an archive that is not the one nodejs.org published.
             return Err(Failure::new(
@@ -117,7 +119,7 @@ async fn npm_package(package: &str, version: &str) -> Result<Vec<u8>> {
     let published = published_integrity(&metadata, package, version)?;
 
     let bytes = download::fetch_bytes(&download::npm_tarball_url(package, version)).await?;
-    verified(package, version, &published, bytes)
+    verified(package, version, &published, bytes).await
 }
 
 /// The comparison itself: the complete buffer against the integrity npm
@@ -131,13 +133,20 @@ async fn npm_package(package: &str, version: &str) -> Result<Vec<u8>> {
 /// The decoded digests are compared rather than the two strings, so a base64
 /// spelling npm changes one day cannot present as tampering; the strings are
 /// what the developer is shown, because they are what is on the registry page.
-pub(super) fn verified(
+///
+/// `async` only because the sha512 goes to the blocking pool — the comparison
+/// and every word of the failure are still decided here, and still without a
+/// network. The digest is taken **once** and reused for the message, which is
+/// what `download::npm_integrity_of` is for: the old spelling re-hashed the
+/// whole tarball on the reactor to write a sentence about it.
+pub(super) async fn verified(
     package: &str,
     version: &str,
     published: &str,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    if download::npm_integrity_digest(published) == Some(download::sha512(&bytes)) {
+    let (bytes, actual) = download::sha512_of(bytes).await?;
+    if download::npm_integrity_digest(published).as_deref() == Some(actual.as_slice()) {
         return Ok(bytes);
     }
     // Never unpack an archive that is not the one npm published.
@@ -150,7 +159,7 @@ pub(super) fn verified(
     )
     .detail(format!(
         "expected {published}, got {}",
-        download::npm_integrity(&bytes)
+        download::npm_integrity_of(&actual)
     ))
     .into())
 }
