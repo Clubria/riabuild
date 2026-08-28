@@ -1,12 +1,19 @@
 //! What the supervisor says about a channel that will not come up, and when.
 //!
-//! Three sentences and one predicate. The predicate is here rather than inline
+//! Two sentences and one predicate. The predicate is here rather than inline
 //! in the loop because it is the whole of the decision and the loop around it
 //! cannot be unit-tested without an `ssh`; the sentences are here because
 //! choosing between them is the same kind of judgement — which of two walls
 //! this is, and whether it is about the server at all.
 //!
-//! [`report`] is where all three land. It never claims riabuild stopped, and it
+//! **Two, because the third was not a failure.** It said that another session
+//! on this server was still holding the channel, which is the ordinary state of
+//! a developer's second terminal into one box and is the case remote mode
+//! exists to serve. `supervise` answers that one before anything is said, with
+//! [`Outcome::AlreadyServed`](super::Outcome::AlreadyServed); nothing that
+//! reaches this file is a working channel.
+//!
+//! [`report`] is where both land. It never claims riabuild stopped, and it
 //! prefers the status bar to the screen, because this runs beside a shell that
 //! owns the terminal.
 
@@ -70,28 +77,23 @@ pub(super) fn lost_track(detail: &str) -> Failure {
 /// The sentence for a connection that keeps failing in a way `diagnose` has no
 /// pattern for.
 ///
-/// Two of them, because one of the two is not a network fault at all and saying
-/// it was sent developers looking at their wifi. A pump that outlived its
-/// laptop — the connection dropped, the server never noticed, and the process
-/// stayed bound to the socket — refuses every replacement with `already
-/// serving`, so the `ssh` reaches the server perfectly and comes back with a
-/// message about a *colleague's* session. "Cannot reach this server" is the one
-/// thing that is definitely not happening.
+/// One sentence, where there were two. The other said that *another session on
+/// this server was still holding the channel*, and it never belonged here,
+/// because that is not a failure. `supervise` now answers
+/// [`ALREADY_SERVED`](crate::pump::ALREADY_SERVED) before anything is said at
+/// all: a socket a sibling terminal's pump is serving is a channel that works
+/// in this terminal too, so the session hands its lease back and stands by
+/// instead of reporting anything. Said here, it meant a developer with two
+/// windows open — which is what remote mode is *for* — read "paste is off"
+/// while pasting.
 ///
-/// It resolves itself now, which is why the wording says to wait rather than to
-/// do something: the pump gives the socket up once its own keepalive goes
-/// unanswered, and the next attempt binds it.
+/// What that branch was really covering is a pump that outlived its laptop: the
+/// connection dropped, the server never noticed, and the process stayed bound
+/// to the socket. That is met the same way and still resolves itself, one floor
+/// up — the pump gives the socket back when its own keepalive goes unanswered,
+/// and the standing-by session's next ask binds it. `hold` is what says so on
+/// the one path where it does not resolve.
 pub(super) fn cannot_connect(stderr: &str) -> Failure {
-    if stderr.to_ascii_lowercase().contains("already serving") {
-        return Failure::new(
-            "another session on this server is still holding the channel",
-            "Nothing to do — it is usually a session whose connection dropped without the \
-             server noticing, and it gives the channel up within a minute. If paste is still \
-             dead after that, run `riabuild channel status` on the server.",
-        )
-        .detail(stderr.trim().to_string());
-    }
-
     Failure::new(
         "the clipboard channel cannot reach this server",
         "Run `riabuild channel status` on the server to check, and `riabuild remote` again \
@@ -168,27 +170,15 @@ mod tests {
         assert!(!should_say_it_cannot_connect(true, false, 99));
     }
 
-    /// The wall that is not a network fault, told apart from the one that is.
+    /// A server that genuinely cannot be reached still says so.
     ///
-    /// `already serving` comes back from a server the `ssh` reached perfectly:
-    /// a pump that outlived its laptop is still bound to the socket and refuses
-    /// the replacement. Reported as "cannot reach this server" — which is what
-    /// every unrecognised failure used to become — it sends a developer to look
-    /// at their network, which is the one thing that is definitely working.
+    /// The other half of what this function used to decide is gone: a socket
+    /// another of this laptop's own pumps is serving never reaches here any
+    /// more, because it is not a failure to report. See
+    /// `a_sibling_serving_the_socket_is_never_reported_as_a_failure` next door,
+    /// which pins that at the level that now decides it.
     #[test]
-    fn a_socket_another_pump_still_holds_is_not_reported_as_an_unreachable_server() {
-        let held = cannot_connect(
-            "riabuild stopped: another riabuild is already serving the clipboard channel at /x",
-        );
-        assert!(
-            !held.to_string().contains("cannot reach"),
-            "{held} blames the network for a server that answered"
-        );
-        assert!(held.attempting.contains("another session"), "{held}");
-        // And it says to wait rather than to do something, because the other
-        // pump's own keepalive is what ends this.
-        assert!(held.action.contains("within a minute"), "{held}");
-
+    fn a_server_that_cannot_be_reached_is_still_named_as_one() {
         let unreachable = cannot_connect("ssh: connect to host build-01 port 22: No route to host");
         assert!(
             unreachable.attempting.contains("cannot reach"),

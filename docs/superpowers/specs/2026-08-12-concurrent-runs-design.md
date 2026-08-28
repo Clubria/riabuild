@@ -46,6 +46,15 @@ name and moves. Every one of those is a lock-free technique applied to one speci
 Nobody applied one to `config.json`, because the second process was always imagined as
 another person, never as the same person's other window.
 
+**This spec closes that gap for the local tree only, and the remote half went on
+believing the same thing for another fortnight.** Every place remote mode reasons about a
+second connection to one server reasons about a colleague under a shared Unix account —
+which produced a clipboard channel that announced "paste is off" in a terminal where paste
+worked, two windows unlinking each other's `ssh-agent` socket, two windows minting two
+server sessions, and a `remote forget` that tore down a server somebody's other terminal
+was sitting in. The same sentence, applied on the other side of the SSH connection, is
+`2026-08-28-many-windows-one-server-design.md`.
+
 ## Approach
 
 Move the read inside the critical section, and make the write atomic.

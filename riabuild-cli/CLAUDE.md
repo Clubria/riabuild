@@ -399,6 +399,26 @@ blocking pool — cargo's sequence, including its rule that a filesystem which c
 is treated as success rather than a reason to refuse to provision. Design:
 `../docs/superpowers/specs/2026-08-12-concurrent-runs-design.md`.
 
+**Remote mode is used from more than one window too, and it took a second pass to say so.**
+"One person connecting to one server in one or more terminals" is the *intended* usage of
+`riabuild remote`, not a corner of it, and every place the crate reasoned about a second
+connection reasoned about a colleague under a shared Unix account instead. Three more
+locks came out of writing that down, each an `flock` for the reason above:
+
+| Lock | Stops |
+|---|---|
+| `agent/<server-hash>/<pid>/run.lock` | two windows unlinking each other's issued-key `ssh-agent` socket, and either one's teardown deleting the directory the other serves from |
+| `remote-sessions/<server-hash>.lock` | two windows both minting a server session, which orphans one — a live 90-day session no `remote forget` can name |
+| `remote-windows/<server-hash>/<pid>.lock` | `remote forget` revoking a session, unauthorising a key and clearing a namespace that another of this laptop's terminals is sitting in, in silence |
+
+The last is a *count*, not a mutex: nothing waits on it, and `forget` warns rather than
+refusing — it is a destructive command typed by name, usually because that server has gone
+wrong, and it also runs unattended from `shared::reconcile`. Liveness is always the
+kernel's answer to "does anybody hold this", never a pid and a `kill -0`: a recycled pid
+says "still connected" about somebody else's `vim`, and an age cap cannot be used because a
+remote session outliving a day is the normal case. Design:
+`../docs/superpowers/specs/2026-08-28-many-windows-one-server-design.md`.
+
 **Paths and keychain stay behind traits.** macOS and Linux are both supported, and
 `riabuild-paths`, `riabuild-keychain`, `riabuild-fetch`'s `tools` and `download`, and
 the binary's `update.rs` are the only places
@@ -790,12 +810,33 @@ is either; `requests` alone still means "somebody's paste worked" and is not wha
 about reachability may be built on. The keepalive is what gives an idle connection anything
 to say for itself, which is why this and the pump's own liveness are one change.
 
-**`cannot_connect` picks the sentence, because one of the two unrecognised walls is not a
-network fault at all.** `another riabuild is already serving the clipboard channel` comes
-back from a server the `ssh` reached perfectly — see the pump's keepalive below — and
-reporting it as "cannot reach this server" sends a developer to look at the one thing that
-is definitely working. It stays a retry rather than becoming a `diagnose` branch, because it
-resolves itself: the pump holding the socket gives it up within the minute.
+**A socket another of this laptop's sessions is serving is not a wall, and is not a
+message.** `pump::ALREADY_SERVED` comes back from a server the `ssh` reached perfectly, and
+it is the one answer that *proves* the channel is up: the shims in this session's own shell
+are already pasting through the pump being complained about. `supervise` answers it with
+`Outcome::AlreadyServed` — before `diagnose`, without a word, without a retry — and `hold`
+hands the lease back and stands by.
+
+It used to fall through to the unrecognised-wall path, and the fix for *that* was a second
+sentence ("another session on this server is still holding the channel"), which was a true
+description of a stale pump and a lie in the far commoner case: one developer with two
+terminals into one box, reading **"paste is off"** while pasting. Recognising the refusal
+and treating it as a failure at all was the error. Three things were wrong and only one was
+the wording — it retried, which is an `ssh` and an authentication against somebody's `sshd`
+every few seconds for as long as two windows are open; and `bind`'s own remedy said *close
+the other riabuild session*, which is advice to break a working session to fix one that was
+never broken.
+
+`ALREADY_SERVED` is **one constant used by both ends**, matched as a substring, and it is a
+wire format: the laptop and the server can be a release apart, so it is deliberately the
+phrase the older wording also contained. Reword it on one side only and nothing fails to
+compile — the false alarm simply comes back.
+
+What is still true is what the pump's keepalive below is for: a pump that outlived its
+laptop holds the socket for real, and paste really is dead until it gives it back. `hold`
+counts the bounces and says one thing after about ninety seconds — never "paste is off",
+because from the laptop riabuild cannot tell that case from a working sibling. Only
+`riabuild channel status`, which asks the socket itself, can.
 
 **Serving the channel is a lease, and every session keeps asking for it.** One of this
 laptop's sessions to a server serves the channel — a second pump would find the first one's
@@ -803,6 +844,17 @@ socket live and be refused — and the rest *stand by*, asking every five second
 lease has fallen free, for as long as their shells are open. `remote::channel::hold` is
 that loop and `remote::channel::lease` is the lease, an `flock` on
 `~/.riabuild/channel-sessions/<hash>/owner.lock`.
+
+**The lease is an optimisation; the server's socket is the authority.** They are keyed
+differently and cannot be made to agree — the lease by the login target *as typed*, the
+socket by the server's `<home>/.riabuild-remote/<member-id>` — so two windows reaching one
+machine as `build-01.fly.dev` and `10.0.0.5` hold a lease each over one socket, and on
+every handoff the standing-by window takes the lease before the old pump has finished
+dying. Do not try to re-key the lease onto the socket path to close that: two *different*
+machines can have identical socket paths, and one of them would then stand by for ever.
+The loser self-corrects instead, which is what `Outcome::AlreadyServed` is for. The bounce
+waits on `supervisor::backoff` rather than the five-second standby poll, because asking the
+lease costs one `flock` on a local file and asking the socket costs an `ssh`.
 
 It replaces a `Claim`: a `sessions/<pid>` marker per session and one question asked once,
 *am I the first?*. A session that answered no started nothing and never asked again, so

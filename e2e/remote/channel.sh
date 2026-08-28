@@ -734,12 +734,14 @@ esac
 echo
 echo "-- a second pump does not take the socket from a live one"
 
-# Two terminals into one box, and the one thing that must not happen is the
-# second silently cutting the first's paste. `pump::bind` connects to the
-# socket to tell a live pump from a dead one — the file looks identical either
-# way — and refuses a live one by name. Remote mode's lease is what makes this
-# rare in production; `bind` is what makes it safe when the lease loses a race,
-# and only a real second pump against a real live socket can show it.
+# Two terminals into one box — which is how remote mode is used, not an exotic
+# case — and the one thing that must not happen is the second silently cutting
+# the first's paste. `pump::bind` connects to the socket to tell a live pump
+# from a dead one (the file looks identical either way) and refuses a live one
+# by name. Remote mode's lease usually means the second window never gets this
+# far; `bind` is what makes it safe when the lease loses a race, which it does
+# on every handoff and whenever two saved records point at one machine. Only a
+# real second pump against a real live socket can show it.
 rc=0
 timeout 30 docker exec "${server_env[@]}" "$CONTAINER" \
   /home/shared/riabuild channel pump </dev/null \
@@ -753,6 +755,18 @@ elif grep -qi "already serving" "$work/second-pump.out"; then
 else
   fail "a second pump failed for some other reason (exit $rc):"
   cat "$work/second-pump.out" >&2 || true
+fi
+# In the words the laptop's supervisor matches on, and in words that do not
+# tell a developer to close their own other window. `ALREADY_SERVED` is a wire
+# format between two copies of riabuild that may be a release apart: the phrase
+# above is what turns this refusal into a silent standby instead of a "paste is
+# off" banner painted over a channel that is working. Reworded on one side
+# only, nothing fails to compile and the false alarm comes back.
+if grep -qi "close the other" "$work/second-pump.out"; then
+  fail "the refusal tells the developer to close a session that is working:"
+  cat "$work/second-pump.out" >&2 || true
+else
+  pass "the refusal does not ask a developer to close their own other window"
 fi
 # And the first one is still the one serving.
 if on_server channel status >"$work/status-still-up.log" 2>&1 \

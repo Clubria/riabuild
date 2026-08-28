@@ -38,7 +38,7 @@ mod run;
 // `supervisor::supervise`, not `supervisor::run::supervise`: which file the
 // loop lives in is this module's business, and a caller that had to know would
 // have to be edited the next time it moves.
-pub use run::{Stop, supervise};
+pub use run::{Outcome, Stop, supervise};
 
 /// The one line the channel speaks on while a full-screen shell owns the
 /// screen — see `bar`. Remote mode starts it, because remote mode is what
@@ -50,6 +50,12 @@ use std::time::Duration;
 
 const BACKOFF_CEILING: Duration = Duration::from_secs(30);
 
+/// Cloneable so `remote::channel::hold` can build more than one connection
+/// from it. Every field is an owned `String` the caller composed once; a
+/// session that hands its lease back and stands by comes round and asks again,
+/// and re-deriving the argv from the flow would be a second spelling of the one
+/// thing this struct exists to stop having two of.
+#[derive(Clone)]
 pub struct Tunnel {
     pub host: String,
     pub user: String,

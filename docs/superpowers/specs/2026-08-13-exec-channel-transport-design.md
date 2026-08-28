@@ -122,6 +122,16 @@ symptoms, one cause, and no two of them looked related:
   reported **"the clipboard channel cannot reach this server"** — about a server it had
   reached on every single attempt.
 
+That last bullet was answered twice, and only the second answer was the right one. The
+first gave the supervisor a *second sentence* for the same wall — "another session on this
+server is still holding the channel" — which is a truer description of a stale pump and a
+false alarm in the case that is far commoner: one developer's second terminal, where the
+socket is answering because the channel is *working*. Recognising the refusal and treating
+it as a wall at all was the mistake. `supervise` now answers `pump::ALREADY_SERVED` with
+`Outcome::AlreadyServed` before `diagnose`, silently and without a retry, and the session
+hands its clipboard lease back and stands by. See
+`2026-08-28-many-windows-one-server-design.md`.
+
 **The pump now measures the laptop, the way `ssh` measures the server.** Every
 `KEEPALIVE_INTERVAL` (15 s, the laptop's `ServerAliveInterval`) it sends one frame up the
 pipe; after `KEEPALIVE_DEADLINE` (45 s, three of them, the laptop's `ServerAliveCountMax`)

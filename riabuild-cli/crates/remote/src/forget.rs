@@ -12,7 +12,7 @@
 //! the server itself. What stays here is the command and this laptop's own
 //! records.
 
-use super::{Remote, identity, store};
+use super::{Remote, identity, store, windows};
 use anyhow::{Result, anyhow};
 use riabuild_api::ApiClient;
 use riabuild_keychain as keychain;
@@ -92,11 +92,47 @@ async fn forget_with(
         return Err(anyhow!("there is no saved server named \"{name}\""));
     };
 
+    warn_about_open_windows(paths, ui, &record).await;
+
     retire_identity(paths, runner, ui, revokes, carries, member_id, &record).await?;
     super::store::forget_one(paths, store, name).await?;
 
     ui.note(&format!("Forgot {}.", record.display_name()));
     Ok(())
+}
+
+/// Says out loud that this will end sessions the developer has open elsewhere.
+///
+/// **A warning and not a refusal.** `forget` is a destructive command the
+/// developer typed by name, and the reason to run it is usually that something
+/// about that server has gone wrong — so a riabuild that refused while a window
+/// was open would be a riabuild that cannot clean up the case it is most needed
+/// for, and there is no prompt to fall back on: this runs unattended in
+/// `shared::reconcile` too. What was wrong before was not that it went ahead;
+/// it is that it went ahead in silence.
+///
+/// Said *first*, before anything is revoked, because a sentence that arrives
+/// after the session is dead tells the developer what happened rather than what
+/// is about to. It names what will break, because "another window is open" is
+/// not actionable and "the shell in your other terminal will stop working" is.
+///
+/// Counts this laptop's own windows and claims nothing more — see `windows`. A
+/// colleague on a second laptop leaves no trace here, which is why the sentence
+/// says "your".
+async fn warn_about_open_windows(paths: &dyn Paths, ui: &Ui, record: &store::Record) {
+    let remote: Remote = record.into();
+    let open = windows::live(paths, &remote).await;
+    if open == 0 {
+        return;
+    }
+    ui.warn(&format!(
+        "{} of your riabuild windows {} still connected to {}. Forgetting it revokes that \
+         server's session and takes riabuild's key back out of its authorized_keys, so the \
+         shells in those terminals will stop working.",
+        open,
+        if open == 1 { "is" } else { "are" },
+        record.display_name()
+    ));
 }
 
 /// Everything [`forget_remote`] does *except* dropping the record: revoke the
@@ -183,6 +219,19 @@ pub(crate) async fn retire_identity(
     // have an `ssh-agent` behind it — neither of which belongs to a server
     // this laptop has been told to let go of.
     match tokio::fs::remove_dir_all(paths.agent_dir(&remote.hash())).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // And the two markers this laptop keeps *about its own windows* into that
+    // server: the lock that serialises minting its session, and the directory
+    // counting the terminals that have it open. Neither is a secret and neither
+    // does anything on its own, which is precisely why they would have been
+    // left behind for ever — a server forgotten and re-added under a new
+    // address is a new `Remote::hash` and would never reuse them.
+    remove_if_present(&paths.remote_session_lock_file(&remote.hash())).await?;
+    match tokio::fs::remove_dir_all(windows::dir(paths, &remote)).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -982,6 +1031,118 @@ mod tests {
              may still have an ssh-agent behind it"
         );
     }
+    /// A forget that will break the developer's other terminal says so first.
+    ///
+    /// It used to say nothing. Revoking the server's session, taking riabuild's
+    /// key back out of its `authorized_keys` and clearing the namespace are
+    /// three things that stop a shell somebody is sitting in, and the only
+    /// framing riabuild had for a second session on one server was "a
+    /// colleague" — which the developer's own second window is not. Now it is
+    /// counted and named.
+    ///
+    /// A warning and not a refusal, and the test says so twice over: the
+    /// `expect` below is the assertion that it still forgets. `forget` is a
+    /// destructive command typed by name, usually because something about that
+    /// server has gone wrong, and one that downed tools while a window was open
+    /// could not clean up the case it is most needed for.
+    #[tokio::test]
+    async fn forgetting_a_server_another_window_is_using_warns_before_it_starts() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+
+        // The other terminal: a window marker whose lock is held, which is what
+        // an open `riabuild remote` leaves behind for the length of its shell.
+        let windows = crate::windows::dir(&paths, &remote());
+        tokio::fs::create_dir_all(&windows).await.expect("mkdir");
+        let _other = riabuild_paths::filelock::FileLock::try_acquire(&windows.join("4242.lock"))
+            .await
+            .expect("lock")
+            .expect("free");
+
+        let mut store = store_with(SESSION_ID);
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+        let ui = Ui::new(false);
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &ui,
+            &revokes,
+            &NoCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("a warning is not a refusal");
+
+        let warning = ui
+            .warned()
+            .into_iter()
+            .find(|warning| warning.contains("still connected"))
+            .unwrap_or_else(|| panic!("nothing warned about the open window: {:?}", ui.warned()));
+        // Named, not merely counted: "another window is open" is not something
+        // a developer can act on, and "the shell in it will stop working" is.
+        assert!(warning.contains("stop working"), "{warning}");
+        assert!(warning.contains("build-01"), "{warning}");
+    }
+
+    /// …and a server nobody has open is forgotten without a word about windows.
+    ///
+    /// The half that keeps the warning worth reading. A sentence printed on
+    /// every `forget` is one nobody reads by the third time, and the count is
+    /// swept by the very call that reads it — so a window that ended yesterday
+    /// must not still be warned about today.
+    #[tokio::test]
+    async fn forgetting_a_server_nobody_has_open_says_nothing_about_windows() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let paths = riabuild_paths::RealPaths::rooted_at(home.path());
+        key_on_disk(&paths).await;
+
+        // A window that has ended: its marker is still on disk, and nothing
+        // holds the lock.
+        let windows = crate::windows::dir(&paths, &remote());
+        tokio::fs::create_dir_all(&windows).await.expect("mkdir");
+        drop(
+            riabuild_paths::filelock::FileLock::try_acquire(&windows.join("4242.lock"))
+                .await
+                .expect("lock")
+                .expect("free"),
+        );
+
+        let mut store = store_with(SESSION_ID);
+        let fake = runner_with_ssh(0, "");
+        let revokes = ScriptedRevoke::ok(fake.clone());
+        let ui = Ui::new(false);
+
+        forget_with(
+            &paths,
+            fake.clone(),
+            &ui,
+            &revokes,
+            &NoCarry,
+            MEMBER_ID,
+            &mut store,
+            "build-01",
+        )
+        .await
+        .expect("forgets");
+
+        assert!(
+            !ui.warned()
+                .iter()
+                .any(|warning| warning.contains("still connected")),
+            "a window that has ended is not a window: {:?}",
+            ui.warned()
+        );
+        assert!(
+            !windows.exists(),
+            "and the markers go with the server they name"
+        );
+    }
+
     /// I010. The id is read out of `remotes.json` and formatted straight into
     /// `/api/v1/cli/sessions/{id}`. This is the one call whose failure must
     /// stop `forget` before anything local changes, so an id carrying a `/` or

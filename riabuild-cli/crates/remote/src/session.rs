@@ -146,6 +146,40 @@ pub async fn ensure(
 ) -> Result<()> {
     let home = super::resolve_home(remote, paths, runner.clone(), store, carry).await?;
 
+    // One window at a time, from here until the token is recorded.
+    //
+    // **What follows is a read and a write with a network round trip between
+    // them, and one person with two terminals into one server is the ordinary
+    // way remote mode is used.** Run concurrently against a server whose token
+    // has expired, both windows find no usable one, both mint, and the second
+    // `remember_session` overwrites the first's `session_id` — leaving a live
+    // 90-day session on riabuild-web that no `riabuild remote forget` can name,
+    // which is the one state `usable_token` above says out loud must never be
+    // produced. The window that waits finds the other's token already in the
+    // keychain and on the record, and mints nothing.
+    //
+    // Held rather than tried: the wait is a second at most, and the thing on
+    // the other side of it is exactly the answer this window wants.
+    let _minting = riabuild_paths::filelock::FileLock::acquire(
+        &paths.remote_session_lock_file(&remote.hash()),
+        || ui.info("Waiting for the riabuild already signing this server in…"),
+    )
+    .await?;
+
+    // Re-read now the lock is held. A sibling window may have minted and
+    // recorded a session while this one waited, and reusing it is the whole
+    // point of having waited — the in-memory `store` was loaded before that
+    // happened. Only the two session fields are taken: everything else on this
+    // record is this run's own, including the home directory `resolve_home`
+    // just cached on it.
+    if let Some(fresh) = super::store::Store::load(paths).await.find(&remote.name) {
+        let (session_id, session_expires_at) = (fresh.session_id.clone(), fresh.session_expires_at);
+        if let Some(mine) = store.find_mut(&remote.name) {
+            mine.session_id = session_id;
+            mine.session_expires_at = session_expires_at;
+        }
+    }
+
     // The laptop's own cache of this server's session, kept under an account
     // named for the server so several servers never collide on one laptop
     // keychain entry, and revoking one server's session can never sign the

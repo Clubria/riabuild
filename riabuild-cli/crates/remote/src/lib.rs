@@ -45,6 +45,7 @@ pub mod shared;
 pub mod shell;
 mod ssh;
 pub mod store;
+mod windows;
 
 pub use flow::{forget_server, list, run};
 
