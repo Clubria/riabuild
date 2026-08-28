@@ -62,6 +62,14 @@ pub enum Command {
     },
     /// Print the environment riabuild would apply, as `export` lines.
     Env,
+    /// Print the config directory riabuild points each tool at.
+    ///
+    /// One line per Claude Code account, Codex profile and Grok Build profile,
+    /// with the variable that addresses it — `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+    /// `GROK_HOME` — and riabuild's own tree beneath them. Each account is a
+    /// uuid riabuild chose, so this is the only way to find out which directory
+    /// holds which login without reading a generated launcher.
+    Paths,
     /// Set up a server and open the Clubria environment on it.
     Remote {
         /// A saved server's name, or `[user@]host[:port]` to add one.

@@ -141,6 +141,13 @@ and trust the checkout.
 
 `riabuild claude` on its own is `list`.
 
+Each account lives in a config directory of its own, and `riabuild paths` prints which is
+which — every Claude Code account against its `CLAUDE_CONFIG_DIR`, every Codex and Grok
+Build profile against its `CODEX_HOME` and `GROK_HOME`, and riabuild's own tree beneath
+them. You need it when something riabuild did not write has to be pointed at one of those
+logins; the launchers set the variable themselves, so `claude`, `codex-3` and the rest
+never do.
+
 ## Other agents, tunnels, and keys
 
 `codex` and `codex-1` … `codex-9` are the Codex CLI, and `grok` and `grok-1` … `grok-9`

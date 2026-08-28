@@ -1008,6 +1008,18 @@ every environment shell opens with the account box, and the org's Claude setting
 checkout's trust, and the plugins the checkout declares apply to every account, never just
 the first.
 
+**`riabuild paths` prints those directories, which is not the same as exporting one.**
+`config_dirs` lists every account against its `CLAUDE_CONFIG_DIR`, every Codex and Grok
+Build profile against its `CODEX_HOME` and `GROK_HOME`, and riabuild's own tree beneath
+them — a page a developer reads, inherited by no process, so the paragraph above is
+untouched. It exists because a uuid riabuild chose is not something a developer can guess:
+without it, "which directory is my second login in?" is answered by opening a generated
+launcher. The one thing it asks rather than computes is who is signed in to each account,
+because a column of uuids with no logins beside it does not answer the question that was
+asked. Nothing there stats a directory: a path is what riabuild *would* point a tool at,
+on a machine nothing has provisioned as much as on one that is set up, and whether the
+machine is in shape is `riabuild --check`'s question.
+
 **Three things riabuild wants cannot be settings, and each has its own home.**
 `hasTrustDialogAccepted`, `hasCompletedOnboarding` and `defaultToAgentsView` are all
 `.claude.json` state that `--settings` cannot express, so `claude_trust`,

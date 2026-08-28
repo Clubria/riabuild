@@ -226,6 +226,10 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
     match &cli.command {
         Some(Command::Logout) => return logout(ctx).await,
         Some(Command::Env) => return print_env(ctx),
+        // Beside `claude` rather than behind `connect`, and for the same
+        // reason: it reads local directories and talks only to Claude Code, so
+        // it must work with no riabuild session and no network.
+        Some(Command::Paths) => return dispatch::paths(ctx).await,
         Some(Command::Shell) => return open_shell(ctx).await,
         Some(Command::Login) => return login(ctx).await,
         Some(Command::Remote {

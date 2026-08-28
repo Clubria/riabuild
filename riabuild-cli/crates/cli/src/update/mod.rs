@@ -95,6 +95,10 @@ pub fn applies_to(command: Option<&Command>) -> bool {
             | Command::MoveProject { .. }
             | Command::Remote { .. }
             | Command::Claude { .. }
+            // Its stdout is a page a person reads and copies one line out of,
+            // never something a shell evaluates — which is the whole of what
+            // separates it from `env` below.
+            | Command::Paths
             // Its stdout is a page a person reads, so the update runs — and it
             // runs before the alternate screen is entered, because
             // `keep_current` is the first thing `run_inner` does.

@@ -20,7 +20,7 @@ use riabuild_paths::{Paths, RealPaths};
 use riabuild_remote as remote;
 use riabuild_runner::{CommandRunner, RealRunner};
 use riabuild_tasks::Ctx;
-use riabuild_tasks::{accounts, shims};
+use riabuild_tasks::{accounts, config_dirs, shims};
 use riabuild_ui::{Failure, Ui};
 use std::sync::Arc;
 
@@ -176,6 +176,15 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
         ClaudeAction::Delete { number, yes } => accounts::command::delete(ctx, number, yes).await,
         ClaudeAction::Primary { number } => accounts::command::primary(ctx, number).await,
     }
+}
+
+/// `riabuild paths`
+///
+/// Not behind `connect`, for the reason `claude` is not: every path it prints
+/// is computed from this machine's own config, so it answers with no riabuild
+/// session, no network, and a machine nothing has provisioned.
+pub async fn paths(ctx: &Ctx) -> Result<i32> {
+    config_dirs::list(ctx).await
 }
 
 /// `riabuild agents`

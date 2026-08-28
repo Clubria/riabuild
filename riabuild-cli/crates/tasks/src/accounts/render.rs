@@ -49,12 +49,26 @@ pub fn accounts_box(accounts: &[Account], theme: Theme) -> String {
     lines.join("\n")
 }
 
-/// The command that runs this account. The primary answers to two names.
+/// The command that runs this account.
 fn label(account: &Account) -> String {
-    if account.number == 1 {
-        "claude-1 / claude".to_string()
+    launcher_label("claude", account.number)
+}
+
+/// The command that runs one of a tool's numbered profiles.
+///
+/// The first answers to two names — `claude-1` and `claude`, `codex-1` and
+/// `codex` — because every launcher riabuild writes gives it both, and a list
+/// has to say which of them the bare name is.
+///
+/// Shared with `config_dirs`, which lists the same names against the
+/// directories they point at: two spellings of "what is this profile called"
+/// would eventually disagree, and the one a developer would meet is a paths
+/// listing naming a launcher the accounts box does not.
+pub fn launcher_label(tool: &str, number: usize) -> String {
+    if number == 1 {
+        format!("{tool}-1 / {tool}")
     } else {
-        format!("claude-{}", account.number)
+        format!("{tool}-{number}")
     }
 }
 

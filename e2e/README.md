@@ -28,6 +28,7 @@ So this covers the seams no unit test reaches:
 | the shell handoff | real `zsh` and `bash` resolving `node`, `pnpm` and `claude` |
 | `CLAUDE_CONFIG_DIR` | still redirecting Claude Code, which is undocumented and therefore only true while something tests it |
 | Claude Code accounts | `riabuild claude list` on a real machine, and account 1's sign-in state as *real* Claude Code reports it |
+| `riabuild paths` | the config directory it prints for account 1 is the one that is actually on the machine, not one the layout code agrees with itself about |
 | the Keychain | `security(1)`, on macOS, storing and deleting the session token |
 
 ## What is faked
