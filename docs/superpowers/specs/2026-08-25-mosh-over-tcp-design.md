@@ -141,6 +141,21 @@ client exist, the same place and for the same reason as `internal askpass`.
 line printed before that would tell the laptop to start sending into a listener that may
 never have bound — and the first thing it would send is the session.
 
+**The subcommand names are one constant each, shared by both ends.** `mosh::UDP_ECHO` and
+`mosh::TCP2UDP` are what the laptop builds its remote command out of *and* what `cli.rs`
+names the clap variants with. That is not tidiness. As shipped, clap derived the far end's
+name from `MoshTcp2Udp` and got **`mosh-tcp2-udp`** — it breaks before the `Udp`, which no
+human spelling of this ever did — while the laptop asked for `mosh-tcp2udp`. So the tunnel
+never came up on any server, ever: clap wrote `unrecognized subcommand` to stderr and
+exited, the laptop read a closed stdout as "this server cannot run the far end", and fell
+back to `ssh` with a warning. Every test in the module passed throughout, because each one
+tested one side against a hand-written stand-in for the other and no test crossed the clap
+boundary. The two guards are `the_server_answers_the_subcommands_the_laptop_sends`, which
+parses the laptop's own spelling, and
+`a_datagram_crosses_both_halves_of_the_tunnel_and_comes_back`, which wires the real
+`tunnel::join` to the real `serve::serve` over a pipe standing in for ssh's stdio and
+pushes a datagram the whole way through.
+
 Two mechanical details that are load-bearing and easy to undo:
 
 - the line is read a **byte at a time**, deliberately not through a `BufReader`. A reader

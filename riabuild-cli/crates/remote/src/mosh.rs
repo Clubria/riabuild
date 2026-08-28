@@ -47,6 +47,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// own UDP is wide open. Asking the real path answers both at once.
 const MOSH_PORTS: std::ops::RangeInclusive<u16> = 60000..=61000;
 
+/// The `internal` subcommand that answers the UDP probe on the server.
+///
+/// Named here rather than written out at each end for the reason [`TCP2UDP`]
+/// records.
+pub const UDP_ECHO: &str = "udp-echo";
+
+/// The `internal` subcommand that is the server's end of the tunnel.
+///
+/// A constant, and used both by the laptop building the remote command and by
+/// `cli.rs` naming the clap variant, because the two spellings drifting apart
+/// is a failure no test in this repository could see: clap's own kebab-casing
+/// of `MoshTcp2Udp` is `mosh-tcp2-udp`, the laptop asked for `mosh-tcp2udp`,
+/// and the whole feature answered every session with "unrecognized subcommand"
+/// on stderr, a closed stdout, and a silent fall back to `ssh`. Nothing on
+/// either machine said so, because falling back quietly is exactly what
+/// `open_over_tcp` returning `None` is *supposed* to do when a server cannot
+/// run the far end.
+pub const TCP2UDP: &str = "mosh-tcp2udp";
+
 /// What `internal udp-echo` prints once it has a socket, followed by the port.
 const ECHO_PORT_LINE: &str = "RIABUILD-UDP-ECHO";
 
@@ -124,7 +143,7 @@ pub(crate) async fn ask(
 ) -> Route {
     let script = format!(
         "command -v mosh-server >/dev/null 2>&1 || exit {NO_MOSH_SERVER}; \
-         exec {binary} internal udp-echo"
+         exec {binary} internal {UDP_ECHO}"
     );
     let child = match Ssh::to(remote, paths, runner.clone())
         .carry(carry)
@@ -393,6 +412,77 @@ mod tests {
         let mut to = Vec::new();
         pump(from, &mut to).await.expect("pumps");
         assert_eq!(to, b"one");
+    }
+
+    /// The test the whole feature was missing: a datagram that goes in one end
+    /// of the tunnel and comes back out of it, with **both real halves** wired
+    /// to each other over a pipe that stands in for ssh's stdio.
+    ///
+    /// Every other test in this module tests one side against a hand-written
+    /// stand-in for the other, and all of them passed while the feature was
+    /// dead: the laptop asked for `internal mosh-tcp2udp` and clap had named
+    /// the subcommand `mosh-tcp2-udp`, so no server ever got past the usage
+    /// error. That mismatch is now impossible — [`TCP2UDP`] is the one spelling
+    /// both ends are built from — and this is what would catch the next
+    /// wiring bug regardless of where it is.
+    #[tokio::test]
+    async fn a_datagram_crosses_both_halves_of_the_tunnel_and_comes_back() {
+        // Standing in for `mosh-server`, which the tunnel only ever reaches on
+        // loopback and which this test needs nothing else about.
+        let mosh = tokio::net::UdpSocket::bind(loopback(0))
+            .await
+            .expect("a socket");
+        let mosh_port = mosh.local_addr().expect("an address").port();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 2048];
+            while let Ok((read, from)) = mosh.recv_from(&mut buffer).await {
+                let mut back = b"PONG:".to_vec();
+                back.extend_from_slice(&buffer[..read]);
+                let _ = mosh.send_to(&back, from).await;
+            }
+        });
+
+        // ssh's stdio: one duplex stream, split at each end exactly as the two
+        // halves see it.
+        let (laptop, server) = tokio::io::duplex(64 * 1024);
+        let (laptop_reads, laptop_writes) = tokio::io::split(laptop);
+        let (server_reads, server_writes) = tokio::io::split(server);
+        tokio::spawn(async move { serve::serve(mosh_port, server_reads, server_writes).await });
+
+        let joined = tokio::time::timeout(
+            Duration::from_secs(10),
+            tunnel::join(laptop_reads, laptop_writes),
+        )
+        .await
+        .expect("the far end announces itself in time")
+        .expect("a joined tunnel");
+
+        let client = tokio::net::UdpSocket::bind(loopback(0))
+            .await
+            .expect("a socket");
+        client
+            .connect(loopback(joined.port))
+            .await
+            .expect("connects");
+        client.send(b"HELLO").await.expect("sends");
+
+        let mut back = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(10), client.recv(&mut back))
+            .await
+            .expect("an answer in time")
+            .expect("an answer");
+        assert_eq!(&back[..read], b"PONG:HELLO");
+        joined.stop();
+    }
+
+    /// The two spellings that used to be able to drift apart, now the same
+    /// constant — and the shape the laptop actually sends, so a `binary` prefix
+    /// or an argument moving still has to keep the subcommand where clap can
+    /// see it.
+    #[test]
+    fn both_ends_name_the_same_subcommand() {
+        assert_eq!(TCP2UDP, "mosh-tcp2udp");
+        assert_eq!(UDP_ECHO, "udp-echo");
     }
 
     /// The probe asks about the ports mosh actually uses. A range that had

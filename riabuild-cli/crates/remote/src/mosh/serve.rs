@@ -56,7 +56,7 @@ pub async fn udp_echo() -> Result<i32> {
         .detail(error.to_string())
     })?;
     let port = socket.local_addr()?.port();
-    announce(&format!("{} {port}", super::ECHO_PORT_LINE))?;
+    announce_port(&format!("{} {port}", super::ECHO_PORT_LINE))?;
 
     let echoing = async {
         let mut buffer = vec![0u8; 2048];
@@ -77,7 +77,7 @@ pub async fn udp_echo() -> Result<i32> {
     Ok(0)
 }
 
-/// `riabuild internal mosh-tcp2udp --port <mosh-port>` — the server end of the
+/// `riabuild internal mosh-tcp2udp <mosh-port>` — the server end of the
 /// tunnel: TCP frames in over ssh's stdio, datagrams out to `mosh-server`.
 ///
 /// Three sockets, all of them loopback, which is what makes this need nothing
@@ -93,6 +93,22 @@ pub async fn udp_echo() -> Result<i32> {
 /// riabuild owning a wire protocol it does not own, and the hop costs a memcpy
 /// on traffic measured in keystrokes.
 pub async fn tcp2udp(mosh_port: u16) -> Result<i32> {
+    serve(mosh_port, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// [`tcp2udp`] with the stdio ssh gave it as parameters.
+///
+/// Split out for one reason: it is the half of the tunnel that cannot be
+/// reached from a test otherwise, because in production its two ends are this
+/// process's real stdin and stdout. With the stream as an argument, the laptop
+/// half in `tunnel::join` can be wired straight to it over a pair of pipes and
+/// a datagram pushed the whole way through — which is the only test that would
+/// have caught either end being unable to speak to the other.
+pub(super) async fn serve<R, W>(mosh_port: u16, mut incoming: R, mut outgoing: W) -> Result<i32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let port = free_local_port().await?;
     let mut options =
         udp_over_tcp::tcp2udp::Options::new(vec![loopback(port)], loopback(mosh_port));
@@ -108,31 +124,42 @@ pub async fn tcp2udp(mosh_port: u16) -> Result<i32> {
     let listening = tokio::spawn(async move { udp_over_tcp::tcp2udp::run(options).await });
 
     let stream = dial(port).await?;
-    // Only now. A ready line printed before the connection succeeded would
-    // tell the laptop to start sending into a listener that may never have
-    // bound, and the first thing it would send is the session.
-    announce(TUNNEL_READY_LINE)?;
+    // Only now, and down the same writer the frames go down rather than a
+    // second handle onto the same file descriptor. A ready line printed before
+    // the connection succeeded would tell the laptop to start sending into a
+    // listener that may never have bound, and the first thing it would send is
+    // the session.
+    announce(&mut outgoing).await?;
 
-    let (incoming, outgoing) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    let (from_mosh, to_mosh) = stream.into_split();
     tokio::select! {
         // The laptop closing stdin is how a session ends cleanly, and how a
         // laptop that went away ends one that did not.
-        _ = pump(&mut stdin, outgoing) => {}
-        _ = pump(incoming, &mut stdout) => {}
+        _ = pump(&mut incoming, to_mosh) => {}
+        _ = pump(from_mosh, &mut outgoing) => {}
     }
     listening.abort();
     Ok(0)
 }
 
-/// Prints one protocol line and makes sure it has actually left the process.
+/// Writes the tunnel's ready line and makes sure it has actually left.
 ///
 /// The flush is not decoration. stdout here is a pipe rather than a terminal,
 /// so it is block-buffered, and a ready line that never left would deadlock
 /// both ends against each other: the laptop waiting for a line, this process
 /// waiting for a session that the laptop will not start until it sees one.
-fn announce(line: &str) -> Result<()> {
+async fn announce<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    writer
+        .write_all(format!("{TUNNEL_READY_LINE}\n").as_bytes())
+        .await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// The same, for the echo responder, whose stdout carries one line and then
+/// nothing at all — so it has no stream to be handed and writes its own.
+fn announce_port(line: &str) -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{line}")?;

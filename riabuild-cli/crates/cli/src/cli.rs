@@ -190,6 +190,7 @@ pub enum InternalAction {
     /// stdout carries one protocol line and nothing else, which is why — like
     /// `askpass` — it is dispatched before the banner and the API client
     /// exist.
+    #[command(name = riabuild_remote::mosh::UDP_ECHO)]
     UdpEcho,
     /// Carry a mosh session's datagrams between this process's stdio and a
     /// local `mosh-server`.
@@ -197,6 +198,14 @@ pub enum InternalAction {
     /// The server end of the tunnel riabuild opens when UDP cannot reach this
     /// machine. After one ready line its **stdout is the wire**, so nothing
     /// else may ever print on it.
+    ///
+    /// Named from the constant the laptop builds the command out of, because
+    /// clap's own kebab-casing of `MoshTcp2Udp` is `mosh-tcp2-udp` — it breaks
+    /// before the `Udp`, which no human spelling of this ever did. The laptop
+    /// asks for `mosh-tcp2udp`, so the derived name meant every tunnel got
+    /// clap's "unrecognized subcommand" on stderr, an immediately closed
+    /// stdout, and a silent fall back to `ssh`.
+    #[command(name = riabuild_remote::mosh::TCP2UDP)]
     MoshTcp2Udp {
         /// The loopback UDP port `mosh-server` is listening on, from the
         /// `MOSH CONNECT` line the laptop already read.
@@ -317,6 +326,40 @@ mod tests {
             riabuild_version::parse(VERSION).is_some(),
             "VERSION {VERSION:?} does not parse as a version"
         );
+    }
+
+    /// The server has to answer the exact subcommand the laptop sends, and
+    /// nothing else in this repository was checking that it did.
+    ///
+    /// clap's kebab-casing of `MoshTcp2Udp` is `mosh-tcp2-udp`, so the tunnel
+    /// spent its whole life being answered with "unrecognized subcommand" on
+    /// stderr and a closed stdout — read by the laptop as a server that cannot
+    /// run the far end, which is a silent fall back to `ssh` by design. Both
+    /// names now come from one constant in `riabuild_remote::mosh`; this is the
+    /// test that clap agrees, which asserting the constants against each other
+    /// could not do.
+    #[test]
+    fn the_server_answers_the_subcommands_the_laptop_sends() {
+        let cli = Cli::parse_from([
+            "riabuild",
+            "internal",
+            riabuild_remote::mosh::TCP2UDP,
+            "60001",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Internal {
+                action: InternalAction::MoshTcp2Udp { port: 60001 }
+            })
+        ));
+
+        let cli = Cli::parse_from(["riabuild", "internal", riabuild_remote::mosh::UDP_ECHO]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Internal {
+                action: InternalAction::UdpEcho
+            })
+        ));
     }
 
     #[test]
