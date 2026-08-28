@@ -185,7 +185,7 @@ stage_table() {
 11|11-machine.sh|What it did to the machine|04 10
 12|12-invariant.sh|The invariant the whole task engine rests on|10
 13|13-environment.sh|The environment a developer actually lands in|04 10 11
-14|14-claude-accounts.sh|The accounts a developer can see and manage|10
+14|14-claude-accounts.sh|The accounts a developer can see and manage|10 11
 15|15-claude-config-dir.sh|CLAUDE_CONFIG_DIR still redirects Claude Code|13
 16|16-signing-out.sh|Signing out|09 10
 TABLE

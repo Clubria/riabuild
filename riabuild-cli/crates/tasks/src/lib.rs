@@ -26,6 +26,7 @@ pub mod claude_plugins;
 pub mod claude_statusline;
 pub mod claude_trust;
 pub mod codex_cli;
+pub mod config_dirs;
 mod ctx;
 pub mod engine;
 pub mod env_local;

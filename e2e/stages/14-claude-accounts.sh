@@ -40,3 +40,31 @@ else
   check_contains "the box offers the command that fixes it" "$LIST_OUT" "claude-1 auth login"
 fi
 
+
+# ---------------------------------------------------------------------------
+# The directories behind those accounts
+# ---------------------------------------------------------------------------
+
+step "riabuild paths"
+
+# Local for the same reasons `claude list` is — no session, no network — and
+# asserted here rather than in a unit test because the whole value of the
+# command is that the path it prints is the directory that is *really* there.
+# Unit tests pin the layout against a tempdir; only a provisioned machine can
+# disagree with it.
+if ! PATHS_OUT="$(riabuild paths 2>&1)"; then
+  printf '%s\n' "$PATHS_OUT" | sed 's/^/         | /' >&2
+  die "riabuild paths failed."
+fi
+printf '%s\n' "$PATHS_OUT" | sed 's/^/         | /'
+check_contains "the variable that points Claude Code at an account is named" \
+  "$PATHS_OUT" "CLAUDE_CONFIG_DIR"
+# The path itself, not the heading: this is the assertion that the directory
+# riabuild prints is the one `11-machine.sh` found on disk and the one the
+# launcher execs against.
+check_contains "account 1's config directory is the one on this machine" \
+  "$PATHS_OUT" "$RIA_HOME/claude/$CLAUDE_ACCOUNT"
+check_contains "the Codex home of the first profile is named" \
+  "$PATHS_OUT" "$RIA_HOME/codex/1"
+check_contains "the Grok Build home of the first profile is named" \
+  "$PATHS_OUT" "$RIA_HOME/grok/1"

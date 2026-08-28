@@ -42,6 +42,7 @@ pub(crate) fn opens_shell(cli: &Cli) -> bool {
             | Command::Login
             | Command::Logout
             | Command::Env
+            | Command::Paths
             | Command::Remote { .. }
             | Command::MoveProject { .. }
             | Command::Channel { .. }
