@@ -706,7 +706,24 @@ jobs:
           version=2026.08.06
           mkdir -p build
 
-          printf '#!/bin/sh\necho "riabuild %s"\n' "$version" > build/riabuild
+          # The stub answers the two things build-packages.sh asks a binary:
+          # its version, and a completion script per shell. The completions
+          # branch has to be here rather than falling through to the version
+          # line, because build-packages.sh only rejects an *empty* script — a
+          # stub that echoed its version for every argv would produce three
+          # one-line files, install them, and let every assertion downstream
+          # pass while proving nothing about the real generator. The real one
+          # is covered by `cargo test -p riabuild-cli`; what this job tests is
+          # the templates.
+          {
+            echo '#!/bin/sh'
+            echo 'if [ "$1" = internal ] && [ "$2" = completions ]; then'
+            echo '  echo "# riabuild $3 completions"'
+            echo '  echo "_riabuild() { :; }"'
+            echo '  exit 0'
+            echo 'fi'
+            echo "echo \"riabuild $version\""
+          } > build/riabuild
           chmod 0755 build/riabuild
 
           packaging/build-packages.sh --version "$version" \

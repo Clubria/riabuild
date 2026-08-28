@@ -75,13 +75,26 @@ if [ -n "$deb" ]; then
   # MIT asks that the notice travel with every copy, including a binary one.
   # Debian looks for it under this exact name.
   grep -q './usr/share/doc/riabuild/copyright' <<<"$contents"
+  # A completion that is not in the directory its shell searches is not a
+  # completion. These paths are the whole feature — nothing on a developer's
+  # machine sources them by name, and nothing errors when they are absent, so
+  # a wrong directory presents as `riabuild <TAB>` quietly doing nothing.
+  grep -q './usr/share/bash-completion/completions/riabuild' <<<"$contents"
+  grep -q './usr/share/zsh/vendor-completions/_riabuild' <<<"$contents"
+  grep -q './usr/share/fish/vendor_completions.d/riabuild.fish' <<<"$contents"
   test "$(dpkg-deb --field "$deb" Version)" = "$version"
   test "$(dpkg-deb --field "$deb" Architecture)" = "$deb_arch"
 fi
 
 if [ -n "$rpm" ]; then
   rpm -qip "$rpm"
-  grep -qx '/usr/bin/riabuild' <<<"$(rpm -qlp "$rpm")"
+  rpm_contents="$(rpm -qlp "$rpm")"
+  grep -qx '/usr/bin/riabuild' <<<"$rpm_contents"
+  # The deb's three, at Fedora's spelling of the zsh one. Same reasoning: an
+  # absent completion is silent on the machine that has it.
+  grep -qx '/usr/share/bash-completion/completions/riabuild' <<<"$rpm_contents"
+  grep -qx '/usr/share/zsh/site-functions/_riabuild' <<<"$rpm_contents"
+  grep -qx '/usr/share/fish/vendor_completions.d/riabuild.fish' <<<"$rpm_contents"
   test "$(rpm -qp --queryformat '%{VERSION}' "$rpm")" = "$version"
   test "$(rpm -qp --queryformat '%{ARCH}' "$rpm")" = "$rpm_arch"
   # AutoReq is off, so an explicit Requires is the only way git gets declared —
@@ -124,6 +137,12 @@ if [ -n "$deb" ]; then
       apt-get install -y -qq "/dist/$DEB"
       test "$(riabuild --version)" = "riabuild $VERSION"
       dpkg -S "$(command -v riabuild)" | grep -q riabuild
+      # Sourced, not just present. A generated script that landed in the right
+      # directory and does not parse is the failure this catches, and it is
+      # otherwise invisible: bash-completion swallows the error, so the only
+      # symptom is Tab doing nothing on a developer'"'"'s machine.
+      source /usr/share/bash-completion/completions/riabuild
+      type _riabuild >/dev/null
     '
 fi
 
@@ -136,6 +155,8 @@ if [ -n "$rpm" ]; then
       dnf install -y "/dist/$RPM"
       test "$(riabuild --version)" = "riabuild $VERSION"
       rpm -qf "$(command -v riabuild)" | grep -q riabuild
+      source /usr/share/bash-completion/completions/riabuild
+      type _riabuild >/dev/null
     '
 fi
 

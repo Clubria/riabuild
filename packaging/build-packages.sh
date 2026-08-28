@@ -73,6 +73,42 @@ check_rendered() {
   fi
 }
 
+# The shell completion scripts both packages install, generated once by the
+# binary being packaged.
+#
+# Generated rather than kept as three files in packaging/: they are rendered
+# from the same clap `Cli` the binary parses argv with, so a renamed subcommand
+# cannot leave a stale completion behind. See `internal::completions`.
+#
+# **This runs $binary**, which is fine in both callers and worth saying out loud
+# because it is the one assumption here that a future change could break.
+# release.yml packages each architecture on the runner that built it — its own
+# comment gives rpmbuild's refusal to cross-build as the reason — and ci.yml
+# passes a stub shell script. A caller that packaged a foreign-architecture
+# binary would get "cannot execute binary file" here. Completion scripts carry
+# nothing architecture-specific, so the fix in that case is to generate once and
+# reuse the output, never to skip them.
+#
+# Written to a file rather than piped, so a short write is an error rather than
+# a truncated completion nobody notices. Emptiness is checked for the same
+# reason: `set -o pipefail` cannot see a binary that exits 0 having printed
+# nothing, and an empty file installed where a shell autoloads it is a broken
+# completion rather than an absent one.
+completions="$builddir/completions"
+rm -rf "$completions"
+mkdir -p "$completions"
+for shell in bash zsh fish; do
+  case "$shell" in
+    # The names each shell expects. bash and fish look for the command's own
+    # name; zsh's autoloader wants the `_name` convention.
+    bash) out="$completions/riabuild" ;;
+    zsh) out="$completions/_riabuild" ;;
+    fish) out="$completions/riabuild.fish" ;;
+  esac
+  "$binary" internal completions "$shell" > "$out"
+  [ -s "$out" ] || die "$binary printed no $shell completion script"
+done
+
 if [ -n "$deb_arch" ]; then
   debroot="$builddir/deb-$deb_arch"
   rm -rf "$debroot"
@@ -82,6 +118,16 @@ if [ -n "$deb_arch" ]; then
   # Debian looks for the licence under this name, and MIT asks that the notice
   # travel with every copy — including a binary one.
   cp "$root/LICENSE" "$debroot/usr/share/doc/riabuild/copyright"
+  # The three directories Debian's own shells already search, so a developer who
+  # installs the package has completions on their next shell and does nothing.
+  # `vendor-completions` rather than `site-functions` for zsh: the former is
+  # what a package owns and the latter is the local administrator's.
+  install -Dm0644 "$completions/riabuild" \
+    "$debroot/usr/share/bash-completion/completions/riabuild"
+  install -Dm0644 "$completions/_riabuild" \
+    "$debroot/usr/share/zsh/vendor-completions/_riabuild"
+  install -Dm0644 "$completions/riabuild.fish" \
+    "$debroot/usr/share/fish/vendor_completions.d/riabuild.fish"
   sed -e "s|@VERSION@|$version|g" -e "s|@DEB_ARCH@|$deb_arch|g" \
     "$root/packaging/debian/control.in" > "$debroot/DEBIAN/control"
   check_rendered "$debroot/DEBIAN/control"
@@ -97,6 +143,11 @@ if [ -n "$rpm_arch" ]; then
   mkdir -p "$rpmsrc"
   install -m0755 "$binary" "$rpmsrc/riabuild"
   cp "$root/LICENSE" "$rpmsrc/LICENSE"
+  # There is no %prep, so everything the spec installs has to be in _sourcedir —
+  # the same route LICENSE above already takes.
+  cp "$completions/riabuild" "$rpmsrc/riabuild.bash"
+  cp "$completions/_riabuild" "$rpmsrc/_riabuild"
+  cp "$completions/riabuild.fish" "$rpmsrc/riabuild.fish"
   spec="$builddir/riabuild-$rpm_arch.spec"
   sed -e "s|@VERSION@|$version|g" -e "s|@RPM_ARCH@|$rpm_arch|g" \
     "$root/packaging/rpm/riabuild.spec.in" > "$spec"

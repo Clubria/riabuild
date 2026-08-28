@@ -115,6 +115,12 @@ base64 = "0.22"
 # is built on, so the returned futures get boxed instead.
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+# Generates the shell completion scripts the packages install. Only the binary
+# depends on it, and only the hidden `internal completions` subcommand reaches
+# it — the completions are rendered from the same `Cli` struct clap parses with,
+# so a new subcommand is completable the moment it exists rather than when
+# somebody remembers to update a hand-written script.
+clap_complete = "4.5"
 flate2 = "1.0"
 # `getrandom` rather than `rand`: the two things riabuild randomises are a v4
 # account id and reconnect jitter, both of which want raw OS bytes — there is

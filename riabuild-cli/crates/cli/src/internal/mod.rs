@@ -309,9 +309,175 @@ pub(crate) async fn askpass(
     Ok(0)
 }
 
+/// The completion script itself, as bytes.
+///
+/// Split from the stdout write beside it so the tests below can read what is
+/// generated. A test cannot capture this process's stdout, and the properties
+/// worth pinning are about the *script*: that every shell the packages install
+/// renders one, and that the `internal` plumbing stays out of what a developer
+/// is offered.
+///
+/// **`#[command(hide = true)]` does not reach a generated script, so `internal`
+/// is emptied here by hand.** `clap_complete`'s ahead-of-time generators
+/// consult `is_hide_set` for a *possible value* and never for a subcommand —
+/// only the dynamic engine filters those — so `riabuild --help` hiding
+/// `internal` bought nothing at all here: every one of its subcommands was
+/// offered, and pressing Tab after `riabuild internal ` proposed
+/// `ngrok-token`, which prints the team's authtoken, and `seed-github`, which
+/// reads a GitHub token off stdin. Neither is a command a person has any
+/// reason to run, and a completion list is exactly where somebody finds one to
+/// try.
+///
+/// Replacing it with an empty `Command` of the same name is what the builder
+/// allows: `mut_subcommand` hands over the subcommand by value and takes a
+/// replacement, and there is no API for removing one outright. So `internal`
+/// itself still appears in the top-level list and completes to nothing beyond
+/// that, which is the half worth having — its *existence* was never secret
+/// (every generated shim in `~/.riabuild/bin` names it, and `ps` shows it),
+/// whereas its argv is plumbing riabuild types at itself.
+///
+/// This is version-pinned behaviour, not a rule: if a later `clap_complete`
+/// starts honouring `hide` in the aot generators, this becomes redundant
+/// rather than wrong. `the_hidden_internal_plumbing_is_never_offered` is what
+/// notices either way.
+fn render_completions(shell: clap_complete::Shell) -> Vec<u8> {
+    use clap::CommandFactory;
+
+    let mut command = crate::cli::Cli::command()
+        .mut_subcommand("internal", |_| clap::Command::new("internal").hide(true));
+    let mut script: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut command, "riabuild", &mut script);
+    script
+}
+
+/// `riabuild internal completions <shell>` — the completion script for one
+/// shell, on stdout.
+///
+/// Rendered from the same `Cli` struct clap parses argv with, so what a
+/// developer can complete and what riabuild accepts cannot drift: a subcommand
+/// or a flag is completable in the release it is added in, without anybody
+/// remembering to edit a second file. That is the whole reason this is
+/// generated rather than three hand-written scripts in `packaging/`.
+///
+/// **Run at packaging time, never on a developer's machine.** The Homebrew
+/// formula calls it through `generate_completions_from_executable`, and
+/// `packaging/build-packages.sh` calls it once per shell and installs what it
+/// prints into the deb and the rpm, where bash, zsh and fish already look. So
+/// completions arrive with the package and there is nothing for a developer to
+/// turn on — which is not a convenience, it is the only shape available:
+/// riabuild does not write to anybody's `.bashrc`, `.zshrc` or `config.fish`
+/// (`../CLAUDE.md`, on `x.ai/cli/install.sh`), so a completion that needed a
+/// line adding to a rcfile would be one nobody ever has.
+///
+/// Takes no `Ctx`, reads nothing about the machine and opens no socket, for
+/// `launch`'s reason one step further: this runs inside Homebrew's build
+/// sandbox and inside a `dpkg-deb` staging tree, where there is no
+/// `~/.riabuild`, no session and no network.
+///
+/// **Generated into a buffer first, then written once.** `clap_complete`'s
+/// writer takes a `&mut dyn Write` and unwraps what it gets back, so handing
+/// it stdout directly would turn a closed pipe into a panic with a Rust
+/// backtrace — the failure the workspace's `panic = "deny"` policy exists to
+/// keep out of a shipped provisioner. A `Vec<u8>` cannot fail that write, and
+/// the one that can then costs an ordinary `?`.
+pub(crate) fn completions(shell: clap_complete::Shell) -> Result<i32> {
+    use std::io::Write;
+
+    let script = render_completions(shell);
+
+    // `write_all` on the lock rather than `print!`, which would panic on the
+    // same closed pipe this is written into a buffer to avoid.
+    //
+    // A reader that stopped reading is not a failure of this command — a
+    // maintainer piping it into `head` to look at it is the ordinary way to
+    // read a generated script, and `EPIPE` there is the pipeline working. It
+    // reached `Failure`'s "send this to your team lead, it is a bug in
+    // riabuild" before this arm existed, which is a sentence that sends
+    // somebody to report `head`. Every other write error still surfaces:
+    // packaging redirects this to a *file*, where a short write means a full
+    // disk and a truncated completion script, and that must be loud.
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(&script).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three the packages actually install. `clap_complete` can render
+    /// more, and nothing installs those, so this list is the contract rather
+    /// than the library's full set.
+    const PACKAGED_SHELLS: [clap_complete::Shell; 3] = [
+        clap_complete::Shell::Bash,
+        clap_complete::Shell::Zsh,
+        clap_complete::Shell::Fish,
+    ];
+
+    fn script_for(shell: clap_complete::Shell) -> String {
+        String::from_utf8(render_completions(shell)).expect("a completion script is UTF-8")
+    }
+
+    #[test]
+    fn every_shell_the_packages_install_renders_a_script_naming_riabuild() {
+        // `build-packages.sh` and the Homebrew formula each install one file
+        // per shell in this list. A shell clap_complete stopped supporting
+        // would otherwise be an empty file installed where a shell autoloads
+        // it, which is a broken completion rather than an absent one.
+        for shell in PACKAGED_SHELLS {
+            let script = script_for(shell);
+            assert!(!script.is_empty(), "{shell} rendered nothing");
+            assert!(
+                script.contains("riabuild"),
+                "{shell}'s script never names the binary: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_offer_the_commands_developers_type() {
+        // The point of generating rather than hand-writing: these are real
+        // subcommands off `Cli`, so this fails when one is renamed without the
+        // completions following. `move-project` is in the list deliberately —
+        // it is the kebab-cased spelling, which a hand-written script is most
+        // likely to get wrong.
+        for shell in PACKAGED_SHELLS {
+            let script = script_for(shell);
+            for command in ["remote", "move-project", "status", "agents"] {
+                assert!(
+                    script.contains(command),
+                    "{shell}'s script does not offer `{command}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hidden_internal_plumbing_is_never_offered() {
+        // `internal` is riabuild talking to itself over SSH: every one of its
+        // subcommands either needs argv a person cannot produce or writes a
+        // payload to stdout. `ngrok-token` prints the team's authtoken and
+        // `seed-github` reads a GitHub token off stdin — a completion list is
+        // exactly where somebody finds a command like that and tries it.
+        //
+        // `#[command(hide = true)]` does *not* cover this: clap_complete's aot
+        // generators ignore it for subcommands, so all ten were offered until
+        // `render_completions` emptied the subtree by hand. Asserted on the
+        // subcommand names rather than on `internal`, which still appears in
+        // the top-level list and cannot be removed through clap's builder.
+        for shell in PACKAGED_SHELLS {
+            let script = script_for(shell);
+            for hidden in ["ngrok-token", "seed-github", "gh-sweep", "agent-turn"] {
+                assert!(
+                    !script.contains(hidden),
+                    "{shell}'s script offers the hidden `{hidden}`"
+                );
+            }
+        }
+    }
 
     fn api_error(code: &str, message: &str) -> anyhow::Error {
         riabuild_api::ApiError {
