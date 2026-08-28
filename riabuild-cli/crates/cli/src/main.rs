@@ -131,6 +131,13 @@ async fn run(cli: Cli) -> Result<i32> {
                 let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
                 return internal::launch(runner.as_ref(), action).await;
             }
+            // And `completions` for the same two reasons at once: its stdout
+            // is a script a shell sources, and it runs inside Homebrew's build
+            // sandbox and a `dpkg-deb` staging tree, where there is no
+            // `~/.riabuild` for a `Ctx` to read.
+            cli::InternalAction::Completions { shell } => {
+                return internal::completions(*shell);
+            }
             _ => {}
         }
     }
@@ -285,7 +292,8 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
                 cli::InternalAction::Askpass { .. }
                 | cli::InternalAction::UdpEcho
                 | cli::InternalAction::MoshTcp2Udp { .. }
-                | cli::InternalAction::Launch { .. },
+                | cli::InternalAction::Launch { .. }
+                | cli::InternalAction::Completions { .. },
         }) => unreachable!("the stdout-is-a-payload subcommands answer before a Ctx is built"),
         Some(Command::Status) | None => {}
     }

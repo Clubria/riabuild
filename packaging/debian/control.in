@@ -6,7 +6,7 @@ Section: devel
 Priority: optional
 Homepage: https://riabuild.clubria.com
 Depends: git
-Recommends: libsecret-tools, xdg-utils
+Recommends: libsecret-tools, xdg-utils, bash-completion
 Description: Sets up a Clubria developer's machine and opens the Clubria environment
  riabuild gets a developer from "accepted a GitHub org invite" to "running
  Claude Code against the Clubria codebase with working secrets" without them
@@ -21,3 +21,5 @@ Description: Sets up a Clubria developer's machine and opens the Clubria environ
  without it riabuild works only with RIABUILD_TOKEN set, which is the right
  answer on a headless box and the wrong one on a laptop. xdg-utils provides
  xdg-open, used once, to put the browser in front of the GitHub sign-in.
+ bash-completion loads the completion file this package installs; zsh and fish
+ need nothing extra, so it is a Recommends rather than a Depends.

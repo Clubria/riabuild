@@ -315,6 +315,38 @@ pub enum InternalAction {
         /// `MOSH CONNECT` line the laptop already read.
         port: u16,
     },
+
+    /// Print the shell completion script for one shell, on stdout.
+    ///
+    /// Run at *packaging* time, not on a developer's machine: the Homebrew
+    /// formula and `packaging/build-packages.sh` each call this once and
+    /// install what it prints where bash, zsh and fish already look. Nothing a
+    /// developer types ever reaches it, and nothing they have to type ever
+    /// will — that is the point. riabuild does not write to anybody's
+    /// `.bashrc`, `.zshrc` or `config.fish`, for the reason `CLAUDE.md` gives
+    /// about `x.ai/cli/install.sh`, so a completion that needed a line adding
+    /// to a rcfile would be a completion nobody has.
+    ///
+    /// Hidden, and under `internal`, because it is plumbing for the packages
+    /// rather than a command: a developer who ran it by hand would get a shell
+    /// script on their terminal and nothing to do with it.
+    ///
+    /// Its stdout is a payload like `askpass` and `mosh-tcp2udp` above — a
+    /// script the shell sources — so it is dispatched before a `Ctx`, a
+    /// banner, or the API client exists. It reads nothing about the machine,
+    /// which is also what makes it safe to run inside Homebrew's build
+    /// sandbox.
+    Completions {
+        /// Which shell to render for.
+        ///
+        /// `clap_complete::Shell` rather than a mirror of
+        /// `riabuild_tasks::shell::Shell`: that enum answers "which shell is
+        /// this developer in", has an `Other(String)` arm for the ones riabuild
+        /// launches generically, and knows nothing about completion syntax.
+        /// This one is the set clap can actually generate, which is the only
+        /// question being asked here.
+        shell: clap_complete::Shell,
+    },
 }
 
 /// `host_key::fingerprint_of` (Task 15) only ever extracts a token starting
