@@ -386,12 +386,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bytes_that_match_the_published_integrity_are_handed_on() {
+    #[tokio::test]
+    async fn bytes_that_match_the_published_integrity_are_handed_on() {
         let tarball = b"a tarball, for the purposes of a hash".to_vec();
         let published = download::npm_integrity(&tarball);
         assert_eq!(
-            verified("@pnpm/linux-x64", "11.11.0", &published, tarball.clone()).unwrap(),
+            verified("@pnpm/linux-x64", "11.11.0", &published, tarball.clone())
+                .await
+                .unwrap(),
             tarball
         );
     }
@@ -401,8 +403,8 @@ mod tests {
     /// This is the last gate before `extract_npm_tarballs`, and it is a
     /// function rather than a branch inside the fetch so that it can be
     /// asserted with no network at all.
-    #[test]
-    fn bytes_that_do_not_match_are_refused_before_anything_is_unpacked() {
+    #[tokio::test]
+    async fn bytes_that_do_not_match_are_refused_before_anything_is_unpacked() {
         let published = download::npm_integrity(b"what npm published");
         let error = verified(
             "@pnpm/linux-x64",
@@ -410,6 +412,7 @@ mod tests {
             &published,
             b"what a proxy handed back".to_vec(),
         )
+        .await
         .expect_err("a mismatch is never installed");
 
         let failure = error

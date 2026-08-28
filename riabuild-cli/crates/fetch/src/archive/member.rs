@@ -78,7 +78,10 @@ fn is_member(path: &str, member: &str) -> bool {
 /// those bytes go straight down an SSH pipe to a server rather than landing on
 /// this machine at all. Writing them out only to read them back would put a
 /// second copy of the binary on the laptop for no reason.
-pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+///
+/// Reached through `archive::extract_single_file`, which is the same function
+/// on the blocking pool. Nothing outside this module calls this one directly.
+pub(super) fn single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     if let Some(found) = read_tar_member_by_filename(bytes, name).map_err(|e| unreadable(&e))? {
         return Ok(found);
     }
@@ -89,7 +92,7 @@ pub fn extract_single_file(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     .into())
 }
 
-/// The whole-archive walk behind [`extract_single_file`], matched on the file
+/// The whole-archive walk behind [`single_file`], matched on the file
 /// name alone rather than on a path boundary — the release tarball holds
 /// `riabuild` at its root and nothing else is called that.
 fn read_tar_member_by_filename(bytes: &[u8], name: &str) -> std::io::Result<Option<Vec<u8>>> {
@@ -129,10 +132,7 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip");
         let gz = encoder.finish().expect("gzip");
 
-        assert_eq!(
-            extract_single_file(&gz, "riabuild").expect("extract"),
-            payload
-        );
-        assert!(extract_single_file(&gz, "not-there").is_err());
+        assert_eq!(single_file(&gz, "riabuild").expect("extract"), payload);
+        assert!(single_file(&gz, "not-there").is_err());
     }
 }

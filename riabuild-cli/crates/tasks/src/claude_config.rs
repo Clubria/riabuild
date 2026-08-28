@@ -1,21 +1,38 @@
 //! The per-account `.claude.json` — Claude Code's own first-run state.
 //!
-//! Not a task. Two tasks write here: `claude_trust` records the trusted
-//! checkout, `claude_onboarding` records that the first-run setup is done.
-//! Neither fact is expressible in a settings file, which is the only reason
-//! riabuild writes into this file at all.
+//! Not a task. Three tasks write here through [`edit`]: `claude_trust` records
+//! the trusted checkout, `claude_onboarding` records that the first-run setup
+//! is done, and `claude_agents_view` settles which view a session opens in.
+//! None of
+//! those facts is expressible in a settings file, which is the only reason
+//! riabuild writes into this file at all. `riabuild claude new` reaches `edit`
+//! too, from outside `.provision.lock`.
 //!
-//! Both edits share the same three hazards, so the read-modify-write lives here
-//! once rather than twice: the file is live state Claude Code may be rewriting
+//! Every edit shares the same hazards, so the read-modify-write lives here once
+//! rather than three times: the file is live state Claude Code may be rewriting
 //! this instant, every key riabuild does not own has to survive, and a
 //! half-written config is one Claude Code cannot start against. Hence
 //! read-modify-write, never a template, and `config::write_atomic` — riabuild's
 //! one atomic write — so the new content lands whole or not at all under a name
 //! no second riabuild is also staging into.
+//!
+//! **Whole is not the same as kept**, which is what the lock in [`edit`] is
+//! for. Two riabuilds that both read before either writes each land a complete
+//! file and one of them lands second, so the first one's key is simply gone —
+//! and the developer meets the dialog it was written to prevent. The lock makes
+//! the read and the write one turn; `write_atomic` is still what makes each
+//! turn whole, and still carries the case where a filesystem refuses to lock.
+//!
+//! What it does **not** cover is the fourth writer. `claude_plugins` writes
+//! this file by running `claude`, which knows nothing about riabuild's lock —
+//! see `claude_plugins`'s own note. Inside one riabuild `Task::writes` keeps it
+//! away from the other three; across two, it is Claude Code's file and riabuild
+//! is the guest.
 
 use super::Ctx;
 use anyhow::Result;
 use riabuild_paths::contract_tilde;
+use riabuild_paths::filelock::FileLock;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -65,6 +82,25 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    // The read, the change and the write are one transaction, which is the
+    // whole reason this is taken *here* rather than around the write below.
+    // Two riabuilds that both read before either writes are two edits and one
+    // survivor, and `write_atomic` cannot help with that: it makes each write
+    // whole, and a lost update is two writes that were each perfectly whole.
+    // The one this was losing is a developer's own — `hasTrustDialogAccepted`
+    // dropped by a `riabuild claude new` that read a moment earlier means the
+    // trust dialog is back on their next launch, which is exactly the thing
+    // these tasks exist to prevent.
+    //
+    // It is the third lock a riabuild can hold, after `.provision.lock` and
+    // `.state.lock`, and there is no cycle between them: nothing takes either
+    // of those while holding this one. Three *different* files, which is what
+    // `std` requires — a second lock on a file this process already holds is
+    // unspecified and may deadlock. Within one process `Task::writes` keeps
+    // the four `.claude.json` writers off each other already, so this one is
+    // only ever contended between processes.
+    let _lock = FileLock::acquire(&ctx.paths.claude_config_lock_file(id), || {}).await?;
+
     let mut root = load_or_reset(ctx, &file).await?;
     change(&mut root);
 
@@ -77,9 +113,9 @@ where
     // whichever renamed second published the other's half-written buffer over
     // the developer's session history and MCP servers. `write_atomic` names the
     // temporary for this process and refuses one that already exists, so the
-    // two writers cannot meet; the loser of the rename race loses only its own
-    // edit, which is the ordinary lost-update this file's read-modify-write
-    // already accepts.
+    // two writers cannot meet even if the lock above could not be taken —
+    // which is a real case, because `FileLock` fails open on a filesystem that
+    // refuses to lock at all.
     riabuild_paths::config::write_atomic(&file, text.as_bytes()).await?;
     Ok(())
 }
@@ -117,14 +153,20 @@ mod tests {
 
     /// Two riabuilds editing one account's `.claude.json` at the same time.
     ///
-    /// The shape this pins is not "the last writer wins" — a lost update is
-    /// what the read-modify-write here already accepts — but that neither
-    /// writer is *broken* by the other. With a constant
-    /// `.claude.json.riabuild-tmp` both staged into one path: one truncated the
-    /// other's buffer, one renamed a file it had not written, and the loser's
-    /// own rename failed on a name that was no longer there. All three are
-    /// invisible under `--check`, and `riabuild claude new` reaches this
-    /// function from outside `.provision.lock`.
+    /// Two properties, and the second one used to be false. Neither writer is
+    /// *broken* by the other: with a constant `.claude.json.riabuild-tmp` both
+    /// staged into one path, so one truncated the other's buffer, one renamed a
+    /// file it had not written, and the loser's own rename failed on a name
+    /// that was no longer there. And neither writer's edit is *lost*: both read
+    /// before either wrote, so the second one published a document assembled
+    /// from a file that no longer existed by the time it landed.
+    ///
+    /// A lost update reads as riabuild not having run. The developer meets the
+    /// trust dialog, or the onboarding, on the next launch — with `check()`
+    /// reporting satisfied, because by then the file says what the *other* task
+    /// wrote and each task only looks at its own key. That is the failure this
+    /// costs one lock to remove, and `riabuild claude new` reaches this
+    /// function from outside `.provision.lock`, so it is not a rare shape.
     ///
     /// Repeated because the interleaving is the scheduler's to choose. One pass
     /// can get lucky; twenty-five in a row cannot.
@@ -155,28 +197,32 @@ mod tests {
             let text = tokio::fs::read_to_string(&file).await.expect("read back");
             let parsed: Value = serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("round {round}: {error} in {text:?}"));
-            // Whole or nothing. Which edits survive is the scheduler's to
-            // decide — one may read the other's file and carry both keys, or
-            // land alone — but what is on disk is always one writer's complete
-            // buffer, never a splice of two or a truncation of either.
+            // Whole *and* kept. The order the two edits land in is still the
+            // scheduler's to choose, and it does not matter: the second reads
+            // inside the lock, so it reads the first one's file and carries
+            // both keys forward. Asserting only that the document parses would
+            // pass just as well with no lock at all.
             let Value::Object(map) = &parsed else {
                 panic!("round {round}: not an object — {parsed}");
             };
-            assert!(!map.is_empty(), "round {round}: {parsed}");
-            for (key, value) in map {
-                assert!(
-                    matches!(
-                        key.as_str(),
-                        "hasTrustDialogAccepted" | "hasCompletedOnboarding"
-                    ) && value == &Value::Bool(true),
-                    "round {round}: {parsed}"
+            for key in ["hasTrustDialogAccepted", "hasCompletedOnboarding"] {
+                assert_eq!(
+                    map.get(key),
+                    Some(&Value::Bool(true)),
+                    "round {round}: an edit was lost — {parsed}"
                 );
             }
+            assert_eq!(map.len(), 2, "round {round}: {parsed}");
         }
     }
 
-    /// The temporary never survives the write, so the account directory a later
-    /// `check()` reads holds the config and nothing beside it.
+    /// The temporary never survives the write.
+    ///
+    /// The lock file does, and is meant to: it is what makes the read and the
+    /// write one turn, so it has to outlive both — see
+    /// `Paths::claude_config_lock_file`. Listing the directory exactly is the
+    /// point of the test. A staged `.claude.json.part` left behind here is a
+    /// leak nobody sweeps, and this is the only thing that would notice it.
     #[tokio::test]
     async fn an_edit_leaves_no_temporary_behind() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
@@ -194,6 +240,11 @@ mod tests {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         names.sort();
-        assert_eq!(names, vec![".claude.json"], "in {}", dir.display());
+        assert_eq!(
+            names,
+            vec![".claude.json", ".claude.json.lock"],
+            "in {}",
+            dir.display()
+        );
     }
 }

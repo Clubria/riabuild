@@ -31,7 +31,10 @@ pub async fn install(release: &Release, tool_dir: &Path) -> Result<PathBuf> {
     let expected = expected_digest(release).await?;
 
     let bytes = download::fetch_bytes(&release.url).await?;
-    let actual = download::sha256_hex(&bytes);
+    // The buffer goes to the blocking pool and comes back with its digest.
+    // Four tools land in one dependency wave and download at the same time, so
+    // a sha256 taken inline here would be four pauses the whole wave shares.
+    let (bytes, actual) = download::sha256_of(bytes).await?;
     if actual != expected {
         return Err(Failure::new(
             format!(

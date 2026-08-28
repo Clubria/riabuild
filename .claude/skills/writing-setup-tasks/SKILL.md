@@ -18,6 +18,8 @@ pub trait Task: Send + Sync {
     fn title(&self) -> &str;
     fn version(&self) -> u32;
     fn depends_on(&self) -> &[TaskId];
+    fn interactive(&self) -> bool { false }        // needs the developer
+    fn writes(&self) -> &[Resource] { &[] }        // shares something with a sibling
     async fn check(&self, ctx: &Ctx) -> Result<Status>;   // Satisfied | Needs(Reason)
     async fn apply(&self, ctx: &mut Ctx) -> Result<()>;
 }
@@ -38,6 +40,48 @@ dependency applied this session (`UpstreamChanged`), or `check()` says so
 
 **After `apply()`, the runner re-runs `check()`.** A still-failing check is a hard error
 surfaced to the developer, never a recorded success.
+
+## Your task runs beside its siblings
+
+The engine runs one dependency *wave* at a time and runs the tasks in it **concurrently** —
+`gh`, `infisical`, `ngrok` and Grok Build have no edges between them, and a cold run used
+to download them one after another. What a developer reads is unchanged: each concurrent
+task is handed a `Ctx` whose `Ui` records instead of printing, and the wave is replayed in
+registry declaration order once it finishes. So the ladder still scrolls past one task at a
+time, in the order `registry()` lists them, whichever download was quickest.
+
+Two declarations are how a task opts out of that, and both are yours to get right — nothing
+can infer either.
+
+**`interactive()` — this task needs the developer.** Anything that prints a device code,
+hands over a pty, or calls `ctx.ui.ask()`. Such a task is run alone, in its declared
+position, against the run's own `Ui`. Get it wrong and there is no crash: `Ui::buffered`
+answers `interactive() == false`, so `ask()` returns `None` and your task quietly takes the
+nobody-is-here path on a machine where somebody *was* here. The rule is mechanical — **if
+`apply()` reaches `ctx.ui.ask()`, `ctx.ui.interactive()`, or a `run_interactive` that waits
+on a person, say `true`** — and `the_tasks_that_need_the_developer_say_so` in
+`engine::tests` is the list you add yourself to.
+
+**`writes()` — this task shares something with a sibling.** `depends_on()` declares
+*ordering*, and until the engine ran a wave concurrently that was the same thing as
+exclusion: the sequential loop gave every task the machine to itself, so two tasks writing
+one file with no edge between them was invisible and free. It is neither now.
+
+The live case is `claude_config`: `claude_trust`, `claude_onboarding` and
+`claude_agents_view` each read-modify-write the same per-account `.claude.json`, and
+`claude_plugins` runs a `claude` that writes it too. All four are independent, so all four
+land in one wave. Two tasks naming a resource in common never run at the same time.
+
+Do **not** reach for an edge in `depends_on()` to fix a shared file. It writes an ordering
+nobody means into the graph, it costs the concurrency of everything downstream, and it says
+nothing about the next pair. Ask instead: *if this ran at the same instant as its wave, what
+would it be inside that something else is also inside?* A file it read-modify-writes, a
+directory it renames into place, a lock it takes. If the answer is nothing, `writes()` stays
+empty, which is the common case.
+
+Anything a task changes through `ctx.update_config` or `ctx.update_state` needs **no**
+resource: both take the state lock and re-read inside it, so concurrent writers cannot lose
+each other's edit. That was true before this engine and is why it needed no change.
 
 ## Rules
 
@@ -128,9 +172,12 @@ directories, revoked access, changed pins.
 1. One file in `crates/tasks/src/`, registered in `crates/tasks/src/lib.rs`.
 2. Declare `depends_on()`. The acyclicity test will catch a cycle; nothing will catch a
    missing edge but you.
-3. Write `check()` first, against the drift list above.
-4. Write `apply()` idempotently.
-5. Unit-test `check()` against a fixture `~/.riabuild` tree and injected `CommandRunner`
+3. Declare `interactive()` and `writes()` if either applies — see "Your task runs beside
+   its siblings" above. Nothing will catch a missing one of these but you either, and the
+   symptom of each is silence rather than a failure.
+4. Write `check()` first, against the drift list above.
+5. Write `apply()` idempotently.
+6. Unit-test `check()` against a fixture `~/.riabuild` tree and injected `CommandRunner`
    output — satisfied, each failure mode, and the post-apply state.
 
 ## Common mistakes

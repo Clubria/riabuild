@@ -49,7 +49,7 @@ pub mod testing;
 pub mod toolchain;
 
 pub use crate::ctx::Ctx;
-pub use crate::task::{Reason, Status, Task, TaskId};
+pub use crate::task::{Reason, Resource, Status, Task, TaskId};
 
 /// Every task riabuild knows how to perform, in declaration order. The engine
 /// sorts by `depends_on`, so this order is for reading, not execution.

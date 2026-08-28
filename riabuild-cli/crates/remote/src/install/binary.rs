@@ -109,7 +109,8 @@ pub(super) async fn ensure_matching_binary(
     // anywhere near the server, so the binary's own digest below is derived
     // from bytes already proven to be the ones upstream published.
     let tarball = downloads.tarball(version, target).await?;
-    if download::sha256_hex(&tarball) != expected {
+    let (tarball, actual) = download::sha256_of(tarball).await?;
+    if actual != expected {
         return Err(Failure::new(
             format!("verifying the riabuild {version} download"),
             "Run `riabuild remote` again. If it keeps failing, tell your team lead.",
@@ -117,8 +118,8 @@ pub(super) async fn ensure_matching_binary(
         .detail("the download did not match its published digest")
         .into());
     }
-    let binary = archive::extract_single_file(&tarball, "riabuild")?;
-    let binary_digest = download::sha256_hex(&binary);
+    let binary = archive::extract_single_file(tarball, "riabuild").await?;
+    let (binary, binary_digest) = download::sha256_of(binary).await?;
 
     // Trusted by digest, never by the version it claims. A co-tenant can put
     // a script at this path that prints any version string it likes, and

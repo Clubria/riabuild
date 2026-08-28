@@ -160,6 +160,7 @@ mod tests {
     /// are the only fields `opens_shell` reads.
     fn cli_for(command: Option<Command>, no_shell: bool, check: bool) -> Cli {
         Cli {
+            jobs: None,
             command,
             project: None,
             repo: None,

@@ -79,6 +79,13 @@ impl Task for ClaudeAccounts {
         &["toolchain"]
     }
 
+    /// `claude auth login` opens a browser, and `sign_in` reads
+    /// `ui.interactive()` before it does. This is the task the registry's
+    /// own comment calls "the one task that waits on a browser".
+    fn interactive(&self) -> bool {
+        true
+    }
+
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
         // Existence before invocation — see `install_needed`. What makes this
         // safe is the dependency edge and not the string: `depends_on

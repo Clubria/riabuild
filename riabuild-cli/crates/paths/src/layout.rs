@@ -140,6 +140,22 @@ pub trait Paths: Send + Sync {
     fn claude_config_file(&self, profile: &str) -> PathBuf {
         self.claude_profile_dir(profile).join(".claude.json")
     }
+    /// Guards a read-modify-write of one account's `.claude.json`.
+    ///
+    /// Per account, not per run: two accounts' configs are two files, and one
+    /// lock over both would serialise edits that never meet.
+    ///
+    /// Not `claude_config_file` itself, for [`state_lock_file`]'s reason — that
+    /// write lands by `rename`, so a lock on the data file is a lock on an
+    /// inode the next write unlinks. And inside the profile directory rather
+    /// than beside it, so that `riabuild claude remove` takes it away with the
+    /// account: a lock in `claude_dir()` would outlive every account it was
+    /// ever made for, and nothing sweeps that directory.
+    ///
+    /// [`state_lock_file`]: Paths::state_lock_file
+    fn claude_config_lock_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join(".claude.json.lock")
+    }
     /// The nine Codex profiles, one directory each.
     ///
     /// A parent rather than a `CODEX_HOME` itself. Codex keeps its credentials
