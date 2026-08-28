@@ -195,7 +195,15 @@ async fn launcher_drift(ctx: &Ctx, name: &str) -> Option<String> {
             return Some(format!("{} could not be read: {error}", path.display()));
         }
     };
+    // A launcher naming a riabuild this process cannot locate would be drift
+    // nothing could repair, so a failure here is reported as a launcher riabuild
+    // cannot vouch for rather than swallowed into "no drift".
+    let riabuild = match shims::running_binary() {
+        Ok(riabuild) => riabuild,
+        Err(error) => return Some(format!("{error:#}")),
+    };
     let wanted = shims::grok::launcher_script(
+        &riabuild,
         &ctx.paths.grok_profile_dir(shims::grok::profile_of(name)),
         &ctx.grok(),
         &ctx.paths.bin_dir(),
@@ -331,16 +339,22 @@ mod tests {
     #[tokio::test]
     async fn every_launcher_bypasses_permissions() {
         // The feature, asserted on the files that actually landed rather than
-        // on the generator. A launcher set where only `grok` carried the flag
-        // would pass every other test here.
+        // on the generator. A launcher set where only `grok` reached the code
+        // that adds the flag would pass every other test here.
+        //
+        // The flag itself is no longer in these files: `shims::grok::handoff`
+        // adds it, once, for every launch — which is why
+        // `the_launcher_bypasses_permissions_by_default` beside it is where
+        // *which* flag is pinned. What each landed file has to prove is that it
+        // goes through that code at all.
         let (ctx, _home) = ready().await;
         for name in shims::grok::launcher_names() {
             let script = tokio::fs::read_to_string(ctx.paths.bin_dir().join(&name))
                 .await
                 .unwrap();
             assert!(
-                script.contains("--permission-mode bypassPermissions"),
-                "{name} does not bypass permissions"
+                script.contains("internal launch grok"),
+                "{name} does not go through riabuild's own launcher: {script}"
             );
         }
     }

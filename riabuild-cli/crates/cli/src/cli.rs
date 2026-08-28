@@ -4,7 +4,7 @@
 //! what drifted, drop into the environment. Everything else is a way to do less
 //! than that.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use riabuild_version::VERSION;
 
 #[derive(Debug, Parser)]
@@ -125,6 +125,30 @@ pub enum Command {
     },
 }
 
+/// Which harness `internal launch` is being asked for.
+///
+/// A parser-side mirror of `riabuild_tasks::shims::Harness`, because only the
+/// binary may see a clap type — the rule `CLAUDE.md` states as "a library that
+/// matches on a command enum has to be compiled with the parser". The two are
+/// kept honest by `every_generated_launcher_parses_back_into_the_plan_that_wrote_it`,
+/// which feeds real generated launchers to the real parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaunchHarness {
+    Claude,
+    Codex,
+    Grok,
+}
+
+impl From<LaunchHarness> for riabuild_tasks::shims::Harness {
+    fn from(harness: LaunchHarness) -> Self {
+        match harness {
+            LaunchHarness::Claude => Self::Claude,
+            LaunchHarness::Codex => Self::Codex,
+            LaunchHarness::Grok => Self::Grok,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum InternalAction {
     /// Read a GitHub token on stdin and hand it to `gh`.
@@ -133,11 +157,18 @@ pub enum InternalAction {
     GhSweep,
     /// Print the team's ngrok authtoken on stdout.
     ///
-    /// Hidden: run by the generated `~/.riabuild/bin/ngrok` on every
-    /// invocation, never by a person. Its stdout is the token itself, which is
-    /// why — like `askpass` — it is one of the commands riabuild does not
-    /// print anything else during.
+    /// Hidden: it was what the generated `~/.riabuild/bin/ngrok` read on every
+    /// invocation, and its stdout is the token itself, which is why — like
+    /// `askpass` — it is one of the commands riabuild does not print anything
+    /// else during.
+    ///
+    /// The shim reaches for `Ngrok` below now, which fetches the token in the
+    /// process that goes on to *become* ngrok rather than handing it back
+    /// through a pipe. This stays because a shim written by an older riabuild
+    /// is still on disk until the next provisioning run rewrites it, and that
+    /// run is not guaranteed to happen before the developer's next `ngrok`.
     NgrokToken,
+
     /// Run infisical with a credential brokered for this one command.
     ///
     /// Hidden: run by the generated `~/.riabuild/bin/infisical`, which is what
@@ -150,6 +181,79 @@ pub enum InternalAction {
     /// typed, and a clap that took an interest in `--env` would fail the
     /// invocation over a flag riabuild has no opinion about.
     Infisical {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Run ngrok with the team's authtoken in its environment.
+    ///
+    /// What `~/.riabuild/bin/ngrok` execs. The token is fetched here, put in
+    /// this process's own environment, and then this process *becomes* ngrok —
+    /// so it is never in an argument list, never on a pipe, and never in a
+    /// shell variable.
+    Ngrok {
+        /// The ngrok riabuild installed, by absolute path.
+        ///
+        /// Named by the shim rather than resolved here, so the shim on disk
+        /// still says which ngrok it runs and `owned_tool`'s check can compare
+        /// it against the version riabuild would install now.
+        #[arg(long, value_name = "PATH")]
+        binary: String,
+
+        /// The developer's own arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Run one harness launcher: `claude`, `codex` or `grok`.
+    ///
+    /// What every launcher in `~/.riabuild/bin` execs, and the reason none of
+    /// them is a shell script any more. The flags carry exactly what riabuild
+    /// resolved when that launcher was written; the decisions made from them
+    /// live in `riabuild_tasks::shims::launch`.
+    ///
+    /// Dispatched before a `Ctx` exists, like `askpass` and `channel`: this
+    /// runs on every `claude` a developer types, so it must not check the
+    /// machine, read the org's settings, or talk to the API.
+    Launch {
+        /// Which harness this launcher is for.
+        harness: LaunchHarness,
+
+        /// `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` for this profile.
+        #[arg(long, value_name = "PATH")]
+        home: String,
+
+        /// The harness binary riabuild installed, as recorded when the
+        /// launcher was written.
+        #[arg(long, value_name = "PATH")]
+        binary: String,
+
+        /// `~/.riabuild/bin`, which is what comes off `PATH` when the recorded
+        /// binary has moved.
+        #[arg(long = "bin-dir", value_name = "PATH")]
+        bin_dir: String,
+
+        /// `~/.riabuild/org-settings.json`. Claude Code only.
+        #[arg(long, value_name = "PATH")]
+        settings: Option<String>,
+
+        /// One per checkout this machine knows a path for, longest first.
+        /// Claude Code only, and only for the agents view.
+        #[arg(long = "checkout", value_name = "PATH")]
+        checkouts: Vec<String>,
+
+        /// What the agents view opens on when the working directory is under
+        /// none of the checkouts. Claude Code only.
+        #[arg(long = "default-checkout", value_name = "PATH")]
+        default_checkout: Option<String>,
+
+        /// The developer's own arguments, verbatim.
+        ///
+        /// `trailing_var_arg` and `allow_hyphen_values` for the reason
+        /// `Askpass` has them, and more sharply: a launcher must be able to
+        /// pass on any flag at all — `claude --resume`, `codex -a on-request`,
+        /// `grok --permission-mode plan` — including ones riabuild has never
+        /// heard of. The generated script always writes `--` ahead of them.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -681,6 +785,139 @@ mod tests {
             panic!("a bare infisical did not parse");
         };
         assert!(args.is_empty(), "{args:?}");
+    }
+
+    /// The seam nothing else can see: a launcher is written by
+    /// `riabuild-tasks`, which has no parser, and read back by this parser,
+    /// which has no generator. A flag renamed on one side and not the other
+    /// compiles perfectly and fails on a developer's laptop the next time they
+    /// type `claude` — with an error from clap, about a launcher they did not
+    /// write.
+    ///
+    /// So this takes the real generated file, splits its `exec` line the way
+    /// `/bin/sh` would, and feeds the result to the real `Cli`. It also covers
+    /// the quoting: a path with a space in it survives the round trip or this
+    /// fails.
+    #[test]
+    fn every_generated_launcher_parses_back_into_the_plan_that_wrote_it() {
+        use riabuild_tasks::shims;
+        use std::path::{Path, PathBuf};
+
+        // A home directory with a space in it is an ordinary macOS home, not a
+        // hypothetical one — and it is what the old launchers' `"{path}"`
+        // interpolation was one careless edit away from splitting in two.
+        let riabuild = Path::new("/opt/riabuild/2026.08.27/riabuild");
+        let checkout = PathBuf::from("/Users/Ada Smith/Clubria/ai-builders-hub");
+        let bin = Path::new("/Users/Ada Smith/.riabuild/bin");
+
+        let cases = [
+            (
+                LaunchHarness::Claude,
+                shims::claude::launcher_script(
+                    riabuild,
+                    Path::new("/Users/Ada Smith/.riabuild/claude/abc"),
+                    "/Users/Ada Smith/.riabuild/node/22.23.1/bin/claude",
+                    Path::new("/Users/Ada Smith/.riabuild/org-settings.json"),
+                    bin,
+                    std::slice::from_ref(&checkout),
+                    Some(&checkout),
+                ),
+            ),
+            (
+                LaunchHarness::Codex,
+                shims::codex::launcher_script(
+                    riabuild,
+                    Path::new("/Users/Ada Smith/.riabuild/codex/1"),
+                    "/Users/Ada Smith/.riabuild/node/22.23.1/bin/codex",
+                    bin,
+                ),
+            ),
+            (
+                LaunchHarness::Grok,
+                shims::grok::launcher_script(
+                    riabuild,
+                    Path::new("/Users/Ada Smith/.riabuild/grok/1"),
+                    "/Users/Ada Smith/.riabuild/grok/1.0.5/grok",
+                    bin,
+                ),
+            ),
+        ];
+
+        for (expected, script) in cases {
+            // What the developer typed, appended by the shell's `"$@"`.
+            let mut argv = split_exec_line(&script);
+            argv.extend(["--resume".to_string(), "a prompt with spaces".to_string()]);
+
+            let parsed = Cli::parse_from(&argv);
+            let Some(Command::Internal {
+                action:
+                    InternalAction::Launch {
+                        harness,
+                        home,
+                        binary,
+                        bin_dir,
+                        args,
+                        ..
+                    },
+            }) = parsed.command
+            else {
+                panic!("{argv:?} did not parse as a launch");
+            };
+            assert_eq!(harness, expected);
+            assert!(home.contains("Ada Smith"), "{home}");
+            assert!(binary.contains("Ada Smith"), "{binary}");
+            assert_eq!(bin_dir, bin.to_string_lossy());
+            // The developer's own arguments arrive whole, hyphens and spaces
+            // included — which is the whole reason for `--`,
+            // `trailing_var_arg` and `allow_hyphen_values`.
+            assert_eq!(args, vec!["--resume", "a prompt with spaces"]);
+        }
+    }
+
+    /// The `exec` line of a generated script, split into argv the way `/bin/sh`
+    /// would.
+    ///
+    /// Only single-quoted, double-quoted and bare words, because that is all
+    /// the generator ever emits — `shell_quote` wraps every value in single
+    /// quotes and escapes any of its own, and the one double-quoted token is
+    /// the trailing `"$@"`. That one is dropped: it is the shell appending the
+    /// developer's arguments, which the caller adds itself.
+    fn split_exec_line(script: &str) -> Vec<String> {
+        let line = script
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("exec "))
+            .unwrap_or_else(|| panic!("no exec line in:\n{script}"));
+
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut started = false;
+        for character in line.chars() {
+            match character {
+                '\'' | '"' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                ' ' if !quoted => {
+                    if started {
+                        words.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                other => {
+                    current.push(other);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            words.push(current);
+        }
+        assert!(!quoted, "unbalanced quote in: {line}");
+        assert_eq!(words.first().map(String::as_str), Some("exec"));
+        words.retain(|word| word != "exec" && word != "$@");
+        words
     }
 
     #[test]

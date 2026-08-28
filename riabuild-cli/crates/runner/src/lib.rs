@@ -151,6 +151,43 @@ pub trait CommandRunner: Send + Sync {
         anyhow::bail!("this CommandRunner cannot detach `{program}`")
     }
 
+    /// Replaces this **process** with the program named — same pid, same
+    /// stdio, same place in the terminal's foreground process group.
+    ///
+    /// The launcher handoff, and the reason it is not `run_interactive`.
+    /// `~/.riabuild/bin/claude` used to be a shell script ending in `exec
+    /// claude`, so what the developer's shell waited on, sent `SIGINT` to and
+    /// listed in `jobs` was Claude Code itself. Now that the script's decisions
+    /// are made in Rust, riabuild is what that shell started — and *spawning*
+    /// the harness here would leave a riabuild parked between the terminal and
+    /// it for the whole session: two processes where the developer sees one,
+    /// `Ctrl+C` delivered to something that does not know what to do with it,
+    /// and an exit status riabuild has to remember to pass on. `execvp(2)` is
+    /// the system call the `exec` in the old script made, and making it here
+    /// keeps the process tree the launcher always had.
+    ///
+    /// On success **this does not return**. The `Ok` arm is for the platforms
+    /// with no `exec`, where the only honest thing left is to run the program
+    /// and hand its status back.
+    ///
+    /// `options.env` and `options.cwd` are applied to *this* process before the
+    /// hand-over, because after it there is no other process to apply them to.
+    /// Everything else in [`RunOptions`] is meaningless here: nothing is
+    /// captured, nothing is fed on stdin, and a timeout cannot bind a process
+    /// that is no longer riabuild.
+    ///
+    /// Defaulted to a refusal, like `spawn_piped` and `spawn_detached`, so the
+    /// stub runners scattered across the workspace do not each need a copy of a
+    /// method they never reach.
+    async fn exec_replacing(
+        &self,
+        program: &str,
+        _args: &[&str],
+        _options: &RunOptions,
+    ) -> Result<i32> {
+        anyhow::bail!("this CommandRunner cannot hand this process over to `{program}`")
+    }
+
     /// Replaces this process's stdio with the child's — used for the
     /// environment shell and for anything that prompts the developer.
     async fn run_interactive(

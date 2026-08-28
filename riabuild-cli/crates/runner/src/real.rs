@@ -85,6 +85,11 @@ impl RealRunner {
         for (key, value) in &options.env {
             command.env(key, value);
         }
+        // After `env`, so a name in both is removed rather than set — see
+        // `RunOptions::env_remove`.
+        for key in &options.env_remove {
+            command.env_remove(key);
+        }
         command
     }
 }
@@ -265,6 +270,45 @@ impl CommandRunner for RealRunner {
             let _ = child.wait().await;
         });
         Ok(())
+    }
+
+    async fn exec_replacing(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // `std::process::Command`, not tokio's: `exec` is not a spawn, and
+            // tokio's wrapper does not offer it. It is also the one call in
+            // this crate that cannot block the reactor, because on success
+            // there is no reactor left — the process image is gone before it
+            // could return.
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            if let Some(cwd) = &options.cwd {
+                command.current_dir(cwd);
+            }
+            for (key, value) in &options.env {
+                command.env(key, value);
+            }
+            for key in &options.env_remove {
+                command.env_remove(key);
+            }
+            // Returns only on failure — there is no success value to match on.
+            let error = command.exec();
+            return Err(anyhow::Error::new(error)
+                .context(format!("could not hand this process over to `{program}`")));
+        }
+        // No `exec` here, so the closest thing is to run it and carry its exit
+        // status back. The extra process in the tree is the platform's cost,
+        // not a choice.
+        #[cfg(not(unix))]
+        {
+            self.run_interactive(program, args, options).await
+        }
     }
 
     async fn run_interactive(

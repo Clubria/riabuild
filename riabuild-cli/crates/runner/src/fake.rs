@@ -95,6 +95,11 @@ pub struct FakeRunner {
 pub struct Recorded {
     pub invocation: String,
     pub env: Vec<(String, String)>,
+    /// The names the call asked to be taken *off* the child's environment.
+    /// Recorded separately from `env` because an unset is not a value, and the
+    /// launchers' `unset SSH_CONNECTION …` is exactly the thing a key/value
+    /// assertion cannot see.
+    pub env_removed: Vec<String>,
     pub stdin: Option<Vec<u8>>,
     /// Whether the caller asked for the pty. Recorded rather than acted on:
     /// there is no terminal under `cargo test`, so the real path is the plain

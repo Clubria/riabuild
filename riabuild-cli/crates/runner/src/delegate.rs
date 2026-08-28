@@ -125,6 +125,16 @@ impl<D: Decoration> CommandRunner for Delegating<D> {
         self.inner.spawn_detached(program, args, &options).await
     }
 
+    async fn exec_replacing(
+        &self,
+        program: &str,
+        args: &[&str],
+        options: &RunOptions,
+    ) -> Result<i32> {
+        let options = self.enter(program, args, options).await?;
+        self.inner.exec_replacing(program, args, &options).await
+    }
+
     async fn run_interactive(
         &self,
         program: &str,

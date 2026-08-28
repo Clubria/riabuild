@@ -6,7 +6,8 @@
 
 mod launcher;
 
-pub use launcher::launcher_script;
+pub(super) use launcher::handoff;
+pub use launcher::{checkout_for, launcher_script};
 
 use super::write_script;
 use crate::Ctx;
@@ -17,6 +18,11 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     tokio::fs::create_dir_all(&bin).await?;
 
+    // Resolved before the first write, for the reason
+    // `provision::write_launchers_with` resolves it before the shims: a run
+    // that cannot say where its own binary is must fail rather than write nine
+    // good launchers and one that names nothing.
+    let riabuild = super::running_binary()?;
     let claude = ctx.claude();
     let settings = ctx.paths.org_settings_file();
     let ids = &ctx.config.claude_accounts;
@@ -34,6 +40,7 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     // shell syntax error. `write_script` is what guarantees that.
     for (index, id) in ids.iter().enumerate() {
         let script = launcher_script(
+            &riabuild,
             &ctx.paths.claude_profile_dir(id),
             &claude,
             &settings,
@@ -187,11 +194,12 @@ mod tests {
     }
 
     /// A second repository this machine knows must reach the generated
-    /// launcher script as its own `case` arm — the end-to-end proof that
-    /// `write_all` wires `known_checkouts` all the way through, not just that
-    /// the helper itself computes the right list.
+    /// launcher as its own `--checkout` — the end-to-end proof that `write_all`
+    /// wires `known_checkouts` all the way through, not just that the helper
+    /// itself computes the right list. Which of them a launch resolves to is
+    /// `launcher::checkout_for`'s question and is tested there.
     #[tokio::test]
-    async fn a_second_known_repository_gets_its_own_cwd_arm_in_the_written_launcher() {
+    async fn a_second_known_repository_reaches_the_written_launcher() {
         let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
         ctx.config.claude_accounts = vec![accounts::new_id()];
         ctx.config.repos.insert(
@@ -210,13 +218,17 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            script.contains(r#""/home/ada/Clubria/riabuild"|"/home/ada/Clubria/riabuild"/*)"#),
+            script.contains("--checkout '/home/ada/Clubria/riabuild'"),
             "{script}"
         );
         assert!(
-            script.contains(
-                r#""/home/ada/Clubria/clubria-tenants"|"/home/ada/Clubria/clubria-tenants"/*)"#
-            ),
+            script.contains("--checkout '/home/ada/Clubria/clubria-tenants'"),
+            "{script}"
+        );
+        // And the run's own repository is the fallback for a developer standing
+        // in neither.
+        assert!(
+            script.contains("--default-checkout '/home/ada/Clubria/clubria-tenants'"),
             "{script}"
         );
     }

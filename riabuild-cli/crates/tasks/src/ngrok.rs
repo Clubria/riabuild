@@ -221,7 +221,11 @@ mod tests {
         let script = tokio::fs::read_to_string(ctx.paths.bin_dir().join("ngrok"))
             .await
             .unwrap();
-        assert!(script.contains("NGROK_AUTHTOKEN=$("), "{script}");
-        assert!(script.contains("internal ngrok-token"), "{script}");
+        // The token is fetched by the process that goes on to *become* ngrok,
+        // so it is not in this file, not in an argument list, and not in a
+        // shell variable on the way there.
+        assert!(script.contains("internal ngrok"), "{script}");
+        assert!(!script.contains("NGROK_AUTHTOKEN"), "{script}");
+        assert!(!script.contains("$("), "{script}");
     }
 }

@@ -1,13 +1,16 @@
 //! `~/.riabuild/bin/grok` — the Grok Build launcher.
 //!
 //! The same shape as the Codex launcher next door, for the same reasons: a
-//! small generated script in `bin/` that pins the config directory riabuild
-//! owns, adds the flag the team wants by default, and falls back to `PATH` when
-//! the binary it recorded has moved.
+//! small generated file in `bin/` that pins the config directory riabuild owns,
+//! adds the flag the team wants by default, and falls back to `PATH` when the
+//! binary it recorded has moved.
 //!
 //! ```sh
 //! GROK_HOME=~/.riabuild/grok/1 grok --permission-mode bypassPermissions
 //! ```
+//!
+//! What decides all of that is [`handoff`], in Rust; the file in `bin/` is one
+//! `exec` naming `riabuild internal launch grok` — see `shims::launch`.
 //!
 //! Nine of them, `grok-1` … `grok-9`, plus `grok` for the first — because Grok
 //! Build keeps several sign-ins apart the way Claude Code and Codex do. Its
@@ -21,11 +24,11 @@
 //! there is no moment at which it would learn a developer wants a second one.
 //! A Grok sign-in is the developer's own xAI account, nothing riabuild brokers.
 //!
-//! What is **not** copied from the Claude launcher: `unset SSH_CONNECTION
-//! SSH_CLIENT SSH_TTY`, the `WAYLAND_DISPLAY` claim, and the `--settings`
-//! layer. All three are workarounds for behaviour read out of the Claude Code
-//! binary; none is a fact about Grok Build, and asserting them here would be
-//! inventing an upstream behaviour rather than accommodating one.
+//! What is **not** copied from the Claude launcher: clearing `SSH_CONNECTION`,
+//! `SSH_CLIENT` and `SSH_TTY`, the `WAYLAND_DISPLAY` claim, and the
+//! `--settings` layer. All three are workarounds for behaviour read out of the
+//! Claude Code binary; none is a fact about Grok Build, and asserting them here
+//! would be inventing an upstream behaviour rather than accommodating one.
 //!
 //! Nor is Codex's Node handling. Codex is a Node script whose `bin/codex` is a
 //! symlink to a `codex.js` with a `#!/usr/bin/env node` shebang, so its
@@ -36,6 +39,8 @@
 
 use anyhow::Result;
 use std::path::Path;
+
+use super::launch::{self, Handoff, Harness, Plan};
 
 /// How many Grok Build profiles riabuild makes.
 ///
@@ -61,8 +66,7 @@ pub const PROFILES: usize = 9;
 /// mode as *CLI beats `[ui]` config beats remote*, so the flag is the only
 /// spelling that cannot be silently overridden by a value already on disk —
 /// and `config.toml` is a file the developer owns and edits, which riabuild
-/// would then be rewriting under them on every run. The launcher is riabuild's
-/// file and says so at the top.
+/// would then be rewriting under them on every run.
 ///
 /// Read out of Grok Build 1.0.5's `resolve_effective_yolo`, and pinned by the
 /// `#[ignore]`d smoke tests at the end of this file.
@@ -79,82 +83,61 @@ const BYPASS: &str = "bypassPermissions";
 /// launcher.
 const PERMISSION_MODE: &str = "--permission-mode";
 
-/// The launcher, which is the only thing that names `GROK_HOME`.
+/// Whether this argument is the developer saying what permission mode they
+/// want.
 ///
-/// Not exported into the environment shell, for the reason `CLAUDE_CONFIG_DIR`
-/// and `CODEX_HOME` are not: an exported value follows every `grok` a developer
+/// Both spellings, because Grok Build accepts both and rejects a second
+/// `--permission-mode` in either. `--always-approve` / `--yolo` is deliberately
+/// **not** matched: it is a separate boolean that Grok Build accepts happily
+/// alongside this flag and which means the same thing, so standing aside for it
+/// would buy nothing.
+///
+/// The scan reads the developer's arguments as text, so a prompt that happens
+/// to contain the flag's name — `grok -p 'what does --permission-mode do?'` —
+/// makes riabuild stand aside. That is the safe direction to be wrong in: the
+/// session asks for approvals rather than silently granting them.
+fn names_a_permission_mode(arg: &str) -> bool {
+    arg == PERMISSION_MODE || arg.starts_with(&format!("{PERMISSION_MODE}="))
+}
+
+/// One Grok Build launch, decided.
+///
+/// The bypass goes **ahead of** the developer's own arguments, because Grok
+/// Build accepts it only as a root option: after a subcommand it is "unexpected
+/// argument '--permission-mode' found", so `grok mcp list` has to become `grok
+/// --permission-mode … mcp list` rather than the other way round. Verified
+/// against 1.0.5.
+pub(super) fn handoff(handoff: Handoff, plan: &Plan) -> Handoff {
+    let stands_aside = plan.args.iter().any(|arg| names_a_permission_mode(arg));
+    let mut args = Vec::new();
+    if !stands_aside {
+        args.push(PERMISSION_MODE.to_string());
+        args.push(BYPASS.to_string());
+    }
+    args.extend(plan.args.iter().cloned());
+    handoff.with_args(args)
+}
+
+/// The plan one profile's launcher records.
+///
+/// The launcher is the only thing that names `GROK_HOME`. It is not exported
+/// into the environment shell, for the reason `CLAUDE_CONFIG_DIR` and
+/// `CODEX_HOME` are not: an exported value follows every `grok` a developer
 /// starts by any route, including one they deliberately ran from outside
 /// riabuild's tree — and one exported value would quietly make all nine
 /// profiles share a directory.
-pub fn launcher_script(grok_home: &Path, grok: &str, bin_dir: &Path) -> String {
-    format!(
-        r#"#!/bin/sh
-# Generated by riabuild. Edits here are overwritten.
-#
-# Launches Grok Build against the config directory riabuild owns, with tool
-# approvals bypassed by default.
-set -e
-GROK_HOME="{grok_home}"
-export GROK_HOME
-# Grok Build creates a GROK_HOME that is not there rather than refusing to start
-# — unlike Codex, which hard-fails with "Error finding codex home". Created here
-# anyway so that a profile riabuild reports as present is present: the gap
-# between two riabuild runs is exactly where a `rm -rf` lands, and a directory
-# conjured by the tool on first use is not the same as one riabuild put there.
-[ -d "$GROK_HOME" ] || mkdir -p "$GROK_HOME"
-grok_binary="{grok}"
-case "$grok_binary" in
-  /*) ;;
-  # `Ctx::grok()` names a versioned directory and is always absolute, so this
-  # arm is unreachable today. It stays because the `-x` test below is
-  # cwd-relative for anything that is not: a same-named executable in whatever
-  # directory the developer is standing in would pass it, skip the PATH strip,
-  # and exec a bare name that PATH search resolves straight back to this script.
-  *) grok_binary="" ;;
-esac
-if [ ! -x "$grok_binary" ]; then
-  # The recorded binary is gone: a version bump since the last run, or a
-  # half-removed install. Fall back to PATH with riabuild's own bin/ removed —
-  # without that this script finds itself, because bin/ comes first inside the
-  # environment shell.
-  PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "{bin_dir}" | paste -sd: -)
-  export PATH
-  grok_binary=grok
-fi
-# --permission-mode {bypass} is a default, not an imposition, and it has
-# to be: Grok Build rejects the flag twice ("cannot be used multiple times"), so
-# appending it unconditionally would make `grok --permission-mode plan` — and
-# `grok --permission-mode ask`, the thing a developer reaches for precisely when
-# they want the prompts back — fail in the parser, naming a flag they never
-# typed. So it is added only where the developer expressed no policy of their
-# own.
-#
-# `--always-approve` / `--yolo` is deliberately not matched here: it is a
-# separate boolean that Grok Build accepts happily alongside this flag, and both
-# mean the same thing, so standing aside for it would buy nothing.
-#
-# The scan reads the developer's arguments as text, so a prompt that happens to
-# contain the flag's name — `grok -p 'what does --permission-mode do?'` — makes
-# it stand aside. That is the safe direction to be wrong in: the session asks
-# for approvals rather than silently granting them.
-for riabuild_arg do
-  case "$riabuild_arg" in
-    {flag} | {flag}=*)
-      exec "$grok_binary" "$@"
-      ;;
-  esac
-done
-# Ahead of "$@", because Grok Build accepts this only as a root option: after a
-# subcommand it is "unexpected argument '--permission-mode' found", so
-# `grok mcp list` has to become `grok --permission-mode ... mcp list` rather
-# than the other way round. Verified against 1.0.5.
-exec "$grok_binary" {flag} {bypass} "$@"
-"#,
-        grok_home = grok_home.display(),
-        bin_dir = bin_dir.display(),
-        flag = PERMISSION_MODE,
-        bypass = BYPASS,
+pub fn plan(grok_home: &Path, grok: &str, bin_dir: &Path) -> Plan {
+    Plan::new(
+        Harness::Grok,
+        grok_home.to_path_buf(),
+        grok.to_string(),
+        bin_dir.to_path_buf(),
     )
+}
+
+/// One profile's launcher: `grok`, or `grok-<n>`.
+pub fn launcher_script(riabuild: &Path, grok_home: &Path, grok: &str, bin_dir: &Path) -> String {
+    launch::script(riabuild, &plan(grok_home, grok, bin_dir))
 }
 
 /// Writes `grok` and `grok-1` … `grok-9`.
@@ -170,9 +153,10 @@ exec "$grok_binary" {flag} {bypass} "$@"
 pub async fn write(ctx: &crate::Ctx) -> Result<()> {
     let bin = ctx.paths.bin_dir();
     let grok = ctx.grok();
+    let riabuild = super::running_binary()?;
 
     for profile in 1..=PROFILES {
-        let script = launcher_script(&ctx.paths.grok_profile_dir(profile), &grok, &bin);
+        let script = launcher_script(&riabuild, &ctx.paths.grok_profile_dir(profile), &grok, &bin);
         super::write_script(&bin, &format!("grok-{profile}"), &script).await?;
         if profile == 1 {
             super::write_script(&bin, "grok", &script).await?;
@@ -201,37 +185,71 @@ pub fn profile_of(name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shims::launch::World;
+    use crate::shims::launch::handoff as launch_handoff;
     use crate::testing::ctx_with;
-    use riabuild_fetch::archive::make_executable;
     use riabuild_runner::FakeRunner;
+    use std::path::PathBuf;
 
-    fn script() -> String {
-        launcher_script(
-            Path::new("/home/ada/.riabuild/grok/1"),
-            "/home/ada/.riabuild/grok/1.0.5/grok",
-            Path::new("/home/ada/.riabuild/bin"),
-        )
+    const GROK_HOME: &str = "/home/ada/.riabuild/grok/1";
+    const BINARY: &str = "/home/ada/.riabuild/grok/1.0.5/grok";
+    const BIN_DIR: &str = "/home/ada/.riabuild/bin";
+
+    fn fixture() -> Plan {
+        plan(Path::new(GROK_HOME), BINARY, Path::new(BIN_DIR))
+    }
+
+    fn carrying(args: &[&str]) -> Plan {
+        Plan {
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            ..fixture()
+        }
+    }
+
+    fn laptop() -> World {
+        World {
+            binary_is_executable: true,
+            path: format!("{BIN_DIR}:/usr/local/bin:/usr/bin"),
+            ..Default::default()
+        }
+    }
+
+    fn value(handoff: &Handoff, key: &str) -> Option<String> {
+        handoff
+            .env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
     }
 
     #[test]
     fn the_launcher_pins_the_config_directory_riabuild_owns() {
-        let script = script();
-        assert!(
-            script.contains(r#"GROK_HOME="/home/ada/.riabuild/grok/1""#),
-            "{script}"
-        );
-        // A dropped `export` would leave every profile sharing whatever
-        // GROK_HOME the environment already had — all nine collapsing into one
-        // — with the rest of this test still green.
-        assert!(script.contains("export GROK_HOME"), "{script}");
+        let handoff = launch_handoff(&fixture(), &laptop());
+        assert_eq!(value(&handoff, "GROK_HOME").as_deref(), Some(GROK_HOME));
     }
 
-    #[test]
-    fn the_launcher_creates_a_config_directory_that_is_not_there() {
-        let script = script();
+    /// Grok Build creates a `GROK_HOME` that is not there rather than refusing
+    /// to start — unlike Codex, which hard-fails with "Error finding codex
+    /// home". riabuild creates it anyway, so that a profile riabuild reports as
+    /// present *is* present: the gap between two riabuild runs is exactly where
+    /// a `rm -rf` lands, and a directory conjured by the tool on first use is
+    /// not the same as one riabuild put there.
+    #[tokio::test]
+    async fn the_launcher_creates_a_config_directory_that_is_not_there() {
+        let home = tempfile::TempDir::new().unwrap();
+        let grok_home = home.path().join("grok").join("1");
+        let plan = plan(&grok_home, BINARY, Path::new(BIN_DIR));
+
+        let runner = FakeRunner::new();
+        launch::run(&runner, &plan).await.expect("the launch runs");
+
         assert!(
-            script.contains(r#"[ -d "$GROK_HOME" ] || mkdir -p "$GROK_HOME""#),
-            "{script}"
+            tokio::fs::metadata(&grok_home)
+                .await
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false),
+            "{}",
+            grok_home.display()
         );
     }
 
@@ -239,26 +257,18 @@ mod tests {
     fn the_launcher_bypasses_permissions_by_default() {
         // The whole feature. `bypassPermissions` and not `dontAsk`, which reads
         // like the same thing and silently denies instead.
-        let script = script();
-        assert!(
-            script.contains(r#"exec "$grok_binary" --permission-mode bypassPermissions "$@""#),
-            "{script}"
-        );
-        assert!(!script.contains("dontAsk"), "{script}");
+        let args = launch_handoff(&fixture(), &laptop()).args;
+        assert_eq!(args, vec![PERMISSION_MODE, BYPASS]);
+        assert!(!args.iter().any(|arg| arg == "dontAsk"), "{args:?}");
     }
 
     #[test]
     fn the_bypass_flag_is_passed_ahead_of_the_developers_own_arguments() {
         // Grok Build accepts `--permission-mode` as a root option only: after a
         // subcommand it is "unexpected argument". A launcher that appended it
-        // would break `grok mcp list` while still containing the right flag.
-        let script = script();
-        let exec = script
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("exec ") && line.contains(BYPASS))
-            .expect("the launcher execs grok with the bypass");
-        assert!(exec.find(PERMISSION_MODE) < exec.find(r#""$@""#), "{exec}");
+        // would break `grok mcp list` while still passing the right flag.
+        let args = launch_handoff(&carrying(&["mcp", "list"]), &laptop()).args;
+        assert_eq!(args, vec![PERMISSION_MODE, BYPASS, "mcp", "list"]);
     }
 
     #[test]
@@ -266,40 +276,56 @@ mod tests {
         // Grok Build refuses `--permission-mode` twice, in both spellings, so
         // appending it unconditionally turns `grok --permission-mode plan` into
         // a parser error naming a flag the developer never typed.
-        let script = script();
-        for spelling in ["--permission-mode", "--permission-mode=*"] {
-            assert!(
-                script.contains(spelling),
-                "{spelling} is not matched: {script}"
+        for chosen in [
+            vec!["--permission-mode", "plan"],
+            vec!["--permission-mode=plan"],
+        ] {
+            let args = launch_handoff(&carrying(&chosen), &laptop()).args;
+            assert_eq!(
+                args,
+                chosen.iter().map(|a| a.to_string()).collect::<Vec<_>>()
             );
         }
-        assert!(script.contains(r#"exec "$grok_binary" "$@""#), "{script}");
+    }
+
+    /// And it does *not* stand aside for `--always-approve`, which Grok Build
+    /// accepts happily beside the flag riabuild adds and which means the same
+    /// thing — so standing aside for it would buy nothing.
+    #[test]
+    fn the_launcher_does_not_stand_aside_for_always_approve() {
+        let args = launch_handoff(&carrying(&["--always-approve"]), &laptop()).args;
+        assert_eq!(args, vec![PERMISSION_MODE, BYPASS, "--always-approve"]);
     }
 
     #[test]
     fn the_launcher_can_never_exec_itself() {
         // `bin/` leads PATH inside the environment shell, so a bare `grok`
-        // would resolve straight back to this script. The strip is what stops
+        // would resolve straight back to this launcher. The strip is what stops
         // the fallback becoming an exec loop.
-        let script = script();
-        assert!(
-            script.contains(r#"grep -vxF "/home/ada/.riabuild/bin""#),
-            "{script}"
+        let moved = World {
+            binary_is_executable: false,
+            ..laptop()
+        };
+        let handoff = launch_handoff(&fixture(), &moved);
+        assert_eq!(handoff.program, "grok");
+        assert_eq!(
+            value(&handoff, "PATH").as_deref(),
+            Some("/usr/local/bin:/usr/bin")
         );
-        assert!(!script.contains("exec grok"), "{script}");
-        // `tr '\n' ':'` would leave a trailing colon, and an empty PATH entry
-        // means the current directory.
-        assert!(script.contains("paste -sd: -"), "{script}");
     }
 
     #[test]
     fn a_grok_that_is_not_an_absolute_path_is_treated_as_no_path_at_all() {
-        let script = launcher_script(
-            Path::new("/home/ada/.riabuild/grok/1"),
-            "grok",
-            Path::new("/home/ada/.riabuild/bin"),
+        let plan = Plan {
+            binary: "grok".to_string(),
+            ..fixture()
+        };
+        let handoff = launch_handoff(&plan, &laptop());
+        assert_eq!(handoff.program, "grok");
+        assert_eq!(
+            value(&handoff, "PATH").as_deref(),
+            Some("/usr/local/bin:/usr/bin")
         );
-        assert!(script.contains(r#"*) grok_binary="" ;;"#), "{script}");
     }
 
     #[test]
@@ -307,11 +333,17 @@ mod tests {
         // Grok Build is a static binary, and the SSH/display handling next door
         // is read out of the Claude Code binary rather than being a fact about
         // this one. Copying either would be inventing upstream behaviour.
-        let script = script();
-        assert!(!script.contains("node"), "{script}");
-        assert!(!script.contains("SSH_CONNECTION"), "{script}");
-        assert!(!script.contains("WAYLAND_DISPLAY"), "{script}");
-        assert!(!script.contains("--settings"), "{script}");
+        let handoff = launch_handoff(&fixture(), &laptop());
+        assert!(handoff.env_remove.is_empty(), "{:?}", handoff.env_remove);
+        assert_eq!(value(&handoff, "WAYLAND_DISPLAY"), None);
+        // No Node directory prepended: `PATH` is untouched on the branch where
+        // the recorded binary is there.
+        assert_eq!(value(&handoff, "PATH"), None);
+        assert!(
+            !handoff.args.iter().any(|arg| arg == "--settings"),
+            "{:?}",
+            handoff.args
+        );
     }
 
     #[test]
@@ -345,7 +377,7 @@ mod tests {
 
     /// The regression that would make nine launchers worthless.
     ///
-    /// Nine scripts that all export the same `GROK_HOME` look right in every
+    /// Nine launchers that all name the same `GROK_HOME` look right in every
     /// other test — present, executable, carrying the bypass flag, and they run
     /// — and yet every one opens the same account. Grok Build keeps sign-ins
     /// apart per `GROK_HOME` and by nothing else, so *distinct* is the whole
@@ -362,8 +394,11 @@ mod tests {
                     .await
                     .unwrap();
             let home = ctx.paths.grok_profile_dir(profile);
-            let line = format!("GROK_HOME=\"{}\"", home.display());
-            assert!(script.contains(&line), "grok-{profile} does not pin {line}");
+            let named = format!("--home '{}'", home.display());
+            assert!(
+                script.contains(&named),
+                "grok-{profile} does not name {named}:\n{script}"
+            );
             homes.insert(home);
         }
         assert_eq!(
@@ -387,27 +422,30 @@ mod tests {
         assert_eq!(bare, first);
     }
 
-    /// Runs the generated launcher against a real Grok Build.
+    /// Runs a real Grok Build with the arguments the launcher decides on.
     ///
-    /// Everything above asserts the *text* of a shell script, which is as far
-    /// as a unit test can go and is not the same as the script working. The
-    /// three facts this launcher is built on are all undocumented — read out of
-    /// `xai-grok-shell`'s `resolve_effective_yolo` and confirmed against the
-    /// shipped 1.0.5 binary — so an upstream change should surface as a test
-    /// failure rather than as broken laptops:
+    /// The three facts this launcher is built on are all undocumented — read
+    /// out of `xai-grok-shell`'s `resolve_effective_yolo` and confirmed against
+    /// the shipped 1.0.5 binary — so an upstream change should surface as a
+    /// test failure rather than as broken laptops:
     ///
     /// - `--permission-mode bypassPermissions` is accepted as a **root** option
     ///   ahead of any subcommand,
     /// - Grok Build **rejects** it twice, which is why the launcher stands
     ///   aside instead of always appending,
     /// - and it does **not** reject it beside `--always-approve`, which is why
-    ///   the stand-aside list does not mention that flag.
+    ///   the stand-aside test does not mention that flag.
+    ///
+    /// Driven through [`handoff`] rather than by running the generated
+    /// launcher, which would need a built riabuild binary to exec into and
+    /// would be asking the same question one process further away. What is
+    /// under test here is Grok Build, not the `exec` line.
     ///
     /// `#[ignore]`d because it needs a real install: run
     /// `cargo test -- --ignored` when `MIN_VERSION` moves.
     #[tokio::test]
     #[ignore = "needs a real Grok Build install; pins the undocumented behaviour the launcher is built on"]
-    async fn the_generated_launcher_runs_a_real_grok() {
+    async fn a_real_grok_accepts_what_the_launcher_decides() {
         use riabuild_runner::{CommandRunner, RealRunner, RunOptions};
         let runner = RealRunner;
         let Some(grok) = runner.which("grok") else {
@@ -416,71 +454,81 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let bin = home.path().join("bin");
-        // Deliberately not created: the launcher creating it is the behaviour
+        // Deliberately not created: `launch::run` creating it is the behaviour
         // under test.
         let grok_home = home.path().join("grok-home");
         tokio::fs::create_dir_all(&bin).await.unwrap();
 
-        let launcher = bin.join("grok");
-        let script = launcher_script(&grok_home, &grok.to_string_lossy(), &bin);
-        tokio::fs::write(&launcher, script.as_bytes())
-            .await
-            .unwrap();
-        make_executable(&launcher).await.unwrap();
+        let world = World {
+            binary_is_executable: true,
+            path: std::env::var("PATH").unwrap_or_default(),
+            ..Default::default()
+        };
+        let run = |args: Vec<String>| {
+            let plan = Plan {
+                args,
+                ..plan(&grok_home, &grok.to_string_lossy(), &bin)
+            };
+            let world = world.clone();
+            async move {
+                tokio::fs::create_dir_all(&plan.home).await.unwrap();
+                let handoff = launch_handoff(&plan, &world);
+                let borrowed: Vec<&str> = handoff.args.iter().map(String::as_str).collect();
+                RealRunner
+                    .run(
+                        &handoff.program,
+                        &borrowed,
+                        &RunOptions {
+                            env: handoff.env.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("grok runs")
+            }
+        };
 
-        let path = launcher.to_string_lossy().into_owned();
-        let version = runner
-            .run(&path, &["--version"], &RunOptions::default())
-            .await
-            .expect("the launcher runs");
+        let version = run(vec!["--version".to_string()]).await;
         assert!(version.ok(), "{version:?}");
         assert!(version.stdout.contains("grok"), "{version:?}");
         assert!(
             tokio::fs::try_exists(&grok_home).await.unwrap(),
-            "the launcher did not create its GROK_HOME"
+            "the launch did not create its GROK_HOME"
         );
 
         // The invocation an unconditional bypass would break, failing in Grok
         // Build's parser and naming a flag the developer never typed.
-        let chosen = runner
-            .run(
-                &path,
-                &["--permission-mode", "plan", "--version"],
-                &RunOptions::default(),
-            )
-            .await
-            .expect("the launcher runs");
+        let chosen = run(vec![
+            "--permission-mode".to_string(),
+            "plan".to_string(),
+            "--version".to_string(),
+        ])
+        .await;
         assert!(
             chosen.ok(),
             "the launcher did not stand aside for a chosen policy: {chosen:?}"
         );
 
         // A root option, so it has to survive a subcommand after it.
-        let sub = runner
-            .run(&path, &["mcp", "list"], &RunOptions::default())
-            .await
-            .expect("the launcher runs");
+        let sub = run(vec!["mcp".to_string(), "list".to_string()]).await;
         assert!(sub.ok(), "the bypass broke a subcommand: {sub:?}");
 
         // And the flag riabuild does *not* stand aside for must still be
         // accepted beside the one it adds.
-        let both = runner
-            .run(
-                &path,
-                &["--always-approve", "--version"],
-                &RunOptions::default(),
-            )
-            .await
-            .expect("the launcher runs");
+        let both = run(vec![
+            "--always-approve".to_string(),
+            "--version".to_string(),
+        ])
+        .await;
         assert!(both.ok(), "--always-approve is not compatible: {both:?}");
     }
 
-    /// Two launchers, two accounts, against a real Grok Build.
+    /// Two profiles, two accounts, against a real Grok Build.
     ///
-    /// This is the claim the other eight launchers exist for, and the one that
-    /// cannot be made by reading a generated script: that pointing Grok Build
-    /// at two `GROK_HOME`s really does keep two sign-ins apart, rather than
-    /// both landing in one store the way a keychain-backed tool would.
+    /// This is the claim the other eight launchers exist for, and the one no
+    /// amount of reading the decision can make: that pointing Grok Build at two
+    /// `GROK_HOME`s really does keep two sign-ins apart, rather than both
+    /// landing in one store the way a keychain-backed tool would.
     ///
     /// riabuild signs nobody in, so this asserts on the store rather than on a
     /// session: `auth.json` is written under the `GROK_HOME` in force and
@@ -498,20 +546,19 @@ mod tests {
             tokio::fs::try_exists(&auth).await.unwrap(),
             "no auth.json under {home} — sign in with `grok-1 login` first"
         );
-        let ambient = dirs_next_home().join(".grok").join("auth.json");
+        let ambient = home_dir().join(".grok").join("auth.json");
         assert_ne!(
             auth, ambient,
             "the profile in force is the developer's own ~/.grok"
         );
     }
 
-    #[cfg(test)]
-    fn dirs_next_home() -> std::path::PathBuf {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    fn home_dir() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
     }
 
     #[cfg(unix)]
-    async fn is_executable(path: &Path) -> bool {
+    async fn is_executable(path: &PathBuf) -> bool {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::metadata(path)
             .await
@@ -520,7 +567,7 @@ mod tests {
     }
 
     #[cfg(not(unix))]
-    async fn is_executable(path: &Path) -> bool {
+    async fn is_executable(path: &PathBuf) -> bool {
         tokio::fs::try_exists(path).await.unwrap_or(false)
     }
 }

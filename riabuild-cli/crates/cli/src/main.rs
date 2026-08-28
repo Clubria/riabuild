@@ -114,11 +114,22 @@ async fn run(cli: Cli) -> Result<i32> {
     // *protocol* — one line, and after it, for `mosh-tcp2udp`, the session's
     // own framed datagrams. A banner on that stream is not an untidy line, it
     // is a corrupted session. Neither reads the tree, so neither needs a `Ctx`.
+    //
+    // And `launch` for the first reason again, at the volume it is reached:
+    // it is what `~/.riabuild/bin/claude` execs, so it runs every time a
+    // developer types `claude`. The shell script it replaces checked the
+    // machine, read nothing, and printed nothing, and this must be the same —
+    // no banner, no `state.json`, no API, and no self-update check, which is
+    // why `update::applies_to` already excepts every `internal` subcommand.
     if let Some(Command::Internal { action }) = &cli.command {
         match action {
             cli::InternalAction::UdpEcho => return riabuild_remote::mosh::udp_echo().await,
             cli::InternalAction::MoshTcp2Udp { port } => {
                 return riabuild_remote::mosh::tcp2udp(*port).await;
+            }
+            cli::InternalAction::Launch { .. } => {
+                let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
+                return internal::launch(runner.as_ref(), action).await;
             }
             _ => {}
         }
@@ -234,6 +245,13 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::Infisical { args },
         }) => return internal::infisical::run(ctx, args).await,
+        // Behind a `Ctx` because it brokers a credential, unlike `launch`: the
+        // token comes from riabuild-web, so this one does need the API client
+        // and the session. Everything it prints goes to stderr — the process
+        // becomes ngrok, and ngrok's stdout is the developer's.
+        Some(Command::Internal {
+            action: cli::InternalAction::Ngrok { binary, args },
+        }) => return internal::ngrok(ctx, binary.clone(), args.clone()).await,
         // Not behind `connect`: a turn is the harness riabuild already installed
         // working in the checkout riabuild already cloned, and it has to keep
         // running on a laptop that has gone offline since the window opened.
@@ -266,7 +284,8 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
             action:
                 cli::InternalAction::Askpass { .. }
                 | cli::InternalAction::UdpEcho
-                | cli::InternalAction::MoshTcp2Udp { .. },
+                | cli::InternalAction::MoshTcp2Udp { .. }
+                | cli::InternalAction::Launch { .. },
         }) => unreachable!("the stdout-is-a-payload subcommands answer before a Ctx is built"),
         Some(Command::Status) | None => {}
     }

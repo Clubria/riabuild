@@ -441,8 +441,11 @@ mod tests {
                 .map(str::trim)
                 .find(|line| line.starts_with("exec "))
                 .unwrap_or_else(|| panic!("{name} has no exec line:\n{script}"));
+            // Single-quoted, which is what every generated script quotes a path
+            // with: a `$`, a backtick or a `"` in a home directory would be
+            // expanded inside double quotes and is inert inside these.
             assert!(
-                exec.starts_with(r#"exec "/"#),
+                exec.starts_with("exec '/"),
                 "{name} does not name an absolute binary: {exec}"
             );
         }

@@ -110,15 +110,114 @@ async fn accept_github_token(ctx: &mut Ctx, token: &str) -> Result<i32> {
 /// work on a machine with no network, and the developer meets the explanation
 /// rather than an empty `NGROK_AUTHTOKEN` that reads as "not authenticated".
 pub(crate) async fn ngrok_token(ctx: &mut Ctx) -> Result<i32> {
+    println!("{}", fetch_ngrok_token(ctx).await?);
+    Ok(0)
+}
+
+/// `riabuild internal launch <harness>` — one Claude Code, Codex or Grok Build
+/// launch.
+///
+/// What every launcher in `~/.riabuild/bin` execs, and the whole reason none of
+/// them is a shell script any more. The flags carry what riabuild resolved when
+/// that launcher was written; `shims::launch` makes the decisions and then
+/// `exec`s the harness, so this function does not return on a successful launch.
+///
+/// Takes no `Ctx` on purpose. It runs every time a developer types `claude`,
+/// and the shell script it replaces read no config, opened no socket and
+/// printed nothing — so building a `Ctx` here would put `config.json`,
+/// `state.json` and a keychain probe in front of every session.
+pub(crate) async fn launch(
+    runner: &dyn riabuild_runner::CommandRunner,
+    action: &crate::cli::InternalAction,
+) -> Result<i32> {
+    use riabuild_tasks::shims::Plan;
+    use std::path::PathBuf;
+
+    let crate::cli::InternalAction::Launch {
+        harness,
+        home,
+        binary,
+        bin_dir,
+        settings,
+        checkouts,
+        default_checkout,
+        args,
+    } = action
+    else {
+        unreachable!("launch is dispatched on its own variant");
+    };
+
+    let plan = Plan {
+        settings: settings.as_deref().map(PathBuf::from),
+        checkouts: checkouts.iter().map(PathBuf::from).collect(),
+        default_checkout: default_checkout.as_deref().map(PathBuf::from),
+        args: args.clone(),
+        ..Plan::new(
+            (*harness).into(),
+            PathBuf::from(home),
+            binary.clone(),
+            PathBuf::from(bin_dir),
+        )
+    };
+    riabuild_tasks::shims::launch::run(runner, &plan).await
+}
+
+/// `riabuild internal ngrok` — ngrok, with the team's authtoken in its
+/// environment and nowhere else.
+///
+/// The shim used to do this in shell, around `internal ngrok-token`'s stdout:
+/// a command substitution into a variable, an `if -n` to decide between
+/// exporting and unsetting it, and then an `exec`. Doing it here means the
+/// credential is fetched by the process that goes on to *become* ngrok, so it
+/// is in no argument list, on no pipe, and in no shell variable — and "print
+/// nothing else on stdout" stops being a rule some other subcommand has to keep
+/// on this one's behalf.
+///
+/// **A fetch that fails is not fatal.** ngrok is started with the variable
+/// *absent* rather than empty, because an empty `NGROK_AUTHTOKEN` reads to
+/// ngrok as "not authenticated" and would override a token the developer had
+/// configured for themselves. So `ngrok --version` and `ngrok help` still work
+/// on a plane, signed out, or before a lead has set one — with riabuild's own
+/// explanation on stderr above whatever ngrok says next.
+pub(crate) async fn ngrok(ctx: &mut Ctx, binary: String, args: Vec<String>) -> Result<i32> {
+    let token = match fetch_ngrok_token(ctx).await {
+        Ok(token) => Some(token),
+        Err(error) => {
+            // stderr, not stdout: this process is about to become ngrok, and
+            // ngrok's stdout belongs to the developer's own pipeline.
+            eprintln!("{error:#}");
+            None
+        }
+    };
+
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    ctx.runner
+        .exec_replacing(
+            &binary,
+            &borrowed,
+            &RunOptions {
+                env: token
+                    .map(|token| vec![("NGROK_AUTHTOKEN".to_string(), token)])
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+/// The team's ngrok authtoken, or why it could not be had.
+///
+/// Shared with [`ngrok_token`], which is the same fetch with the answer going
+/// to stdout instead of into an environment.
+async fn fetch_ngrok_token(ctx: &mut Ctx) -> Result<String> {
     ctx.connect().await?;
     if ctx.org.is_none() {
         return Err(not_signed_in().into());
     }
-    let fetched = riabuild_api::ngrok::fetch_authtoken(&ctx.api)
+    Ok(riabuild_api::ngrok::fetch_authtoken(&ctx.api)
         .await
-        .map_err(explain)?;
-    println!("{}", fetched.token);
-    Ok(0)
+        .map_err(explain)?
+        .token)
 }
 
 /// `riabuild internal agent-turn` — one turn of one agent session.
