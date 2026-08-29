@@ -370,3 +370,326 @@ mod tests {
         );
     }
 }
+
+/// The script's own behaviour, asked of the script.
+///
+/// Everything above this point tests the *file* — that it arrives, where it
+/// arrives, who can read it. None of that can answer the question the status
+/// line now has to get right: *which repository is this?* That answer is
+/// computed in JavaScript from a checkout on disk, so these tests run the
+/// shipped bytes on `node` the way Claude Code does, against `.git` directories
+/// written by hand.
+///
+/// Written by hand rather than by `git`, on purpose. The script reads
+/// `.git/config` as a file instead of shelling out — Claude Code re-renders a
+/// status line continuously, and a subprocess per render is a cost a marker
+/// does not justify — so a fixture needs no `git` binary either, and these
+/// tests pin the on-disk layout the script actually depends on.
+#[cfg(test)]
+mod rendering {
+    use super::SCRIPT;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    /// Runs the status line the way Claude Code does — `node <script>`, the
+    /// payload on stdin, the session's directory as the cwd — and returns what
+    /// it drew.
+    ///
+    /// A missing `node` fails rather than skips. riabuild installs a Node and
+    /// this whole file is about a script that runs on one, so "no interpreter
+    /// here" is a machine that cannot check what it is shipping — and a test
+    /// that quietly passes in that state is the "recorded intention read as
+    /// coverage" this module's own history has already paid for once.
+    fn render(cwd: &Path, payload: &str) -> String {
+        let script = cwd.join("claude-statusline-under-test.js");
+        std::fs::write(&script, SCRIPT).unwrap();
+
+        let mut child = match Command::new("node")
+            .arg(&script)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => panic!(
+                "these tests run the status line on `node`, and there is none on PATH — \
+                 put any Node there to check the script this release ships"
+            ),
+            Err(error) => panic!("running node: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "the status line exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// A checkout whose `origin` is `url`.
+    fn checkout(at: &Path, url: &str) {
+        write(
+            &at.join(".git").join("config"),
+            &format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n"),
+        );
+    }
+
+    /// A linked worktree of `checkout`, laid out the way `git worktree add`
+    /// leaves one: a `.git` *file* naming a directory under the checkout's own
+    /// `.git`, and a `commondir` in that directory pointing back at the config
+    /// the two share.
+    fn worktree(checkout: &Path, at: &Path, name: &str) {
+        let gitdir = checkout.join(".git").join("worktrees").join(name);
+        write(&gitdir.join("commondir"), "../..\n");
+        write(&at.join(".git"), &format!("gitdir: {}\n", gitdir.display()));
+    }
+
+    fn payload_at(dir: &Path) -> String {
+        format!(
+            r#"{{"workspace":{{"current_dir":{:?}}}}}"#,
+            dir.to_string_lossy()
+        )
+    }
+
+    #[test]
+    fn the_marker_names_the_repository_the_session_is_in() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render(home.path(), &payload_at(&dir));
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+    }
+
+    /// The repository goes *inside* the parentheses. There is one marker to
+    /// learn, the same one the prompt draws — not a marker with a second thing
+    /// sitting next to it that reads as two environments.
+    #[test]
+    fn the_repository_is_part_of_the_marker_rather_than_beside_it() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render(home.path(), &payload_at(&dir));
+        assert!(
+            !drawn.contains("(riabuild)"),
+            "the bare marker must not be drawn beside the named one: {drawn:?}"
+        );
+    }
+
+    /// A linked worktree's `.git` is a *file* with no `config` behind it, so a
+    /// walk that only recognises a `.git` **directory** finds nothing there and
+    /// reports "not a repository" — in the one place a developer most needs
+    /// telling which repository they are in. Following the `gitdir:` line to
+    /// `commondir` is what makes it resolve.
+    ///
+    /// The worktree here sits **beside** the checkout rather than under it, and
+    /// that placement is the test. riabuild's own live in
+    /// `.claude/worktrees/`, physically inside the checkout — where the walk
+    /// upwards reaches the main `.git` on its own and returns the right answer
+    /// for the wrong reason. A fixture in that shape passes with the `commondir`
+    /// branch deleted, which makes it no coverage of the branch at all.
+    /// `git worktree add` accepts any path, so this one is also a real layout
+    /// and not a contrivance built to fail.
+    #[test]
+    fn a_linked_worktree_resolves_to_the_repository_it_belongs_to() {
+        let home = tempfile::TempDir::new().unwrap();
+        let main = home.path().join("riabuild");
+        checkout(&main, "git@github.com:Clubria/riabuild.git");
+        let wt = home.path().join("worktrees").join("feat-thing");
+        worktree(&main, &wt, "feat-thing");
+
+        let drawn = render(home.path(), &payload_at(&wt));
+        assert!(drawn.contains("(riabuild · Clubria/riabuild)"), "{drawn:?}");
+    }
+
+    /// The shape riabuild actually produces: a worktree under the checkout's own
+    /// `.claude/worktrees/`. It resolves through `commondir` like any other, and
+    /// the walk upwards would reach the same repository anyway — which is why
+    /// this is here as the layout riabuild ships rather than as the proof, and
+    /// the test above is the one that holds the branch honest.
+    #[test]
+    fn a_worktree_under_the_checkout_names_the_same_repository() {
+        let home = tempfile::TempDir::new().unwrap();
+        let main = home.path().join("riabuild");
+        checkout(&main, "git@github.com:Clubria/riabuild.git");
+        let wt = main.join(".claude").join("worktrees").join("feat-thing");
+        worktree(&main, &wt, "feat-thing");
+
+        let drawn = render(home.path(), &payload_at(&wt));
+        assert!(drawn.contains("(riabuild · Clubria/riabuild)"), "{drawn:?}");
+    }
+
+    /// A directory *inside* the checkout is still in the repository. The walk
+    /// upwards is the whole reason that holds, and a developer spends most of
+    /// their time several directories down.
+    #[test]
+    fn a_directory_below_the_checkout_is_still_in_the_repository() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "https://github.com/Clubria/payments.git");
+        let deep = dir.join("crates").join("api").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let drawn = render(home.path(), &payload_at(&deep));
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+    }
+
+    /// git records the same repository in several spellings depending on how it
+    /// was cloned, and a developer who cloned over HTTPS is in the same
+    /// repository as one who cloned over SSH. `Repo::matches_remote` accepts
+    /// exactly these on the Rust side; the status line has to agree.
+    #[test]
+    fn every_spelling_of_a_remote_names_the_same_repository() {
+        for url in [
+            "git@github.com:Clubria/payments.git",
+            "git@github.com:Clubria/payments",
+            "https://github.com/Clubria/payments.git",
+            "https://github.com/Clubria/payments",
+            "https://github.com/Clubria/payments/",
+            "ssh://git@github.com/Clubria/payments.git",
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let dir = home.path().join("payments");
+            checkout(&dir, url);
+
+            let drawn = render(home.path(), &payload_at(&dir));
+            assert!(
+                drawn.contains("(riabuild · Clubria/payments)"),
+                "{url} drew {drawn:?}"
+            );
+        }
+    }
+
+    /// `origin` is the remote riabuild cloned from and the one the `project`
+    /// task verifies against; another remote in the same file is somebody
+    /// else's fork.
+    #[test]
+    fn a_second_remote_does_not_get_mistaken_for_origin() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        write(
+            &dir.join(".git").join("config"),
+            "[remote \"upstream\"]\n\turl = git@github.com:someone-else/fork.git\n\
+             [remote \"origin\"]\n\turl = git@github.com:Clubria/payments.git\n",
+        );
+
+        let drawn = render(home.path(), &payload_at(&dir));
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+    }
+
+    /// Two states that are not a mistake to be recovered from: a checkout with
+    /// no `origin`, and a directory that is no checkout at all. Both keep the
+    /// bare marker, because the alternative is guessing a repository out of a
+    /// directory name and being confidently wrong on the status line.
+    #[test]
+    fn a_checkout_with_no_origin_keeps_the_bare_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("scratch");
+        write(&dir.join(".git").join("config"), "[core]\n\tbare = false\n");
+
+        let drawn = render(home.path(), &payload_at(&dir));
+        assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+        assert!(!drawn.contains('·'), "{drawn:?}");
+    }
+
+    #[test]
+    fn somewhere_that_is_not_a_checkout_keeps_the_bare_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("not-a-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let drawn = render(home.path(), &payload_at(&dir));
+        assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+        assert!(!drawn.contains('·'), "{drawn:?}");
+    }
+
+    /// The session's *current* directory, not the one it was launched in. A
+    /// developer who has cd'd into their second checkout is in that repository,
+    /// and `project_dir` would still be naming the first.
+    #[test]
+    fn the_repository_is_where_the_session_is_now() {
+        let home = tempfile::TempDir::new().unwrap();
+        let started_in = home.path().join("ai-builders-hub");
+        checkout(&started_in, "git@github.com:Clubria/ai-builders-hub.git");
+        let moved_to = home.path().join("payments");
+        checkout(&moved_to, "git@github.com:Clubria/payments.git");
+
+        let drawn = render(
+            &started_in,
+            &format!(
+                r#"{{"cwd":{:?},"workspace":{{"current_dir":{:?},"project_dir":{:?}}}}}"#,
+                moved_to.to_string_lossy(),
+                moved_to.to_string_lossy(),
+                started_in.to_string_lossy()
+            ),
+        );
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+    }
+
+    /// A Claude Code that sends no directory at all still gets an answer: the
+    /// script is run in the session's own directory, so its cwd is the fallback.
+    #[test]
+    fn a_payload_with_no_directory_falls_back_to_where_the_script_runs() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render(&dir, "{}");
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+    }
+
+    /// The context bar is what was already there, and naming the repository
+    /// must not have cost it. Both are drawn, in that order.
+    #[test]
+    fn the_context_bar_still_draws_beside_the_repository() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render(
+            home.path(),
+            &format!(
+                r#"{{"workspace":{{"current_dir":{:?}}},
+                    "context_window":{{"remaining_percentage":40,"total_tokens":1000000}}}}"#,
+                dir.to_string_lossy()
+            ),
+        );
+        let marker = drawn.find("Clubria/payments").expect("the repository");
+        let bar = drawn.find('█').expect("the context bar");
+        assert!(marker < bar, "{drawn:?}");
+        assert!(drawn.contains("72%"), "{drawn:?}");
+    }
+
+    /// A status line that throws renders as *no status line at all*, which is a
+    /// worse answer than an undecorated marker — so every way the input can be
+    /// wrong ends at the label rather than at a stack trace.
+    #[test]
+    fn a_payload_that_is_not_json_still_leaves_a_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let drawn = render(home.path(), "not json at all");
+        assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+    }
+
+    #[test]
+    fn a_directory_that_does_not_exist_still_leaves_a_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let drawn = render(home.path(), &payload_at(&home.path().join("gone")));
+        assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+    }
+}

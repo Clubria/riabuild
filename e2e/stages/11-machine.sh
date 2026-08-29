@@ -295,6 +295,17 @@ check "the first account's config directory exists" test -d "$RIA_HOME/claude/$C
 check "the status line script was installed from the binary" \
   test -s "$RIA_HOME/claude-statusline.js"
 
+# And that it answers with the repository the developer is standing in. The unit
+# tests run this script against `.git` directories written by hand, which is the
+# right shape for the branches but proves nothing about the chain: this is the
+# one place where riabuild's own Node runs the script the binary carried, inside
+# a checkout `gh repo clone` really made, against an `origin` nobody wrote down
+# for the occasion.
+check_contains "the status line names the repository the developer is in" \
+  "$(cd "$PROJECT_DIR" && printf '{}' \
+      | "$RIA_HOME/node/$NODE_VERSION/bin/node" "$RIA_HOME/claude-statusline.js" 2>&1)" \
+  "(riabuild · $E2E_REPO_SLUG)"
+
 # The whole reason riabuild exists: a developer ends up with working secrets.
 ENV_DEV="$PROJECT_DIR/.env.dev"
 check "the project has a .env.dev" test -f "$ENV_DEV"
