@@ -45,6 +45,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use riabuild_harness::Kind;
+
+use crate::account::Account;
 use riabuild_paths::Paths;
 use riabuild_paths::filelock::FileLock;
 use riabuild_runner::{CommandRunner, RunOptions};
@@ -72,6 +74,14 @@ pub struct Record {
     /// What this session resumes under. `None` until the harness has said.
     #[serde(default)]
     pub thread: Option<String>,
+    /// Which of that harness's nine sign-ins made this session, 1-based.
+    ///
+    /// Beside `home` and not instead of it: the home is what a turn runs under
+    /// and the number is what a developer calls it. A record written before the
+    /// window offered a choice was made under the first account, which is what
+    /// the default says.
+    #[serde(default = "first_account")]
+    pub account: usize,
     /// The profile directory the session was created under.
     ///
     /// Stored rather than recomputed, because it is what resume depends on: if
@@ -88,9 +98,20 @@ pub struct Record {
     pub updated: u64,
 }
 
+/// What a record with no account named was made under, which is the only
+/// account `riabuild agents` could reach when those records were written.
+fn first_account() -> usize {
+    1
+}
+
 impl Record {
     pub fn harness(&self) -> Option<Kind> {
         Kind::from_tag(&self.kind)
+    }
+
+    /// `claude-2`, `grok-1` — the launcher's spelling, for the list.
+    pub fn account_name(&self) -> String {
+        format!("{}-{}", self.kind, self.account)
     }
 }
 
@@ -214,7 +235,12 @@ impl Store {
     }
 
     /// Creates a session directory and its record.
-    pub async fn create(&self, kind: Kind, cwd: &Path, home: Option<PathBuf>) -> Result<Record> {
+    ///
+    /// Takes the whole account rather than a harness and a home: those two are
+    /// one fact, and a signature that let them be passed separately is a
+    /// signature that lets a session be recorded as `claude-2` while running out
+    /// of `claude-1`'s store.
+    pub async fn create(&self, account: &Account, cwd: &Path) -> Result<Record> {
         let id = new_id();
         tokio::fs::create_dir_all(self.session_dir(&id))
             .await
@@ -222,9 +248,10 @@ impl Store {
         let stamp = now();
         let record = Record {
             id,
-            kind: kind.tag().to_string(),
+            kind: account.kind.tag().to_string(),
             thread: None,
-            home,
+            account: account.number,
+            home: account.home.clone(),
             cwd: cwd.to_path_buf(),
             title: String::new(),
             created: stamp,
@@ -403,10 +430,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_remembers_which_sign_in_made_it() {
+        // The number is what the list shows and the home is what the turn runs
+        // under. A session made on `claude-3` that came back as `claude-1` would
+        // be a developer sending work to the wrong account with the right label
+        // on it.
+        let (_dir, store) = store();
+        let account = Account::new(Kind::Grok, 3, Some("/r/grok/3".into()));
+        let record = store.create(&account, Path::new("/work")).await.unwrap();
+        assert_eq!(record.account, 3);
+
+        let read = store.read(&record.id).await.unwrap();
+        assert_eq!(read.account, 3);
+        assert_eq!(read.home, Some(PathBuf::from("/r/grok/3")));
+        assert_eq!(read.account_name(), "grok-3");
+    }
+
+    #[tokio::test]
+    async fn a_record_written_before_accounts_reads_as_the_first_one() {
+        // The only account `riabuild agents` could reach when those records were
+        // written. Anything else would relabel every session on disk.
+        let (_dir, store) = store();
+        let record = store
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
+            .await
+            .unwrap();
+        let text = tokio::fs::read_to_string(store.record_path(&record.id))
+            .await
+            .unwrap();
+        let older: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut older = older.as_object().unwrap().clone();
+        older.remove("account");
+        tokio::fs::write(
+            store.record_path(&record.id),
+            serde_json::to_vec(&older).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(store.read(&record.id).await.unwrap().account, 1);
+    }
+
+    #[tokio::test]
     async fn a_session_survives_being_written_and_read_back() {
         let (_dir, store) = store();
         let cwd = Path::new("/work/repo");
-        let mut record = store.create(Kind::Claude, cwd, None).await.unwrap();
+        let mut record = store
+            .create(&Account::new(Kind::Claude, 1, None), cwd)
+            .await
+            .unwrap();
         record.thread = Some("abc".into());
         record.title = "fix the bug".into();
         store.write(&record).await.unwrap();
@@ -423,11 +495,11 @@ mod tests {
         // another: the list is short and about what is in front of you.
         let (_dir, store) = store();
         store
-            .create(Kind::Claude, Path::new("/work/one"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work/one"))
             .await
             .unwrap();
         store
-            .create(Kind::Codex, Path::new("/work/two"), None)
+            .create(&Account::new(Kind::Codex, 1, None), Path::new("/work/two"))
             .await
             .unwrap();
 
@@ -456,7 +528,7 @@ mod tests {
         // Either way the sessions beside it must still be listed.
         let (_dir, store) = store();
         let good = store
-            .create(Kind::Grok, Path::new("/work"), None)
+            .create(&Account::new(Kind::Grok, 1, None), Path::new("/work"))
             .await
             .unwrap();
         let broken = store.session_dir("not-a-session");
@@ -476,7 +548,7 @@ mod tests {
         // is lost on a downgrade; the file is not.
         let (_dir, store) = store();
         let mut record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
         record.kind = "gemini".into();
@@ -488,7 +560,7 @@ mod tests {
     async fn an_idle_session_is_not_running_and_a_held_lock_is() {
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
         assert!(!store.running(&record.id).await);
@@ -508,7 +580,7 @@ mod tests {
     async fn a_spool_is_read_back_whole_and_then_followed() {
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
         assert_eq!(store.spool(&record.id).await.unwrap(), "");
@@ -533,7 +605,7 @@ mod tests {
         // have moved past it.
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
         tokio::fs::write(store.spool_path(&record.id), "{\"a\":1}\n{\"b\":")
@@ -559,7 +631,7 @@ mod tests {
         let (_dir, store) = store();
         let runner = Arc::new(FakeRunner::new());
         let record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
 
@@ -599,7 +671,10 @@ mod tests {
         let cwd = Path::new("/work");
         let mut ids = Vec::new();
         for index in 0..(KEEP + 3) {
-            let mut record = store.create(Kind::Claude, cwd, None).await.unwrap();
+            let mut record = store
+                .create(&Account::new(Kind::Claude, 1, None), cwd)
+                .await
+                .unwrap();
             // Distinct timestamps, so "newest" is well defined without sleeping.
             record.updated = 1_000 + index as u64;
             store.write(&record).await.unwrap();

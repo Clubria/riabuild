@@ -12,6 +12,8 @@
 
 use riabuild_harness::{Event, Kind};
 
+use crate::account::{Account, Accounts};
+
 /// Where a session has got to.
 ///
 /// Not stored — computed from two facts that are each answerable on their own:
@@ -77,6 +79,11 @@ pub struct Pane {
     /// The store's id. A directory name, stable across windows and reboots.
     pub id: String,
     pub kind: Kind,
+    /// Which of that harness's nine sign-ins this session runs under, 1-based:
+    /// `claude-2` is `kind` Claude and `account` 2. Read off the record rather
+    /// than recomputed, for the reason the home is — a session is only
+    /// resumable under the account that made it.
+    pub account: usize,
     /// The first prompt, which is what tells two sessions apart. Sessions are
     /// scoped to one checkout, so the directory never could.
     pub title: String,
@@ -106,10 +113,14 @@ pub struct Pane {
 }
 
 impl Pane {
+    /// A pane on a harness's first account, which is what a window opens
+    /// with. A restored session and one started from the chooser say otherwise
+    /// by setting [`Pane::account`], the way they already set the thread id.
     pub fn new(id: String, kind: Kind, title: String) -> Self {
         Self {
             id,
             kind,
+            account: 1,
             title,
             thread: None,
             model: None,
@@ -134,10 +145,21 @@ impl Pane {
         }
     }
 
+    /// The sign-in this session runs under, spelled the way its launcher is:
+    /// `claude-2`, `grok-1`. What the list shows instead of the bare harness,
+    /// because with nine accounts each "claude" no longer identifies anything.
+    pub fn account_name(&self) -> String {
+        format!("{}-{}", self.kind.tag(), self.account)
+    }
+
     /// The name this session goes by in the list.
+    ///
+    /// "new session" rather than "new claude" for one nobody has spoken to yet:
+    /// the row beside it already says `claude-1`, and a list of `claude-1 new
+    /// claude` reads as a stutter.
     pub fn label(&self) -> String {
         if self.title.is_empty() {
-            format!("new {}", self.kind.tag())
+            "new session".to_string()
         } else {
             self.title.clone()
         }
@@ -231,19 +253,40 @@ impl Pane {
     }
 }
 
-/// Which half of the screen the keyboard is talking to.
+/// Which part of the screen the keyboard is talking to.
+///
+/// Reading is the resting state, not choosing. A developer spends the whole of
+/// a session watching one transcript go by and switches session occasionally,
+/// so the arrow keys move *within* what is being read and the session column is
+/// somewhere you go — left — rather than what the arrows always mean.
+///
+/// That is also what makes `PageUp` unnecessary. Scrolling the transcript used
+/// to be the one thing only those two keys did, and on a laptop keyboard they
+/// are a chord: `Fn` plus an arrow. A screen whose main gesture needs a key half
+/// the keyboards in the room do not have is a screen nobody scrolls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    /// Moving between sessions.
-    List,
-    /// Typing a prompt for the selected one.
+    /// Reading the selected session. Up and down scroll it.
+    Transcript,
+    /// The session column, reached with the left arrow. Up and down pick a
+    /// session; right, enter or escape go back to reading it.
+    Sessions,
+    /// Typing a prompt for the selected session.
     Compose,
+    /// Choosing which sign-in a new session runs under.
+    Picker,
 }
 
 /// The whole interface.
 pub struct App {
     pub panes: Vec<Pane>,
     pub selected: usize,
+    /// Every sign-in a new session can be started under. Resolved once by the
+    /// caller and carried here so the chooser is drawable and testable without
+    /// a filesystem.
+    pub accounts: Accounts,
+    /// Which row the chooser is on, while it is open.
+    pub picking: usize,
     pub focus: Focus,
     pub composing: String,
     pub quit: bool,
@@ -254,18 +297,19 @@ pub struct App {
     pub tick: usize,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl App {
-    pub fn new() -> Self {
+    /// A window offering these sign-ins.
+    ///
+    /// Takes them rather than defaulting to one per harness: an empty list is a
+    /// machine with no accounts, which the chooser says out loud, and inventing
+    /// a plausible one here would start sessions under a home nobody has.
+    pub fn new(accounts: Accounts) -> Self {
         Self {
             panes: Vec::new(),
             selected: 0,
-            focus: Focus::List,
+            accounts,
+            picking: 0,
+            focus: Focus::Transcript,
             composing: String::new(),
             quit: false,
             scrollback: 0,
@@ -275,6 +319,40 @@ impl App {
 
     pub fn add(&mut self, pane: Pane) {
         self.panes.push(pane);
+    }
+
+    /// Opens the chooser, on the account the selected session is already
+    /// running under.
+    ///
+    /// Starting there rather than at the top is what makes "another one of
+    /// these" a single keypress, which is the thing a developer asks for most:
+    /// a second Claude on the same sign-in, beside the one that is busy.
+    pub fn open_picker(&mut self) {
+        self.picking = self
+            .selected()
+            .and_then(|pane| self.accounts.position(pane.kind, pane.account))
+            .unwrap_or(0);
+        self.focus = Focus::Picker;
+    }
+
+    /// The account the chooser is on.
+    pub fn picked(&self) -> Option<&Account> {
+        self.accounts.get(self.picking)
+    }
+
+    pub fn pick_next(&mut self) {
+        if !self.accounts.is_empty() {
+            self.picking = (self.picking + 1) % self.accounts.len();
+        }
+    }
+
+    pub fn pick_previous(&mut self) {
+        if !self.accounts.is_empty() {
+            self.picking = self
+                .picking
+                .checked_sub(1)
+                .unwrap_or(self.accounts.len() - 1);
+        }
     }
 
     pub fn selected(&self) -> Option<&Pane> {
@@ -343,7 +421,7 @@ mod tests {
     use riabuild_harness::testing;
 
     fn play(kind: Kind, transcript: &str) -> App {
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), kind, "the first prompt".into()));
         for event in testing::decode(kind, transcript) {
             app.observe("s1", &event);
@@ -425,7 +503,7 @@ mod tests {
     fn a_tool_result_resolves_the_newest_matching_call() {
         // A long session reuses tool names constantly; only the id is unique,
         // and an older open call with the same id must not steal the result.
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         for event in [
             Event::ToolStarted {
@@ -458,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_result_for_a_call_nobody_saw_is_recorded_rather_than_dropped() {
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
             "s1",
@@ -472,7 +550,7 @@ mod tests {
 
     #[test]
     fn a_subagents_work_is_marked_as_its_own() {
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe("s1", &Event::Said("mine".into()));
         app.observe(
@@ -492,7 +570,7 @@ mod tests {
     fn two_usage_reports_in_one_turn_are_not_added_together() {
         // Both Claude and Codex report cumulative counts. Summing them makes a
         // session appear to have spent twice what it did.
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
             "s1",
@@ -516,9 +594,9 @@ mod tests {
     fn a_session_is_named_by_what_it_was_asked() {
         // Every session in the list is in the same checkout, so the directory
         // cannot tell two apart. The first prompt can.
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
-        assert_eq!(app.selected().unwrap().label(), "new claude");
+        assert_eq!(app.selected().unwrap().label(), "new session");
         app.sent("fix the flaky test");
         assert_eq!(app.selected().unwrap().label(), "fix the flaky test");
         // and the title is not rewritten by the second prompt
@@ -528,7 +606,7 @@ mod tests {
 
     #[test]
     fn selection_wraps_in_both_directions_and_never_panics_when_empty() {
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         // The empty case is the first frame of every run.
         app.select_next();
         app.select_previous();
@@ -547,7 +625,7 @@ mod tests {
     fn sending_a_prompt_shows_it_and_marks_the_session_working() {
         // Otherwise the pane reads idle through the whole of a process start,
         // which looks like a prompt that never arrived.
-        let mut app = App::new();
+        let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.sent("do the thing");
         let pane = app.selected().unwrap();

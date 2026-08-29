@@ -85,7 +85,7 @@ spool possible, which made live viewing and rehydration the *same* code path.
 
 ```
 <root>/agents/<session-id>/
-  meta.json        harness, thread id, profile home, checkout, title, times
+  meta.json        harness, account, thread id, profile home, checkout, title, times
   events.ndjson    every turn's stdout, appended, exactly as the harness wrote it
   turn.lock        held by the running turn and by nothing else
   pending/*.txt    prompts waiting for a turn to pick them up
@@ -156,6 +156,58 @@ conversation under the same pane, with nothing on screen saying so.
 
 The *binary* is the opposite and is resolved per turn, because a versioned path moves with
 every riabuild upgrade: a session started last week must run this week's Claude Code.
+
+## All twenty-seven sign-ins, and three panes
+
+riabuild writes a launcher for every profile it keeps — `claude-1` … `claude-9`, and the
+same for Codex and Grok Build — and this window could reach exactly three of them: the first
+of each. A developer who had deliberately signed `grok-2` in to a second xAI account had no
+way to use it here at all.
+
+So `Request` carries the whole list rather than three homes, `n` opens a chooser over it,
+and the session records the **number** beside the home. Both, because they are two different
+facts: the home is what a turn runs under, and the number is what the developer calls it.
+Every row in the session list is labelled `claude-2` rather than `claude`, which is the only
+thing that tells two panes on one harness apart before either has been asked anything.
+
+What the window still does *not* do is open one pane per account. Twenty-seven panes is a
+list nobody can read, built for a developer who is using two of them; the rest are one
+keypress away instead. The chooser opens on the sign-in the selected session is already
+running under, because "another one of these, beside the one that is busy" is the thing
+actually asked for most.
+
+Claude's accounts are the list riabuild manages, keyed by uuid — they can be deleted and
+renumbered, and position is the number. Codex's and Grok Build's are a fixed nine, so the
+number is the directory name. A machine with no Claude account yet still gets a Claude pane,
+under whatever home Claude Code picks for itself, which is what every session did before
+this window could offer a choice: answering a half-finished setup by hiding a tool would be
+worse than the setup.
+
+## The keyboard, and the two keys a laptop does not have
+
+Reading is the resting state. The arrow keys scroll the transcript, `←` goes to the session
+column and `↑↓` pick a session only while the keyboard is talking to it, `→` (or enter, or
+escape) comes back. The divider between the two carries the focus, because `↑↓` mean two
+different things depending on which side of it you are on and that has to be visible without
+reading the footer.
+
+It was the other way round, and `PageUp`/`PageDown` were the only way to scroll. On every
+laptop keyboard in the room those are a chord — `Fn` and an arrow — which made the main
+gesture of this screen one most of its developers could not perform. They still work where
+the keys exist; nothing now depends on them.
+
+## Clearing the screen riabuild took
+
+`riabuild agents` claims the terminal by hand — raw mode, alternate screen — rather than
+through `ratatui::init`, and so it has to do what that function does: **clear**. Ratatui
+writes only the cells that differ from the frame before, and on the first draw "the frame
+before" is ratatui's idea of a blank screen rather than the terminal's. Every cell this
+interface leaves empty is therefore never written at all, and whatever was on the alternate
+screen shows through underneath — old shell history behind a live interface.
+
+Resizing hid it: `autoresize` clears on every size change, so the symptom vanished the first
+time anyone dragged the window and never came back. The popup has the same problem in
+miniature, which is what `Clear` under it is for.
 
 ## Permissions are bypassed, in three spellings
 
