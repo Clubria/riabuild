@@ -99,6 +99,47 @@ describe("secret brokering", () => {
     });
   });
 
+  test("a lead is brokered through the identity that may do everything", async () => {
+    vi.stubEnv("INFISICAL_LEAD_CLIENT_ID", "lead-id");
+    vi.stubEnv("INFISICAL_LEAD_CLIENT_SECRET", "lead-secret");
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "lead" });
+    const { token } = await issueSession(t, rowId);
+    let loginBody: unknown = null;
+    stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    expect(response.status).toBe(200);
+    expect(loginBody).toEqual({
+      clientId: "lead-id",
+      clientSecret: "lead-secret",
+    });
+  });
+
+  test("a lead on a deployment without mi-lead is brokered as a developer", async () => {
+    // The two lead variables are unset in `beforeEach`, which is the state of
+    // every deployment until somebody sets them. A lead keeps the access they
+    // had rather than meeting a 503 for a credential nobody has created.
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "lead" });
+    const { token } = await issueSession(t, rowId);
+    let loginBody: unknown = null;
+    stubUpstreams({ membership: 204, onLogin: (body) => (loginBody = body) });
+
+    const response = await t.fetch("/api/v1/secrets/token", {
+      method: "POST",
+      headers: bearer(token),
+    });
+    expect(response.status).toBe(200);
+    expect(loginBody).toEqual({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+    });
+  });
+
   test("a developer is told to pull dev and staging", async () => {
     const t = setup();
     const { rowId } = await seedMember(t, { role: "developer" });

@@ -5,6 +5,44 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+describe("which machine identity a role is brokered through", () => {
+  function stubLeadIdentity() {
+    vi.stubEnv("INFISICAL_LEAD_CLIENT_ID", "lead-id");
+    vi.stubEnv("INFISICAL_LEAD_CLIENT_SECRET", "lead-secret");
+  }
+
+  test("a lead gets the identity Infisical grants everything", () => {
+    stubLeadIdentity();
+    const identity = identityForRole("lead");
+    expect(identity.name).toBe("mi-lead");
+    expect(identity.clientIdVar).toBe("INFISICAL_LEAD_CLIENT_ID");
+    expect(identity.clientSecretVar).toBe("INFISICAL_LEAD_CLIENT_SECRET");
+  });
+
+  test("a developer and a candidate are unaffected by it", () => {
+    // Widening a lead must not widen anybody else: the credential is the only
+    // thing that differs, and the permissions behind each are Infisical's.
+    stubLeadIdentity();
+    expect(identityForRole("developer").name).toBe("mi-developer");
+    expect(identityForRole("candidate").name).toBe("mi-candidate");
+  });
+
+  test("a deployment without mi-lead keeps its leads on mi-developer", () => {
+    // Where every lead was brokered before `mi-lead` existed. Failing their
+    // runs until two Convex environment variables are set would cost more than
+    // it buys, and the fallback only ever narrows.
+    expect(identityForRole("lead").name).toBe("mi-developer");
+  });
+
+  test("half a lead identity is not one", () => {
+    // A client id typed and a secret still to come is a deployment mid-setup.
+    // Authenticating with an incomplete pair fails against Infisical with a
+    // 401 nobody can read; the narrower identity that works is the answer.
+    vi.stubEnv("INFISICAL_LEAD_CLIENT_ID", "lead-id");
+    expect(identityForRole("lead").name).toBe("mi-developer");
+  });
+});
+
 describe("which environments a role may pull", () => {
   test("a developer and a lead get dev and staging", () => {
     expect(environmentsForRole("developer")).toEqual(["dev", "staging"]);
