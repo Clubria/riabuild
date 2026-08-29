@@ -1115,6 +1115,32 @@ block that **does not run yet** — see reason (2) in its header — so it is a 
 intention rather than coverage, and reading it as coverage is the mistake that file's own
 comments exist to prevent.
 
+**The status line names the repository, and it asks git rather than riabuild.** It draws
+`(riabuild · Clubria/payments)` — the marker the prompt shares, with `owner/repo` inside
+the parentheses rather than a second thing beside it, because two markers on one line read
+as two environments. The repository is read by walking up from the session's directory to
+`.git/config` and taking `[remote "origin"]`.
+
+Reading riabuild's own `config.json` instead is the obvious alternative and cannot work,
+for the reason the paragraph above is about: this script lives in `tools_root()`, one file
+shared by every developer with an account on a server, while `config.json` lives in
+`~/.riabuild-remote/<member-id>/` — a directory the script has no way to name. **A shared
+script cannot read per-developer state.** Git's answer is also the truthful one, since it
+names the repository the developer is *in* — including a checkout riabuild never cloned,
+and including the case where `active_repo` is not where they are standing.
+
+It reads `.git/config` as a **file** rather than running `git`. Claude Code re-renders the
+status line continuously, so this runs orders of magnitude more often than a provisioning
+step, and a subprocess per render is a cost to hang on a marker. That also makes the whole
+thing testable from files, which is what `claude_statusline::rendering` does — it runs the
+shipped bytes on `node` against `.git` directories written by hand. A **linked worktree**
+is the case worth knowing about, and the case a fixture gets wrong by accident: its `.git`
+is a *file* naming a directory with no `config` in it, so the answer comes from
+`commondir`. A fixture placed under the checkout — riabuild's own `.claude/worktrees/`
+shape — passes with that branch deleted, because the walk upwards reaches the main `.git`
+on its own and is right for the wrong reason, so the test that holds the branch honest puts
+the worktree *beside* the checkout.
+
 `claude_agents_view` is also the one task that **offers** rather than imposes. It writes
 the key only where the account has no answer, because `/config` persists a developer's
 `false` and a task that asserted `true` every run would silently overrule them on every
