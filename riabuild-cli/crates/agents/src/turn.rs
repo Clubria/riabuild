@@ -199,6 +199,7 @@ async fn note_trouble(store: &Store, id: &str, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::Account;
     use riabuild_harness::Kind;
     use riabuild_runner::FakeRunner;
 
@@ -220,7 +221,7 @@ mod tests {
     async fn a_turn_appends_the_harnesss_own_bytes_and_learns_the_thread_id() {
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Claude, Path::new("/work"), None)
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
         let file = queued(&store, &record.id, "hello").await;
@@ -251,9 +252,8 @@ mod tests {
         let (_dir, store) = store();
         let mut record = store
             .create(
-                Kind::Claude,
+                &Account::new(Kind::Claude, 2, Some("/r/claude/abc".into())),
                 Path::new("/work"),
-                Some("/r/claude/abc".into()),
             )
             .await
             .unwrap();
@@ -286,7 +286,7 @@ mod tests {
         // nothing on screen saying why.
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Grok, Path::new("/work"), None)
+            .create(&Account::new(Kind::Grok, 1, None), Path::new("/work"))
             .await
             .unwrap();
         let file = queued(&store, &record.id, "hello").await;
@@ -310,7 +310,7 @@ mod tests {
     async fn the_lock_is_held_for_the_whole_turn_and_given_back_after() {
         let (_dir, store) = store();
         let record = store
-            .create(Kind::Codex, Path::new("/work"), None)
+            .create(&Account::new(Kind::Codex, 1, None), Path::new("/work"))
             .await
             .unwrap();
         let file = queued(&store, &record.id, "hello").await;

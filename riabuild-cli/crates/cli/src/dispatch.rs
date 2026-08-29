@@ -16,6 +16,7 @@ use crate::cli::{ChannelAction, ClaudeAction, Cli, RemoteAction};
 use anyhow::Result;
 use riabuild_agents as agents;
 use riabuild_channel as channel;
+use riabuild_harness::Kind;
 use riabuild_paths::{Paths, RealPaths};
 use riabuild_remote as remote;
 use riabuild_runner::{CommandRunner, RealRunner};
@@ -212,7 +213,7 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         // in full: it is the one tool riabuild does not put on `PATH`.
         riabuild: shims::running_binary()?,
         cwd,
-        homes: homes(ctx),
+        accounts: every_account(ctx),
         prompt,
         theme: ctx.ui.theme(),
         // The same question `riabuild-ui` already answered for the banner, asked
@@ -224,25 +225,57 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
     Ok(0)
 }
 
-/// Which profile each harness runs under.
+/// Every sign-in a session in the agents window may run under.
 ///
-/// The first of riabuild's nine for each, and recorded on every session it
-/// starts. Resume is scoped to the profile that created a session — each tool
-/// keeps its transcripts inside its own home — so a session started under one
-/// and resumed under another finds nothing and quietly begins a new
-/// conversation, with nothing on screen saying so.
+/// All of them, not the first of each. riabuild keeps nine profiles per harness
+/// and writes a launcher for every one — `claude-3`, `codex-2`, `grok-9` — so a
+/// window that could only ever reach account 1 left a developer who signed in to
+/// three of them with no way to use two. The chooser lists what is here, and
+/// what a session was opened under is recorded on it.
 ///
-/// Claude's is keyed by the *primary account's* id rather than by position,
-/// because accounts can be deleted and renumbered and a session outlives that.
-/// Codex and Grok have a fixed set of nine, so the number is the name.
-fn homes(ctx: &Ctx) -> agents::Homes {
-    agents::Homes {
-        claude: accounts::id_of(&ctx.config, 1)
-            .ok()
-            .map(|id| ctx.paths.claude_profile_dir(&id)),
-        codex: Some(ctx.paths.codex_profile_dir(1)),
-        grok: Some(ctx.paths.grok_profile_dir(1)),
+/// Resume is scoped to the profile that created a session — each tool keeps its
+/// transcripts inside its own home — so a session started under one and resumed
+/// under another finds nothing and quietly begins a new conversation, with
+/// nothing on screen saying so. That is why the home travels with the number
+/// rather than being looked up again later.
+///
+/// Claude's are keyed by each *account's id* rather than by position, because
+/// accounts can be deleted and renumbered and a session outlives that. Codex and
+/// Grok Build have a fixed set of nine, so the number is the directory name.
+///
+/// The order is `Kind::ALL` and then the number within it, which is the order
+/// `riabuild claude` lists them in and the order the launchers are numbered.
+fn every_account(ctx: &Ctx) -> agents::Accounts {
+    let mut all = Vec::new();
+    for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
+        all.push(agents::Account::new(
+            Kind::Claude,
+            index + 1,
+            Some(ctx.paths.claude_profile_dir(id)),
+        ));
     }
+    // A machine where riabuild has not made a Claude account yet still gets a
+    // Claude pane, under whatever home Claude Code picks for itself — which is
+    // what every session did before this window could offer a choice. Leaving
+    // the harness out instead would answer a setup problem by hiding a tool.
+    if all.is_empty() {
+        all.push(agents::Account::new(Kind::Claude, 1, None));
+    }
+    for number in 1..=shims::codex::PROFILES {
+        all.push(agents::Account::new(
+            Kind::Codex,
+            number,
+            Some(ctx.paths.codex_profile_dir(number)),
+        ));
+    }
+    for number in 1..=shims::grok::PROFILES {
+        all.push(agents::Account::new(
+            Kind::Grok,
+            number,
+            Some(ctx.paths.grok_profile_dir(number)),
+        ));
+    }
+    agents::Accounts::from(all)
 }
 
 /// `riabuild remote …`

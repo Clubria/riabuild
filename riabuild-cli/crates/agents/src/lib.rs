@@ -65,37 +65,15 @@ use riabuild_runner::CommandRunner;
 use riabuild_theme::Theme;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+pub mod account;
 pub mod app;
 pub mod draw;
 pub mod store;
 pub mod turn;
 
+pub use account::{Account, Accounts};
 use app::{App, Focus, Pane};
 use store::Store;
-
-/// Which sign-in each harness runs under.
-///
-/// Resolved by the caller from riabuild's own account list, and recorded on the
-/// session when it is created — never recomputed. A session is only resumable
-/// under the profile that made it, so if the primary Claude account changes
-/// between turns, a recomputed home would point at a different store and the
-/// conversation would silently start over as a new one.
-#[derive(Debug, Clone, Default)]
-pub struct Homes {
-    pub claude: Option<PathBuf>,
-    pub codex: Option<PathBuf>,
-    pub grok: Option<PathBuf>,
-}
-
-impl Homes {
-    fn get(&self, kind: Kind) -> Option<PathBuf> {
-        match kind {
-            Kind::Claude => self.claude.clone(),
-            Kind::Codex => self.codex.clone(),
-            Kind::Grok => self.grok.clone(),
-        }
-    }
-}
 
 /// What `riabuild agents` was asked to do.
 #[derive(Debug, Clone)]
@@ -108,7 +86,16 @@ pub struct Request {
     pub riabuild: PathBuf,
     /// The checkout every session in this window belongs to.
     pub cwd: PathBuf,
-    pub homes: Homes,
+    /// Every sign-in a session in this window may be started under —
+    /// `claude-1` … `claude-9`, and the same for Codex and Grok Build.
+    ///
+    /// Resolved by the caller from riabuild's own account list, and the one that
+    /// was chosen is recorded on the session when it is created — never
+    /// recomputed. A session is only resumable under the profile that made it,
+    /// so if the primary Claude account changes between turns, a recomputed home
+    /// would point at a different store and the conversation would silently
+    /// start over as a new one.
+    pub accounts: Accounts,
     /// The first thing to say, asked of every harness at once.
     pub prompt: Option<String>,
     pub theme: Theme,
@@ -126,7 +113,8 @@ pub enum Action {
     Nothing,
     Quit,
     Send(String),
-    Open(Kind),
+    /// Start a session under this sign-in.
+    Open(Account),
 }
 
 /// The keymap.
@@ -146,13 +134,13 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
     match app.focus {
         Focus::Compose => match event.code {
             KeyCode::Esc => {
-                app.focus = Focus::List;
+                app.focus = Focus::Transcript;
                 Action::Nothing
             }
             KeyCode::Enter => {
                 let text = app.composing.trim().to_string();
                 app.composing.clear();
-                app.focus = Focus::List;
+                app.focus = Focus::Transcript;
                 if text.is_empty() {
                     Action::Nothing
                 } else {
@@ -169,7 +157,37 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
             }
             _ => Action::Nothing,
         },
-        Focus::List => match event.code {
+        // Choosing which sign-in a new session runs under. Escape is the way
+        // out of it, and choosing nothing is always possible: this is the one
+        // screen that appears because a developer asked a question, so it must
+        // be answerable with "never mind".
+        Focus::Picker => match event.code {
+            KeyCode::Esc => {
+                app.focus = Focus::Transcript;
+                Action::Nothing
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.pick_next();
+                Action::Nothing
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.pick_previous();
+                Action::Nothing
+            }
+            KeyCode::Enter => match app.picked().cloned() {
+                Some(account) => {
+                    app.focus = Focus::Transcript;
+                    Action::Open(account)
+                }
+                // No accounts at all. Nothing to open, and refusing silently is
+                // better than opening a session under a home nobody has.
+                None => Action::Nothing,
+            },
+            _ => Action::Nothing,
+        },
+        // The session column. Up and down mean "another session" only here,
+        // which is the whole of what the left arrow bought.
+        Focus::Sessions => match event.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 app.select_next();
@@ -179,6 +197,39 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
                 app.select_previous();
                 Action::Nothing
             }
+            // Three ways back, because there is nothing to confirm: moving the
+            // cursor has already switched session, so every one of these is
+            // "done here" rather than "accept".
+            KeyCode::Right | KeyCode::Enter | KeyCode::Esc => {
+                app.focus = Focus::Transcript;
+                Action::Nothing
+            }
+            KeyCode::Char('n') => {
+                app.open_picker();
+                Action::Nothing
+            }
+            _ => Action::Nothing,
+        },
+        // Reading. The resting state, so the arrows scroll what is in front of
+        // the developer rather than moving between sessions — `PageUp` is `Fn`
+        // and an arrow on a laptop, which made scrolling a gesture half the
+        // keyboards in the room could not perform.
+        Focus::Transcript => match event.code {
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Left => {
+                app.focus = Focus::Sessions;
+                Action::Nothing
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.scrollback = app.scrollback.saturating_add(1);
+                Action::Nothing
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.scrollback = app.scrollback.saturating_sub(1);
+                Action::Nothing
+            }
+            // Kept, rather than relied on: a full-size keyboard has them and a
+            // page is a faster way through a long transcript than a line.
             KeyCode::PageUp => {
                 app.scrollback = app.scrollback.saturating_add(10);
                 Action::Nothing
@@ -187,9 +238,25 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
                 app.scrollback = app.scrollback.saturating_sub(10);
                 Action::Nothing
             }
-            KeyCode::Char('n') | KeyCode::Char('1') => Action::Open(Kind::Claude),
-            KeyCode::Char('2') => Action::Open(Kind::Codex),
-            KeyCode::Char('3') => Action::Open(Kind::Grok),
+            // Tab still cycles sessions without leaving the transcript, which is
+            // what a developer watching two agents at once actually does.
+            KeyCode::Tab => {
+                app.select_next();
+                Action::Nothing
+            }
+            KeyCode::BackTab => {
+                app.select_previous();
+                Action::Nothing
+            }
+            KeyCode::Char('n') => {
+                app.open_picker();
+                Action::Nothing
+            }
+            // The quick way to a new session on a harness's first sign-in, for
+            // a developer who has one of each and does not want a chooser.
+            KeyCode::Char('1') => open_first(app, Kind::Claude),
+            KeyCode::Char('2') => open_first(app, Kind::Codex),
+            KeyCode::Char('3') => open_first(app, Kind::Grok),
             KeyCode::Enter => {
                 if app.selected().is_some() {
                     app.focus = Focus::Compose;
@@ -198,6 +265,17 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
             }
             _ => Action::Nothing,
         },
+    }
+}
+
+/// A new session on a harness's first sign-in.
+///
+/// Nothing at all where that harness has no accounts, which is only reachable
+/// on a machine where riabuild has not finished setting one up.
+fn open_first(app: &App, kind: Kind) -> Action {
+    match app.accounts.first(kind) {
+        Some(account) => Action::Open(account.clone()),
+        None => Action::Nothing,
     }
 }
 
@@ -231,7 +309,7 @@ pub async fn run(
     // rather than by a command nobody remembers to run.
     let _ = store.prune(&request.cwd).await;
 
-    let mut app = App::new();
+    let mut app = App::new(request.accounts.clone());
     let mut readers: HashMap<String, Reader> = HashMap::new();
     restore(&store, &request, &mut app, &mut readers).await?;
 
@@ -273,6 +351,7 @@ async fn restore(
         };
         let mut pane = Pane::new(record.id.clone(), kind, record.title.clone());
         pane.thread = record.thread.clone();
+        pane.account = record.account;
         // Replayed through the same decoder a live turn is read with, so a
         // reopened pane shows what was on screen when the work happened rather
         // than a reconstruction of it.
@@ -296,18 +375,30 @@ async fn restore(
         app.add(pane);
     }
 
-    // Every harness riabuild installs gets a pane. One that already has a
-    // session keeps it — reopening should hand a developer back the conversation
-    // they were having, not a fourth empty pane beside it.
+    // Every harness riabuild installs gets a pane, on its first sign-in. One
+    // that already has a session keeps it — reopening should hand a developer
+    // back the conversation they were having, not a fourth empty pane beside it.
+    //
+    // One pane per *harness* and not one per account: nine sign-ins each is
+    // twenty-seven panes, which is a list nobody can read, for a developer who
+    // is using two of them. The other twenty-four are a keypress away in the
+    // chooser rather than on screen from the start.
     for kind in Kind::ALL {
         if app.panes.iter().any(|pane| pane.kind == kind) {
             continue;
         }
-        let record = store
-            .create(kind, &request.cwd, request.homes.get(kind))
-            .await?;
+        // A harness with no accounts still gets its pane, under no home at all —
+        // which is what this did for all three before accounts were offered.
+        let account = request
+            .accounts
+            .first(kind)
+            .cloned()
+            .unwrap_or_else(|| Account::new(kind, 1, None));
+        let record = store.create(&account, &request.cwd).await?;
         readers.insert(record.id.clone(), Reader::new(kind));
-        app.add(Pane::new(record.id, kind, String::new()));
+        let mut pane = Pane::new(record.id, kind, String::new());
+        pane.account = account.number;
+        app.add(pane);
     }
     app.selected = 0;
     Ok(())
@@ -319,7 +410,26 @@ fn claim() -> Result<Screen> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    // The alternate screen is not a blank one, and ratatui only writes the cells
+    // that differ from the frame before. On the very first draw the frame before
+    // is *ratatui's* idea of blank rather than the terminal's, so every cell this
+    // interface leaves empty — the margins, the gaps between panes, everything
+    // below a short transcript — is never written at all, and whatever the
+    // terminal already had there stays on screen underneath. That is old shell
+    // history showing through the window, and it looks like a rendering bug
+    // because it is one.
+    //
+    // `Terminal::new` does not do this and `ratatui::init` does; riabuild claims
+    // the terminal by hand, so it has to. Resizing is already covered —
+    // `autoresize` clears on every size change — which is why the symptom
+    // vanished the moment anyone dragged the window and never came back.
+    terminal.clear()?;
+    // Paired with the `show_cursor` in `release`. The compose line draws its own
+    // block where the caret belongs; the terminal's real one would sit wherever
+    // the last cell was written and blink there through every redraw.
+    terminal.hide_cursor()?;
+    Ok(terminal)
 }
 
 fn release(terminal: &mut Screen) {
@@ -370,13 +480,16 @@ async fn drive(
         match action {
             Action::Nothing => {}
             Action::Quit => app.quit = true,
-            Action::Open(kind) => {
-                let record = store
-                    .create(kind, &request.cwd, request.homes.get(kind))
-                    .await?;
-                readers.insert(record.id.clone(), Reader::new(kind));
-                app.add(Pane::new(record.id, kind, String::new()));
+            Action::Open(account) => {
+                let record = store.create(&account, &request.cwd).await?;
+                readers.insert(record.id.clone(), Reader::new(account.kind));
+                let mut pane = Pane::new(record.id, account.kind, String::new());
+                pane.account = account.number;
+                app.add(pane);
                 app.selected = app.panes.len().saturating_sub(1);
+                // Straight to reading the new session rather than leaving the
+                // cursor in the column it was opened from.
+                app.scrollback = 0;
             }
             Action::Send(text) => send(store, runner, request, app, &text).await,
         }
@@ -473,8 +586,19 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Every sign-in riabuild keeps, which is what the window is handed.
+    fn every_account() -> Accounts {
+        let mut all = Vec::new();
+        for kind in Kind::ALL {
+            for number in 1..=9 {
+                all.push(Account::new(kind, number, Some(PathBuf::from("/r"))));
+            }
+        }
+        Accounts::from(all)
+    }
+
     fn with_one_session() -> App {
-        let mut app = App::new();
+        let mut app = App::new(every_account());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app
     }
@@ -494,7 +618,7 @@ mod tests {
         );
         // and the box is cleared, so the next prompt does not start with the last
         assert_eq!(app.composing, "");
-        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.focus, Focus::Transcript);
     }
 
     #[test]
@@ -503,6 +627,93 @@ mod tests {
         key(&mut app, press(KeyCode::Enter));
         key(&mut app, press(KeyCode::Char(' ')));
         assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+    }
+
+    #[test]
+    fn the_arrows_scroll_what_is_being_read_and_the_left_one_leaves_it() {
+        // `PageUp` is `Fn` and an arrow on a laptop keyboard. Scrolling was the
+        // one thing only those two keys did, which made the main gesture of this
+        // screen one half the keyboards in the room cannot perform.
+        let mut app = with_one_session();
+        assert_eq!(app.focus, Focus::Transcript);
+        key(&mut app, press(KeyCode::Up));
+        key(&mut app, press(KeyCode::Up));
+        assert_eq!(app.scrollback, 2);
+        key(&mut app, press(KeyCode::Down));
+        assert_eq!(app.scrollback, 1);
+        // and never past the newest line
+        key(&mut app, press(KeyCode::Down));
+        key(&mut app, press(KeyCode::Down));
+        assert_eq!(app.scrollback, 0);
+
+        // Left is where sessions live, and only there do the arrows change one.
+        key(&mut app, press(KeyCode::Left));
+        assert_eq!(app.focus, Focus::Sessions);
+        key(&mut app, press(KeyCode::Up));
+        assert_eq!(app.scrollback, 0);
+        key(&mut app, press(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn moving_between_sessions_happens_in_the_column_and_nowhere_else() {
+        let mut app = with_one_session();
+        app.add(Pane::new("s2".into(), Kind::Codex, String::new()));
+        key(&mut app, press(KeyCode::Left));
+        key(&mut app, press(KeyCode::Down));
+        assert_eq!(app.selected, 1);
+        key(&mut app, press(KeyCode::Up));
+        assert_eq!(app.selected, 0);
+        // Enter is "done here" rather than "accept": the cursor has already
+        // switched session, so there is nothing left to confirm.
+        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(app.focus, Focus::Transcript);
+        // and tab still switches without going over there at all
+        key(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn a_new_session_can_be_opened_under_any_sign_in() {
+        // The bug: `n` opened `claude-1` and there was no way to reach the other
+        // eight, or any of Codex's or Grok Build's nine, from this window.
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Char('n')));
+        assert_eq!(app.focus, Focus::Picker);
+        // On the sign-in the selected session is already running under, so
+        // "another one of these" is one keypress.
+        assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-1"));
+
+        for _ in 0..3 {
+            key(&mut app, press(KeyCode::Down));
+        }
+        assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-4"));
+        let opened = key(&mut app, press(KeyCode::Enter));
+        assert_eq!(
+            opened,
+            Action::Open(Account::new(Kind::Claude, 4, Some(PathBuf::from("/r"))))
+        );
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn the_chooser_can_be_left_without_opening_anything() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Char('n')));
+        key(&mut app, press(KeyCode::Down));
+        assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn a_window_with_no_accounts_opens_nothing_rather_than_guessing() {
+        // Reachable on a machine riabuild has not finished setting up. A session
+        // under an invented home would resume from a store nobody has.
+        let mut app = App::new(Accounts::default());
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        key(&mut app, press(KeyCode::Char('n')));
+        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(key(&mut app, press(KeyCode::Char('1'))), Action::Nothing);
     }
 
     #[test]
@@ -522,7 +733,12 @@ mod tests {
 
     #[test]
     fn ctrl_c_leaves_from_either_mode() {
-        for focus in [Focus::List, Focus::Compose] {
+        for focus in [
+            Focus::Transcript,
+            Focus::Sessions,
+            Focus::Compose,
+            Focus::Picker,
+        ] {
             let mut app = with_one_session();
             app.focus = focus;
             let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -531,24 +747,17 @@ mod tests {
     }
 
     #[test]
-    fn each_harness_has_its_own_key_and_n_opens_the_default() {
-        let mut app = with_one_session();
-        assert_eq!(
-            key(&mut app, press(KeyCode::Char('n'))),
-            Action::Open(Kind::Claude)
-        );
-        assert_eq!(
-            key(&mut app, press(KeyCode::Char('1'))),
-            Action::Open(Kind::Claude)
-        );
-        assert_eq!(
-            key(&mut app, press(KeyCode::Char('2'))),
-            Action::Open(Kind::Codex)
-        );
-        assert_eq!(
-            key(&mut app, press(KeyCode::Char('3'))),
-            Action::Open(Kind::Grok)
-        );
+    fn each_harness_has_a_key_that_opens_its_first_sign_in() {
+        // For the developer with one account each, who should not be asked to
+        // choose from twenty-seven of them to get a second Codex.
+        for (digit, kind) in [('1', Kind::Claude), ('2', Kind::Codex), ('3', Kind::Grok)] {
+            let mut app = with_one_session();
+            let Action::Open(account) = key(&mut app, press(KeyCode::Char(digit))) else {
+                panic!("{digit} opened nothing");
+            };
+            assert_eq!(account.kind, kind);
+            assert_eq!(account.number, 1);
+        }
     }
 
     #[test]
@@ -557,7 +766,7 @@ mod tests {
         key(&mut app, press(KeyCode::Enter));
         key(&mut app, press(KeyCode::Char('x')));
         assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
-        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.focus, Focus::Transcript);
     }
 
     #[test]
@@ -589,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_back_stops_at_the_newest_line() {
+    fn a_page_at_a_time_still_works_where_the_keyboard_has_the_keys() {
         let mut app = with_one_session();
         key(&mut app, press(KeyCode::PageDown));
         assert_eq!(app.scrollback, 0);
@@ -598,17 +807,28 @@ mod tests {
     }
 
     #[test]
-    fn a_home_is_recorded_per_harness_and_never_shared() {
+    fn a_home_is_recorded_per_account_and_never_shared() {
         // Resume is scoped to the profile that created the session. One home
-        // used for all three would put every session in the wrong store.
-        let homes = Homes {
-            claude: Some("/r/claude/abc".into()),
-            codex: Some("/r/codex/1".into()),
-            grok: Some("/r/grok/1".into()),
-        };
-        let all: Vec<_> = Kind::ALL.into_iter().map(|k| homes.get(k)).collect();
-        assert_eq!(all[0], Some(PathBuf::from("/r/claude/abc")));
-        assert_eq!(all[1], Some(PathBuf::from("/r/codex/1")));
-        assert_eq!(all[2], Some(PathBuf::from("/r/grok/1")));
+        // used for two accounts would put both conversations in one store, and
+        // the second would resume the first's.
+        let accounts = Accounts::from(vec![
+            Account::new(Kind::Claude, 1, Some("/r/claude/abc".into())),
+            Account::new(Kind::Claude, 2, Some("/r/claude/def".into())),
+            Account::new(Kind::Codex, 1, Some("/r/codex/1".into())),
+            Account::new(Kind::Grok, 1, Some("/r/grok/1".into())),
+        ]);
+        // A harness opens on its first account, never on whichever came first
+        // in the list.
+        assert_eq!(
+            accounts.first(Kind::Claude).and_then(|a| a.home.clone()),
+            Some(PathBuf::from("/r/claude/abc"))
+        );
+        assert_eq!(
+            accounts.first(Kind::Codex).and_then(|a| a.home.clone()),
+            Some(PathBuf::from("/r/codex/1"))
+        );
+        let homes: Vec<_> = accounts.all().iter().map(|a| a.home.clone()).collect();
+        assert_eq!(homes[0], Some(PathBuf::from("/r/claude/abc")));
+        assert_ne!(homes[0], homes[1]);
     }
 }

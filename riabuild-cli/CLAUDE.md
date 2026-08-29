@@ -1381,6 +1381,26 @@ All three open, always. There is no flag to choose: riabuild installs all three,
 session that has not been spoken to has started no process, so two idle panes cost three
 lines on screen.
 
+**Three panes, twenty-seven sign-ins.** The window opens each harness on its first account
+and `n` opens a chooser over every profile riabuild keeps — `claude-1` … `claude-9`, and the
+same for Codex and Grok Build, named exactly as their launchers are. One pane per account
+instead would be a list of twenty-seven nobody can read, built for a developer using two of
+them. Every row is labelled with its sign-in rather than its harness, because that is the
+only thing that tells two panes on one harness apart before either has been asked anything.
+
+**The keyboard: reading is the resting state.** The arrows scroll the transcript, `←` goes
+to the session column and `↑↓` change session only there, `→` comes back. It was the other
+way round with `PageUp`/`PageDown` as the only way to scroll, which is `Fn` and an arrow on
+every laptop keyboard in the room — the main gesture of the screen behind a chord most of
+its developers do not have. They still work; nothing depends on them.
+
+**A window that takes the terminal by hand has to clear it.** `claim()` does what
+`ratatui::init` would: ratatui writes only the cells that differ from the previous frame,
+and on the first draw that frame is ratatui's idea of blank rather than the terminal's — so
+every cell this interface leaves empty is never written, and the alternate screen's old
+contents show through underneath. Resizing hid it, because `autoresize` clears. Anything
+drawn over something else needs the `Clear` widget for the same reason.
+
 **The harnesses are driven headless, not embedded.** Each runs in its own structured
 output mode and riabuild draws the result; nothing renders a vendor's own full-screen
 interface in a pane. That is the choice the whole design rests on, and what it buys is
@@ -1421,8 +1441,9 @@ and `kill -0` on a recycled pid answers about the wrong process — and here it 
 reboot right for free, because the kernel releases an `flock` however the holder died.
 
 **A session is a directory, and the spool is the harness's own bytes.**
-`<root>/agents/<id>/` holds `meta.json` (harness, thread id, profile home, checkout,
-title), `events.ndjson`, `turn.lock`, a `pending/` queue of prompts, and `errors.log`. The
+`<root>/agents/<id>/` holds `meta.json` (harness, account, thread id, profile home,
+checkout, title), `events.ndjson`, `turn.lock`, a `pending/` queue of prompts, and
+`errors.log`. The
 spool is the raw NDJSON the harness produced, appended across turns, because replaying it
 through the same `Reader` that reads a live turn is what makes a reopened session show what
 was on screen rather than a reconstruction of it. Under `root()` and not `tools_root()`, so
@@ -1435,7 +1456,9 @@ a session that sits idle for ever with no explanation.
 
 **The profile is recorded, never recomputed.** riabuild keeps nine sign-ins for each
 harness and a session is only resumable under the one that created it, so `meta.json`
-carries the `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` it was started with. Recompute
+carries the `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` it was started with — and the
+account *number* beside it, because the home is what a turn runs under and the number is
+what a developer calls it. Recompute
 it and a changed primary account points the next turn at a different store, where it finds
 no session and quietly begins a new conversation under the same pane. The *binary* is the
 opposite and is resolved per turn: a versioned path moves with every upgrade.
