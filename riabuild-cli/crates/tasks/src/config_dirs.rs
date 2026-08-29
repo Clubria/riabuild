@@ -291,6 +291,7 @@ mod tests {
             number,
             id: id.to_string(),
             identity,
+            tracked: false,
         }
     }
 

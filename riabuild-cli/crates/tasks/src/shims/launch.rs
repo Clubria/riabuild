@@ -120,6 +120,20 @@ pub struct Plan {
     /// What the agents view opens on when the developer is standing in none of
     /// `checkouts`. Claude Code only.
     pub default_checkout: Option<PathBuf>,
+    /// Where this account's status line writes usage samples, when the
+    /// developer has marked the account as one to track. Claude Code only.
+    ///
+    /// `None` is the whole of "do not collect from this account": no path
+    /// reaches the status line's environment, so it returns before it writes
+    /// anything rather than filling a spool nothing will ever send. Which
+    /// accounts are tracked is `UserConfig::tracked_accounts`, and it is
+    /// resolved *here*, at write time, for the reason every other value on this
+    /// line is — so that `claude` never has to read `config.json` to start.
+    ///
+    /// Being on the launcher line is also what makes it drift `check()` can
+    /// see: `riabuild claude track 2` changes what riabuild would write, and
+    /// the next run rewrites the launcher.
+    pub usage_spool: Option<PathBuf>,
     /// The developer's own arguments, verbatim.
     pub args: Vec<String>,
 }
@@ -136,6 +150,7 @@ impl Plan {
             settings: None,
             checkouts: Vec::new(),
             default_checkout: None,
+            usage_spool: None,
             args: Vec::new(),
         }
     }
@@ -173,6 +188,16 @@ pub struct World {
     pub selected_checkout_exists: bool,
     /// `$PATH`, for the fallback that has to take `bin_dir` back off it.
     pub path: String,
+    /// This process's own binary, which is riabuild's — the launcher `exec`ed
+    /// it, so `current_exe()` is the absolute path the launcher named.
+    ///
+    /// Passed to the status line as `RIABUILD_SELF` so it can start a flush.
+    /// Not `RIABUILD_BIN`, which e2e and CI already use to name the binary
+    /// under test — a collision there would point a flush at a build fixture.
+    /// `None` where the platform will not say, and the cost of that is only the
+    /// one-a-minute cadence: the sample is still spooled and the next `riabuild`
+    /// run still sends it.
+    pub riabuild: Option<PathBuf>,
 }
 
 /// What the launcher hands over to, once every question has been answered.
@@ -452,6 +477,7 @@ async fn observe(plan: &Plan) -> World {
         cwd,
         selected_checkout_exists,
         path: std::env::var("PATH").unwrap_or_default(),
+        riabuild: std::env::current_exe().ok(),
     }
 }
 
@@ -498,6 +524,9 @@ pub fn script(riabuild: &Path, plan: &Plan) -> String {
     }
     if let Some(default) = &plan.default_checkout {
         flag("--default-checkout", &default.to_string_lossy());
+    }
+    if let Some(spool) = &plan.usage_spool {
+        flag("--usage-spool", &spool.to_string_lossy());
     }
     // `--` so that a developer's own first argument can be anything at all:
     // `claude --resume`, `codex -a on-request`, `grok --permission-mode plan`.

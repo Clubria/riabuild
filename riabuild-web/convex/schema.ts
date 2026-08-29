@@ -275,6 +275,97 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_label", ["label"]),
 
+  /**
+   * One row per Claude Code session, per developer, per Claude account — the
+   * cumulative totals the status line already prints, sent on by
+   * `riabuild internal usage-flush` and upserted here.
+   *
+   * Design: `docs/superpowers/specs/2026-08-29-usage-tracking-design.md`.
+   *
+   * Two things about the key are decisions rather than details. The member
+   * comes from the authenticated session and never from the request body, so
+   * there is no way to file a sample against somebody else. And the account is
+   * `accountId` — riabuild's own config-directory uuid — rather than the Claude
+   * login's email address: these are personal Pro and Max subscriptions, so
+   * keying on the email would make this table a durable map of which private
+   * Anthropic accounts each developer owns, acquired as a side effect of
+   * picking a primary key.
+   *
+   * Every metric is optional because every one of them is genuinely absent
+   * somewhere: an API-key or Console login gets no `rate_limits` block at all,
+   * a session that has not called the API yet has no `cost`, and a harness that
+   * is not Claude Code will arrive with a different subset again. Absent means
+   * "never measured" and is not the same as zero, which is why nothing here
+   * defaults to `0` on the way in.
+   */
+  usageSessions: defineTable({
+    memberId: v.id("members"),
+    /**
+     * The uuid riabuild names a Claude config directory with — not an email,
+     * and not the account *number* a developer sees in `riabuild claude`, which
+     * renumbers when one is deleted.
+     */
+    accountId: v.string(),
+    sessionId: v.string(),
+    /** "claude" today. Grok publishes a status line of the same shape; Codex will arrive over a different producer. */
+    harness: v.string(),
+    model: v.optional(v.string()),
+    /**
+     * Unix **seconds**, stamped by the server when the sample arrived. Not the
+     * laptop's clock: a machine with a wrong one would otherwise decide which
+     * rows a lead's window contains and which rows the reaper deletes.
+     */
+    observedAt: v.number(),
+    /**
+     * What the session would have cost against the public API price sheet.
+     * Nobody spent it — these are subscriptions — so it is labelled
+     * "list-price equivalent" everywhere it is shown, and never "spend".
+     */
+    costUsd: v.optional(v.number()),
+    /**
+     * There is deliberately **no token count here**, and its absence is a
+     * finding rather than an omission. The status line's
+     * `context_window.total_input_tokens` and `total_output_tokens` are what is
+     * *currently in the context window*, taken from the most recent API
+     * response: zero before the first one, and smaller again after every
+     * `/compact`. Merged by maximum — which is what every other number here
+     * does — they would report the largest context this session ever held,
+     * under a heading saying "tokens". `current_usage` describes one API call
+     * and is no better. The payload carries no cumulative billed-token field at
+     * all, so `costUsd` is the volume proxy, and a column nobody can populate
+     * honestly is worse than no column.
+     */
+    durationMs: v.optional(v.number()),
+    apiDurationMs: v.optional(v.number()),
+    linesAdded: v.optional(v.number()),
+    linesRemoved: v.optional(v.number()),
+    /**
+     * The rate-limit windows, which exist in no other surface: the Admin APIs
+     * cannot see a personal subscription and OpenTelemetry does not emit these.
+     * On a plan where nobody pays per token, consumed window is the only
+     * measure of the thing that actually runs out.
+     *
+     * These are the fields that take the *newest* sample rather than the
+     * largest, because a percentage legitimately falls when its window resets.
+     */
+    fiveHourPct: v.optional(v.number()),
+    fiveHourResetsAt: v.optional(v.number()),
+    sevenDayPct: v.optional(v.number()),
+    sevenDayResetsAt: v.optional(v.number()),
+  })
+    /** The upsert key. One row per session, however many samples describe it. */
+    .index("by_member_account_session", ["memberId", "accountId", "sessionId"])
+    /** One member's window, newest first — what the lead rollup reads. */
+    .index("by_member_observed", ["memberId", "observedAt"])
+    /**
+     * For the ninety-day sweep in `crons.ts`, the same way
+     * `cliSessions.by_expiresAt` serves its reaper. Without it the sweep is a
+     * `filter` that walks every row ever written on every run — and in the
+     * steady state, where there is nothing to delete, it walks all of them and
+     * finds none. The rows worth deleting are a prefix of this index.
+     */
+    .index("by_observed", ["observedAt"]),
+
   auditLog: defineTable({
     actorId: v.optional(v.id("members")),
     action: v.string(),

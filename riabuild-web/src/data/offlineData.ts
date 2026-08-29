@@ -24,6 +24,7 @@ export function offlineData(message: string): Data {
     sharedServers: failed,
     issuedKeys: failed,
     auditLog: failed,
+    usage: failed,
     orgConfig: failed,
     now: 0,
     updateProfile: reject,

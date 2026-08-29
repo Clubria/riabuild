@@ -123,6 +123,7 @@ mod tests {
             number: 1,
             id: "id-1".into(),
             identity: Identity::LoggedIn("clubria@proton.me".into()),
+            tracked: false,
         }];
         let prelude =
             crate::shell::prelude(&accounts, riabuild_theme::Theme::plain(), Some("build-01"));

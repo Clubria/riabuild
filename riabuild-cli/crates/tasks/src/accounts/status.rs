@@ -34,6 +34,14 @@ pub struct Account {
     pub number: usize,
     pub id: String,
     pub identity: Identity,
+    /// Whether this account reports usage to the team dashboard.
+    ///
+    /// Shown in the box rather than left to a document, because it is the one
+    /// thing here a developer might not expect and would want to check: these
+    /// accounts include personal subscriptions. Read from
+    /// `UserConfig::tracked_accounts`, which is empty until somebody runs
+    /// `riabuild claude track`.
+    pub tracked: bool,
 }
 
 /// Every account, asked at the same time.
@@ -43,22 +51,26 @@ pub async fn read_all(ctx: &Ctx) -> Vec<Account> {
     // A panicked lookup's `JoinError` carries no payload, so the number and id
     // it would have reported are kept here, keyed by the task that owns them —
     // that is the only way to still list the account rather than lose it.
-    let mut pending: HashMap<tokio::task::Id, (usize, String)> = HashMap::new();
+    let mut pending: HashMap<tokio::task::Id, (usize, String, bool)> = HashMap::new();
     for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
         let runner = ctx.runner.clone();
         let claude = claude.clone();
         let dir = ctx.paths.claude_profile_dir(id);
         let number = index + 1;
         let id_for_task = id.clone();
+        // Captured before the spawn: the config is the run's own snapshot and
+        // the task outlives this borrow of it.
+        let tracked = ctx.config.tracked_accounts.contains(id);
         let handle = asking.spawn(async move {
             let identity = ask(runner.as_ref(), &claude, &dir).await;
             Account {
                 number,
                 id: id_for_task,
                 identity,
+                tracked,
             }
         });
-        pending.insert(handle.id(), (number, id.clone()));
+        pending.insert(handle.id(), (number, id.clone(), tracked));
     }
 
     let mut found = Vec::new();
@@ -68,10 +80,11 @@ pub async fn read_all(ctx: &Ctx) -> Vec<Account> {
             // A panicked lookup must not take the account with it — the
             // number and id are still known even though the identity is not.
             Err(error) => {
-                if let Some((number, id)) = pending.remove(&error.id()) {
+                if let Some((number, id, tracked)) = pending.remove(&error.id()) {
                     found.push(Account {
                         number,
                         id,
+                        tracked,
                         identity: Identity::Unknown("the lookup did not finish".to_string()),
                     });
                 }

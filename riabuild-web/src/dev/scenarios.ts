@@ -9,6 +9,8 @@ import {
   OrgConfig,
   Session,
   SharedServer,
+  UsageRollup,
+  UsageRow,
 } from "../data/types";
 
 /**
@@ -387,6 +389,89 @@ const ISSUED_KEYS: IssuedKey[] = [
   },
 ];
 
+/**
+ * The usage rollup, in the four shapes that read differently.
+ *
+ * `NOW` is milliseconds and every field on a usage row is unix **seconds**, so
+ * each timestamp here is divided rather than written twice — a fixture that got
+ * that wrong would render a reset time in 1970 and look like a formatting bug.
+ */
+const SECONDS = Math.floor(NOW / 1000);
+const HOUR_S = 60 * 60;
+const DAY_S = 24 * HOUR_S;
+
+const USAGE_ROWS: UsageRow[] = [
+  // Nearly out of headroom on the five-hour window, which is the row a lead
+  // opens this panel to find.
+  {
+    memberId: DEVELOPER._id,
+    githubLogin: DEVELOPER.githubLogin,
+    sessions: 14,
+    costUsd: 46.82,
+    linesAdded: 2140,
+    linesRemoved: 830,
+    fiveHourPct: 94,
+    fiveHourResetsAt: SECONDS + 2 * HOUR_S,
+    sevenDayPct: 61,
+    sevenDayResetsAt: SECONDS + 3 * DAY_S,
+    lastObservedAt: SECONDS - 4 * 60,
+    truncated: false,
+  },
+  {
+    memberId: LEAD._id,
+    githubLogin: LEAD.githubLogin,
+    sessions: 6,
+    costUsd: 12.4,
+    linesAdded: 310,
+    linesRemoved: 96,
+    fiveHourPct: 78,
+    fiveHourResetsAt: SECONDS + 40 * 60,
+    sevenDayPct: 33,
+    sevenDayResetsAt: SECONDS + 5 * DAY_S,
+    lastObservedAt: SECONDS - 90 * 60,
+    truncated: false,
+  },
+  {
+    memberId: CANDIDATE._id,
+    githubLogin: CANDIDATE.githubLogin,
+    sessions: 1,
+    costUsd: 0.34,
+    linesAdded: 12,
+    linesRemoved: 0,
+    fiveHourPct: 3,
+    fiveHourResetsAt: SECONDS + 4 * HOUR_S,
+    sevenDayPct: 1,
+    sevenDayResetsAt: SECONDS + 6 * DAY_S,
+    lastObservedAt: SECONDS - 2 * DAY_S,
+    truncated: false,
+  },
+  /**
+   * An account that reports no rate-limit block at all — an API-key or Console
+   * login, which the status line documents and which is not the same as a
+   * window sitting at zero. The panel has to say "—" rather than "0%".
+   */
+  {
+    memberId: SUSPENDED._id,
+    githubLogin: SUSPENDED.githubLogin,
+    sessions: 3,
+    costUsd: 5,
+    linesAdded: 44,
+    linesRemoved: 44,
+    fiveHourPct: null,
+    fiveHourResetsAt: null,
+    sevenDayPct: null,
+    sevenDayResetsAt: null,
+    lastObservedAt: SECONDS - 6 * DAY_S,
+    truncated: false,
+  },
+];
+
+const USAGE: UsageRollup = {
+  windowDays: 7,
+  since: SECONDS - 7 * DAY_S,
+  rows: USAGE_ROWS,
+};
+
 const NOOP = async () => {};
 const REJECT = async (): Promise<never> => {
   throw new Error(
@@ -410,6 +495,7 @@ function base(viewer: Member | null): Data {
     sharedServers: { state: "ready", value: SHARED_SERVERS },
     issuedKeys: { state: "ready", value: ISSUED_KEYS },
     auditLog: { state: "ready", value: AUDIT },
+    usage: { state: "ready", value: USAGE },
     orgConfig: { state: "ready", value: ORG },
     now: NOW,
     updateProfile: NOOP,
@@ -450,6 +536,7 @@ export const SCENARIOS: Record<string, () => Data> = {
     auth: "loading",
     viewer: { state: "loading" },
     sessions: { state: "loading" },
+    usage: { state: "loading" },
     orgConfig: { state: "loading" },
   }),
 
@@ -607,6 +694,62 @@ export const SCENARIOS: Record<string, () => Data> = {
       state: "error",
       message:
         "[CONVEX Q(members:auditLog)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
+  }),
+
+  /**
+   * Nobody has opted an account in yet, which is the state every deployment
+   * starts in and stays in until developers run `riabuild claude track`. The
+   * empty state has to say that, or a lead reads it as broken.
+   */
+  "usage-empty": () => ({
+    ...base(LEAD),
+    usage: {
+      state: "ready" as const,
+      value: { ...USAGE, rows: [] },
+    },
+  }),
+
+  /** One row, which is what a team looks like on the first day. */
+  "usage-one": () => ({
+    ...base(LEAD),
+    usage: {
+      state: "ready" as const,
+      value: { ...USAGE, rows: [USAGE_ROWS[0]] },
+    },
+  }),
+
+  /** Everybody at once — twenty rows, and every band of the meter. */
+  "usage-many": () => ({
+    ...base(LEAD),
+    usage: {
+      state: "ready" as const,
+      value: {
+        ...USAGE,
+        rows: Array.from({ length: 20 }, (_, i) => ({
+          ...USAGE_ROWS[i % USAGE_ROWS.length],
+          memberId: id<"members">(`m_usage_${i}`),
+          githubLogin: `dev-${String(i).padStart(2, "0")}`,
+          fiveHourPct: i * 5,
+          sevenDayPct: 100 - i * 5,
+          sessions: i,
+          costUsd: i * 3.5,
+        })),
+      },
+    },
+  }),
+
+  "usage-loading": () => ({
+    ...base(LEAD),
+    usage: { state: "loading" as const },
+  }),
+
+  "usage-error": () => ({
+    ...base(LEAD),
+    usage: {
+      state: "error" as const,
+      message:
+        "[CONVEX Q(usage:rollup)] Uncaught Error: Server Error — the deployment is not answering.",
     },
   }),
 
@@ -799,6 +942,37 @@ export const SCENARIOS: Record<string, () => Data> = {
         ...ORG,
         repoSlug: `Clubria/${"very-long-repository-name".repeat(6)}`,
         claudeSettings: `{"note":"${"z".repeat(400)}"}`,
+      },
+    },
+    usage: {
+      state: "ready",
+      value: {
+        ...USAGE,
+        rows: [
+          {
+            ...USAGE_ROWS[0],
+            memberId: id<"members">("m_usage_hostile"),
+            // The 60-character unbroken login the rest of the overflow
+            // scenario uses, beside a `partial` badge — which is where this
+            // table runs out of room first.
+            githubLogin: "a".repeat(60),
+            sessions: 999_999,
+            // Wider than the column, and a reminder that this is notional: a
+            // number this size is exactly the one somebody would put in a
+            // budget if it were not labelled.
+            costUsd: 1_234_567.89,
+            linesAdded: 9_876_543,
+            linesRemoved: 8_765_432,
+            fiveHourPct: 100,
+            sevenDayPct: 100,
+            truncated: true,
+          },
+          {
+            ...USAGE_ROWS[3],
+            memberId: id<"members">("m_usage_unicode"),
+            githubLogin: UNICODE.githubLogin,
+          },
+        ],
       },
     },
     auditLog: {

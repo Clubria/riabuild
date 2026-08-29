@@ -176,6 +176,8 @@ pub async fn claude(ctx: &mut Ctx, action: Option<ClaudeAction>) -> Result<i32> 
         ClaudeAction::New => accounts::command::new(ctx).await,
         ClaudeAction::Delete { number, yes } => accounts::command::delete(ctx, number, yes).await,
         ClaudeAction::Primary { number } => accounts::command::primary(ctx, number).await,
+        ClaudeAction::Track { number } => accounts::command::track(ctx, number, true).await,
+        ClaudeAction::Untrack { number } => accounts::command::track(ctx, number, false).await,
     }
 }
 

@@ -37,7 +37,7 @@ pub mod codex;
 pub mod grok;
 pub mod launch;
 
-pub use claude::{launcher_script, write_all};
+pub use claude::{Checkouts, launcher_script, write_all};
 pub use launch::{Harness, Plan};
 
 use crate::Ctx;
@@ -606,8 +606,15 @@ mod tests {
                 "/home/dev/.riabuild/node/22.23.1/bin/claude",
                 Path::new("/home/dev/.riabuild/org-settings.json"),
                 Path::new("/home/dev/.riabuild/bin"),
-                std::slice::from_ref(&checkout),
-                Some(&checkout),
+                claude::Checkouts {
+                    all: std::slice::from_ref(&checkout),
+                    default: Some(&checkout),
+                },
+                // A tracked account, so the `--usage-spool` flag is covered by
+                // the single-exec gate too. A flag that broke that property
+                // would break it on the accounts that carry it, not on the
+                // ones that do not.
+                Some(Path::new("/home/dev/.riabuild/usage/abc.ndjson")),
             ),
             codex::launcher_script(
                 riabuild,

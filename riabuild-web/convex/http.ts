@@ -17,6 +17,7 @@ import {
   type MemberView,
 } from "./lib/guard";
 import { brokerToken, environmentsForRole } from "./infisical";
+import { MAX_SAMPLES_PER_REQUEST } from "./usage";
 import { RETIRED_DEFAULT_PROJECT_PATH } from "./org";
 
 const http = httpRouter();
@@ -689,5 +690,160 @@ http.route({
     }),
   ),
 });
+
+/* -------------------------------------------------------------------------- */
+/* POST /api/v1/usage — session totals from the status line                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The one write endpoint a laptop makes on its own schedule, and the only one
+ * whose caller nobody is watching: `riabuild internal usage-flush` runs
+ * detached beside an interactive Claude Code session and treats every failure
+ * as "keep the spool, try again in a minute". So this handler is written for a
+ * reader who will never see its message — the status code is the whole
+ * conversation.
+ *
+ * `org: true` like every other route that carries member data. Usage is not a
+ * secret being brokered, but it is a member's data being written under their
+ * name, and a developer who left the org yesterday should stop filing rows
+ * today without anybody remembering to edit a Convex row.
+ *
+ * Design: `docs/superpowers/specs/2026-08-29-usage-tracking-design.md`.
+ */
+http.route({
+  path: "/api/v1/usage",
+  method: "POST",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const { member } = await guard(ctx, req, { version: true, org: true });
+
+      const body: unknown = await req.json().catch(() => null);
+      const samples = parseSamples(body);
+
+      const result = await ctx.runMutation(internal.usage.record, {
+        // From the session, never from the body. There is no `memberId` on the
+        // wire at all: the flush has already proved who it is with a bearer
+        // token, and a member named in the body would be a client-supplied
+        // claim standing in front of one the request had proved.
+        memberId: member._id,
+        // Stamped here, from the server's clock. A laptop whose clock is wrong
+        // — or a caller that would like its rows to outlive the reaper — does
+        // not get to choose which window a sample lands in.
+        observedAt: Math.floor(Date.now() / 1000),
+        samples,
+      });
+
+      // No `auditLog` row, deliberately, and not one per sample either. See
+      // `usage.record`: that table records changes to access, and a flush every
+      // sixty seconds per active developer would bury every one of them.
+      return jsonResponse({ accepted: result.accepted });
+    }),
+  ),
+});
+
+/** The one malformed-body failure this route has. */
+function badUsageBody(): never {
+  fail(
+    400,
+    "bad_request",
+    "riabuild sent a usage report this server could not read.",
+    "Upgrade riabuild with `brew upgrade clubria/tap/riabuild`; nothing else is affected.",
+  );
+}
+
+/** Long enough for anything real; short enough that a field cannot be a payload. */
+const MAX_USAGE_FIELD_LENGTH = 200;
+
+function usageString(raw: unknown, required: boolean): string | undefined {
+  if (raw === undefined || raw === null) {
+    if (required) badUsageBody();
+    return undefined;
+  }
+  if (typeof raw !== "string") badUsageBody();
+  const value = raw.trim();
+  if (value === "") {
+    if (required) badUsageBody();
+    return undefined;
+  }
+  return value.slice(0, MAX_USAGE_FIELD_LENGTH);
+}
+
+/**
+ * A number, or nothing.
+ *
+ * `NaN` and `Infinity` are refused rather than stored: both pass
+ * `typeof === "number"`, both come back out of `JSON.stringify` as `null`, and
+ * one of either poisons every sum in the lead's rollup for the whole team. A
+ * negative is refused for the same reason — every field here is a count, a
+ * duration or a percentage, and none of them runs backwards.
+ */
+function usageNumber(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+    badUsageBody();
+  }
+  return raw;
+}
+
+/**
+ * `{ samples: [...] }`, narrowed.
+ *
+ * Unknown keys inside a sample are **ignored rather than refused**, which is
+ * the compatibility rule read from the other side: a newer CLI that starts
+ * reporting a field this deployment has not learned about yet must keep
+ * working, and riabuild upgrades on every developer's own schedule. What is
+ * refused is a body of the wrong *shape* — that one is a bug in one of the two
+ * halves, and accepting it quietly would file rows nobody can read.
+ */
+function parseSamples(body: unknown) {
+  if (typeof body !== "object" || body === null) badUsageBody();
+  const raw = (body as { samples?: unknown }).samples;
+  if (!Array.isArray(raw)) badUsageBody();
+
+  // A bound on one transaction rather than a rate limit: the flush compacts its
+  // spool to one line per session before sending, so a laptop that has been
+  // offline for a week sends its session count and not its message count.
+  // Refused rather than truncated — the CLI clears what the server said it
+  // accepted, so a silently dropped tail is a total that is quietly wrong for
+  // ever.
+  if (raw.length > MAX_SAMPLES_PER_REQUEST) {
+    fail(
+      400,
+      "bad_request",
+      `riabuild sent ${raw.length} usage samples at once; this server takes ${MAX_SAMPLES_PER_REQUEST}.`,
+      "Nothing is lost — riabuild sends them in smaller batches on its next try.",
+    );
+  }
+
+  return raw.map((entry) => {
+    if (typeof entry !== "object" || entry === null) badUsageBody();
+    const sample = entry as Record<string, unknown>;
+    const harness = usageString(sample.harness, true);
+    const accountId = usageString(sample.accountId, true);
+    const sessionId = usageString(sample.sessionId, true);
+    if (
+      harness === undefined ||
+      accountId === undefined ||
+      sessionId === undefined
+    ) {
+      badUsageBody();
+    }
+    return {
+      harness,
+      accountId,
+      sessionId,
+      model: usageString(sample.model, false),
+      costUsd: usageNumber(sample.costUsd),
+      durationMs: usageNumber(sample.durationMs),
+      apiDurationMs: usageNumber(sample.apiDurationMs),
+      linesAdded: usageNumber(sample.linesAdded),
+      linesRemoved: usageNumber(sample.linesRemoved),
+      fiveHourPct: usageNumber(sample.fiveHourPct),
+      fiveHourResetsAt: usageNumber(sample.fiveHourResetsAt),
+      sevenDayPct: usageNumber(sample.sevenDayPct),
+      sevenDayResetsAt: usageNumber(sample.sevenDayResetsAt),
+    };
+  });
+}
 
 export default http;

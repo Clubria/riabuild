@@ -16,6 +16,7 @@
 //! as the value, and the other is the developer's `infisical export > .env`.
 
 pub(crate) mod infisical;
+pub(crate) mod usage;
 
 use anyhow::Result;
 use riabuild_gh_session as gh_session;
@@ -141,6 +142,7 @@ pub(crate) async fn launch(
         settings,
         checkouts,
         default_checkout,
+        usage_spool,
         args,
     } = action
     else {
@@ -151,6 +153,7 @@ pub(crate) async fn launch(
         settings: settings.as_deref().map(PathBuf::from),
         checkouts: checkouts.iter().map(PathBuf::from).collect(),
         default_checkout: default_checkout.as_deref().map(PathBuf::from),
+        usage_spool: usage_spool.as_deref().map(PathBuf::from),
         args: args.clone(),
         ..Plan::new(
             (*harness).into(),

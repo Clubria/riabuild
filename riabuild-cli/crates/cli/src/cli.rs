@@ -278,6 +278,12 @@ pub enum InternalAction {
         #[arg(long = "default-checkout", value_name = "PATH")]
         default_checkout: Option<String>,
 
+        /// Where this account's status line writes usage samples. Claude Code
+        /// only, and written only for an account `riabuild claude track` has
+        /// marked — its absence is what stops collection.
+        #[arg(long = "usage-spool", value_name = "PATH")]
+        usage_spool: Option<String>,
+
         /// The developer's own arguments, verbatim.
         ///
         /// `trailing_var_arg` and `allow_hyphen_values` for the reason
@@ -288,6 +294,16 @@ pub enum InternalAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Send the usage samples the Claude status line has spooled.
+    ///
+    /// Started detached by `claude-statusline.js`, at most once a minute, and
+    /// never by a person. It takes the flush lock non-blocking and gives up
+    /// rather than queueing — three windows on one laptop reach for it in the
+    /// same second and the winner's work makes the others unnecessary — and it
+    /// fails silently, because nothing reads its output and it runs beside an
+    /// interactive session that did not ask for it.
+    UsageFlush,
+
     /// Run one agent turn.
     ///
     /// Started detached by `riabuild agents`, never by a person. It is a
@@ -409,6 +425,21 @@ pub enum ClaudeAction {
         /// Remove it without asking.
         #[arg(long)]
         yes: bool,
+    },
+    /// Report this account's usage to the team dashboard.
+    ///
+    /// Off for every account until it is asked for. A developer's accounts
+    /// include personal subscriptions, and collecting from one nobody marked
+    /// would ship a person's private usage to their employer.
+    Track {
+        /// Which account, as shown by `riabuild claude`.
+        #[arg(value_name = "NUMBER")]
+        number: usize,
+    },
+    /// Stop reporting this account's usage.
+    Untrack {
+        #[arg(value_name = "NUMBER")]
+        number: usize,
     },
     /// Make an account the one `claude` runs.
     Primary {
@@ -882,8 +913,13 @@ mod tests {
                     "/Users/Ada Smith/.riabuild/node/22.23.1/bin/claude",
                     Path::new("/Users/Ada Smith/.riabuild/org-settings.json"),
                     bin,
-                    std::slice::from_ref(&checkout),
-                    Some(&checkout),
+                    shims::Checkouts {
+                        all: std::slice::from_ref(&checkout),
+                        default: Some(&checkout),
+                    },
+                    // A tracked account, so `--usage-spool` crosses the seam
+                    // too — and with a space in it, like every other path here.
+                    Some(Path::new("/Users/Ada Smith/.riabuild/usage/abc.ndjson")),
                 ),
             ),
             (
@@ -920,6 +956,7 @@ mod tests {
                         binary,
                         bin_dir,
                         args,
+                        usage_spool,
                         ..
                     },
             }) = parsed.command
@@ -927,6 +964,17 @@ mod tests {
                 panic!("{argv:?} did not parse as a launch");
             };
             assert_eq!(harness, expected);
+
+            // Claude Code is the only harness that writes one today, so the
+            // other two prove the flag is genuinely optional rather than
+            // silently defaulted.
+            let expected_spool = match expected {
+                LaunchHarness::Claude => {
+                    Some("/Users/Ada Smith/.riabuild/usage/abc.ndjson".to_string())
+                }
+                _ => None,
+            };
+            assert_eq!(usage_spool, expected_spool, "{argv:?}");
             assert!(home.contains("Ada Smith"), "{home}");
             assert!(binary.contains("Ada Smith"), "{binary}");
             assert_eq!(bin_dir, bin.to_string_lossy());

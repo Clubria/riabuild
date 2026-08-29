@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 // Marks the status line the way the environment shell marks `PS1` — same word,
 // same bold blue. The prompt and the status line are two renderers answering
@@ -181,17 +182,126 @@ function cwdOf(payload) {
   return payload.workspace?.current_dir || payload.cwd || process.cwd();
 }
 
+
+// How often starting a flush is worth it. This script runs about once per
+// assistant message, which is far more often than a usage dashboard needs, so
+// the spool is *sent* at most once a minute and every other render only appends.
+const FLUSH_EVERY_MS = 60_000;
+
+// One usage sample, in the shape `POST /api/v1/usage` takes.
+//
+// Only fields Claude Code documents as **cumulative for the session** are
+// carried, because the server merges samples by taking the larger of what it
+// holds and what arrives. A per-call figure merged that way would report the
+// largest single request rather than the session — a number that means nothing
+// and looks like one that does.
+//
+// **No token count is collected, and that is deliberate.**
+// `context_window.total_input_tokens` reads like a session total and is
+// documented as the tokens *currently in the context window*: `0` before the
+// first response, and smaller again after every `/compact`. Merged by maximum
+// it would report the largest the context ever grew, under a column heading
+// that said "tokens". `cost.total_cost_usd` is the only cumulative measure of
+// volume the status line offers, so it is the one taken.
+//
+// Nothing about *what* the developer was doing is collected: no prompt, no file
+// path, and not the repository — which this script has in hand for the marker
+// and deliberately does not send.
+function sample(payload) {
+  const cost = payload.cost ?? {};
+  const limits = payload.rate_limits ?? {};
+  const out = {
+    harness: 'claude',
+    sessionId: payload.session_id,
+    model: payload.model?.id,
+    costUsd: cost.total_cost_usd,
+    durationMs: cost.total_duration_ms,
+    apiDurationMs: cost.total_api_duration_ms,
+    linesAdded: cost.total_lines_added,
+    linesRemoved: cost.total_lines_removed,
+    fiveHourPct: limits.five_hour?.used_percentage,
+    fiveHourResetsAt: limits.five_hour?.resets_at,
+    sevenDayPct: limits.seven_day?.used_percentage,
+    sevenDayResetsAt: limits.seven_day?.resets_at,
+  };
+  // An absent cost means unreported, never free, and the server tells the two
+  // apart — so a key with no value is dropped rather than sent as null.
+  for (const key of Object.keys(out)) {
+    if (out[key] == null) delete out[key];
+  }
+  return out;
+}
+
+// Appends a sample and, at most once a minute, starts a flush.
+//
+// Every failure is swallowed by the caller. This is on the render path of an
+// interactive session, and a provisioner that breaks a developer's status line
+// because a dashboard is unreachable has turned a usage tracker into an outage.
+function collect(payload) {
+  // Set by the Claude launcher, and **only for an account the developer marked
+  // as work** — see `riabuild claude track`. An untracked account is handed no
+  // path, so this returns before writing anything and a personal subscription
+  // leaves no trace at all.
+  const spool = process.env.RIABUILD_USAGE_SPOOL;
+  if (!spool || !payload.session_id) return;
+
+  // The spool is `<root>/usage/<account-uuid>.ndjson`, so the account names
+  // itself and nothing has to be passed twice.
+  const accountId = path.basename(spool, '.ndjson');
+  fs.mkdirSync(path.dirname(spool), { recursive: true });
+  fs.appendFileSync(spool, JSON.stringify({ ...sample(payload), accountId }) + '\n');
+
+  // The marker's mtime is when a flush was last *attempted*, not when one last
+  // succeeded. A laptop that cannot reach riabuild-web then retries once a
+  // minute and no more; moving it only on success would spawn a process on
+  // every render for as long as the dashboard was down.
+  const marker = path.join(path.dirname(spool), 'flushed');
+  let due;
+  try {
+    due = Date.now() - fs.statSync(marker).mtimeMs >= FLUSH_EVERY_MS;
+  } catch {
+    due = true; // no marker yet: this machine has never flushed.
+  }
+  if (!due) return;
+
+  // Absolute, from the launcher, because `~/.riabuild/bin` is the one directory
+  // riabuild does not put itself in — see `no_shim_looks_riabuild_up_on_the_path`.
+  // `RIABUILD_SELF` and not `RIABUILD_BIN`, which e2e and CI already use to name
+  // the binary under test. Without it the sample still lands in the spool and
+  // the next `riabuild` run sends it; only the one-a-minute cadence is lost.
+  const riabuild = process.env.RIABUILD_SELF;
+  if (!riabuild) return;
+
+  // Detached, with its output thrown away. Claude Code kills a status line
+  // script a newer render supersedes, and a flush in this process group would
+  // die with it — mid-POST, having already taken the lock.
+  spawn(riabuild, ['internal', 'usage-flush'], {
+    detached: true,
+    stdio: 'ignore',
+  }).unref();
+}
+
 let input = '';
 process.stdin.on('data', (c) => (input += c));
 process.stdin.on('end', () => {
   let label = marker('');
   let bar = '';
+  let payload = null;
   try {
-    const payload = JSON.parse(input || '{}');
+    payload = JSON.parse(input || '{}');
     label = marker(repoOf(cwdOf(payload)));
     bar = contextBar(payload);
   } catch {
     // Silent fail: a broken bar still leaves a labelled status line.
   }
+
+  // After the marker and the bar, and in its own `try`, so that nothing about
+  // collecting usage can cost a developer the status line they asked for.
+  try {
+    if (payload) collect(payload);
+  } catch {
+    // Silent fail: see `collect`.
+  }
+
   process.stdout.write(label + bar);
 });

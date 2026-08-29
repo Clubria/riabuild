@@ -24,6 +24,7 @@ pub mod org;
 pub mod remotes;
 pub mod repo;
 pub mod secrets;
+pub mod usage;
 
 pub use repo::Repo;
 mod error;

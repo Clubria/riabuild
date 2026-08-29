@@ -1223,6 +1223,80 @@ plugin-trust key; there isn't one.
 
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
 
+## Usage tracking
+
+The status line collects it, because on **personal Pro and Max subscriptions** nothing
+else can. Every server-side answer needs org-admin authority over a Console or Enterprise
+organisation, Anthropic states outright that the Admin API is unavailable for individual
+accounts, and the endpoint behind Claude Code's own `/usage` is undocumented, returns
+percentages rather than tokens, and is barred to third-party tools by the Consumer Terms
+attached to the credential. So the data comes off the laptop, out of a surface Anthropic
+publishes for the purpose.
+
+**`claude-statusline.js` writes a line and `riabuild` sends it. Never the other way round.**
+The script must not open a socket — Claude Code debounces status line updates at 300ms and
+*cancels the in-flight script*, so a network round-trip there stalls the bar whenever the
+network is slow — and it must not hold a credential, because every way of giving it one is
+already forbidden: in Claude Code's environment the model can read it with `env` (the
+stated reason `ngrok` is a shim), in a file it breaks "No secrets in `~/.riabuild/`", and
+out of the keychain it is `riabuild-keychain` reimplemented in JavaScript on the render
+path. `riabuild internal usage-flush` already holds the token and already speaks `/api/v1`.
+
+**The spool is `root()`, the script is `tools_root()`, and the script finds one from the
+other.** Same split as `agents_dir()`: a sample names one person's session, so it must not
+land in the tree every developer on a server shares. The script is one byte-identical
+constant on every machine and cannot have the path compiled in, so it derives it from
+`CLAUDE_CONFIG_DIR` — `<root>/claude/<uuid>`, whose `basename` is the account and whose
+grandparent is the root. That is also why the marker and the lock live beside the spools.
+
+**Collection is opt-in per account, and empty by default.** `UserConfig::tracked_accounts`
+holds uuids, `riabuild claude track <n>` adds one, and the account box shows which are in
+it. A developer's nine accounts include personal subscriptions —
+`../docs/superpowers/specs/2026-08-06-claude-accounts-design.md` describes the list as "a
+personal subscription and one or more work accounts" — so defaulting to on would collect
+from exactly the developer who never read the release note. The mark is stored against the
+**uuid** rather than the number, so deleting account 2 does not silently begin tracking
+whatever moves up into its place.
+
+An untracked account is handed no `--usage-spool` on its launcher line, so the script
+returns before writing anything. That is the whole mechanism: not a filter applied later,
+an absence.
+
+**`RIABUILD_SELF`, never `RIABUILD_BIN`.** The second is already how `e2e/run.sh`,
+`e2e/remote/run.sh` and `ci.yml` name the binary under test — and those run *inside* Claude
+Code sessions on this repository, so setting it in a launcher would point them at a
+provisioned riabuild instead of the build they meant to exercise.
+`the_launcher_never_sets_riabuild_bin` is the gate.
+
+**Merge by maximum, never by sum.** `cost.total_cost_usd` and the session counters are
+cumulative for a session and reset on `/clear`, so the newest sample is the whole truth and
+the rest are prefixes. Summing them overstates by roughly the number of messages in the
+session — worst exactly where somebody is most likely to look. Both ends apply it: the
+flush compacts the spool to one line per session before sending, which is also what bounds
+a spool on a laptop that has been offline. The rate-limit percentages are the exception and
+take the *newest* value, because a five-hour window legitimately falls when it resets.
+
+**No token count is collected, and it is not an oversight.**
+`context_window.total_input_tokens` reads like a session total and is documented as the
+tokens *currently in the window* — `0` before the first response, smaller again after every
+`/compact`. Merged by maximum it reports peak context size under a heading saying "tokens".
+`cost.total_cost_usd` is the only cumulative measure of volume the status line offers, and
+it is rendered as **list-price equivalent** everywhere, because on a subscription it is not
+money anyone spent. `no_token_count_is_ever_spooled` and
+`nothing_about_the_work_itself_is_spooled` are the gates — the second because the script
+has the repository in hand for the marker and must not send it.
+
+**Everything about the flush is silent and non-blocking.** It takes
+`FileLock::try_acquire` and gives up rather than queueing, because three Claude Code
+windows reach for it in the same second and the winner's work makes the others
+unnecessary. It fails silently and leaves the spool, because it runs beside an interactive
+session that did not ask for it. And it is an `internal` subcommand, which is what keeps
+`update::applies_to` from turning a flush every minute into a version check every minute.
+The marker's mtime is when a flush was last *attempted*, so an unreachable dashboard costs
+one process a minute rather than one per render.
+
+Design: `../docs/superpowers/specs/2026-08-29-usage-tracking-design.md`.
+
 ## The Codex CLI
 
 `codex_cli` installs `@openai/codex` with the Node riabuild owns and writes ten launchers:

@@ -22,6 +22,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 clap_complete.workspace = true
 riabuild-agents.workspace = true
 riabuild-api.workspace = true

@@ -249,6 +249,13 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
         Some(Command::Internal {
             action: cli::InternalAction::NgrokToken,
         }) => return internal::ngrok_token(ctx).await,
+        // Needs a `Ctx` — it reads the keychain and posts to `/api/v1` — so it
+        // is dispatched here rather than beside `launch`. It is still an
+        // `internal` subcommand, which is what keeps `update::applies_to` from
+        // turning a flush every minute into a version check every minute.
+        Some(Command::Internal {
+            action: cli::InternalAction::UsageFlush,
+        }) => return internal::usage::flush(ctx).await,
         // Behind `connect`, but softly and inside itself: an invocation that
         // needs no credential — `infisical --version`, `infisical scan` — must
         // not wait on the network first, and one that cannot get a credential
