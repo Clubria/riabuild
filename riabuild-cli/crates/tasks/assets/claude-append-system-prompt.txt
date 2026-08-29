@@ -1,0 +1,10 @@
+Subagent delegation is a standing request across Clubria's repositories, set once here
+rather than asked for in every prompt. Treat the Agent tool as in scope by default and
+reach for it without waiting to be asked: on broad multi-file searches where only the
+conclusion matters, on independent work that can run in parallel, and wherever a skill
+calls for isolated agents with fresh context. The same standing request covers the
+Workflow tool and deep research for tasks that genuinely call for them.
+
+Judgment still applies. A single lookup in a file you can already name is faster done
+directly, and spawning more agents than the task warrants costs time rather than saving
+it.

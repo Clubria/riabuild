@@ -12,7 +12,8 @@
 //! CLAUDE_CONFIG_DIR=~/.riabuild/claude/<uuid> claude \
 //!   --settings ~/.riabuild/org-settings.json \
 //!   --exclude-dynamic-system-prompt-sections \
-//!   --allow-dangerously-skip-permissions "$@"
+//!   --allow-dangerously-skip-permissions \
+//!   --append-system-prompt '<the org's standing instruction>' "$@"
 //! ```
 //!
 //! Both used to be built by a ninety-line `sh` script in `~/.riabuild/bin`.
@@ -28,6 +29,19 @@
 //! because Claude Code offers no settings key for it: it is read off argv
 //! (`excludeDynamicSections`) and appears nowhere in the settings schema, so the
 //! launcher is the only place riabuild can turn it on for the whole team.
+//!
+//! `--append-system-prompt` is the third of these, and it is the one where the
+//! settings key is not merely absent but *apparently present*.
+//! `appendSystemPrompt` is a real name in the Claude Code bundle, and neither of
+//! its two homes is the settings file: it is a field of the Agent SDK's options
+//! object and of the remote enterprise policy payload. Put it in an account's
+//! `settings.json`, in the file `--settings` names, or in
+//! `/etc/claude-code/managed-settings.json` and every one of the three is
+//! accepted in silence and reaches no request. All three were tried against
+//! 2.1.250 with the outgoing request captured, which is the only way to tell a
+//! key that does nothing from one that does something invisible. So the launcher
+//! is the only place riabuild can say this for the whole team, and what it says
+//! is compiled in — see `ORG_SYSTEM_PROMPT`.
 //!
 //! `--allow-dangerously-skip-permissions` is a flag for a related reason. The
 //! org settings already carry `permissions.defaultMode: "bypassPermissions"`,
@@ -46,7 +60,9 @@
 //! is taken off with its value, the second is folded into the dispatch defaults
 //! the view hands to the sessions it starts — and
 //! `--exclude-dynamic-system-prompt-sections` is not. So the first two ride
-//! along and the third cannot.
+//! along and the third cannot — and `--append-system-prompt` is a fourth on the
+//! wrong side of that line for the same reason, which is why the org's standing
+//! instruction reaches every launch that carries arguments and no bare one.
 //!
 //! Passing it anyway does not degrade to a view with one feature missing:
 //! `agents` falls through to the ordinary parser as the *background-agents*
@@ -122,6 +138,38 @@ use super::super::launch::{self, Handoff, Harness, Plan, World};
 /// of them — so the pair does not open a view with a longer prompt, it opens
 /// the background-agents subcommand and exits. See the module header.
 pub(super) const STATIC_SYSTEM_PROMPT: &str = "--exclude-dynamic-system-prompt-sections";
+
+/// The org's standing instruction, appended to the system prompt of every
+/// session a launcher starts.
+///
+/// A flag rather than a settings key for the same reason as
+/// `STATIC_SYSTEM_PROMPT`, and the reason is worth writing down because the key
+/// *appears* to exist. `appendSystemPrompt` is a real name in the Claude Code
+/// bundle, and it is not a settings key: its two homes are the Agent SDK's
+/// options object and the remote enterprise policy payload. Put it in
+/// `settings.json`, in a `--settings` file, or in `/etc/claude-code/managed-settings.json`
+/// and it is accepted in silence and never reaches the wire — all three were
+/// tried against 2.1.250 and the request was captured to confirm it. The
+/// launcher is the only place riabuild can say this for the whole team.
+///
+/// Withheld from the bare interactive launch on the same grounds as
+/// `STATIC_SYSTEM_PROMPT`, and not by analogy: the `agents` positional is
+/// honoured only when the rest of the line is empty after Claude Code strips
+/// the options it recognises. A flag it does not strip does not open a view
+/// with a longer prompt — it opens the background-agents subcommand and exits.
+/// See the module header.
+pub(super) const APPEND_SYSTEM_PROMPT: &str = "--append-system-prompt";
+
+/// What `APPEND_SYSTEM_PROMPT` carries.
+///
+/// Compiled in with `include_str!` for the reason `claude_statusline::SCRIPT`
+/// is: the org settings may name a program and never carry one, and the same
+/// sentence holds for a prompt. Text the *server* chose the contents of would be
+/// the task manifest under another name — riabuild-web deciding what every
+/// developer's agent is told. This moves in a release, under review, or it does
+/// not move.
+pub(super) const ORG_SYSTEM_PROMPT: &str =
+    include_str!("../../../assets/claude-append-system-prompt.txt");
 
 /// Keeps bypass-permissions in the Shift+Tab cycle, without making it the mode.
 ///
@@ -339,7 +387,12 @@ fn argument_line(plan: &Plan, world: &World) -> Vec<String> {
         // prompt"`, `claude-2 auth login`. The two flags go ahead of the
         // developer's own arguments, because behind them they would land after
         // a line Claude Code's parser has already consumed.
-        let mut line = vec![STATIC_SYSTEM_PROMPT.to_string(), ALLOW_BYPASS.to_string()];
+        let mut line = vec![
+            STATIC_SYSTEM_PROMPT.to_string(),
+            ALLOW_BYPASS.to_string(),
+            APPEND_SYSTEM_PROMPT.to_string(),
+            ORG_SYSTEM_PROMPT.trim().to_string(),
+        ];
         line.extend(plan.args.iter().cloned());
         return line;
     }
@@ -506,6 +559,8 @@ mod tests {
                 SETTINGS,
                 STATIC_SYSTEM_PROMPT,
                 ALLOW_BYPASS,
+                APPEND_SYSTEM_PROMPT,
+                ORG_SYSTEM_PROMPT.trim(),
                 "-p",
                 "fix the build",
             ]
@@ -649,7 +704,13 @@ mod tests {
         // And the launch still happens, with the developer's arguments intact.
         assert_eq!(
             handoff.args,
-            vec![STATIC_SYSTEM_PROMPT, ALLOW_BYPASS, "--resume"]
+            vec![
+                STATIC_SYSTEM_PROMPT,
+                ALLOW_BYPASS,
+                APPEND_SYSTEM_PROMPT,
+                ORG_SYSTEM_PROMPT.trim(),
+                "--resume"
+            ]
         );
     }
 
@@ -714,6 +775,57 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    /// The same guard for the org's appended prompt, and it is a separate test
+    /// rather than a second assertion because the two flags fail differently.
+    /// Losing `STATIC_SYSTEM_PROMPT` off the view costs a shared cache prefix;
+    /// putting `APPEND_SYSTEM_PROMPT` *on* it costs the developer the `claude`
+    /// command, which prints a list of background agents and exits.
+    #[test]
+    fn the_agents_view_and_the_org_prompt_flag_never_share_a_line() {
+        for (plan, world) in [
+            (fixture(), laptop()),
+            (
+                fixture(),
+                World {
+                    selected_checkout_exists: false,
+                    ..laptop()
+                },
+            ),
+            (plan_for(&[], None), laptop()),
+            (carrying(&["-p", "hello"]), laptop()),
+            (
+                fixture(),
+                World {
+                    stdin_is_tty: false,
+                    ..laptop()
+                },
+            ),
+        ] {
+            let args = launch_handoff(&plan, &world).args;
+            assert!(
+                !(args.iter().any(|arg| arg == "agents")
+                    && args.iter().any(|arg| arg == APPEND_SYSTEM_PROMPT)),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The flag is worth nothing without its value, and an empty one is worse
+    /// than absent: Claude Code accepts `--append-system-prompt ""` and appends
+    /// a blank section, so a truncated asset would look exactly like a working
+    /// launcher. Pinned here rather than trusted to `include_str!`.
+    #[test]
+    fn the_org_prompt_reaches_claude_with_something_in_it() {
+        let args = launch_handoff(&carrying(&["-p", "hello"]), &laptop()).args;
+        let value = args
+            .iter()
+            .position(|arg| arg == APPEND_SYSTEM_PROMPT)
+            .and_then(|at| args.get(at + 1))
+            .expect("the flag carries a value");
+        assert!(!value.trim().is_empty(), "{args:?}");
+        assert!(value.contains("Agent tool"), "{value}");
     }
 
     /// Asserted on *every* shape of launch, because the machine that matters
@@ -945,7 +1057,14 @@ mod tests {
         let args = launch_handoff(&fixture(), &piped).args;
         assert_eq!(
             args,
-            vec!["--settings", SETTINGS, STATIC_SYSTEM_PROMPT, ALLOW_BYPASS,]
+            vec![
+                "--settings",
+                SETTINGS,
+                STATIC_SYSTEM_PROMPT,
+                ALLOW_BYPASS,
+                APPEND_SYSTEM_PROMPT,
+                ORG_SYSTEM_PROMPT.trim(),
+            ]
         );
     }
 
