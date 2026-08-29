@@ -64,6 +64,11 @@ npx convex env set INFISICAL_CANDIDATE_CLIENT_ID     <mi-candidate client id>
 npx convex env set INFISICAL_CANDIDATE_CLIENT_SECRET <mi-candidate client secret>
 npx convex env set INFISICAL_DEVELOPER_CLIENT_ID     <mi-developer client id>
 npx convex env set INFISICAL_DEVELOPER_CLIENT_SECRET <mi-developer client secret>
+# Optional, and the credential that may do everything in the project — see
+# section 3. Unset, a lead is brokered through `mi-developer`, which is where
+# every lead was before `mi-lead` existed.
+npx convex env set INFISICAL_LEAD_CLIENT_ID          <mi-lead client id>
+npx convex env set INFISICAL_LEAD_CLIENT_SECRET      <mi-lead client secret>
 ```
 
 Never set `RIABUILD_DEV_SEED` on a production deployment. It gates `convex/devSeed.ts`,
@@ -91,20 +96,59 @@ sign-in gate and the profile prefill both depend on it.
 
 ## 3. Infisical machine identities
 
-Service tokens and API keys were deprecated in April 2024. Two **machine identities**
-with universal auth, already created:
+Service tokens and API keys were deprecated in April 2024. Three **machine identities**
+with universal auth:
 
 | Identity | Access |
 |---|---|
 | `mi-candidate` | the subset of dev paths a candidate may read |
 | `mi-developer` | all dev paths, in both `dev` and `staging` |
+| `mi-lead` | everything the project has |
 
 Path scoping is enforced by Infisical's own RBAC. riabuild only chooses which identity
 to authenticate as, and never sees a secret value.
 
+### `mi-lead` is the one with no scoping
+
+Create it with **full access to the project** — the built-in admin role over every
+subject, not a hand-listed subset: reading *and writing* secrets, creating, renaming and
+deleting the folders they live in, secret imports and rollbacks, certificate management
+and its authorities, environments, tags, webhooks, the audit log, and whatever Infisical
+adds next. A lead administers the team's secrets; a permission there they do not have is
+a lead going round riabuild to do their job, which is the outcome this exists to prevent.
+
+Say the cost out loud rather than discovering it later: **a lead's laptop can, for the
+five minutes that token lives, delete the team's secrets.** What bounds it is the same
+three things that bound every other brokered credential — the token is short-lived and
+never written down, the request re-verifies GitHub org membership before minting it, and
+`auditLog` records who asked. Infisical's own audit log records what they then did with
+it, and it is the only record of that: riabuild brokers the credential and never sees a
+call made with it.
+
+Grant it in Infisical, never here. riabuild names three credentials and no permissions,
+so widening or narrowing a lead is a change an admin makes to the identity — one that
+takes effect on the next brokered token, everywhere, with no riabuild release involved.
+A permission list living in this repository would be riabuild deciding what a laptop may
+do to the team's secrets, which is the boundary in `../CLAUDE.md` seen from the
+authorization side.
+
+`INFISICAL_LEAD_CLIENT_ID` and `INFISICAL_LEAD_CLIENT_SECRET` are **optional**, and a
+deployment that sets neither brokers its leads through `mi-developer` exactly as it did
+before this identity existed. That is the only fallback: a half-set pair — an id typed
+and the secret still to come — is treated as unset rather than authenticated with, since
+an incomplete pair buys a 401 from Infisical instead of a working developer credential.
+
+### Environments
+
 riabuild asks for `dev` and `staging` on behalf of a developer or a lead, and for `dev`
 alone on behalf of a candidate — one `.env.<environment>` per environment, in the
-checkout. `mi-developer` therefore needs `INFISICAL_SECRET_PATH` readable in the
+checkout. That list is unchanged by `mi-lead`: what a lead's credential *may* reach is
+now the whole project, but what riabuild pulls into a checkout on their behalf is still
+the two environments every developer gets. A lead reaching further does it by hand —
+`infisical secrets --env=prod` through the shim — which is a command they typed rather
+than a file riabuild wrote.
+
+`mi-developer` needs `INFISICAL_SECRET_PATH` readable in the
 `staging` environment as well; if it is not, a developer's run fails on the staging
 export rather than degrading quietly. An org with no staging environment sets
 `INFISICAL_STAGING_ENVIRONMENT` to the empty string, and every role gets `dev` alone.
@@ -149,7 +193,7 @@ It is set to `/dev-env`, which holds the 15 entries that make up a developer's
 The brokered token currently lives **30 days** (`expiresIn: 2592000`), which is the
 identity default. The design calls for a short-lived credential, and riabuild pipes it
 straight into `infisical export` and discards it — nothing needs it for more than a few
-seconds. Set **Access Token TTL to 300** on both identities in Infisical; nothing in
+seconds. Set **Access Token TTL to 300** on all three identities in Infisical; nothing in
 riabuild has to change.
 
 ## 4. Hosting the dashboard

@@ -34,8 +34,29 @@ export type BrokerResult =
   | { status: "upstream_error"; detail: string };
 
 /**
- * `candidate` gets a narrower identity than `developer`/`lead`. The difference
- * is enforced inside Infisical — riabuild only chooses which credential to use.
+ * One machine identity per role — widest for a lead, narrowest for a candidate.
+ * The difference is enforced inside Infisical; riabuild only chooses which
+ * credential to authenticate as.
+ *
+ * `mi-lead` is the identity Infisical grants **everything** in the project:
+ * writing secrets as well as reading them, creating and deleting the folders
+ * they live in, certificate management, and every other subject the project
+ * has. A developer keeps the identity that reads the team's paths, and a
+ * candidate the subset of those.
+ *
+ * Which is why this function names three credentials and no permissions. The
+ * permission set belongs to the identity in Infisical, where it is administered
+ * and audited; a list of subjects held here would be riabuild-web deciding what
+ * a laptop may do to the team's secrets, which is the boundary in
+ * `../CLAUDE.md` seen from the authorization side. Widening a lead is a change
+ * an Infisical admin makes to `mi-lead`, not a deploy of this file.
+ *
+ * **A deployment that has not created `mi-lead` yet keeps its leads on
+ * `mi-developer`.** That is where every lead was brokered before this existed,
+ * and failing their runs the moment this deploys — before anyone can set two
+ * Convex environment variables — costs more than it buys. The fallback only
+ * ever narrows: a deployment that has not opted in is never silently widened,
+ * it carries on exactly as it did.
  */
 export function identityForRole(role: Role): {
   name: string;
@@ -47,6 +68,17 @@ export function identityForRole(role: Role): {
       name: "mi-candidate",
       clientIdVar: "INFISICAL_CANDIDATE_CLIENT_ID",
       clientSecretVar: "INFISICAL_CANDIDATE_CLIENT_SECRET",
+    };
+  }
+  if (
+    role === "lead" &&
+    process.env.INFISICAL_LEAD_CLIENT_ID &&
+    process.env.INFISICAL_LEAD_CLIENT_SECRET
+  ) {
+    return {
+      name: "mi-lead",
+      clientIdVar: "INFISICAL_LEAD_CLIENT_ID",
+      clientSecretVar: "INFISICAL_LEAD_CLIENT_SECRET",
     };
   }
   return {

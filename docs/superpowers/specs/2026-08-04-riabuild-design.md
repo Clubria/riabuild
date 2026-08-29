@@ -138,7 +138,15 @@ using a **per-role machine identity**:
 | `members.role` | Infisical machine identity | Scope |
 |---|---|---|
 | `candidate` | `mi-candidate` | subset of dev paths |
-| `developer`, `lead` | `mi-developer` | all dev paths |
+| `developer` | `mi-developer` | all dev paths |
+| `lead` | `mi-lead` | the whole project — writing secrets, secret folders, certificate management, everything |
+
+A lead administers the team's secrets, so the identity they are brokered through is the
+one Infisical grants everything rather than a wider read. riabuild names the credential
+and never the permissions behind it: what a lead may do is a role on that identity,
+changed by an Infisical admin and effective at the next brokered token. A deployment that
+has not created `mi-lead` leaves `INFISICAL_LEAD_CLIENT_ID` unset and its leads stay on
+`mi-developer` — the fallback narrows and never widens.
 
 It returns a short-lived Infisical access token. The CLI pipes it directly into
 `infisical export` and never persists it.

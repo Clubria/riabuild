@@ -92,13 +92,20 @@ Infisical service tokens are deprecated (announced April 2024, migration deadlin
 POST /api/v1/secrets/token
   → authenticate session, confirm active, re-verify org membership
   → pick the machine identity for members.role:
-        candidate          → mi-candidate  (subset of dev paths)
-        developer | lead   → mi-developer  (all dev paths)
+        candidate  → mi-candidate  (subset of dev paths)
+        developer  → mi-developer  (all dev paths)
+        lead       → mi-lead       (everything: writes, folders, certificates)
   → universal-auth login with that identity's client id + secret
   → return { token, expiresAt }
 ```
 
 The identity credentials are Convex environment variables. They never leave the server.
+
+`mi-lead`'s two are **optional**, and a deployment that has not created the identity
+brokers its leads through `mi-developer` instead. Add roles to that table, never
+permissions: what an identity may do is a role inside Infisical, and a subject list in
+this repository would be riabuild-web deciding what a laptop may do to the team's
+secrets. See `docs/deploying.md` §3.
 
 ## Errors
 
