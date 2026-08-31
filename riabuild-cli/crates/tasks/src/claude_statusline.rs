@@ -402,10 +402,28 @@ mod rendering {
     /// that quietly passes in that state is the "recorded intention read as
     /// coverage" this module's own history has already paid for once.
     fn render(cwd: &Path, payload: &str) -> String {
+        render_as(cwd, payload, None)
+    }
+
+    /// The same, with `CLAUDE_CONFIG_DIR` set to `account` — which is how the
+    /// launchers start Claude Code, and therefore what the status line inherits.
+    ///
+    /// `None` **removes** the variable rather than merely not setting it. These
+    /// tests are themselves run from a Claude Code session more often than not,
+    /// and that session's own account directory is in the environment: inherited
+    /// once, every assertion below about a line with no account in it would be
+    /// checking the developer's own login instead of the fixture, and would pass
+    /// or fail depending on whose machine ran it.
+    fn render_as(cwd: &Path, payload: &str, account: Option<&Path>) -> String {
         let script = cwd.join("claude-statusline-under-test.js");
         std::fs::write(&script, SCRIPT).unwrap();
 
-        let mut child = match Command::new("node")
+        let mut command = Command::new("node");
+        match account {
+            Some(dir) => command.env("CLAUDE_CONFIG_DIR", dir),
+            None => command.env_remove("CLAUDE_CONFIG_DIR"),
+        };
+        let mut child = match command
             .arg(&script)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -691,6 +709,266 @@ mod rendering {
         let home = tempfile::TempDir::new().unwrap();
         let drawn = render(home.path(), &payload_at(&home.path().join("gone")));
         assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+    }
+
+    /// One developer's riabuild namespace: `config.json` at the root, and the
+    /// account directories under `claude/` beside it, which is the layout
+    /// `Paths::config_file` and `Paths::claude_profile_dir` produce on a laptop
+    /// and on a server alike.
+    ///
+    /// Returns the directory `CLAUDE_CONFIG_DIR` would name for each account, in
+    /// the order the accounts were given — so a test can hand the second one to
+    /// `render_as` and assert it is called `claude-2`.
+    fn namespace(root: &Path, accounts: &[(&str, Option<&str>)]) -> Vec<std::path::PathBuf> {
+        let uuids: Vec<&str> = accounts.iter().map(|(uuid, _)| *uuid).collect();
+        write(
+            &root.join("config.json"),
+            &format!(
+                r#"{{"claude_accounts":[{}]}}"#,
+                uuids
+                    .iter()
+                    .map(|uuid| format!("{uuid:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
+        accounts
+            .iter()
+            .map(|(uuid, email)| {
+                let dir = root.join("claude").join(uuid);
+                std::fs::create_dir_all(&dir).unwrap();
+                // A directory with no `.claude.json` is an account nothing has
+                // signed in yet — which is a real state and not a broken one.
+                if let Some(email) = email {
+                    write(
+                        &dir.join(".claude.json"),
+                        &format!(r#"{{"oauthAccount":{{"emailAddress":{email:?}}}}}"#),
+                    );
+                }
+                dir
+            })
+            .collect()
+    }
+
+    /// The question the marker cannot answer: *which of my logins is this
+    /// window?* Two accounts, and the second one has to say so — the number
+    /// comes from position in `claude_accounts` and nothing else records it.
+    #[test]
+    fn the_account_names_the_launcher_and_the_email() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[
+                ("uuid-one", Some("ada@clubria.com")),
+                ("uuid-two", Some("grace@clubria.com")),
+            ],
+        );
+
+        let drawn = render_as(home.path(), "{}", Some(&dirs[1]));
+        assert!(drawn.contains("claude-2 · grace@clubria.com"), "{drawn:?}");
+        // The *other* account's email must not be what a number lookup reaches
+        // for: an off-by-one here names a colleague's login on this line.
+        assert!(!drawn.contains("ada@clubria.com"), "{drawn:?}");
+    }
+
+    /// The account sits **beside** the marker, which is the opposite of where
+    /// the repository goes and is deliberate. The repository answers *which
+    /// environment is this*, the question the shell prompt also answers, so it
+    /// belongs inside the one marker. The account answers *who am I here* — the
+    /// prompt does not carry it, and it changes without the environment
+    /// changing — so folding it in would grow the marker a clause the prompt
+    /// does not share.
+    #[test]
+    fn the_account_sits_beside_the_marker_rather_than_inside_it() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[("uuid-one", Some("ada@clubria.com"))],
+        );
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render_as(home.path(), &payload_at(&dir), Some(&dirs[0]));
+        assert!(drawn.contains("(riabuild · Clubria/payments)"), "{drawn:?}");
+        assert!(
+            drawn.find("Clubria/payments") < drawn.find("claude-1"),
+            "the account comes after the closing parenthesis: {drawn:?}"
+        );
+    }
+
+    /// A signed-out account still names its launcher. `claude-2` with nothing
+    /// after it is the answer to "which window is this?", and it is also how a
+    /// developer notices they are signed out of the one they are typing into —
+    /// so the two halves are drawn independently rather than all-or-nothing.
+    #[test]
+    fn a_signed_out_account_still_names_its_launcher() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[("uuid-one", None), ("uuid-two", Some("ada@clubria.com"))],
+        );
+
+        let drawn = render_as(home.path(), "{}", Some(&dirs[0]));
+        assert!(drawn.contains("claude-1"), "{drawn:?}");
+        assert!(!drawn.contains('@'), "{drawn:?}");
+    }
+
+    /// The other half of that: a `claude` pointed at a config directory
+    /// riabuild's own list does not contain. There is no launcher to name, so
+    /// none is invented — but who is signed in there is still true and still
+    /// worth saying.
+    #[test]
+    fn an_account_riabuild_does_not_list_still_names_who_is_signed_in() {
+        let home = tempfile::TempDir::new().unwrap();
+        let root = home.path().join("ns");
+        namespace(&root, &[("uuid-one", Some("ada@clubria.com"))]);
+        let stranger = root.join("claude").join("uuid-unlisted");
+        write(
+            &stranger.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"solo@clubria.com"}}"#,
+        );
+
+        let drawn = render_as(home.path(), "{}", Some(&stranger));
+        assert!(drawn.contains("solo@clubria.com"), "{drawn:?}");
+        assert!(
+            !drawn.contains("claude-"),
+            "an unlisted directory has no number, and claude-0 is not a launcher: {drawn:?}"
+        );
+    }
+
+    /// **The property a file every developer shares has to have.** This script
+    /// lives in `tools_root()` — one copy for the whole box — while the accounts
+    /// live under `root()`, a per-developer namespace. The same bytes must
+    /// therefore answer differently for two colleagues, which they can only do
+    /// by reading the namespace out of the running session's environment rather
+    /// than out of anything baked into the script.
+    ///
+    /// The failure this forbids is a status line that names a colleague's email,
+    /// which is worse than naming none.
+    #[test]
+    fn two_developers_on_one_server_get_their_own_account() {
+        let home = tempfile::TempDir::new().unwrap();
+        let ada = namespace(
+            &home.path().join("member-a"),
+            &[("uuid-a", Some("ada@clubria.com"))],
+        );
+        let grace = namespace(
+            &home.path().join("member-b"),
+            &[
+                ("uuid-b1", Some("someone@clubria.com")),
+                ("uuid-b2", Some("grace@clubria.com")),
+            ],
+        );
+
+        let hers = render_as(home.path(), "{}", Some(&ada[0]));
+        assert!(hers.contains("claude-1 · ada@clubria.com"), "{hers:?}");
+        assert!(!hers.contains("grace@clubria.com"), "{hers:?}");
+
+        let theirs = render_as(home.path(), "{}", Some(&grace[1]));
+        assert!(
+            theirs.contains("claude-2 · grace@clubria.com"),
+            "{theirs:?}"
+        );
+        assert!(!theirs.contains("ada@clubria.com"), "{theirs:?}");
+    }
+
+    /// A `claude` the launchers did not start has no `CLAUDE_CONFIG_DIR`, so
+    /// there is no account to name and the line is the one that shipped before
+    /// this. Not an error state: a developer's own install is a real thing to
+    /// find on a laptop.
+    #[test]
+    fn a_claude_the_launchers_did_not_start_draws_no_account() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render_as(home.path(), &payload_at(&dir), None);
+        assert_eq!(
+            drawn.matches('·').count(),
+            1,
+            "only the repository's separator: {drawn:?}"
+        );
+        assert!(!drawn.contains("claude-"), "{drawn:?}");
+    }
+
+    /// The account is not computed from the payload, so a payload that will not
+    /// parse must not take it off the line. Which account this window is goes
+    /// missing exactly when something is already wrong, otherwise.
+    #[test]
+    fn the_account_survives_a_payload_that_will_not_parse() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[("uuid-one", Some("ada@clubria.com"))],
+        );
+
+        let drawn = render_as(home.path(), "not json at all", Some(&dirs[0]));
+        assert!(drawn.contains("(riabuild)"), "{drawn:?}");
+        assert!(drawn.contains("claude-1 · ada@clubria.com"), "{drawn:?}");
+    }
+
+    /// Claude Code rewrites `.claude.json` while it runs, so a render can read
+    /// it mid-write. That is a parse error and *not* a signed-out account: it
+    /// draws no email, rather than a fragment of one or a stack trace.
+    #[test]
+    fn a_half_written_config_draws_no_email_rather_than_half_of_one() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(&home.path().join("ns"), &[("uuid-one", None)]);
+        write(
+            &dirs[0].join(".claude.json"),
+            r#"{"oauthAccount":{"emailAdd"#,
+        );
+
+        let drawn = render_as(home.path(), "{}", Some(&dirs[0]));
+        assert!(drawn.contains("claude-1"), "{drawn:?}");
+        assert!(!drawn.contains("emailAdd"), "{drawn:?}");
+        assert!(!drawn.contains('@'), "{drawn:?}");
+    }
+
+    /// A namespace with no `config.json` at all — a machine riabuild has not
+    /// provisioned, or one whose config was set aside as unreadable. There is no
+    /// list to find a number in, and the email is in a different file that is
+    /// still perfectly good.
+    #[test]
+    fn a_missing_config_costs_the_number_and_not_the_email() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("ns").join("claude").join("uuid-one");
+        write(
+            &dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"ada@clubria.com"}}"#,
+        );
+
+        let drawn = render_as(home.path(), "{}", Some(&dir));
+        assert!(drawn.contains("ada@clubria.com"), "{drawn:?}");
+        assert!(!drawn.contains("claude-"), "{drawn:?}");
+    }
+
+    /// The context bar is what was already there, and neither the repository nor
+    /// the account may have cost it. All three are drawn, in reading order.
+    #[test]
+    fn the_context_bar_still_draws_beside_the_account() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[("uuid-one", Some("ada@clubria.com"))],
+        );
+        let dir = home.path().join("payments");
+        checkout(&dir, "git@github.com:Clubria/payments.git");
+
+        let drawn = render_as(
+            home.path(),
+            &format!(
+                r#"{{"workspace":{{"current_dir":{:?}}},
+                    "context_window":{{"remaining_percentage":40,"total_tokens":1000000}}}}"#,
+                dir.to_string_lossy()
+            ),
+            Some(&dirs[0]),
+        );
+        let repo = drawn.find("Clubria/payments").expect("the repository");
+        let who = drawn.find("ada@clubria.com").expect("the account");
+        let bar = drawn.find('█').expect("the context bar");
+        assert!(repo < who && who < bar, "{drawn:?}");
+        assert!(drawn.contains("72%"), "{drawn:?}");
     }
 }
 

@@ -146,6 +146,128 @@ function marker(repo) {
   return `\x1b[1;34m${inner}\x1b[0m`;
 }
 
+// Which Claude Code account this window is signed in as: `claude-2 · ada@clubria.com`.
+//
+// The question the marker above cannot answer. A developer runs `claude-1` in
+// one window and `claude-2` in another — two logins, two subscriptions, often
+// two organisations — and the launchers that tell them apart are generated
+// scripts nobody opens. Every window then looks identical, and the way that is
+// discovered is by having asked the wrong account to do something.
+//
+// **Read out of the environment, never guessed from this file's own location,
+// and that is what makes it legal here.** This script lives in `tools_root()` —
+// one copy shared by every developer with an account on a server — while the
+// account directories live under `root()`, a per-developer namespace a shared
+// file has no business naming. It does not name one: `CLAUDE_CONFIG_DIR` is set
+// by the launcher on *this session's* environment and inherited by everything
+// Claude Code spawns, so the namespace arrives from the running session rather
+// than from a guess baked into bytes every developer reads. The same script
+// serves two colleagues on one box and answers differently for each, which is
+// the property a shared file has to have.
+
+// The account's config directory, as `CLAUDE_CONFIG_DIR` names it.
+//
+// Absent for a `claude` that riabuild's launcher did not start. That is a real
+// case rather than a broken one — a developer's own install, or a `claude` run
+// straight off `PATH` — and it has no account number, so it gets none.
+function configDir() {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir ? path.resolve(dir) : null;
+}
+
+// The email Claude Code recorded for the account signed in there.
+//
+// Read as a file, for the reason `originUrl` reads `.git/config` as a file:
+// `claude auth status --json` is the supported way to ask this and riabuild
+// uses it in `accounts::status`, where it costs one Claude Code startup —
+// about 450 ms — once per run. A status line re-renders continuously, so the
+// same call here is that cost *per render*, and it would be Claude Code
+// starting itself to answer a question about itself.
+//
+// `oauthAccount.emailAddress` is Claude Code's own state and nothing promises
+// to keep the key, which `accounts::status` says out loud and is why it is not
+// the route riabuild takes when it can afford the subprocess. What makes the
+// weaker source acceptable *here* is the failure it has: a key that moves takes
+// the email off the status line and leaves everything else drawn. Nothing
+// breaks, nothing is misreported, and the marker a developer navigates by is
+// untouched — whereas a signed-out account and a renamed key must never be
+// told apart by guessing, so neither is: both draw nothing.
+function emailIn(dir) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(dir, '.claude.json'), 'utf8');
+  } catch {
+    return '';
+  }
+  try {
+    const email = JSON.parse(text).oauthAccount?.emailAddress;
+    return typeof email === 'string' ? email : '';
+  } catch {
+    // Claude Code rewrites this file while it runs. A read that lands mid-write
+    // is a parse error and not a signed-out account, so it draws nothing rather
+    // than saying something wrong for the one render it affects.
+    return '';
+  }
+}
+
+// Which launcher opens this account — the `2` in `claude-2`.
+//
+// Position in `claude_accounts` *is* the number, exactly as
+// `UserConfig::claude_accounts` records it: account 3 is index 2, and removing
+// one renumbers the rest by moving them. Nothing persists the number, so the
+// only way to name the launcher a developer would actually type is to find the
+// directory in that list.
+//
+// `config.json` sits at `root()`, and `CLAUDE_CONFIG_DIR` is
+// `root()/claude/<uuid>` — so two levels up from the account directory is the
+// namespace this session belongs to, on a laptop and on a server alike. Derived
+// rather than assumed for the reason above: `~/.riabuild/config.json` is the
+// right file on a laptop and the wrong developer's on a server.
+function accountNumber(dir) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(path.dirname(path.dirname(dir)), 'config.json'), 'utf8');
+  } catch {
+    return 0;
+  }
+  try {
+    const accounts = JSON.parse(text).claude_accounts;
+    if (!Array.isArray(accounts)) return 0;
+    return accounts.indexOf(path.basename(dir)) + 1;
+  } catch {
+    return 0;
+  }
+}
+
+// `claude-2 · ada@clubria.com`, in dim grey, and only the halves that are known.
+//
+// Beside the marker rather than inside it, which is the opposite of what the
+// repository does one function up and for the opposite reason. The repository
+// says *which environment is this*, the same question the shell prompt answers,
+// so it belongs in the one marker a developer learns. The account says *who am
+// I here* — a different fact, that the prompt does not carry and that changes
+// without the environment changing — and folding it into the marker would make
+// the thing a developer navigates by grow a second clause it does not share
+// with the prompt.
+//
+// The two halves fail independently on purpose. A logged-out account still
+// names its launcher, because `claude-2` with nothing after it is the answer to
+// "which window is this?" and is also how a developer notices they are signed
+// out. An account riabuild's config does not list still shows its email, which
+// is what a `claude` started outside the launchers has to look like. Neither
+// known: nothing is drawn, and the line is the one that shipped before this.
+function account() {
+  const dir = configDir();
+  if (!dir) return '';
+  const parts = [];
+  const number = accountNumber(dir);
+  if (number > 0) parts.push(`claude-${number}`);
+  const email = emailIn(dir);
+  if (email) parts.push(email);
+  if (parts.length === 0) return '';
+  return ` \x1b[2m${parts.join(' · ')}\x1b[0m`;
+}
+
 // How full the context window is: `█████░░░░░ 54%`, coloured green → yellow →
 // orange → blinking red 💀. Returns '' when Claude Code sends no window data.
 function contextBar(payload) {
@@ -287,6 +409,17 @@ process.stdin.on('end', () => {
   let label = marker('');
   let bar = '';
   let payload = null;
+  // Computed outside the payload's `try`, because it is not computed *from* the
+  // payload: the account comes from this process's environment and two files on
+  // disk. Inside, a Claude Code that sent something unparseable would take the
+  // signed-in account off the line along with the bar, and which account this
+  // window is would go missing exactly when something is already wrong.
+  let who = '';
+  try {
+    who = account();
+  } catch {
+    // Same bargain as everything else here: no account beats no status line.
+  }
   try {
     payload = JSON.parse(input || '{}');
     label = marker(repoOf(cwdOf(payload)));
@@ -303,5 +436,5 @@ process.stdin.on('end', () => {
     // Silent fail: see `collect`.
   }
 
-  process.stdout.write(label + bar);
+  process.stdout.write(label + who + bar);
 });
