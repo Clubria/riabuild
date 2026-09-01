@@ -231,6 +231,14 @@ async fn fetch_ngrok_token(ctx: &mut Ctx) -> Result<String> {
 /// versioned path moves with every riabuild upgrade — a session started last
 /// week must run this week's Claude Code, not a directory that no longer exists.
 /// The *profile* is the opposite and is recorded: it is what resume depends on.
+///
+/// The team's Claude Code settings are resolved here for the first of those
+/// reasons and never recorded either. What makes them worth passing at all is
+/// that this is the one place a Claude Code session starts *without* an account
+/// launcher in front of it: every `claude`, `claude-1` … `claude-N` passes
+/// `--settings`, and until a turn did too, the model the org chose and a lead's
+/// `permissions.deny` reached every interactive session and nothing
+/// `riabuild agents` ran.
 pub(crate) async fn agent_turn(ctx: &mut Ctx, session: &str, prompt_file: &str) -> Result<i32> {
     let store = riabuild_agents::store::Store::new(ctx.paths.as_ref());
     let record = store.read(session).await?;
@@ -242,11 +250,22 @@ pub(crate) async fn agent_turn(ctx: &mut Ctx, session: &str, prompt_file: &str) 
         riabuild_harness::Kind::Codex => ctx.codex(),
         riabuild_harness::Kind::Grok => ctx.grok(),
     };
+    // Absent rather than fetched. This runs detached, with no network to depend
+    // on and no `connect` in front of it, so a machine that has never completed
+    // a provisioning run gets a turn with no `--settings` — exactly what the
+    // account launchers do with the same missing file, rather than a turn that
+    // fails because org policy could not be looked up.
+    let org_settings = ctx.paths.org_settings_file();
+    let org_settings = tokio::fs::try_exists(&org_settings)
+        .await
+        .unwrap_or(false)
+        .then_some(org_settings);
     riabuild_agents::turn::run(
         ctx.runner.as_ref(),
         &store,
         session,
         &program,
+        org_settings.as_deref(),
         std::path::Path::new(prompt_file),
     )
     .await

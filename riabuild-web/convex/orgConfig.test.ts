@@ -385,9 +385,18 @@ describe("org config and claude settings", () => {
     const t = setup();
     const chosen = {
       theme: "dark",
+      // An org that chose the *opposite* split from the one riabuild ships:
+      // a cheaper session model and a more expensive subagent default. Both
+      // are answers, and a backfill that "corrected" either would be
+      // overwriting a lead rather than filling a gap.
+      model: "sonnet",
       permissions: { defaultMode: "acceptEdits", deny: [] },
       skipDangerousModePermissionPrompt: false,
-      env: { CLUBRIA_ORG: "1", EXTRA: "kept" },
+      env: {
+        CLUBRIA_ORG: "1",
+        CLAUDE_CODE_SUBAGENT_MODEL: "opus",
+        EXTRA: "kept",
+      },
       statusLine: { type: "command", command: "my-own-statusline" },
     };
     await seedOrgConfig(t, JSON.stringify(chosen));
@@ -398,6 +407,28 @@ describe("org config and claude settings", () => {
     const { row, settings } = await storedSettings(t);
     expect(settings).toEqual(chosen);
     expect(row.claudeSettingsUpdatedAt).toBe(1234);
+  });
+
+  test("the defaults backfill teaches an org the opus/sonnet split", async () => {
+    // The two halves are spelled differently by Claude Code — the session's
+    // model is a settings key, its subagents' default is an environment
+    // variable — so they land through two different arms of `fillMissing`:
+    // `model` is absent at the top level, and `env` is present on every stored
+    // row, which means the variable only arrives by descending into it.
+    const t = setup();
+    await seedOrgConfig(t, preBypassSettings);
+
+    const result = await t.mutation(internal.org.backfillClaudeDefaults, {});
+    expect(result.updated).toBe(true);
+
+    const { settings } = await storedSettings(t);
+    expect(settings.model).toBe("opus");
+    expect(settings.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("sonnet");
+    // The org's own variable is still there: descending fills gaps and
+    // replaces nothing.
+    expect(settings.env.CLUBRIA_ORG).toBe("1");
+    expect(result.added).toContain("model");
+    expect(result.added).toContain("env.CLAUDE_CODE_SUBAGENT_MODEL");
   });
 
   test("the defaults backfill never restores deny rules an org removed", async () => {

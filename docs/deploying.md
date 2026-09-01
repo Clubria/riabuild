@@ -176,6 +176,25 @@ secrets riabuild has just brokered are readable by every Claude Code account.
 nothing. See "Changing `DEFAULT_CLAUDE_SETTINGS` reaches nobody on its own" in
 `../riabuild-web/CLAUDE.md`.
 
+### Deploying the opus/sonnet split onto an existing deployment
+
+One step, and it is not optional on a deployment that has ever saved org config:
+
+```sh
+npx convex run org:backfillClaudeDefaults --prod
+```
+
+The org's Claude Code settings now carry `model: "opus"` and
+`env.CLAUDE_CODE_SUBAGENT_MODEL: "sonnet"` — a session on Opus whose subagents default to
+Sonnet. Unlike the deny-list migration above, the ordinary backfill **is** the right tool
+here: `model` is absent at the top level of every stored row, and `env` is present on all
+of them, so the variable arrives by `fillMissing` descending into it. An org that already
+answered either key keeps its answer.
+
+Without this the edit reaches fresh deployments and nowhere else, and the symptom is not
+an error: every session simply goes on using whatever model it defaulted to, with nothing
+on any screen naming one.
+
 ### `INFISICAL_SECRET_PATH` is not `/`
 
 The `dev` environment has **no secrets at its root** — they live in folders (`convex`,

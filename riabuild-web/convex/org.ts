@@ -47,6 +47,25 @@ export const DEFAULT_STATUS_LINE = {
  * disclaimer interactively first" — so shipping `defaultMode` without it would
  * look configured and behave otherwise.
  *
+ * `model` and `env.CLAUDE_CODE_SUBAGENT_MODEL` are one decision written in two
+ * places, because Claude Code spells them in two places: the session's own model
+ * is a settings key and the model its subagents default to is an environment
+ * variable, with **no settings key of its own** (verified against 2.1.252 —
+ * `CLAUDE_CODE_SUBAGENT_MODEL` is a string in the binary and nothing beside it
+ * is). A subagent reads it only where its own `.claude/agents/*.md` frontmatter
+ * names no `model:`, so a checkout that pins one still wins — which is the right
+ * way round: the frontmatter arrives through a pull request and this does not.
+ *
+ * Aliases rather than `claude-opus-5` and `claude-sonnet-5` on purpose. A pinned
+ * id is a dashboard edit every time Anthropic ships a generation, and the org
+ * that forgets is left on last year's model with nothing on screen saying so.
+ *
+ * Neither key names a program, which is why both pass `vetting.rs`: `model` is
+ * on `CARRIES_ONLY_DATA` and a model name is an answer, not an instruction.
+ * `env` is vetted a second time against `INJECTS_A_PROGRAM` — the interpreter
+ * back doors, `NODE_OPTIONS` and `PATH` among them — and a model alias is none
+ * of those.
+ *
  * Trusting the checkout is deliberately *not* here: `hasTrustDialogAccepted` is
  * per-project state in `.claude.json`, not a settings key, and no settings file
  * can express it. `claude_trust` in the CLI does that half.
@@ -65,6 +84,7 @@ export const DEFAULT_STATUS_LINE = {
 export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
   {
     theme: "auto",
+    model: "opus",
     permissions: {
       defaultMode: "bypassPermissions",
       // `Read(./.env.*)` rather than one entry per environment: riabuild now
@@ -75,7 +95,7 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
       deny: ["Read(./.env)", "Read(./.env.*)", "Bash(git push --force:*)"],
     },
     skipDangerousModePermissionPrompt: true,
-    env: { CLUBRIA_ORG: "1" },
+    env: { CLUBRIA_ORG: "1", CLAUDE_CODE_SUBAGENT_MODEL: "sonnet" },
     statusLine: DEFAULT_STATUS_LINE,
   },
   null,
