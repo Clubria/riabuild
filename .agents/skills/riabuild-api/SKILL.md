@@ -75,7 +75,7 @@ durable credential without all three is a bug:
   attribution that exists, since one account carries the whole team; for an issued key it
   is the record of who took a copy of what.
 
-`riabuild-web/CLAUDE.md` is the authority on both, and
+`riabuild-web/AGENTS.md` is the authority on both, and
 `docs/superpowers/specs/2026-08-13-issued-ssh-keys-design.md` and
 `docs/superpowers/specs/2026-08-18-ngrok-design.md` are why they are bounded the way they
 are.
