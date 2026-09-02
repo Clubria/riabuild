@@ -107,6 +107,21 @@ pub async fn read(ctx: &Ctx, id: &str) -> Identity {
     .await
 }
 
+/// One account, by the directory it lives in.
+///
+/// Everything [`ask`] needs and nothing borrowed from a [`Ctx`], so a caller can
+/// spawn it and pick the answer up later. That is what the agents window does:
+/// twenty-seven of these at 450 ms each is a blank terminal for a second and a
+/// half before the first frame, so it opens without them and fills the sign-ins
+/// in as the children answer.
+pub async fn read_at(
+    runner: std::sync::Arc<dyn CommandRunner>,
+    claude: String,
+    dir: std::path::PathBuf,
+) -> Identity {
+    ask(runner.as_ref(), &claude, &dir).await
+}
+
 /// The exit code is deliberately not consulted.
 ///
 /// It says the same thing as `loggedIn` today, but an exit code is one channel
