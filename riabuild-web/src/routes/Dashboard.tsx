@@ -8,6 +8,7 @@ import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
 import { Invite } from "../components/Invite";
 import { IssuedKeys } from "../components/IssuedKeys";
 import { SharedServers } from "../components/SharedServers";
+import { Usage } from "../components/Usage";
 import { Alert, Badge, Command, Panel, Tab } from "../ui";
 
 /** What riabuild will do to the machine, stated before it does it. */
@@ -29,7 +30,15 @@ export function DASHBOARD_TABS(isLead: boolean): Tab[] {
     { id: "install", label: "install", href: "#install" },
     { id: "machines", label: "machines", href: "#machines" },
   ];
-  if (isLead) tabs.push({ id: "lead", label: "lead", href: "#lead" });
+  if (isLead) {
+    tabs.push({ id: "lead", label: "lead", href: "#lead" });
+    // Its own tab rather than a section a lead scrolls to: it is the one lead
+    // panel somebody opens the dashboard *for*, rather than one they arrive at
+    // while doing something else. Both this and the panel it points at are
+    // gated on `isLead`, so the anchor can never name a section that is not
+    // rendered.
+    tabs.push({ id: "usage", label: "usage", href: "#usage" });
+  }
   return tabs;
 }
 
@@ -182,6 +191,11 @@ export function Dashboard({ member }: { member: Member }) {
           <Panel index="lead" title="issued SSH keys" tone="accent">
             <ErrorBoundary label="the issued keys">
               <IssuedKeys />
+            </ErrorBoundary>
+          </Panel>
+          <Panel id="usage" index="lead" title="usage" tone="accent">
+            <ErrorBoundary label="the usage panel">
+              <Usage />
             </ErrorBoundary>
           </Panel>
           <Panel index="lead" title="audit log" tone="accent">

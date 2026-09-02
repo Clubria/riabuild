@@ -218,6 +218,46 @@ pub trait Paths: Send + Sync {
     fn log_file(&self) -> PathBuf {
         self.root().join("logs").join("riabuild.log")
     }
+    /// Usage samples the status line has written and nothing has sent yet.
+    ///
+    /// Under `root()` and emphatically not `tools_root()`, unlike the status
+    /// line script that writes into it. The script is a program the machine
+    /// runs and every developer on a server gets the same bytes; a sample names
+    /// one person's session, and putting it in the shared tree would let two
+    /// developers on one box read each other's.
+    ///
+    /// That split is the reason the script derives this path from
+    /// `CLAUDE_CONFIG_DIR` rather than having it compiled in: the script is one
+    /// constant on every machine, and `<root>/claude/<uuid>` is the only thing
+    /// in its environment that names the per-developer root.
+    fn usage_dir(&self) -> PathBuf {
+        self.root().join("usage")
+    }
+    /// One Claude account's spool. The file name *is* the account id, which is
+    /// what lets the status line name the account without being told it twice.
+    fn usage_spool_file(&self, account: &str) -> PathBuf {
+        self.usage_dir().join(format!("{account}.ndjson"))
+    }
+    /// Held for the length of a flush, and taken non-blocking.
+    ///
+    /// Three Claude Code windows on one laptop notice a stale spool in the same
+    /// second, and the one that wins is doing the work that makes the other two
+    /// unnecessary — so they exit rather than queue. An `flock` and never a pid
+    /// file, for the reason in the many-windows spec: the kernel releases it
+    /// however the process ends.
+    fn usage_lock_file(&self) -> PathBuf {
+        self.usage_dir().join("flush.lock")
+    }
+    /// Touched when a flush is *attempted*, which is what paces the status
+    /// line's one-a-minute check.
+    ///
+    /// Attempted rather than succeeded, deliberately. A laptop that cannot
+    /// reach riabuild-web should retry every minute and no more often; a marker
+    /// that only moved on success would make an unreachable dashboard into a
+    /// spawned process on every render.
+    fn usage_flushed_marker(&self) -> PathBuf {
+        self.usage_dir().join("flushed")
+    }
     /// The servers this laptop knows about — see `remote::store`.
     fn remotes_file(&self) -> PathBuf {
         self.root().join("remotes.json")

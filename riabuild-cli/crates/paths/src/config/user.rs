@@ -59,6 +59,21 @@ pub struct UserConfig {
     /// UUID is the only identity anything persists.
     #[serde(default)]
     pub claude_accounts: Vec<String>,
+    /// Which Claude accounts report usage to riabuild-web, by UUID.
+    ///
+    /// A separate list rather than a flag inside `claude_accounts`, because
+    /// position in that vector *is* the account number and nothing may disturb
+    /// it — and because the identity persisted here has to survive `riabuild
+    /// claude delete` renumbering the account it belongs to.
+    ///
+    /// **Empty by default, and that is the feature.** A developer's accounts
+    /// include personal subscriptions; see `2026-08-06-claude-accounts-design.md`.
+    /// Collecting from an account nobody marked would ship a person's private
+    /// usage to their employer's dashboard, and the developer it would happen to
+    /// is exactly the one who did not read the release note. `riabuild claude
+    /// track <n>` adds one; the account list shows which are in it.
+    #[serde(default)]
+    pub tracked_accounts: Vec<String>,
     /// The single profile older riabuilds recorded.
     ///
     /// Read on load and folded into `claude_accounts`, never written back —

@@ -1586,6 +1586,7 @@ dependencies = [
  "riabuild-theme",
  "riabuild-ui",
  "riabuild-version",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

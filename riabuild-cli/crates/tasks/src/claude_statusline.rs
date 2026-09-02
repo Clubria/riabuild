@@ -693,3 +693,240 @@ mod rendering {
         assert!(drawn.contains("(riabuild)"), "{drawn:?}");
     }
 }
+
+/// What the status line *collects*, run on a real `node`.
+///
+/// Separate from `rendering` because these need an environment — the spool path
+/// the launcher hands over — and because the two answer different questions.
+/// `rendering` asks what a developer sees; this asks what leaves the machine,
+/// which is the half with a privacy answer attached to it.
+#[cfg(test)]
+mod collecting {
+    use super::SCRIPT;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    /// As `rendering::render`, plus the environment the Claude launcher sets
+    /// for an account the developer marked. `RIABUILD_SELF` is deliberately
+    /// never set here: a test that spawned a real flush would be a test that
+    /// posts to riabuild-web.
+    fn render_with_spool(cwd: &Path, spool: Option<&Path>, payload: &str) -> String {
+        let script = cwd.join("claude-statusline-under-test.js");
+        std::fs::write(&script, SCRIPT).unwrap();
+
+        let mut command = Command::new("node");
+        command
+            .arg(&script)
+            .current_dir(cwd)
+            .env_remove("RIABUILD_USAGE_SPOOL")
+            .env_remove("RIABUILD_SELF")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(spool) = spool {
+            command.env("RIABUILD_USAGE_SPOOL", spool);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                panic!("these tests run the status line on `node`, and there is none on PATH")
+            }
+            Err(error) => panic!("running node: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "the status line exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A payload of the shape Claude Code documents, with the fields this
+    /// collects and several it must ignore.
+    fn payload() -> String {
+        serde_json::json!({
+            "session_id": "sess-1",
+            "model": { "id": "claude-opus-5", "display_name": "Opus" },
+            "workspace": { "current_dir": "/tmp", "project_dir": "/tmp" },
+            "cost": {
+                "total_cost_usd": 0.5,
+                "total_duration_ms": 45_000,
+                "total_api_duration_ms": 2_300,
+                "total_lines_added": 156,
+                "total_lines_removed": 23
+            },
+            "context_window": {
+                "remaining_percentage": 92,
+                "total_input_tokens": 15_500,
+                "total_output_tokens": 1_200
+            },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 23.5, "resets_at": 1_738_425_600u64 },
+                "seven_day": { "used_percentage": 41.2, "resets_at": 1_738_857_600u64 }
+            }
+        })
+        .to_string()
+    }
+
+    /// The default, and the whole of the privacy answer: with no spool in the
+    /// environment nothing is written anywhere.
+    #[test]
+    fn an_untracked_account_writes_nothing() {
+        let home = tempfile::TempDir::new().unwrap();
+
+        let drawn = render_with_spool(home.path(), None, &payload());
+
+        assert!(
+            drawn.contains("(riabuild"),
+            "the bar still renders: {drawn:?}"
+        );
+        let stray: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".ndjson"))
+            .collect();
+        assert!(stray.is_empty(), "nothing may be spooled: {stray:?}");
+    }
+
+    /// A tracked account writes exactly one line, and it carries the fields the
+    /// server merges by maximum.
+    #[test]
+    fn a_tracked_account_spools_one_line_per_render() {
+        let home = tempfile::TempDir::new().unwrap();
+        let spool = home.path().join("usage").join("acc-uuid.ndjson");
+
+        render_with_spool(home.path(), Some(&spool), &payload());
+        render_with_spool(home.path(), Some(&spool), &payload());
+
+        let written = std::fs::read_to_string(&spool).unwrap();
+        let lines: Vec<_> = written.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one line per render: {written:?}");
+
+        let sample: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(sample["harness"], "claude");
+        assert_eq!(sample["sessionId"], "sess-1");
+        // The file name *is* the account, so nothing has to be passed twice.
+        assert_eq!(sample["accountId"], "acc-uuid");
+        assert_eq!(sample["costUsd"], 0.5);
+        assert_eq!(sample["fiveHourPct"], 23.5);
+        assert_eq!(sample["sevenDayPct"], 41.2);
+    }
+
+    /// The fields that read like session totals and are not.
+    ///
+    /// `context_window.total_input_tokens` is documented as the tokens
+    /// *currently in the window* — zero before the first response, smaller
+    /// again after every `/compact` — so merged by maximum it would report peak
+    /// context size under a heading that said "tokens". This test is what stops
+    /// it being added back because the payload obviously has it.
+    #[test]
+    fn no_token_count_is_ever_spooled() {
+        let home = tempfile::TempDir::new().unwrap();
+        let spool = home.path().join("usage").join("acc.ndjson");
+
+        render_with_spool(home.path(), Some(&spool), &payload());
+
+        let written = std::fs::read_to_string(&spool).unwrap();
+        for forbidden in ["Token", "token", "15500", "1200"] {
+            assert!(
+                !written.contains(forbidden),
+                "no token figure may be spooled ({forbidden}): {written}"
+            );
+        }
+    }
+
+    /// Nothing about *what* the developer was doing leaves the machine.
+    ///
+    /// The script has the repository in hand — it draws it in the marker — and
+    /// the payload carries the transcript path beside it. Neither is collected,
+    /// and a column that appeared later would have to pass this test first.
+    #[test]
+    fn nothing_about_the_work_itself_is_spooled() {
+        let home = tempfile::TempDir::new().unwrap();
+        let spool = home.path().join("usage").join("acc.ndjson");
+        let payload = serde_json::json!({
+            "session_id": "sess-1",
+            "transcript_path": "/home/ada/.claude/projects/x/sess-1.jsonl",
+            "workspace": {
+                "current_dir": "/home/ada/Clubria/payments",
+                "repo": { "host": "github.com", "owner": "Clubria", "name": "payments" }
+            },
+            "cost": { "total_cost_usd": 0.5 }
+        })
+        .to_string();
+
+        render_with_spool(home.path(), Some(&spool), &payload);
+
+        let written = std::fs::read_to_string(&spool).unwrap();
+        for forbidden in ["payments", "Clubria", "transcript", "jsonl", "/home/ada"] {
+            assert!(
+                !written.contains(forbidden),
+                "the work itself must not be spooled ({forbidden}): {written}"
+            );
+        }
+    }
+
+    /// An API-key or Console login has no `rate_limits`, and a session before
+    /// its first response has no `cost`. Neither may become a zero.
+    #[test]
+    fn an_unmeasured_field_is_absent_rather_than_zero() {
+        let home = tempfile::TempDir::new().unwrap();
+        let spool = home.path().join("usage").join("acc.ndjson");
+
+        render_with_spool(
+            home.path(),
+            Some(&spool),
+            &serde_json::json!({ "session_id": "sess-1" }).to_string(),
+        );
+
+        let written = std::fs::read_to_string(&spool).unwrap();
+        let sample: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        assert!(sample.get("costUsd").is_none(), "{written}");
+        assert!(sample.get("fiveHourPct").is_none(), "{written}");
+        assert_eq!(sample["sessionId"], "sess-1");
+    }
+
+    /// A render before Claude Code has a session is not a sample.
+    #[test]
+    fn a_payload_with_no_session_spools_nothing() {
+        let home = tempfile::TempDir::new().unwrap();
+        let spool = home.path().join("usage").join("acc.ndjson");
+
+        render_with_spool(home.path(), Some(&spool), "{}");
+
+        assert!(!spool.exists(), "no session, no sample");
+    }
+
+    /// A spool that cannot be written must not cost the developer their status
+    /// line. The directory is made read-only so `appendFileSync` throws.
+    #[cfg(unix)]
+    #[test]
+    fn a_spool_that_cannot_be_written_still_leaves_a_status_line() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let locked = home.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let drawn = render_with_spool(
+            home.path(),
+            Some(&locked.join("usage").join("acc.ndjson")),
+            &payload(),
+        );
+
+        assert!(drawn.contains("(riabuild"), "{drawn:?}");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}

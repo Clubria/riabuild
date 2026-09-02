@@ -34,4 +34,23 @@ crons.interval(
   {},
 );
 
+/**
+ * `usageSessions` is the fastest-growing table here — a row per Claude Code
+ * session per developer, written by a flush that fires while somebody is
+ * working — and the lead rollup reads it with a `take(500)` per member, which
+ * is the shape an unreaped table turns into a silent truncation.
+ *
+ * Ninety days because nothing in it is a business record. It is "who is close
+ * to their rate limit" plus a fortnight of context, and everything past that is
+ * a standing description of how much each developer worked, kept for no stated
+ * reason — on data collected from personal Pro and Max subscriptions, which is
+ * exactly the kind of tail to delete on a timer rather than to decide about
+ * later. `usage.rollup` caps the window a lead may ask for at the same ninety
+ * days, so the query never promises rows this has already removed.
+ *
+ * Hourly, like the two above, and bounded per run: a sweep that must finish in
+ * one transaction is a sweep that eventually cannot.
+ */
+crons.interval("reap old usage rows", { hours: 1 }, internal.usage.reapOld, {});
+
 export default crons;

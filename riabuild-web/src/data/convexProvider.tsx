@@ -56,6 +56,13 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     isLead ? {} : "skip",
   );
   const issuedKeys = useLoadable(api.issuedKeys.list, isLead ? {} : "skip");
+  // The window the panel says it is showing. Named here rather than defaulted
+  // silently on the server, so the two cannot disagree about what "last 7 days"
+  // means.
+  const usage = useLoadable(
+    api.usage.rollup,
+    isLead ? { windowDays: 7 } : "skip",
+  );
 
   const updateProfile = useMutation(api.members.updateProfile);
   const setRole = useMutation(api.members.setRole);
@@ -206,6 +213,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       sharedServers,
       issuedKeys,
       auditLog,
+      usage,
       orgConfig,
       now,
       ...actions,
@@ -222,6 +230,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       orgConfig,
       sessions,
       sharedServers,
+      usage,
       viewer,
     ],
   );

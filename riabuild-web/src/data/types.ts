@@ -166,6 +166,52 @@ export type IssuedKey = {
   updatedAt: number;
 };
 
+/**
+ * One member's line in the usage rollup, over the window the query was asked
+ * for.
+ *
+ * `costUsd` is **list-price equivalent** and is labelled that way everywhere it
+ * is rendered. These are personal Pro and Max subscriptions: the number is what
+ * the work would have cost against the public API price sheet, it is a
+ * reasonable measure of relative effort, and it is not money anybody spent.
+ * Left unlabelled it ends up in a budget.
+ *
+ * There is deliberately no token count. The status line reports what is
+ * currently in the context window rather than what a session consumed, so a
+ * "tokens" column here could only be filled with the largest context a session
+ * ever held — see `convex/schema.ts`.
+ *
+ * A `null` percentage is a harness that reported no rate-limit window at all
+ * (an API-key or Console login), which is not the same as a window at zero.
+ */
+export type UsageRow = {
+  memberId: MemberId;
+  githubLogin: string;
+  sessions: number;
+  costUsd: number;
+  linesAdded: number;
+  linesRemoved: number;
+  fiveHourPct: number | null;
+  /** Unix **seconds**, like everything else on this row. */
+  fiveHourResetsAt: number | null;
+  sevenDayPct: number | null;
+  sevenDayResetsAt: number | null;
+  lastObservedAt: number;
+  /**
+   * This member had more sessions in the window than one read returns, so the
+   * totals beside them are a floor. Rendered rather than swallowed: a
+   * truncation nobody mentions is a number that is quietly wrong.
+   */
+  truncated: boolean;
+};
+
+export type UsageRollup = {
+  windowDays: number;
+  /** Unix seconds — the start of the window these rows describe. */
+  since: number;
+  rows: UsageRow[];
+};
+
 export type MembershipStatus =
   "member" | "not_member" | "unavailable" | "signed_out" | "checking";
 
@@ -205,6 +251,11 @@ export type Data = {
   /** Lead-only, like `sharedServers`. A developer receives these through their CLI. */
   issuedKeys: Loadable<IssuedKey[]>;
   auditLog: Loadable<AuditEntry[]>;
+  /**
+   * Lead-only, like `members`. Every developer's Claude Code usage in one
+   * table is not something a colleague reads about a colleague.
+   */
+  usage: Loadable<UsageRollup>;
   orgConfig: Loadable<OrgConfig>;
   /** Ticking clock, so "expired" is computed rather than frozen at mount. */
   now: number;
