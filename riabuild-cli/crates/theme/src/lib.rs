@@ -62,6 +62,20 @@ pub const ORANGE: Color = Color::Rgb(0xf0, 0x56, 0x3c);
 /// `--green`. Reserved for "this is done".
 pub const GREEN: Color = Color::Rgb(0x3d, 0xdc, 0x84);
 
+/// The raised surface on a dark terminal, and the ink that goes on it.
+///
+/// Chosen rather than computed, because there is nothing to compute from: a
+/// terminal does not report its own background, and even where [`tone_for`]
+/// answers, it answers "dark" and not `#0d1117`. `#1e1e22` sits above the
+/// near-blacks the common dark themes use and below the lightest of them, so it
+/// reads as raised on almost all of them and as level — never inverted — on the
+/// rest.
+const SURFACE_DARK: Color = Color::Rgb(0x1e, 0x1e, 0x22);
+const INK_DARK: Color = Color::Rgb(0xe4, 0xe2, 0xdf);
+/// The same one step, taken the other way.
+const SURFACE_LIGHT: Color = Color::Rgb(0xf2, 0xf0, 0xed);
+const INK_LIGHT: Color = Color::Rgb(0x1c, 0x1b, 0x1a);
+
 /// The channels of a colour that has them.
 ///
 /// [`Color`] is a sum over four different ways of naming a colour and only
@@ -145,6 +159,41 @@ pub fn depth_for(
         // An unset TERM on a real terminal is unusual but not a reason to give
         // up colour entirely — the original sixteen are always safe.
         _ => Depth::Ansi16,
+    }
+}
+
+/// Which way round the terminal's own background is.
+///
+/// riabuild draws one raised surface — the agents window's session pane — and a
+/// terminal cannot composite, so "one step lighter than whatever is behind it"
+/// has to be a colour chosen in advance rather than one computed. This is the
+/// only input to that choice, and nothing else consults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Dark,
+    Light,
+}
+
+/// Reads the tone out of `COLORFGBG`, the one thing a terminal volunteers about
+/// its own background without being asked.
+///
+/// Set by rxvt, konsole and several others as `fg;bg` or `fg;default;bg`, in
+/// ANSI colour numbers. The last field is the background, and the dark half of
+/// the original sixteen is `0`–`6` plus `8`: `7` is light grey and `9`–`15` are
+/// the bright half, both of which are light backgrounds.
+///
+/// Anything unset or unparseable is dark, because that is what the great
+/// majority of terminals are — and because a wrong guess is survivable rather
+/// than fatal. [`Theme::surface`] paints a foreground as well as a background,
+/// so the pane is legible either way round instead of dark-on-dark.
+pub fn tone_for(colorfgbg: Option<&str>) -> Tone {
+    let Some(field) = colorfgbg.and_then(|value| value.rsplit(';').next()) else {
+        return Tone::Dark;
+    };
+    match field.trim().parse::<u8>() {
+        Ok(0..=6) | Ok(8) => Tone::Dark,
+        Ok(_) => Tone::Light,
+        Err(_) => Tone::Dark,
     }
 }
 
@@ -395,6 +444,7 @@ fn sgr_colour(colour: Color, ground: bool) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     depth: Depth,
+    tone: Tone,
 }
 
 impl Default for Theme {
@@ -413,19 +463,32 @@ impl Theme {
                 std::env::var("COLORTERM").ok().as_deref(),
                 std::env::var("TERM").ok().as_deref(),
             ),
+            tone: tone_for(std::env::var("COLORFGBG").ok().as_deref()),
         }
     }
 
     /// No colour, ever. The shape tests and non-terminal output use this.
     pub const fn plain() -> Self {
-        Self { depth: Depth::None }
+        Self {
+            depth: Depth::None,
+            tone: Tone::Dark,
+        }
     }
 
     /// A theme pinned to one rung of the ladder, so a test can assert what a
     /// given terminal actually receives.
     #[cfg(any(test, feature = "testing"))]
     pub const fn with_depth(depth: Depth) -> Self {
-        Self { depth }
+        Self {
+            depth,
+            tone: Tone::Dark,
+        }
+    }
+
+    /// A theme pinned to a rung *and* a background, for the surfaces.
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn with_depth_and_tone(depth: Depth, tone: Tone) -> Self {
+        Self { depth, tone }
     }
 
     /// Whether anything at all will be painted.
@@ -436,6 +499,48 @@ impl Theme {
     /// What this terminal can render, for a caller that has to branch on it.
     pub fn depth(self) -> Depth {
         self.depth
+    }
+
+    /// Which way round this terminal's own background is.
+    pub fn tone(self) -> Tone {
+        self.tone
+    }
+
+    /// The raised surface: one step off the terminal's own background, for a
+    /// pane riabuild wants read as sitting on top of the window rather than
+    /// fenced off from it by a rule.
+    ///
+    /// It carries a **foreground as well as a background**, which is the whole
+    /// of why it is safe. [`tone_for`] is a guess — most terminals say nothing
+    /// about their background — and a surface that painted only a background
+    /// would render dark-on-dark the first time that guess went wrong. Painting
+    /// both makes the pane internally consistent whichever way it went, and
+    /// every role drawn on top of it is a hue that reads on either.
+    ///
+    /// Empty below 256 colours. There is no shade of "slightly lighter" in the
+    /// original sixteen, and spending `Black` or `White` on one would repaint
+    /// the developer's whole window rather than raise a pane of it — so a
+    /// caller that separates two panes by their backgrounds needs a rule
+    /// between them for that case. [`Theme::has_surfaces`] is that question.
+    pub fn surface(self) -> Style {
+        if !self.has_surfaces() {
+            return Style::new();
+        }
+        let (bg, fg) = match self.tone {
+            Tone::Dark => (SURFACE_DARK, INK_DARK),
+            Tone::Light => (SURFACE_LIGHT, INK_LIGHT),
+        };
+        self.lower(Style::new().bg(bg).fg(fg))
+    }
+
+    /// Whether a raised surface is available on this terminal at all.
+    ///
+    /// The one thing a widget may branch on rather than asking for a role,
+    /// because the answer is not a colour: below 256 colours there is no
+    /// surface, and a layout that separates by background has to say something
+    /// else instead.
+    pub fn has_surfaces(self) -> bool {
+        self.depth >= Depth::Ansi256
     }
 
     /// A role's [`Style`], lowered onto this terminal.
@@ -733,5 +838,59 @@ mod tests {
     fn an_empty_style_paints_nothing_at_all() {
         assert_eq!(sgr_of(Style::new()), None);
         assert_eq!(sgr_of(Style::new().fg(Color::Reset)), None);
+    }
+
+    #[test]
+    fn the_background_is_read_off_colorfgbg_and_dark_wherever_it_is_not() {
+        // The `fg;default;bg` spelling is as common as the two-field one, so
+        // the *last* field is the background rather than the second.
+        assert_eq!(tone_for(Some("15;0")), Tone::Dark);
+        assert_eq!(tone_for(Some("15;default;0")), Tone::Dark);
+        assert_eq!(tone_for(Some("0;15")), Tone::Light);
+        assert_eq!(tone_for(Some("0;7")), Tone::Light);
+        // 8 is bright black, which is a dark background however it is spelled.
+        assert_eq!(tone_for(Some("15;8")), Tone::Dark);
+        // Unset, and set to something nobody can read: dark, because that is
+        // what most terminals are and because a surface is legible either way.
+        assert_eq!(tone_for(None), Tone::Dark);
+        assert_eq!(tone_for(Some("rgb:0000/0000/0000")), Tone::Dark);
+    }
+
+    #[test]
+    fn a_surface_paints_its_own_foreground_as_well_as_its_background() {
+        // The whole of why guessing the tone is survivable. A background with
+        // no foreground beside it renders dark-on-dark the first time the guess
+        // is wrong, and nothing on screen says why.
+        for tone in [Tone::Dark, Tone::Light] {
+            let surface = Theme::with_depth_and_tone(Depth::TrueColor, tone).surface();
+            assert!(surface.bg.is_some(), "{tone:?}");
+            assert!(surface.fg.is_some(), "{tone:?}");
+            assert_ne!(surface.bg, surface.fg, "{tone:?}");
+        }
+    }
+
+    #[test]
+    fn there_is_no_surface_below_256_colours_and_the_caller_can_ask() {
+        // The sixteen hold no shade of "slightly lighter", and spending Black
+        // or White on one would repaint the window rather than raise a pane.
+        for depth in [Depth::None, Depth::Ansi16] {
+            let theme = Theme::with_depth(depth);
+            assert!(!theme.has_surfaces(), "{depth:?}");
+            assert_eq!(theme.surface(), Style::new(), "{depth:?}");
+        }
+        for depth in [Depth::Ansi256, Depth::TrueColor] {
+            let theme = Theme::with_depth(depth);
+            assert!(theme.has_surfaces(), "{depth:?}");
+            assert_ne!(theme.surface(), Style::new(), "{depth:?}");
+        }
+    }
+
+    #[test]
+    fn a_surface_is_lowered_onto_the_terminal_like_every_other_colour() {
+        // The bug the whole crate exists to stop: a `Color::Rgb` reaching a
+        // 256-colour terminal as a 24-bit escape it cannot read.
+        let surface = Theme::with_depth(Depth::Ansi256).surface();
+        assert!(matches!(surface.bg, Some(Color::Indexed(_))));
+        assert!(matches!(surface.fg, Some(Color::Indexed(_))));
     }
 }

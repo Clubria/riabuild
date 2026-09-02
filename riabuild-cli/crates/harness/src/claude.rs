@@ -35,6 +35,18 @@ pub(super) fn argv(thread: Option<&str>, prompt: &str, org_settings: Option<&str
         // nothing else, so every tool call, every subagent and the whole of the
         // reasoning never arrive.
         "--verbose".into(),
+        // The same flag every generated launcher passes, for the same reason:
+        // the dynamic sections of the system prompt change between launches, so
+        // carrying them defeats prompt caching for every turn of every session
+        // — and there is no settings key for it, only this flag. The agents
+        // window is the one place a Clubria developer reaches Claude Code
+        // *without* going through a launcher, so leaving it out here made this
+        // the only uncached way to run it.
+        //
+        // Unlike the bare interactive launch, `-p` is an ordinary option line
+        // with no `agents` positional to be dropped through into, so nothing
+        // stops it riding along.
+        "--exclude-dynamic-system-prompt-sections".into(),
     ];
     args.extend(Kind::Claude.bypass().iter().map(|flag| (*flag).to_string()));
     // The team's Claude Code settings. An interactive session gets them because
@@ -481,6 +493,33 @@ mod tests {
         // naming one that is not there. The account launchers drop `--settings`
         // under exactly the same condition.
         assert!(!args.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn a_turn_carries_the_static_system_prompt_flag_every_launcher_passes() {
+        // The agents window is the one place a Clubria developer reaches Claude
+        // Code without going through a generated launcher, so leaving this out
+        // made it the only uncached way to run it — the dynamic sections change
+        // between launches and defeat the prompt cache for every turn.
+        //
+        // It rides along here and cannot on the bare interactive launch: that
+        // line carries an `agents` positional the flag would drop through into,
+        // turning the launch into the background-agents *listing*. `-p` has no
+        // positional but the prompt, which is last.
+        // Every shape of turn, because a flag the fresh line carries and the
+        // resumed one drops would leave every turn after the first uncached —
+        // which is all of them.
+        for thread in [None, Some("abc")] {
+            for settings in [None, Some("/home/dev/.riabuild/org.json")] {
+                let args = argv(thread, "hello", settings);
+                assert!(
+                    args.iter()
+                        .any(|a| a == "--exclude-dynamic-system-prompt-sections"),
+                    "{args:?}"
+                );
+                assert_eq!(args.last().unwrap(), "hello");
+            }
+        }
     }
 
     #[test]

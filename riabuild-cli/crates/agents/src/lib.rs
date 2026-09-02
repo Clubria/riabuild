@@ -21,6 +21,15 @@
 //! crate. Owning a child would mean the turn ends when the window does, which is
 //! precisely what this design exists to avoid.
 //!
+//! # A session is made by being asked something
+//!
+//! The rail holds sessions and *offers*, and an offer is not a session: it is a
+//! sign-in a new one could be started under, with no directory, no spool and
+//! nothing to count. The window used to create one per harness on the way in,
+//! which reported "3 sessions" before a developer had typed anything and left
+//! three directories on disk to prove it. The first prompt is what creates one
+//! now — see [`drive::send`].
+//!
 //! # Ownership of the terminal
 //!
 //! This is the third thing in riabuild that writes to a terminal, and it is a
@@ -45,7 +54,6 @@
 // found and the reasoning is written out in full.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,19 +68,22 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{event, execute};
-use riabuild_harness::{Kind, Reader};
+use riabuild_harness::Kind;
 use riabuild_runner::CommandRunner;
 use riabuild_theme::Theme;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 pub mod account;
 pub mod app;
+pub mod compose;
 pub mod draw;
+mod drive;
+pub mod frame;
 pub mod store;
 pub mod turn;
 
 pub use account::{Account, Accounts};
-use app::{App, Focus, Pane};
+use app::{App, Focus};
 use store::Store;
 
 /// What `riabuild agents` was asked to do.
@@ -86,6 +97,13 @@ pub struct Request {
     pub riabuild: PathBuf,
     /// The checkout every session in this window belongs to.
     pub cwd: PathBuf,
+    /// That checkout's repository, `owner/repo`, for the window to say so.
+    ///
+    /// The scoping itself is [`Store::sessions`]'s and was never this field's:
+    /// a session records the checkout it was created in and the window lists
+    /// only its own. What was missing was saying it out loud, which is what made
+    /// the window look as though it held every agent on the machine.
+    pub repo: Option<String>,
     /// Every sign-in a session in this window may be started under —
     /// `claude-1` … `claude-9`, and the same for Codex and Grok Build.
     ///
@@ -104,17 +122,29 @@ pub struct Request {
     pub unicode: bool,
 }
 
+/// Who a sign-in belongs to, as riabuild finds out.
+///
+/// Streamed rather than resolved before the window opens: asking a harness who
+/// is signed in is a subprocess per account, and twenty-seven of them is a
+/// second and a half of a blank terminal before the first frame. An answer that
+/// has not arrived is rendered as nothing, never as "signed out".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub kind: Kind,
+    pub number: usize,
+    pub email: String,
+}
+
 /// What a keypress asks for.
 ///
 /// Returned rather than performed, so the whole keymap is testable without a
-/// terminal, a process or a filesystem.
+/// terminal, a process or a filesystem. Opening a session is not among them:
+/// the chooser *offers* a sign-in, and the prompt is what creates anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Nothing,
     Quit,
     Send(String),
-    /// Start a session under this sign-in.
-    Open(Account),
 }
 
 /// The keymap.
@@ -124,158 +154,173 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
     if event.kind == KeyEventKind::Release {
         return Action::Nothing;
     }
-    // Ctrl-C leaves, from either mode. A developer who has just typed half a
-    // prompt still expects it to work — and leaving now interrupts nothing,
-    // because the turn is not this process's child.
+    // Ctrl-C leaves, from anywhere. A developer who has just typed half a prompt
+    // still expects it to work — and leaving now interrupts nothing, because the
+    // turn is not this process's child.
     if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
         return Action::Quit;
     }
 
     match app.focus {
-        Focus::Compose => match event.code {
-            KeyCode::Esc => {
-                app.focus = Focus::Transcript;
-                Action::Nothing
-            }
-            KeyCode::Enter => {
-                let text = app.composing.trim().to_string();
-                app.composing.clear();
-                app.focus = Focus::Transcript;
-                if text.is_empty() {
-                    Action::Nothing
-                } else {
-                    Action::Send(text)
-                }
-            }
-            KeyCode::Backspace => {
-                app.composing.pop();
-                Action::Nothing
-            }
-            KeyCode::Char(ch) => {
-                app.composing.push(ch);
-                Action::Nothing
-            }
-            _ => Action::Nothing,
-        },
-        // Choosing which sign-in a new session runs under. Escape is the way
-        // out of it, and choosing nothing is always possible: this is the one
-        // screen that appears because a developer asked a question, so it must
-        // be answerable with "never mind".
-        Focus::Picker => match event.code {
-            KeyCode::Esc => {
-                app.focus = Focus::Transcript;
-                Action::Nothing
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.pick_next();
-                Action::Nothing
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.pick_previous();
-                Action::Nothing
-            }
-            KeyCode::Enter => match app.picked().cloned() {
-                Some(account) => {
-                    app.focus = Focus::Transcript;
-                    Action::Open(account)
-                }
-                // No accounts at all. Nothing to open, and refusing silently is
-                // better than opening a session under a home nobody has.
-                None => Action::Nothing,
-            },
-            _ => Action::Nothing,
-        },
-        // The session column. Up and down mean "another session" only here,
-        // which is the whole of what the left arrow bought.
-        Focus::Sessions => match event.code {
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                app.select_next();
-                Action::Nothing
-            }
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                app.select_previous();
-                Action::Nothing
-            }
-            // Three ways back, because there is nothing to confirm: moving the
-            // cursor has already switched session, so every one of these is
-            // "done here" rather than "accept".
-            KeyCode::Right | KeyCode::Enter | KeyCode::Esc => {
-                app.focus = Focus::Transcript;
-                Action::Nothing
-            }
-            KeyCode::Char('n') => {
-                app.open_picker();
-                Action::Nothing
-            }
-            _ => Action::Nothing,
-        },
-        // Reading. The resting state, so the arrows scroll what is in front of
-        // the developer rather than moving between sessions — `PageUp` is `Fn`
-        // and an arrow on a laptop, which made scrolling a gesture half the
-        // keyboards in the room could not perform.
-        Focus::Transcript => match event.code {
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Left => {
-                app.focus = Focus::Sessions;
-                Action::Nothing
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.scrollback = app.scrollback.saturating_add(1);
-                Action::Nothing
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.scrollback = app.scrollback.saturating_sub(1);
-                Action::Nothing
-            }
-            // Kept, rather than relied on: a full-size keyboard has them and a
-            // page is a faster way through a long transcript than a line.
-            KeyCode::PageUp => {
-                app.scrollback = app.scrollback.saturating_add(10);
-                Action::Nothing
-            }
-            KeyCode::PageDown => {
-                app.scrollback = app.scrollback.saturating_sub(10);
-                Action::Nothing
-            }
-            // Tab still cycles sessions without leaving the transcript, which is
-            // what a developer watching two agents at once actually does.
-            KeyCode::Tab => {
-                app.select_next();
-                Action::Nothing
-            }
-            KeyCode::BackTab => {
-                app.select_previous();
-                Action::Nothing
-            }
-            KeyCode::Char('n') => {
-                app.open_picker();
-                Action::Nothing
-            }
-            // The quick way to a new session on a harness's first sign-in, for
-            // a developer who has one of each and does not want a chooser.
-            KeyCode::Char('1') => open_first(app, Kind::Claude),
-            KeyCode::Char('2') => open_first(app, Kind::Codex),
-            KeyCode::Char('3') => open_first(app, Kind::Grok),
-            KeyCode::Enter => {
-                if app.selected().is_some() {
-                    app.focus = Focus::Compose;
-                }
-                Action::Nothing
-            }
-            _ => Action::Nothing,
-        },
+        Focus::List => list_key(app, event.code),
+        Focus::Session => session_key(app, event.code),
+        Focus::Picker => picker_key(app, event.code),
     }
 }
 
-/// A new session on a harness's first sign-in.
+/// The rail. Up and down move between sessions and offers, and only here.
+fn list_key(app: &mut App, code: KeyCode) -> Action {
+    match code {
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            app.select_next();
+            Action::Nothing
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+            app.select_previous();
+            Action::Nothing
+        }
+        // One keypress into the pane, and typing works immediately once there.
+        // It used to take two — one to reach the session, one to reach its box —
+        // which is a confirmation of a decision the cursor had already made.
+        KeyCode::Right | KeyCode::Enter => {
+            app.focus = Focus::Session;
+            Action::Nothing
+        }
+        KeyCode::Char('n') => {
+            app.open_picker();
+            Action::Nothing
+        }
+        // The quick way to a harness's own offer, for a developer who has one
+        // account each and does not want a chooser.
+        KeyCode::Char('1') => {
+            app.jump_to_offer(Kind::Claude);
+            Action::Nothing
+        }
+        KeyCode::Char('2') => {
+            app.jump_to_offer(Kind::Codex);
+            Action::Nothing
+        }
+        KeyCode::Char('3') => {
+            app.jump_to_offer(Kind::Grok);
+            Action::Nothing
+        }
+        _ => Action::Nothing,
+    }
+}
+
+/// A session, or an offer about to become one. Every character typed here goes
+/// into the box; the arrows keep their meanings around it.
+fn session_key(app: &mut App, code: KeyCode) -> Action {
+    match code {
+        KeyCode::Esc => {
+            app.focus = Focus::List;
+            Action::Nothing
+        }
+        // The one exception to "typed characters go in the box", and the one the
+        // developer asked for by name: a caret at position 0 has nowhere further
+        // left to go inside the line, so the next left is out of it.
+        KeyCode::Left => {
+            if app.compose.at_start() {
+                app.focus = Focus::List;
+            } else {
+                app.compose.left();
+            }
+            Action::Nothing
+        }
+        KeyCode::Right => {
+            app.compose.right();
+            Action::Nothing
+        }
+        KeyCode::Home => {
+            app.compose.start();
+            Action::Nothing
+        }
+        KeyCode::End => {
+            app.compose.end();
+            Action::Nothing
+        }
+        // `PageUp` is `Fn` and an arrow on a laptop, which made scrolling a
+        // gesture half the keyboards in the room could not perform. Both work.
+        KeyCode::Up => {
+            app.scrollback = app.scrollback.saturating_add(1);
+            Action::Nothing
+        }
+        KeyCode::Down => {
+            app.scrollback = app.scrollback.saturating_sub(1);
+            Action::Nothing
+        }
+        KeyCode::PageUp => {
+            app.scrollback = app.scrollback.saturating_add(10);
+            Action::Nothing
+        }
+        KeyCode::PageDown => {
+            app.scrollback = app.scrollback.saturating_sub(10);
+            Action::Nothing
+        }
+        KeyCode::Tab => {
+            app.select_next();
+            Action::Nothing
+        }
+        KeyCode::BackTab => {
+            app.select_previous();
+            Action::Nothing
+        }
+        KeyCode::Backspace => {
+            app.compose.backspace();
+            Action::Nothing
+        }
+        KeyCode::Delete => {
+            app.compose.delete();
+            Action::Nothing
+        }
+        // Sending does not leave. A conversation is a sequence of prompts, and
+        // being put back in a list after each one is a keypress per turn.
+        KeyCode::Enter => {
+            let text = app.compose.take().trim().to_string();
+            if text.is_empty() {
+                Action::Nothing
+            } else {
+                Action::Send(text)
+            }
+        }
+        KeyCode::Char(ch) => {
+            app.compose.insert(ch);
+            Action::Nothing
+        }
+        _ => Action::Nothing,
+    }
+}
+
+/// Choosing which sign-in to put on the rail.
 ///
-/// Nothing at all where that harness has no accounts, which is only reachable
-/// on a machine where riabuild has not finished setting one up.
-fn open_first(app: &App, kind: Kind) -> Action {
-    match app.accounts.first(kind) {
-        Some(account) => Action::Open(account.clone()),
-        None => Action::Nothing,
+/// Escape is the way out, and choosing nothing is always possible: this is the
+/// one screen that appears because a developer asked a question, so it must be
+/// answerable with "never mind".
+fn picker_key(app: &mut App, code: KeyCode) -> Action {
+    match code {
+        KeyCode::Esc => {
+            app.focus = Focus::List;
+            Action::Nothing
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.pick_next();
+            Action::Nothing
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.pick_previous();
+            Action::Nothing
+        }
+        KeyCode::Enter => {
+            // Offered, never opened. A directory created because somebody
+            // browsed a list is the "3 sessions" bug written down.
+            if let Some(account) = app.picked().cloned() {
+                app.offer(account);
+            }
+            app.focus = Focus::List;
+            Action::Nothing
+        }
+        _ => Action::Nothing,
     }
 }
 
@@ -303,6 +348,7 @@ pub async fn run(
     runner: Arc<dyn CommandRunner>,
     paths: &dyn riabuild_paths::Paths,
     request: Request,
+    logins: UnboundedReceiver<Login>,
 ) -> Result<()> {
     let store = Store::new(paths);
     // Before anything is listed, so the cap is enforced by using the window
@@ -310,98 +356,37 @@ pub async fn run(
     let _ = store.prune(&request.cwd).await;
 
     let mut app = App::new(request.accounts.clone());
-    let mut readers: HashMap<String, Reader> = HashMap::new();
-    restore(&store, &request, &mut app, &mut readers).await?;
+    let mut readers = drive::restore(&store, &request, &mut app).await?;
 
     if let Some(prompt) = request.prompt.clone() {
-        for index in 0..app.panes.len() {
-            app.selected = index;
-            send(&store, runner.as_ref(), &request, &mut app, &prompt).await;
-        }
-        app.selected = 0;
+        drive::first_prompt(
+            &store,
+            runner.as_ref(),
+            &request,
+            &mut app,
+            &mut readers,
+            &prompt,
+        )
+        .await;
     }
 
+    restore_terminal_on_panic();
     let mut terminal = claim().context("could not take the terminal")?;
     // Whatever happens below, the terminal is handed back. A provisioner that
     // left a developer in raw mode on the alternate screen would be worse than
     // one that simply failed.
-    let outcome = drive(
+    let outcome = drive::drive(
         &mut terminal,
         &store,
         runner.as_ref(),
         &request,
         &mut app,
         &mut readers,
+        logins,
     )
     .await;
     release(&mut terminal);
     outcome
-}
-
-/// Loads this checkout's sessions and replays what they have already said.
-async fn restore(
-    store: &Store,
-    request: &Request,
-    app: &mut App,
-    readers: &mut HashMap<String, Reader>,
-) -> Result<()> {
-    for record in store.sessions(&request.cwd).await.unwrap_or_default() {
-        let Some(kind) = record.harness() else {
-            continue;
-        };
-        let mut pane = Pane::new(record.id.clone(), kind, record.title.clone());
-        pane.thread = record.thread.clone();
-        pane.account = record.account;
-        // Replayed through the same decoder a live turn is read with, so a
-        // reopened pane shows what was on screen when the work happened rather
-        // than a reconstruction of it.
-        let mut reader = Reader::new(kind);
-        let spool = store.spool(&record.id).await.unwrap_or_default();
-        pane.offset = spool.len() as u64;
-        for line in spool.lines() {
-            for event in reader.read(line) {
-                pane.observe(&event);
-            }
-        }
-        // Replayed like the spool, so a failure from yesterday's turn is still
-        // on screen when the window comes back.
-        let (trouble, at) = store.trouble_since(&record.id, 0).await.unwrap_or_default();
-        for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
-            pane.observe(&riabuild_harness::Event::Trouble(line.to_string()));
-        }
-        pane.trouble_offset = at;
-        pane.running = store.running(&record.id).await;
-        readers.insert(record.id.clone(), reader);
-        app.add(pane);
-    }
-
-    // Every harness riabuild installs gets a pane, on its first sign-in. One
-    // that already has a session keeps it — reopening should hand a developer
-    // back the conversation they were having, not a fourth empty pane beside it.
-    //
-    // One pane per *harness* and not one per account: nine sign-ins each is
-    // twenty-seven panes, which is a list nobody can read, for a developer who
-    // is using two of them. The other twenty-four are a keypress away in the
-    // chooser rather than on screen from the start.
-    for kind in Kind::ALL {
-        if app.panes.iter().any(|pane| pane.kind == kind) {
-            continue;
-        }
-        // A harness with no accounts still gets its pane, under no home at all —
-        // which is what this did for all three before accounts were offered.
-        let account = request
-            .accounts
-            .first(kind)
-            .cloned()
-            .unwrap_or_else(|| Account::new(kind, 1, None));
-        let record = store.create(&account, &request.cwd).await?;
-        readers.insert(record.id.clone(), Reader::new(kind));
-        let mut pane = Pane::new(record.id, kind, String::new());
-        pane.account = account.number;
-        app.add(pane);
-    }
-    app.selected = 0;
-    Ok(())
 }
 
 type Screen = Terminal<CrosstermBackend<std::io::Stdout>>;
@@ -432,10 +417,21 @@ fn claim() -> Result<Screen> {
     Ok(terminal)
 }
 
+/// Hands the terminal back, and takes the window off the screen with it.
+///
+/// The clear is what Ctrl-C was missing. Leaving the alternate screen restores
+/// the developer's scrollback *where the terminal honours one* — and tmux with
+/// `alternate-screen off`, `screen`, and a `TERM` with no `smcup`/`rmcup` do
+/// not, so on those the last frame simply stayed there and the shell's next
+/// prompt printed on top of it. Clearing first costs nothing where the switch
+/// works and is the whole of the fix where it does not.
+///
+/// Every step is attempted even if an earlier one failed: giving the terminal
+/// back matters more than reporting why raw mode would not come off, and there
+/// is nobody to report to until it has.
 fn release(terminal: &mut Screen) {
-    // Every step is attempted even if an earlier one failed: leaving the
-    // alternate screen matters more than reporting why raw mode would not come
-    // off, and there is nobody to report to until it has.
+    let _ = terminal.clear();
+    let _ = terminal.flush();
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
@@ -445,142 +441,27 @@ fn release(terminal: &mut Screen) {
     let _ = terminal.show_cursor();
 }
 
-async fn drive(
-    terminal: &mut Screen,
-    store: &Store,
-    runner: &dyn CommandRunner,
-    request: &Request,
-    app: &mut App,
-    readers: &mut HashMap<String, Reader>,
-) -> Result<()> {
-    let mut keys = keys();
-    // Fast enough for the spinner to read as motion and for output to feel live,
-    // slow enough that an idle window is not reading three files a hundred times
-    // a second.
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
-
-    loop {
-        terminal.draw(|frame| draw::render(frame, app, request.theme, request.unicode))?;
-        if app.quit {
-            return Ok(());
-        }
-
-        let action = tokio::select! {
-            Some(event) = keys.recv() => match event {
-                TermEvent::Key(pressed) => key(app, pressed),
-                _ => Action::Nothing,
-            },
-            _ = ticker.tick() => {
-                app.tick = app.tick.wrapping_add(1);
-                follow(store, app, readers).await;
-                Action::Nothing
-            }
-        };
-
-        match action {
-            Action::Nothing => {}
-            Action::Quit => app.quit = true,
-            Action::Open(account) => {
-                let record = store.create(&account, &request.cwd).await?;
-                readers.insert(record.id.clone(), Reader::new(account.kind));
-                let mut pane = Pane::new(record.id, account.kind, String::new());
-                pane.account = account.number;
-                app.add(pane);
-                app.selected = app.panes.len().saturating_sub(1);
-                // Straight to reading the new session rather than leaving the
-                // cursor in the column it was opened from.
-                app.scrollback = 0;
-            }
-            Action::Send(text) => send(store, runner, request, app, &text).await,
-        }
-    }
-}
-
-/// Reads whatever the running turns have appended since the last tick.
-async fn follow(store: &Store, app: &mut App, readers: &mut HashMap<String, Reader>) {
-    let ids: Vec<(String, u64, u64)> = app
-        .panes
-        .iter()
-        .map(|pane| (pane.id.clone(), pane.offset, pane.trouble_offset))
-        .collect();
-    for (id, offset, trouble_at) in ids {
-        if let Ok((fresh, moved)) = store.spool_since(&id, offset).await
-            && !fresh.is_empty()
-        {
-            if let Some(reader) = readers.get_mut(&id) {
-                let events: Vec<_> = fresh.lines().flat_map(|line| reader.read(line)).collect();
-                for event in events {
-                    app.observe(&id, &event);
-                }
-            }
-            if let Some(pane) = app.pane_mut(&id) {
-                pane.offset = moved;
-            }
-        }
-        // riabuild's own failures, which have nowhere in the harness's stream to
-        // live: a binary that would not start writes here and nowhere else.
-        if let Ok((trouble, at)) = store.trouble_since(&id, trouble_at).await
-            && !trouble.is_empty()
-        {
-            for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
-                app.observe(&id, &riabuild_harness::Event::Trouble(line.to_string()));
-            }
-            if let Some(pane) = app.pane_mut(&id) {
-                pane.trouble_offset = at;
-            }
-        }
-        // Asked every tick rather than inferred from the stream: a turn can also
-        // end by being killed, and nothing is written then.
-        let running = store.running(&id).await;
-        app.set_running(&id, running);
-    }
-}
-
-/// Starts a turn for the selected session.
-async fn send(
-    store: &Store,
-    runner: &dyn CommandRunner,
-    request: &Request,
-    app: &mut App,
-    text: &str,
-) {
-    let Some(id) = app.selected().map(|pane| pane.id.clone()) else {
-        return;
-    };
-    app.sent(text);
-
-    // Re-read rather than trusting what this window remembers: a turn started
-    // from another window may have learned the thread id since, and resuming
-    // without it starts a second conversation instead of continuing this one.
-    let record = match store.read(&id).await {
-        Ok(mut record) => {
-            if record.title.is_empty() {
-                record.title = store::title_of(text);
-                let _ = store.write(&record).await;
-            }
-            record
-        }
-        Err(error) => {
-            app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
-            app.set_running(&id, false);
-            return;
-        }
-    };
-
-    // A turn that will not start is this session's problem and not the window's:
-    // the other agents keep running and the pane says what happened.
-    if let Err(error) = store
-        .start_turn(runner, &request.riabuild, &record, text)
-        .await
-    {
-        app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
-        app.set_running(&id, false);
-    }
+/// Gives the terminal back if this process panics inside the window.
+///
+/// A panic between [`claim`] and [`release`] would otherwise leave a developer
+/// in raw mode on the alternate screen with the backtrace painted somewhere they
+/// cannot scroll to. Installed by [`run`] on the way in, and it chains rather
+/// than replaces — the existing hook is what prints the message, and a hook that
+/// swallowed it would trade a wrecked terminal for a silent crash.
+fn restore_terminal_on_panic() {
+    let existing = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut out = std::io::stdout();
+        let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = disable_raw_mode();
+        existing(info);
+    }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Pane;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -599,26 +480,70 @@ mod tests {
 
     fn with_one_session() -> App {
         let mut app = App::new(every_account());
-        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        app.add(Pane::new("s1".into(), Kind::Claude, "a title".into()));
+        app.cursor = 0;
         app
     }
 
+    fn type_into(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            key(app, press(KeyCode::Char(ch)));
+        }
+    }
+
     #[test]
-    fn typing_a_prompt_and_pressing_enter_sends_it() {
+    fn the_window_opens_on_the_rail() {
+        // Where a window with nothing running has something to say. Reading an
+        // empty transcript is not a resting state.
+        let app = App::new(every_account());
+        assert_eq!(app.focus, Focus::List);
+    }
+
+    #[test]
+    fn one_keypress_reaches_the_box_and_the_next_character_lands_in_it() {
+        // The complaint: enter, then enter again, before a letter counted.
         let mut app = with_one_session();
         assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert_eq!(app.focus, Focus::Compose);
-        for ch in "hello".chars() {
-            key(&mut app, press(KeyCode::Char(ch)));
-        }
-        assert_eq!(app.composing, "hello");
+        assert_eq!(app.focus, Focus::Session);
+        type_into(&mut app, "hello");
+        assert_eq!(app.compose.text(), "hello");
         assert_eq!(
             key(&mut app, press(KeyCode::Enter)),
             Action::Send("hello".into())
         );
-        // and the box is cleared, so the next prompt does not start with the last
-        assert_eq!(app.composing, "");
-        assert_eq!(app.focus, Focus::Transcript);
+        // and the box is cleared, and the developer is still in the session —
+        // a conversation is a sequence of prompts.
+        assert_eq!(app.compose.text(), "");
+        assert_eq!(app.focus, Focus::Session);
+    }
+
+    #[test]
+    fn the_right_arrow_reaches_the_box_too() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Session);
+        type_into(&mut app, "x");
+        assert_eq!(app.compose.text(), "x");
+    }
+
+    #[test]
+    fn left_moves_the_caret_until_there_is_nowhere_left_to_go() {
+        // The rule the developer stated: the box takes every character *unless*
+        // the caret is at position 0 and left is pressed.
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        type_into(&mut app, "ab");
+        key(&mut app, press(KeyCode::Left));
+        assert_eq!(app.compose.caret(), 1);
+        assert_eq!(app.focus, Focus::Session);
+        key(&mut app, press(KeyCode::Left));
+        assert_eq!(app.compose.caret(), 0);
+        assert_eq!(app.focus, Focus::Session);
+        // Only now, with nowhere further left inside the line.
+        key(&mut app, press(KeyCode::Left));
+        assert_eq!(app.focus, Focus::List);
+        // and what was typed survives the trip
+        assert_eq!(app.compose.text(), "ab");
     }
 
     #[test]
@@ -630,12 +555,23 @@ mod tests {
     }
 
     #[test]
-    fn the_arrows_scroll_what_is_being_read_and_the_left_one_leaves_it() {
-        // `PageUp` is `Fn` and an arrow on a laptop keyboard. Scrolling was the
-        // one thing only those two keys did, which made the main gesture of this
-        // screen one half the keyboards in the room cannot perform.
+    fn letters_are_letters_in_a_session_and_commands_in_the_rail() {
+        // The bug this stops: `q` typed into a prompt quitting the program, and
+        // taking the half-written message with it.
         let mut app = with_one_session();
-        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Quit);
+
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Nothing);
+        assert_eq!(key(&mut app, press(KeyCode::Char('n'))), Action::Nothing);
+        assert_eq!(app.compose.text(), "qn");
+    }
+
+    #[test]
+    fn the_arrows_scroll_inside_a_session_and_change_row_in_the_rail() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
         key(&mut app, press(KeyCode::Up));
         key(&mut app, press(KeyCode::Up));
         assert_eq!(app.scrollback, 2);
@@ -646,99 +582,84 @@ mod tests {
         key(&mut app, press(KeyCode::Down));
         assert_eq!(app.scrollback, 0);
 
-        // Left is where sessions live, and only there do the arrows change one.
-        key(&mut app, press(KeyCode::Left));
-        assert_eq!(app.focus, Focus::Sessions);
-        key(&mut app, press(KeyCode::Up));
-        assert_eq!(app.scrollback, 0);
-        key(&mut app, press(KeyCode::Right));
-        assert_eq!(app.focus, Focus::Transcript);
-    }
-
-    #[test]
-    fn moving_between_sessions_happens_in_the_column_and_nowhere_else() {
-        let mut app = with_one_session();
-        app.add(Pane::new("s2".into(), Kind::Codex, String::new()));
-        key(&mut app, press(KeyCode::Left));
+        key(&mut app, press(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
         key(&mut app, press(KeyCode::Down));
-        assert_eq!(app.selected, 1);
-        key(&mut app, press(KeyCode::Up));
-        assert_eq!(app.selected, 0);
-        // Enter is "done here" rather than "accept": the cursor has already
-        // switched session, so there is nothing left to confirm.
-        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert_eq!(app.focus, Focus::Transcript);
-        // and tab still switches without going over there at all
-        key(&mut app, press(KeyCode::Tab));
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.scrollback, 0);
     }
 
     #[test]
-    fn a_new_session_can_be_opened_under_any_sign_in() {
-        // The bug: `n` opened `claude-1` and there was no way to reach the other
-        // eight, or any of Codex's or Grok Build's nine, from this window.
+    fn the_rail_runs_over_the_sessions_and_then_the_sign_ins() {
+        let mut app = with_one_session();
+        // one session and three offers
+        assert_eq!(app.rows(), 4);
+        for expected in [1, 2, 3, 0] {
+            key(&mut app, press(KeyCode::Down));
+            assert_eq!(app.cursor, expected);
+        }
+        key(&mut app, press(KeyCode::Up));
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn a_digit_jumps_to_a_harnesss_own_sign_in() {
+        for (digit, kind) in [('1', Kind::Claude), ('2', Kind::Codex), ('3', Kind::Grok)] {
+            let mut app = with_one_session();
+            key(&mut app, press(KeyCode::Char(digit)));
+            assert_eq!(app.offered().map(|account| account.kind), Some(kind));
+        }
+    }
+
+    #[test]
+    fn the_chooser_offers_a_sign_in_rather_than_opening_a_session() {
+        // The whole of the fix for "3 sessions": browsing twenty-seven sign-ins
+        // must not create anything on disk.
         let mut app = with_one_session();
         key(&mut app, press(KeyCode::Char('n')));
         assert_eq!(app.focus, Focus::Picker);
-        // On the sign-in the selected session is already running under, so
-        // "another one of these" is one keypress.
+        // On the sign-in the selected session already runs under, so "another
+        // one of these" is one keypress.
         assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-1"));
-
         for _ in 0..3 {
             key(&mut app, press(KeyCode::Down));
         }
         assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-4"));
-        let opened = key(&mut app, press(KeyCode::Enter));
+        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.panes.len(), 1, "nothing was created");
         assert_eq!(
-            opened,
-            Action::Open(Account::new(Kind::Claude, 4, Some(PathBuf::from("/r"))))
+            app.offered().map(Account::name).as_deref(),
+            Some("claude-4")
         );
-        assert_eq!(app.focus, Focus::Transcript);
     }
 
     #[test]
-    fn the_chooser_can_be_left_without_opening_anything() {
+    fn the_chooser_can_be_left_without_offering_anything() {
         let mut app = with_one_session();
+        let offers = app.offers.len();
         key(&mut app, press(KeyCode::Char('n')));
         key(&mut app, press(KeyCode::Down));
         assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
-        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.offers.len(), offers);
     }
 
     #[test]
-    fn a_window_with_no_accounts_opens_nothing_rather_than_guessing() {
-        // Reachable on a machine riabuild has not finished setting up. A session
-        // under an invented home would resume from a store nobody has.
+    fn a_window_with_no_accounts_offers_a_harness_under_no_home_rather_than_nothing() {
+        // Reachable on a machine riabuild has not finished setting up. Leaving
+        // the harness off the rail would answer a setup problem by hiding a tool
+        // riabuild installs.
         let mut app = App::new(Accounts::default());
-        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        assert_eq!(app.offers.len(), 3);
         key(&mut app, press(KeyCode::Char('n')));
         assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert_eq!(key(&mut app, press(KeyCode::Char('1'))), Action::Nothing);
+        assert!(app.panes.is_empty());
     }
 
     #[test]
-    fn letters_are_letters_while_typing_and_commands_otherwise() {
-        // The bug this stops: `q` typed into a prompt quitting the program, and
-        // taking the half-written message with it.
-        let mut app = with_one_session();
-        assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Quit);
-
-        let mut app = with_one_session();
-        key(&mut app, press(KeyCode::Enter));
-        assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Nothing);
-        assert_eq!(app.composing, "q");
-        assert_eq!(key(&mut app, press(KeyCode::Char('n'))), Action::Nothing);
-        assert_eq!(app.composing, "qn");
-    }
-
-    #[test]
-    fn ctrl_c_leaves_from_either_mode() {
-        for focus in [
-            Focus::Transcript,
-            Focus::Sessions,
-            Focus::Compose,
-            Focus::Picker,
-        ] {
+    fn ctrl_c_leaves_from_anywhere() {
+        for focus in [Focus::List, Focus::Session, Focus::Picker] {
             let mut app = with_one_session();
             app.focus = focus;
             let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -747,26 +668,13 @@ mod tests {
     }
 
     #[test]
-    fn each_harness_has_a_key_that_opens_its_first_sign_in() {
-        // For the developer with one account each, who should not be asked to
-        // choose from twenty-seven of them to get a second Codex.
-        for (digit, kind) in [('1', Kind::Claude), ('2', Kind::Codex), ('3', Kind::Grok)] {
-            let mut app = with_one_session();
-            let Action::Open(account) = key(&mut app, press(KeyCode::Char(digit))) else {
-                panic!("{digit} opened nothing");
-            };
-            assert_eq!(account.kind, kind);
-            assert_eq!(account.number, 1);
-        }
-    }
-
-    #[test]
-    fn escape_abandons_the_prompt_without_sending_it() {
+    fn escape_leaves_the_box_without_losing_what_is_in_it() {
         let mut app = with_one_session();
         key(&mut app, press(KeyCode::Enter));
-        key(&mut app, press(KeyCode::Char('x')));
+        type_into(&mut app, "half a thought");
         assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
-        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.compose.text(), "half a thought");
     }
 
     #[test]
@@ -784,22 +692,29 @@ mod tests {
         let mut app = with_one_session();
         app.set_running("s1", true);
         key(&mut app, press(KeyCode::Enter));
-        assert_eq!(app.focus, Focus::Compose);
+        type_into(&mut app, "and another thing");
+        assert_eq!(
+            key(&mut app, press(KeyCode::Enter)),
+            Action::Send("and another thing".into())
+        );
     }
 
     #[test]
-    fn backspace_deletes_and_stops_at_empty() {
+    fn backspace_and_delete_work_around_the_caret() {
         let mut app = with_one_session();
         key(&mut app, press(KeyCode::Enter));
-        key(&mut app, press(KeyCode::Char('a')));
+        type_into(&mut app, "abc");
+        key(&mut app, press(KeyCode::Left));
         key(&mut app, press(KeyCode::Backspace));
-        key(&mut app, press(KeyCode::Backspace));
-        assert_eq!(app.composing, "");
+        assert_eq!(app.compose.text(), "ac");
+        key(&mut app, press(KeyCode::Delete));
+        assert_eq!(app.compose.text(), "a");
     }
 
     #[test]
     fn a_page_at_a_time_still_works_where_the_keyboard_has_the_keys() {
         let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
         key(&mut app, press(KeyCode::PageDown));
         assert_eq!(app.scrollback, 0);
         key(&mut app, press(KeyCode::PageUp));
@@ -822,10 +737,6 @@ mod tests {
         assert_eq!(
             accounts.first(Kind::Claude).and_then(|a| a.home.clone()),
             Some(PathBuf::from("/r/claude/abc"))
-        );
-        assert_eq!(
-            accounts.first(Kind::Codex).and_then(|a| a.home.clone()),
-            Some(PathBuf::from("/r/codex/1"))
         );
         let homes: Vec<_> = accounts.all().iter().map(|a| a.home.clone()).collect();
         assert_eq!(homes[0], Some(PathBuf::from("/r/claude/abc")));

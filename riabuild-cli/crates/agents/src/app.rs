@@ -9,10 +9,23 @@
 //! spool through the same decoder that reads a running turn, so what a pane
 //! shows tomorrow is what it showed when the work happened rather than a
 //! reconstruction of it.
+//!
+//! # A session and an offer are not the same thing
+//!
+//! The rail holds both, and telling them apart is the whole of why there is a
+//! [`Row`]. A **session** is a directory with a spool, a lock and a
+//! conversation in it. An **offer** is a sign-in a new one *could* be started
+//! under, and it is nothing else — no directory, no process, nothing to count.
+//! The first prompt is what turns one into the other.
+//!
+//! Conflating the two is what made a window that had been asked nothing report
+//! "3 sessions" on its first frame, and it cost more than a wrong number: three
+//! directories were created on disk before a developer had typed anything.
 
 use riabuild_harness::{Event, Kind};
 
 use crate::account::{Account, Accounts};
+use crate::compose::Compose;
 
 /// Where a session has got to.
 ///
@@ -154,12 +167,11 @@ impl Pane {
 
     /// The name this session goes by in the list.
     ///
-    /// "new session" rather than "new claude" for one nobody has spoken to yet:
-    /// the row beside it already says `claude-1`, and a list of `claude-1 new
-    /// claude` reads as a stutter.
+    /// Only reachable now for a session written by an older riabuild: a session
+    /// is created by its first prompt, and that prompt is what titles it.
     pub fn label(&self) -> String {
         if self.title.is_empty() {
-            "new session".to_string()
+            "untitled".to_string()
         } else {
             self.title.clone()
         }
@@ -253,42 +265,64 @@ impl Pane {
     }
 }
 
+/// One row of the rail.
+///
+/// Sessions first, then offers, which is why both are an index rather than a
+/// payload: the order is arithmetic and the rail never has to be rebuilt to be
+/// asked what the cursor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    /// A session, by index into [`App::panes`].
+    Session(usize),
+    /// A sign-in a new session could be started under, by index into
+    /// [`App::offers`].
+    Offer(usize),
+}
+
 /// Which part of the screen the keyboard is talking to.
 ///
-/// Reading is the resting state, not choosing. A developer spends the whole of
-/// a session watching one transcript go by and switches session occasionally,
-/// so the arrow keys move *within* what is being read and the session column is
-/// somewhere you go — left — rather than what the arrows always mean.
-///
-/// That is also what makes `PageUp` unnecessary. Scrolling the transcript used
-/// to be the one thing only those two keys did, and on a laptop keyboard they
-/// are a chord: `Fn` plus an arrow. A screen whose main gesture needs a key half
-/// the keyboards in the room do not have is a screen nobody scrolls.
+/// Two places, not three. Reading a session and writing to it used to be
+/// separate, and the cost was a developer pressing Enter twice to say anything:
+/// once to reach the session, once to reach its box. There is nothing between
+/// the two worth a keypress — the pane has one text field, so being in the pane
+/// *is* being in the field, and the arrows keep their meanings around it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    /// Reading the selected session. Up and down scroll it.
-    Transcript,
-    /// The session column, reached with the left arrow. Up and down pick a
-    /// session; right, enter or escape go back to reading it.
-    Sessions,
-    /// Typing a prompt for the selected session.
-    Compose,
-    /// Choosing which sign-in a new session runs under.
+    /// The rail. Up and down move between sessions and offers; right or enter
+    /// go into the one under the cursor.
+    List,
+    /// A session. Typed characters go into its box, `↑↓` scroll the transcript,
+    /// and `←` at the start of the line — or escape — comes back to the rail.
+    Session,
+    /// Choosing which of the twenty-seven sign-ins a new session runs under.
     Picker,
 }
 
 /// The whole interface.
 pub struct App {
     pub panes: Vec<Pane>,
-    pub selected: usize,
+    /// The sign-ins the rail offers a new session under.
+    ///
+    /// One per harness to begin with, and whatever the chooser has added since.
+    /// Deliberately not one per account: twenty-seven rows is a list nobody
+    /// reads, for a developer using two of them.
+    pub offers: Vec<Account>,
+    /// Which rail row the cursor is on — sessions first, then offers.
+    pub cursor: usize,
     /// Every sign-in a new session can be started under. Resolved once by the
     /// caller and carried here so the chooser is drawable and testable without
     /// a filesystem.
     pub accounts: Accounts,
+    /// Who each sign-in belongs to, as riabuild learns it.
+    ///
+    /// Beside [`Account`] rather than inside it: an account is compared by
+    /// identity all over this crate, and an email that arrives half a second
+    /// after the window opened would make two of the same account unequal.
+    logins: Vec<(Kind, usize, String)>,
     /// Which row the chooser is on, while it is open.
     pub picking: usize,
     pub focus: Focus,
-    pub composing: String,
+    pub compose: Compose,
     pub quit: bool,
     /// How far the transcript is scrolled from the bottom, in lines. Zero
     /// follows the newest output.
@@ -304,13 +338,31 @@ impl App {
     /// machine with no accounts, which the chooser says out loud, and inventing
     /// a plausible one here would start sessions under a home nobody has.
     pub fn new(accounts: Accounts) -> Self {
+        // A harness with no accounts at all still gets an offer, under no home
+        // — which is what every session ran under before accounts were offered.
+        // Leaving the harness out instead would answer a setup problem by
+        // hiding a tool riabuild installed.
+        let offers = Kind::ALL
+            .into_iter()
+            .map(|kind| {
+                accounts
+                    .first(kind)
+                    .cloned()
+                    .unwrap_or_else(|| Account::new(kind, 1, None))
+            })
+            .collect();
         Self {
             panes: Vec::new(),
-            selected: 0,
+            offers,
+            cursor: 0,
             accounts,
+            logins: Vec::new(),
             picking: 0,
-            focus: Focus::Transcript,
-            composing: String::new(),
+            // The rail, because that is where a window with nothing running
+            // has something to say. Reading an empty transcript is not a
+            // resting state.
+            focus: Focus::List,
+            compose: Compose::default(),
             quit: false,
             scrollback: 0,
             tick: 0,
@@ -321,17 +373,104 @@ impl App {
         self.panes.push(pane);
     }
 
-    /// Opens the chooser, on the account the selected session is already
-    /// running under.
+    /// How many rows the rail has.
+    pub fn rows(&self) -> usize {
+        self.panes.len() + self.offers.len()
+    }
+
+    /// What the cursor is on.
+    pub fn row(&self) -> Option<Row> {
+        match self.cursor.checked_sub(self.panes.len()) {
+            Some(offer) if offer < self.offers.len() => Some(Row::Offer(offer)),
+            Some(_) => None,
+            None => Some(Row::Session(self.cursor)),
+        }
+    }
+
+    /// The session under the cursor, if it is on one at all.
+    pub fn selected(&self) -> Option<&Pane> {
+        match self.row()? {
+            Row::Session(index) => self.panes.get(index),
+            Row::Offer(_) => None,
+        }
+    }
+
+    /// The sign-in under the cursor, if it is on an offer.
+    pub fn offered(&self) -> Option<&Account> {
+        match self.row()? {
+            Row::Offer(index) => self.offers.get(index),
+            Row::Session(_) => None,
+        }
+    }
+
+    /// Turns the offer under the cursor into a session.
+    ///
+    /// Called once the store has made the directory, which is what the first
+    /// prompt does — nothing here writes anything.
+    pub fn begin(&mut self, id: String, account: &Account) {
+        let mut pane = Pane::new(id, account.kind, String::new());
+        pane.account = account.number;
+        self.panes.push(pane);
+        self.cursor = self.panes.len() - 1;
+        self.scrollback = 0;
+    }
+
+    /// Puts a sign-in on the rail and moves the cursor to it.
+    ///
+    /// What the chooser does. It offers rather than opens: a directory made
+    /// before anybody typed anything is the "3 sessions" bug written down.
+    pub fn offer(&mut self, account: Account) {
+        let at = self
+            .offers
+            .iter()
+            .position(|held| held.kind == account.kind && held.number == account.number)
+            .unwrap_or_else(|| {
+                self.offers.push(account);
+                self.offers.len() - 1
+            });
+        self.cursor = self.panes.len() + at;
+        self.scrollback = 0;
+    }
+
+    /// Records who a sign-in belongs to.
+    pub fn set_login(&mut self, kind: Kind, number: usize, email: String) {
+        match self
+            .logins
+            .iter_mut()
+            .find(|(held, at, _)| *held == kind && *at == number)
+        {
+            Some(entry) => entry.2 = email,
+            None => self.logins.push((kind, number, email)),
+        }
+    }
+
+    /// `None` where nobody has said yet, which is rendered as nothing rather
+    /// than as a claim that the account is signed out.
+    pub fn login_of(&self, kind: Kind, number: usize) -> Option<&str> {
+        self.logins
+            .iter()
+            .find(|(held, at, _)| *held == kind && *at == number)
+            .map(|(_, _, email)| email.as_str())
+    }
+
+    /// Opens the chooser, on the sign-in the cursor is already on.
     ///
     /// Starting there rather than at the top is what makes "another one of
     /// these" a single keypress, which is the thing a developer asks for most:
     /// a second Claude on the same sign-in, beside the one that is busy.
     pub fn open_picker(&mut self) {
-        self.picking = self
-            .selected()
-            .and_then(|pane| self.accounts.position(pane.kind, pane.account))
-            .unwrap_or(0);
+        let at = match self.row() {
+            Some(Row::Session(index)) => self
+                .panes
+                .get(index)
+                .and_then(|pane| self.accounts.position(pane.kind, pane.account)),
+            Some(Row::Offer(index)) => self
+                .offers
+                .get(index)
+                .and_then(|account| self.accounts.position(account.kind, account.number)),
+            None => None,
+        };
+        self.picking = at.unwrap_or(0);
         self.focus = Focus::Picker;
     }
 
@@ -355,10 +494,6 @@ impl App {
         }
     }
 
-    pub fn selected(&self) -> Option<&Pane> {
-        self.panes.get(self.selected)
-    }
-
     pub fn pane_mut(&mut self, id: &str) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|pane| pane.id == id)
     }
@@ -377,13 +512,15 @@ impl App {
         }
     }
 
-    /// Marks the selected session busy, for the moment between a developer
-    /// pressing Enter and the wrapper taking the lock.
+    /// Marks the session under the cursor busy, for the moment between a
+    /// developer pressing Enter and the wrapper taking the lock.
     ///
     /// Without it the pane stays idle through the whole of a process start,
     /// which reads as a prompt that was not delivered.
     pub fn sent(&mut self, text: &str) {
-        if let Some(pane) = self.panes.get_mut(self.selected) {
+        if let Some(Row::Session(index)) = self.row()
+            && let Some(pane) = self.panes.get_mut(index)
+        {
             pane.push(Entry::Note(format!("› {text}")), false);
             pane.running = true;
             // A new question is the developer acting on whatever went wrong.
@@ -396,15 +533,23 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if !self.panes.is_empty() {
-            self.selected = (self.selected + 1) % self.panes.len();
+        if self.rows() > 0 {
+            self.cursor = (self.cursor + 1) % self.rows();
             self.scrollback = 0;
         }
     }
 
     pub fn select_previous(&mut self) {
-        if !self.panes.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.panes.len() - 1);
+        if self.rows() > 0 {
+            self.cursor = self.cursor.checked_sub(1).unwrap_or(self.rows() - 1);
+            self.scrollback = 0;
+        }
+    }
+
+    /// Moves the cursor to the offer for a harness, for the digit keys.
+    pub fn jump_to_offer(&mut self, kind: Kind) {
+        if let Some(at) = self.offers.iter().position(|offer| offer.kind == kind) {
+            self.cursor = self.panes.len() + at;
             self.scrollback = 0;
         }
     }
@@ -596,7 +741,6 @@ mod tests {
         // cannot tell two apart. The first prompt can.
         let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
-        assert_eq!(app.selected().unwrap().label(), "new session");
         app.sent("fix the flaky test");
         assert_eq!(app.selected().unwrap().label(), "fix the flaky test");
         // and the title is not rewritten by the second prompt
@@ -605,35 +749,84 @@ mod tests {
     }
 
     #[test]
-    fn selection_wraps_in_both_directions_and_never_panics_when_empty() {
-        let mut app = App::new(Accounts::default());
-        // The empty case is the first frame of every run.
-        app.select_next();
-        app.select_previous();
-        assert_eq!(app.selected, 0);
-
-        for index in 1..=3 {
-            app.add(Pane::new(format!("s{index}"), Kind::Claude, String::new()));
-        }
-        app.select_previous();
-        assert_eq!(app.selected, 2);
-        app.select_next();
-        assert_eq!(app.selected, 0);
+    fn a_window_that_has_been_asked_nothing_has_no_sessions_at_all() {
+        // The bug in one assertion: three offers and a count of zero. It used
+        // to be three panes, three directories on disk, and a header saying
+        // "3 sessions" before anybody had typed a word.
+        let app = App::new(Accounts::default());
+        assert!(app.panes.is_empty());
+        assert_eq!(app.offers.len(), 3);
+        assert_eq!(app.rows(), 3);
+        assert_eq!(app.busy_count(), 0);
+        // and the cursor starts on the first of them, so the window opens with
+        // something under it rather than on an empty transcript
+        assert_eq!(app.row(), Some(Row::Offer(0)));
+        assert_eq!(app.focus, Focus::List);
     }
 
     #[test]
-    fn sending_a_prompt_shows_it_and_marks_the_session_working() {
-        // Otherwise the pane reads idle through the whole of a process start,
-        // which looks like a prompt that never arrived.
+    fn a_prompt_is_what_turns_an_offer_into_a_session() {
+        let mut app = App::new(Accounts::default());
+        let account = app.offered().cloned().unwrap();
+        assert_eq!(account.kind, Kind::Claude);
+        app.begin("s1".into(), &account);
+        assert_eq!(app.row(), Some(Row::Session(0)));
+        // The offer stays: "another Claude" is still one row away.
+        assert_eq!(app.offers.len(), 3);
+        assert_eq!(app.rows(), 4);
+        app.sent("do the thing");
+        assert_eq!(app.selected().unwrap().state(), State::Busy);
+    }
+
+    #[test]
+    fn the_cursor_runs_over_sessions_and_then_offers() {
         let mut app = App::new(Accounts::default());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
-        app.sent("do the thing");
-        let pane = app.selected().unwrap();
-        assert_eq!(pane.state(), State::Busy);
+        assert_eq!(app.rows(), 4);
+        assert_eq!(app.row(), Some(Row::Session(0)));
+        app.select_next();
+        assert_eq!(app.row(), Some(Row::Offer(0)));
+        assert!(app.selected().is_none());
+        assert!(app.offered().is_some());
+        // and it wraps in both directions
+        app.select_previous();
+        assert_eq!(app.row(), Some(Row::Session(0)));
+        app.select_previous();
+        assert_eq!(app.row(), Some(Row::Offer(2)));
+    }
+
+    #[test]
+    fn choosing_a_sign_in_offers_it_rather_than_opening_it() {
+        // Nothing is written until a prompt is typed, so a developer who opens
+        // the chooser, picks `claude-4` and changes their mind has left no
+        // directory behind.
+        let mut app = App::new(Accounts::default());
+        app.offer(Account::new(Kind::Claude, 4, None));
+        assert!(app.panes.is_empty());
+        assert_eq!(app.offers.len(), 4);
         assert_eq!(
-            pane.entries.last(),
-            Some(&Entry::Note("› do the thing".into()))
+            app.offered().map(Account::name).as_deref(),
+            Some("claude-4")
         );
+        // and choosing it twice does not put it on the rail twice
+        app.offer(Account::new(Kind::Claude, 4, None));
+        assert_eq!(app.offers.len(), 4);
+    }
+
+    #[test]
+    fn an_email_arriving_late_does_not_change_what_an_account_is() {
+        // `Account` is compared by identity all over this crate. An email
+        // stored inside one would make the same sign-in unequal to itself for
+        // the half second before `claude auth status` answers.
+        let mut app = App::new(Accounts::default());
+        assert_eq!(app.login_of(Kind::Claude, 1), None);
+        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
+        assert_eq!(app.login_of(Kind::Claude, 1), Some("ada@clubria.com"));
+        // Re-signing in replaces rather than appends.
+        app.set_login(Kind::Claude, 1, "grace@clubria.com".into());
+        assert_eq!(app.login_of(Kind::Claude, 1), Some("grace@clubria.com"));
+        assert_eq!(app.login_of(Kind::Claude, 2), None);
+        assert_eq!(app.login_of(Kind::Codex, 1), None);
     }
 
     #[test]

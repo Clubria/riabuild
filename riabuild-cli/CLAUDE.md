@@ -716,7 +716,7 @@ crates form a straight line, each depending only on those above it:
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation, and `launch` — what those one-line launchers do, in Rust), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `repo` is the question straight after it — which repository, asked here rather than on the server, and forwarded as `--repo`; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `harness` | what to run for each agent harness and how to read what it says. `claude`, `codex` and `grok` build one turn's argv and decode that harness's NDJSON. Starts nothing and reads nothing | — |
-| `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure); `draw` turns that into ratatui lines and then into a frame | harness, paths, runner, theme, ui |
+| `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure), with `compose` the one text field in it; `draw` turns that into ratatui lines and `frame` puts those lines into areas; `drive` is the loop, and the one place a session is created | harness, paths, runner, theme, ui |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -1451,29 +1451,81 @@ how the feature has its own executable name — a second binary would mean a `[[
 install line in the Homebrew formula, the deb and the rpm, and another artefact for
 `release.yml` to build, sign and strip.
 
-All three open, always. There is no flag to choose: riabuild installs all three, and a
-session that has not been spoken to has started no process, so two idle panes cost three
-lines on screen.
+**An offer is not a session, and that distinction is the whole of the rail.** A
+**session** is a directory with a spool, a lock and a conversation in it. An **offer** is a
+sign-in a new one *could* be started under — no directory, no process, nothing to count —
+and the two are separate groups on the rail, marked differently: a state dot for a session,
+a `+` for an offer. The window used to open a pane per harness on the way in, which said
+"3 sessions" on a first frame nobody had typed into and left three directories on disk to
+prove it. `drive::send` is the one place a session is created, and the first prompt is what
+calls it. `restore` forgets an untouched session an older riabuild left behind, so a
+machine that upgrades is cleaned up rather than carrying the old count forward.
 
-**Three panes, twenty-seven sign-ins.** The window opens each harness on its first account
-and `n` opens a chooser over every profile riabuild keeps — `claude-1` … `claude-9`, and the
-same for Codex and Grok Build, named exactly as their launchers are. One pane per account
-instead would be a list of twenty-seven nobody can read, built for a developer using two of
-them. Every row is labelled with its sign-in rather than its harness, because that is the
-only thing that tells two panes on one harness apart before either has been asked anything.
+**Three offers, twenty-seven sign-ins.** The rail offers each harness's first account and
+`n` opens a chooser over every profile riabuild keeps — `claude-1` … `claude-9`, and the
+same for Codex and Grok Build, named exactly as their launchers are. Choosing one *offers*
+it rather than opening it, for the reason above. One row per account instead would be a
+list of twenty-seven nobody can read, built for a developer using two of them. Every row is
+labelled with its sign-in rather than its harness, because that is the only thing that
+tells two sessions on one harness apart before either has been asked anything — with the
+account's email beside it where riabuild has learnt one, and nothing where it has not.
 
-**The keyboard: reading is the resting state.** The arrows scroll the transcript, `←` goes
-to the session column and `↑↓` change session only there, `→` comes back. It was the other
-way round with `PageUp`/`PageDown` as the only way to scroll, which is `Fn` and an arrow on
-every laptop keyboard in the room — the main gesture of the screen behind a chord most of
-its developers do not have. They still work; nothing depends on them.
+**Who a sign-in belongs to arrives after the window does.** `claude auth status --json` is
+a subprocess costing about 450 ms, so `dispatch::ask_who_is_signed_in` starts them all and
+streams the answers in over a channel the draw loop selects on. Blocking on nine of them
+would be four seconds of blank terminal before the first frame. An account nobody has
+answered for renders as **nothing** — never as "signed out", which would be a claim
+riabuild has not established. The emails live in a side table on `App` rather than on
+`Account`, because an `Account` is compared by identity all over that crate and an email
+arriving late must not make the same sign-in unequal to itself.
 
-**A window that takes the terminal by hand has to clear it.** `claim()` does what
+**The window says which repository it is scoped to.** The scoping itself was never new —
+`Store::sessions` filters by the checkout a session records — but nothing said so, and a
+window that lists a subset without naming it looks like one that lists everything.
+`Request.repo` is `Ctx::repo`'s slug and the header states it.
+
+**The keyboard: two places, and one keypress between them.** `←`/`→` cross between the
+rail and the pane; `↑↓` move the cursor in the rail and scroll the transcript in the pane.
+Reaching a session *is* reaching its box — every character typed there lands in it
+immediately — because reading and writing as separate focuses cost a second Enter to say
+anything, which is a confirmation of a decision the cursor had already made. The one
+exception is the one a text field needs: `←` moves the caret, and only at position 0 does
+it leave for the rail (`compose.at_start()` is what that branches on). Enter sends and
+*stays*, since a conversation is a sequence of prompts. `PageUp`/`PageDown` still work and
+nothing depends on them — they are `Fn` and an arrow on every laptop keyboard in the room,
+which is why the plain arrows scroll.
+
+**Separation is a background, not a line.** The session pane sits on `Theme::surface`, one
+step off the terminal's own background; the rail sits on the terminal's. No borders, no
+rules, no dividers anywhere else — two columns of prose split by a `│` read as a table, and
+a table is the wrong shape for a conversation. The whole frame is inset two columns each
+side with a blank row above it, on the terminal's own background, so it reads as a window
+on the screen rather than a program that has taken it. It degrades honestly: `surface` is
+empty below 256 colours, because there is no "slightly lighter" in the original sixteen and
+spending `Black` or `White` on one would repaint the developer's window rather than raise a
+pane of it — so `has_surfaces()` is false there and `frame.rs` puts a muted rule in the
+gutter instead. That is the one thing a widget may branch on rather than asking for a role.
+
+**A pane with no session behind it says what typing would start.** Centred in the middle of
+the pane: *create a **Claude** session* over *login: claude-1 · ada@clubria.com*, with only
+the vendor's name accented. "waiting for the first reply…" was said there before, over
+something that had not been asked anything and never would be until it existed.
+
+**A window that takes the terminal by hand has to clear it — twice.** `claim()` does what
 `ratatui::init` would: ratatui writes only the cells that differ from the previous frame,
 and on the first draw that frame is ratatui's idea of blank rather than the terminal's — so
 every cell this interface leaves empty is never written, and the alternate screen's old
 contents show through underneath. Resizing hid it, because `autoresize` clears. Anything
 drawn over something else needs the `Clear` widget for the same reason.
+
+`release()` clears too, **before** leaving the alternate screen, and that is the other half
+of Ctrl-C giving a developer their shell back. Leaving the alternate screen restores
+scrollback only where the terminal honours one, and tmux with `alternate-screen off`,
+`screen`, and any `TERM` without `smcup`/`rmcup` do not — on those the last frame simply
+stayed on screen and the next shell prompt printed on top of it. The clear costs nothing
+where the switch works and is the whole of the fix where it does not.
+`restore_terminal_on_panic` chains onto the existing hook for the same reason, and chains
+rather than replaces so the backtrace is still printed.
 
 **The harnesses are driven headless, not embedded.** Each runs in its own structured
 output mode and riabuild draws the result; nothing renders a vendor's own full-screen
@@ -1536,6 +1588,15 @@ what a developer calls it. Recompute
 it and a changed primary account points the next turn at a different store, where it finds
 no session and quietly begins a new conversation under the same pane. The *binary* is the
 opposite and is resolved per turn: a versioned path moves with every upgrade.
+
+**Every Claude turn also carries `--exclude-dynamic-system-prompt-sections`**, the same
+flag every generated launcher passes and for the same reason: the dynamic sections change
+between launches, so carrying them defeats prompt caching on every turn of every session.
+There is no settings key for it, only the flag. The agents window is the one place a
+Clubria developer reaches Claude Code *without* going through a launcher, so leaving it out
+here made this the only uncached way to run it. It rides along on `-p` and cannot on the
+bare interactive launch — that line carries an `agents` positional the flag would drop
+through into, turning the launch into the background-agents listing.
 
 **Every session is started with that harness's approvals off, in its own spelling.**
 `--permission-mode bypassPermissions` for Claude Code,
@@ -1612,6 +1673,20 @@ The palette is Clubria's own, read from clubria.com: `#f74f25` is the logo mark'
 with `--pink`, `--orange` and `--green` beside it. `Muted` and `Strong` stay *attributes*
 (dim, bold) rather than becoming a fixed grey — a hardcoded grey is invisible on one
 terminal theme and muddy on another.
+
+**A background is the one colour that is not a role, and it needs to know which way the
+terminal is.** `Theme::surface` is the raised pane the agents window separates by — one
+step off the terminal's own background rather than a rule between two columns. A terminal
+cannot composite, so "one step lighter than whatever is behind it" has to be a colour
+chosen in advance, and `Tone` (read from `COLORFGBG`, defaulting to dark) is the only input
+to that choice. Two rules keep a wrong guess survivable rather than fatal: the surface
+paints a **foreground as well as a background**, so a pane is internally consistent
+whichever way the guess went instead of rendering dark-on-dark; and it is **empty below 256
+colours**, because there is no shade of "slightly lighter" in the original sixteen and
+spending `Black` or `White` on one repaints the developer's window rather than raising a
+pane of it. `Theme::has_surfaces` is the question a layout asks to know whether it needs a
+rule instead, and it is the only thing in riabuild a widget may branch on rather than
+asking for a role — because the answer is not a colour.
 
 **The types are ratatui's, and the ladder is not.** `Color`, `Style` and `Modifier` are
 re-exported from `ratatui-core` rather than defined here, because riabuild now paints two

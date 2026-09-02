@@ -1,24 +1,38 @@
-//! The frame.
+//! What the screen says.
 //!
-//! Split in two on purpose. The `*_lines` functions turn [`App`] into styled
-//! [`Line`]s and touch no widget, no area and no terminal, so what the screen
-//! *says* is testable without a backend; [`render`] is the thin part that puts
-//! those lines into blocks. A renderer written as one function would only be
-//! assertable by drawing it into a buffer and reading pixels back.
+//! Every function here turns [`App`] into styled [`Line`]s and touches no
+//! widget, no area and no terminal, so what is on screen is assertable without a
+//! backend. Where those lines *go* is `frame.rs`. A renderer written as one
+//! function would only be testable by drawing it into a buffer and reading
+//! pixels back.
 //!
 //! Every colour comes from a [`Role`] through [`Theme::style`], never from a
-//! literal. That is the same rule the rest of riabuild follows, and it matters
-//! more here rather than less: ratatui will happily send a 24-bit escape to a
-//! sixteen-colour terminal, so `Theme::style` is what stands between the
-//! palette and an SSH session that cannot render it.
+//! literal — the same rule the rest of riabuild follows, and it matters more
+//! here rather than less: ratatui will happily send a 24-bit escape to a
+//! sixteen-colour terminal, so `Theme::style` is what stands between the palette
+//! and an SSH session that cannot render it.
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use riabuild_theme::{Role, Style, Theme};
 
-use crate::app::{App, Entry, Focus, Pane, State};
+use crate::account::Account;
+use crate::app::{App, Entry, Focus, Pane, Row, State};
+
+/// What every line-builder needs and none of them should look up twice.
+///
+/// `Copy`, because it is threaded through the whole of `frame.rs` and a
+/// reference would put a lifetime on every helper for no benefit.
+#[derive(Debug, Clone, Copy)]
+pub struct Chrome<'a> {
+    pub theme: Theme,
+    /// Whether this terminal can be trusted with the block glyphs.
+    pub unicode: bool,
+    /// The repository every session in this window belongs to, `owner/repo`.
+    ///
+    /// `None` on a checkout with no GitHub remote, which is rendered as nothing
+    /// rather than as a guess.
+    pub repo: Option<&'a str>,
+}
 
 /// The mark against a session's state, and the role that colours it.
 fn state_style(state: State, theme: Theme) -> Style {
@@ -32,30 +46,30 @@ fn state_style(state: State, theme: Theme) -> Style {
 /// The frames of the one spinner, for a session that is working.
 ///
 /// Braille rather than the block glyphs `riabuild-ui` uses for its own status
-/// line: this one turns in place inside a list row, where a glyph that changes
+/// line: this one turns in place inside a rail row, where a glyph that changes
 /// width would make the column jitter on every tick.
 const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
-
-/// The session column, in columns.
-///
-/// Wide enough for a sign-in and a few words of a title, and narrow enough that
-/// the transcript — which is prose — keeps a readable measure on an 80-column
-/// terminal.
-const LIST_WIDTH: u16 = 28;
 
 /// The widest sign-in there is: `claude-9` is eight, and one space after it.
 const ACCOUNT_WIDTH: usize = 9;
 
-/// What is left of a row for the title, after the border, the cursor, the state
-/// mark and the sign-in.
-const TITLE_WIDTH: usize = LIST_WIDTH as usize - 1 - 1 - 2 - ACCOUNT_WIDTH;
+/// How wide the rail is, given the whole window.
+///
+/// A third of the window, held between a floor that fits `claude-9` and a title
+/// and a ceiling that leaves the transcript — which is prose — a readable
+/// measure. Dynamic rather than a constant because the emails an offer row
+/// carries are any length, and a fixed twenty-eight columns could never show
+/// one.
+pub fn rail_width(total: u16) -> u16 {
+    (total / 3).clamp(22, 40).min(total.saturating_sub(8))
+}
 
 /// `text`, ending in an ellipsis where it did not fit.
 ///
 /// The alternative is what ratatui does by itself, which is to stop drawing at
 /// the edge: a title cut mid-word with no mark reads as the whole title, and the
 /// two sessions it was meant to tell apart look identical.
-fn clip(text: &str, width: usize) -> String {
+pub fn clip(text: &str, width: usize) -> String {
     if width == 0 || text.chars().count() <= width {
         return text.to_string();
     }
@@ -69,62 +83,110 @@ fn clip(text: &str, width: usize) -> String {
     format!("{}…", &text[..cut])
 }
 
-/// The session column.
-pub fn list_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
-    if app.panes.is_empty() {
-        return vec![Line::from(Span::styled(
-            "no sessions yet — press n",
-            theme.style(Role::Muted),
-        ))];
+/// A group heading in the rail.
+fn heading(text: &str, theme: Theme) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), theme.style(Role::Muted)))
+}
+
+/// The cursor mark, which is a bar down the left edge rather than a reversed
+/// row: the rail is read down that edge, and a full-width highlight fights the
+/// state colour the row exists to show.
+fn cursor_mark(selected: bool, unicode: bool) -> &'static str {
+    match (selected, unicode) {
+        (true, true) => "▌",
+        (true, false) => ">",
+        (false, _) => " ",
     }
-    app.panes
-        .iter()
-        .enumerate()
-        .map(|(index, pane)| {
-            let selected = index == app.selected;
-            let mark = if pane.state() == State::Busy && unicode {
-                SPINNER[app.tick % SPINNER.len()]
-            } else {
-                pane.state().mark(unicode)
-            };
-            // The selected row is marked by a leading bar rather than by a
-            // reversed background: a session list is read down its left edge,
-            // and a full-width highlight fights the state colour that is the
-            // one thing the row exists to show.
-            let cursor = match (selected, unicode) {
-                (true, true) => "▌",
-                (true, false) => ">",
-                (false, _) => " ",
-            };
-            Line::from(vec![
-                Span::styled(cursor, theme.style(Role::Brand)),
-                Span::styled(format!("{mark} "), state_style(pane.state(), theme)),
-                // The sign-in leads, and at a fixed width, for two reasons. It
-                // is what tells two panes on one harness apart before either has
-                // been asked anything — and a title is any length, so anything
-                // after one is the thing that falls off the edge of a
-                // twenty-eight column list. It is the launcher's own name, so it
-                // matches whatever the developer signed in with.
-                Span::styled(
-                    format!("{:<ACCOUNT_WIDTH$}", pane.account_name()),
-                    theme.style(Role::Muted),
-                ),
-                Span::styled(
-                    clip(&pane.label(), TITLE_WIDTH),
-                    theme.style(if selected { Role::Strong } else { Role::Muted }),
-                ),
-            ])
-        })
-        .collect()
+}
+
+/// The rail: the sessions in this checkout, and the sign-ins a new one can be
+/// started under.
+///
+/// The two are separate groups and marked differently on purpose. An offer is
+/// not a session — it has no directory, no spool and nothing to count — and
+/// listing the two together is what made a window that had been asked nothing
+/// report "3 sessions" on its first frame.
+pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static>> {
+    let theme = chrome.theme;
+    let inner = width.saturating_sub(2) as usize;
+    let mut lines = vec![heading("SESSIONS", theme)];
+
+    if app.panes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none yet",
+            theme.style(Role::Muted),
+        )));
+    }
+    for (index, pane) in app.panes.iter().enumerate() {
+        let selected = app.cursor == index;
+        let mark = if pane.state() == State::Busy && chrome.unicode {
+            SPINNER[app.tick % SPINNER.len()]
+        } else {
+            pane.state().mark(chrome.unicode)
+        };
+        // The sign-in leads, and at a fixed width: it is what tells two sessions
+        // on one harness apart before either has been asked anything, and a
+        // title is any length, so a title placed first is what pushes it off.
+        let title_width = inner.saturating_sub(2 + ACCOUNT_WIDTH);
+        lines.push(Line::from(vec![
+            Span::styled(
+                cursor_mark(selected, chrome.unicode),
+                theme.style(Role::Brand),
+            ),
+            Span::styled(format!("{mark} "), state_style(pane.state(), theme)),
+            Span::styled(
+                format!("{:<ACCOUNT_WIDTH$}", pane.account_name()),
+                theme.style(Role::Muted),
+            ),
+            Span::styled(
+                clip(&pane.label(), title_width),
+                theme.style(if selected { Role::Strong } else { Role::Muted }),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(String::new()));
+    lines.push(heading("NEW SESSION", theme));
+    for (index, account) in app.offers.iter().enumerate() {
+        let selected = app.cursor == app.panes.len() + index;
+        let name = account.name();
+        let mut spans = vec![
+            Span::styled(
+                cursor_mark(selected, chrome.unicode),
+                theme.style(Role::Brand),
+            ),
+            // A plus and never a state mark. An offer has no state — nothing is
+            // running and nothing has failed — and a green dot beside one would
+            // be claiming an idle session that does not exist.
+            Span::styled("+ ", theme.style(Role::Brand)),
+            Span::styled(
+                name.clone(),
+                theme.style(if selected { Role::Strong } else { Role::Muted }),
+            ),
+        ];
+        // Dropped rather than truncated where it does not fit. Half an email
+        // address identifies nobody, and a rail that is narrow today is wide
+        // again the moment the developer resizes the window.
+        if let Some(email) = app.login_of(account.kind, account.number) {
+            let room = inner.saturating_sub(2 + name.chars().count());
+            if email.chars().count() + 3 <= room {
+                spans.push(Span::styled(" · ", theme.style(Role::Muted)));
+                spans.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The selected session's transcript.
+///
+/// Empty for an offer: there is no conversation, and `frame.rs` puts the splash
+/// there instead. Saying "waiting for the first reply" about a session that has
+/// not been created would be describing something that is not happening.
 pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
     let Some(pane) = pane else {
-        return vec![Line::from(Span::styled(
-            "Press n to start an agent.",
-            theme.style(Role::Muted),
-        ))];
+        return Vec::new();
     };
     let mut lines = Vec::new();
     for (index, entry) in pane.entries.iter().enumerate() {
@@ -199,6 +261,30 @@ pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec
     lines
 }
 
+/// What a pane says when the cursor is on an offer rather than on a session.
+///
+/// A sentence rather than a status, because nothing is happening yet: the only
+/// thing worth saying is what typing would start, and under whose sign-in. Only
+/// the vendor's name is accented — the rest is prose.
+pub fn splash_lines(account: &Account, email: Option<&str>, theme: Theme) -> Vec<Line<'static>> {
+    let mut login = vec![
+        Span::styled("login: ", theme.style(Role::Muted)),
+        Span::styled(account.name(), theme.style(Role::Strong)),
+    ];
+    if let Some(email) = email {
+        login.push(Span::styled(" · ", theme.style(Role::Muted)));
+        login.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
+    }
+    vec![
+        Line::from(vec![
+            Span::styled("create a ", Style::default()),
+            Span::styled(account.kind.short(), theme.style(Role::Brand)),
+            Span::styled(" session", Style::default()),
+        ]),
+        Line::from(login),
+    ]
+}
+
 /// The sign-ins a new session can be started under.
 pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
     if app.accounts.is_empty() {
@@ -213,72 +299,122 @@ pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>
         .enumerate()
         .map(|(index, account)| {
             let selected = index == app.picking;
-            let cursor = match (selected, unicode) {
-                (true, true) => "▌",
-                (true, false) => ">",
-                (false, _) => " ",
+            let tail = match app.login_of(account.kind, account.number) {
+                Some(email) => email.to_string(),
+                None => account.kind.label().to_string(),
             };
             Line::from(vec![
-                Span::styled(cursor, theme.style(Role::Brand)),
+                Span::styled(cursor_mark(selected, unicode), theme.style(Role::Brand)),
                 Span::styled(
                     format!("{:<10}", account.name()),
                     theme.style(if selected { Role::Strong } else { Role::Muted }),
                 ),
-                Span::styled(account.kind.label(), theme.style(Role::Muted)),
+                Span::styled(tail, theme.style(Role::Muted)),
             ])
         })
         .collect()
 }
 
-/// The one-line header.
-pub fn header_line(app: &App, theme: Theme) -> Line<'static> {
-    let busy = app.busy_count();
-    let mut spans = vec![
-        Span::styled("riabuild agents", theme.style(Role::Brand)),
-        Span::styled(
-            format!("  {} session{}", app.panes.len(), plural(app.panes.len())),
-            theme.style(Role::Muted),
-        ),
-    ];
-    if busy > 0 {
-        spans.push(Span::styled(
-            format!("  {busy} working"),
-            theme.style(Role::Busy),
-        ));
+/// The window's own name, and the repository it is scoped to.
+pub fn header_line(chrome: Chrome<'_>) -> Line<'static> {
+    let theme = chrome.theme;
+    let mut spans = vec![Span::styled("riabuild agents", theme.style(Role::Brand))];
+    // Stated rather than implied. Every session in this window belongs to this
+    // checkout — the store filters by it — and a window that did not say so
+    // looked like every agent on the machine.
+    if let Some(repo) = chrome.repo {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(repo.to_string(), theme.style(Role::Strong)));
     }
-    if let Some(pane) = app.selected()
-        && (pane.input_tokens > 0 || pane.output_tokens > 0)
-    {
+    Line::from(spans)
+}
+
+/// How many sessions there are, and how many are working.
+///
+/// Sessions only. An offer is not one, and counting the three the rail opens
+/// with is the "3 sessions" bug written down.
+pub fn counts_line(app: &App, theme: Theme) -> Line<'static> {
+    let sessions = app.panes.len();
+    let mut spans = vec![Span::styled(
+        format!("{sessions} session{}", plural(sessions)),
+        theme.style(Role::Muted),
+    )];
+    let busy = app.busy_count();
+    if busy > 0 {
+        spans.push(Span::styled(" · ", theme.style(Role::Muted)));
         spans.push(Span::styled(
-            format!(
-                "  {} in / {} out",
-                thousands(pane.input_tokens),
-                thousands(pane.output_tokens)
-            ),
-            theme.style(Role::Muted),
+            format!("{busy} working"),
+            theme.style(Role::Busy),
         ));
     }
     Line::from(spans)
 }
 
+/// The pane's own first line: whose sign-in this is, and what it has spent.
+///
+/// Padded to `width` rather than rendered as two paragraphs, because the second
+/// would repaint the cells of the first — including the raised background this
+/// pane is drawn on.
+pub fn status_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
+    let Some((name, kind, number)) = whose(app) else {
+        return Line::from(String::new());
+    };
+    let mut left = vec![Span::styled(name.clone(), theme.style(Role::Strong))];
+    let mut used = name.chars().count();
+    if let Some(email) = app.login_of(kind, number) {
+        left.push(Span::styled(" · ", theme.style(Role::Muted)));
+        left.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
+        used += 3 + email.chars().count();
+    }
+    let spent = match app.selected() {
+        Some(pane) if pane.input_tokens > 0 || pane.output_tokens > 0 => format!(
+            "{} in / {} out",
+            thousands(pane.input_tokens),
+            thousands(pane.output_tokens)
+        ),
+        _ => String::new(),
+    };
+    if !spent.is_empty() {
+        let gap = (width as usize).saturating_sub(used + spent.chars().count());
+        if gap > 0 {
+            left.push(Span::raw(" ".repeat(gap)));
+            left.push(Span::styled(spent, theme.style(Role::Muted)));
+        }
+    }
+    Line::from(left)
+}
+
+/// Which sign-in the pane is showing, session or offer.
+fn whose(app: &App) -> Option<(String, riabuild_harness::Kind, usize)> {
+    match app.row()? {
+        Row::Session(index) => app
+            .panes
+            .get(index)
+            .map(|pane| (pane.account_name(), pane.kind, pane.account)),
+        Row::Offer(index) => app
+            .offers
+            .get(index)
+            .map(|account| (account.name(), account.kind, account.number)),
+    }
+}
+
 /// The key hints, which change with what the keyboard is talking to.
 pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
     let keys: &[(&str, &str)] = match app.focus {
-        Focus::Transcript => &[
+        Focus::List => &[
+            ("↑↓", "move"),
+            ("→", "open"),
+            ("n", "sign-in"),
+            ("q", "quit"),
+        ],
+        // No letters advertised: every one of them is a character in the box.
+        Focus::Session => &[
+            ("type", "to write"),
+            ("enter", "send"),
             ("↑↓", "scroll"),
             ("←", "sessions"),
-            ("enter", "write"),
-            ("n", "new"),
-            ("q", "quit"),
         ],
-        Focus::Sessions => &[
-            ("↑↓", "session"),
-            ("→", "read"),
-            ("n", "new"),
-            ("q", "quit"),
-        ],
-        Focus::Compose => &[("enter", "send"), ("esc", "back")],
-        Focus::Picker => &[("↑↓", "account"), ("enter", "open"), ("esc", "back")],
+        Focus::Picker => &[("↑↓", "account"), ("enter", "choose"), ("esc", "back")],
     };
     let mut spans = Vec::new();
     for (index, (key, what)) in keys.iter().enumerate() {
@@ -291,25 +427,26 @@ pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The prompt box.
+/// The prompt box, which lives inside the pane and never across the window.
 pub fn compose_line(app: &App, theme: Theme) -> Line<'static> {
-    let writing = app.focus == Focus::Compose;
-    let can_send = app.selected().is_some();
-    if !can_send {
-        return Line::from(Span::styled(
-            "this session has ended",
+    let mut spans = vec![Span::styled("› ", theme.style(Role::Brand))];
+    let (before, after) = app.compose.split();
+    if app.focus == Focus::Session {
+        spans.push(Span::raw(before.to_string()));
+        // A block rather than the terminal's own cursor, which would have to be
+        // positioned and would blink wherever the last cell was written.
+        spans.push(Span::styled("▏", theme.style(Role::Brand)));
+        spans.push(Span::raw(after.to_string()));
+    } else if app.compose.is_empty() {
+        spans.push(Span::styled(
+            "press → to write".to_string(),
             theme.style(Role::Muted),
         ));
-    }
-    let mut spans = vec![Span::styled("› ", theme.style(Role::Brand))];
-    if writing {
-        spans.push(Span::raw(app.composing.clone()));
-        // A block rather than a real cursor: the terminal's own cursor would
-        // have to be positioned, and every redraw would move it.
-        spans.push(Span::styled("▏", theme.style(Role::Brand)));
     } else {
+        // A half-written prompt stays on screen from the rail. Hiding it would
+        // read as having lost it.
         spans.push(Span::styled(
-            "press enter to write".to_string(),
+            app.compose.text().to_string(),
             theme.style(Role::Muted),
         ));
     }
@@ -321,7 +458,7 @@ fn plural(count: usize) -> &'static str {
 }
 
 /// Groups digits, because a token count is read as a magnitude.
-fn thousands(value: u64) -> String {
+pub fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
@@ -333,97 +470,8 @@ fn thousands(value: u64) -> String {
     out
 }
 
-/// Puts the lines above into blocks.
-pub fn render(frame: &mut Frame, app: &App, theme: Theme, unicode: bool) {
-    let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Min(3),    // body
-        Constraint::Length(1), // compose
-        Constraint::Length(1), // footer
-    ])
-    .split(area);
-
-    frame.render_widget(Paragraph::new(header_line(app, theme)), rows[0]);
-
-    let body =
-        Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(20)]).split(rows[1]);
-    render_list(frame, app, theme, unicode, body[0]);
-    render_transcript(frame, app, theme, unicode, body[1]);
-
-    frame.render_widget(Paragraph::new(compose_line(app, theme)), rows[2]);
-    frame.render_widget(Paragraph::new(footer_line(app, theme)), rows[3]);
-
-    // Last, and over the body: it is a question, so it covers what it was asked
-    // from rather than taking a column away from it.
-    if app.focus == Focus::Picker {
-        render_picker(frame, app, theme, unicode, rows[1]);
-    }
-}
-
-fn render_list(frame: &mut Frame, app: &App, theme: Theme, unicode: bool, area: Rect) {
-    // The divider carries the focus. Up and down mean two different things
-    // depending on which side of it the keyboard is talking to, so which side
-    // that is has to be visible without reading the footer.
-    let border = if app.focus == Focus::Sessions {
-        Role::Brand
-    } else {
-        Role::Muted
-    };
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme.style(border));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(list_lines(app, theme, unicode)), inner);
-}
-
-fn render_transcript(frame: &mut Frame, app: &App, theme: Theme, unicode: bool, area: Rect) {
-    let lines = transcript_lines(app.selected(), theme, unicode);
-    // Follow the newest output unless the developer has scrolled up. Ratatui's
-    // `scroll` counts from the top, so "stick to the bottom" has to be computed
-    // from the height every frame — there is no follow mode to switch on.
-    let height = area.height.saturating_sub(1);
-    let overflow = (lines.len() as u16).saturating_sub(height);
-    let offset = overflow.saturating_sub(app.scrollback);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0))
-            .block(Block::default().padding(ratatui::widgets::Padding::horizontal(1))),
-        area,
-    );
-}
-
-/// The chooser, centred over the body.
-fn render_picker(frame: &mut Frame, app: &App, theme: Theme, unicode: bool, area: Rect) {
-    let lines = picker_lines(app, theme, unicode);
-    let width = 30.min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-    // Without this the transcript underneath shows through the gaps in the box,
-    // for the reason the terminal's own history did before `claim` cleared it:
-    // ratatui writes differences, and a cell a widget does not set is a cell
-    // nobody wrote.
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .title(" new session ")
-        .border_style(theme.style(Role::Brand));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    // Twenty-seven sign-ins do not fit in a box this size, so the list follows
-    // the cursor rather than the cursor being limited to the box.
-    let offset = (app.picking as u16 + 1).saturating_sub(inner.height.max(1));
-    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::account::{Account, Accounts};
     use crate::app::Pane as TestPane;
@@ -431,7 +479,7 @@ mod tests {
     use riabuild_theme::Depth;
 
     /// Every sign-in riabuild keeps, which is what the window is handed.
-    fn every_account() -> Accounts {
+    pub(crate) fn every_account() -> Accounts {
         let mut all = Vec::new();
         for kind in Kind::ALL {
             for number in 1..=9 {
@@ -441,16 +489,25 @@ mod tests {
         Accounts::from(all)
     }
 
-    fn text_of(line: &Line<'_>) -> String {
+    pub(crate) fn text_of(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
     }
 
+    fn plain_chrome() -> Chrome<'static> {
+        Chrome {
+            theme: Theme::plain(),
+            unicode: true,
+            repo: Some("Clubria/riabuild"),
+        }
+    }
+
     fn played(kind: Kind, transcript: &str) -> App {
         let mut app = App::new(every_account());
         app.add(TestPane::new("s1".into(), kind, "the first prompt".into()));
+        app.cursor = 0;
         for event in testing::decode(kind, transcript) {
             app.observe("s1", &event);
         }
@@ -479,8 +536,14 @@ mod tests {
         // The rule the rest of riabuild follows, and the one ratatui makes easy
         // to break: a literal `Color::Rgb` here would reach a sixteen-colour
         // terminal as an escape it cannot read.
-        let app = played(Kind::Claude, testing::CLAUDE);
+        let mut app = played(Kind::Claude, testing::CLAUDE);
+        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
         let sixteen = Theme::with_depth(Depth::Ansi16);
+        let chrome = Chrome {
+            theme: sixteen,
+            unicode: true,
+            repo: Some("Clubria/riabuild"),
+        };
         let roles: Vec<Style> = [
             Role::Brand,
             Role::Ok,
@@ -495,11 +558,18 @@ mod tests {
         .collect();
 
         let mut lines = transcript_lines(app.selected(), sixteen, true);
-        lines.extend(list_lines(&app, sixteen, true));
-        lines.push(header_line(&app, sixteen));
+        lines.extend(rail_lines(&app, chrome, 30));
+        lines.push(header_line(chrome));
+        lines.push(counts_line(&app, sixteen));
+        lines.push(status_line(&app, sixteen, 60));
         lines.push(footer_line(&app, sixteen));
         lines.push(compose_line(&app, sixteen));
         lines.extend(picker_lines(&app, sixteen, true));
+        lines.extend(splash_lines(
+            &Account::new(Kind::Claude, 1, None),
+            Some("ada@clubria.com"),
+            sixteen,
+        ));
 
         for line in &lines {
             for span in &line.spans {
@@ -531,9 +601,14 @@ mod tests {
         }
         // and the ASCII fallbacks are used rather than glyphs a dumb terminal
         // would render as boxes
-        let list: String = list_lines(&app, plain, false).iter().map(text_of).collect();
-        assert!(list.contains('!'), "{list}");
-        assert!(!list.contains('▲'), "{list}");
+        let chrome = Chrome {
+            theme: plain,
+            unicode: false,
+            repo: None,
+        };
+        let rail: String = rail_lines(&app, chrome, 30).iter().map(text_of).collect();
+        assert!(rail.contains('!'), "{rail}");
+        assert!(!rail.contains('▲'), "{rail}");
     }
 
     #[test]
@@ -556,41 +631,121 @@ mod tests {
     }
 
     #[test]
-    fn the_header_counts_sessions_and_says_how_many_are_working() {
-        let mut app = App::new(Accounts::default());
-        assert!(text_of(&header_line(&app, Theme::plain())).contains("0 sessions"));
+    fn an_offer_is_never_counted_as_a_session() {
+        // The complaint this redesign started from: a window that had been
+        // asked nothing said "3 sessions", because opening a pane per harness
+        // was how the three sign-ins were offered.
+        let app = App::new(every_account());
+        let counts = text_of(&counts_line(&app, Theme::plain()));
+        assert!(counts.contains("0 sessions"), "{counts}");
+        assert!(!counts.contains("working"), "{counts}");
 
-        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
-        let text = text_of(&header_line(&app, Theme::plain()));
+        let mut app = app;
+        app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
+        let one = text_of(&counts_line(&app, Theme::plain()));
         // Singular, because "1 sessions" is the kind of detail that makes a
         // tool feel unfinished.
-        assert!(text.contains("1 session"), "{text}");
-        // Opening a session is not working. The window opens with three of
-        // them and has asked none of them anything, so a header claiming three
-        // are busy would be wrong on the very first frame.
-        assert!(!text.contains("working"), "{text}");
-
+        assert!(one.contains("1 session"), "{one}");
         app.sent("do the thing");
-        let busy = text_of(&header_line(&app, Theme::plain()));
+        let busy = text_of(&counts_line(&app, Theme::plain()));
         assert!(busy.contains("1 working"), "{busy}");
     }
 
     #[test]
-    fn the_window_opens_one_pane_per_harness_riabuild_installs() {
-        // No flag decides this. All three are installed, and the two that start
-        // no process until they are spoken to cost nothing to have open.
-        let mut app = App::new(Accounts::default());
-        for (index, kind) in Kind::ALL.into_iter().enumerate() {
-            app.add(TestPane::new(format!("s{index}"), kind, String::new()));
-        }
-        let rendered: Vec<String> = list_lines(&app, Theme::plain(), true)
+    fn the_rail_separates_what_is_running_from_what_could_be_started() {
+        let app = App::new(every_account());
+        let rows: Vec<String> = rail_lines(&app, plain_chrome(), 30)
             .iter()
             .map(text_of)
             .collect();
-        assert_eq!(rendered.len(), 3);
-        for (row, kind) in rendered.iter().zip(Kind::ALL) {
+        assert_eq!(rows[0], "SESSIONS");
+        assert!(rows[1].contains("none yet"), "{rows:#?}");
+        assert!(rows.iter().any(|row| row == "NEW SESSION"), "{rows:#?}");
+        // An offer carries a `+` and never a state mark: nothing is running, so
+        // a green dot beside one would be claiming an idle session.
+        let offers: Vec<&String> = rows.iter().filter(|row| row.contains("+ ")).collect();
+        assert_eq!(offers.len(), 3, "{rows:#?}");
+        for (row, kind) in offers.iter().zip(Kind::ALL) {
             assert!(row.contains(kind.tag()), "{row}");
         }
+    }
+
+    #[test]
+    fn a_sign_in_carries_the_email_it_belongs_to() {
+        // What a developer with nine Claude accounts actually needs: `claude-1`
+        // says which login it is only to riabuild.
+        let mut app = App::new(every_account());
+        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
+        let wide: String = rail_lines(&app, plain_chrome(), 40)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert!(wide.contains("claude-1 · ada@clubria.com"), "{wide}");
+        // Dropped rather than cut in half where the rail is narrow: half an
+        // address identifies nobody.
+        let narrow: String = rail_lines(&app, plain_chrome(), 22)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert!(narrow.contains("claude-1"), "{narrow}");
+        assert!(!narrow.contains("ada@"), "{narrow}");
+    }
+
+    #[test]
+    fn a_session_says_which_sign_in_and_which_login_it_is_running_under() {
+        let mut app = App::new(every_account());
+        app.set_login(Kind::Claude, 2, "ada@clubria.com".into());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 2, None));
+        let status = text_of(&status_line(&app, Theme::plain(), 60));
+        assert!(status.starts_with("claude-2 · ada@clubria.com"), "{status}");
+    }
+
+    #[test]
+    fn a_sign_in_nobody_has_asked_about_yet_claims_nothing() {
+        // The probe is a subprocess per account and answers late. An unknown
+        // login renders as nothing rather than as "signed out", which would be
+        // a claim riabuild has not established.
+        let mut app = App::new(every_account());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 2, None));
+        let status = text_of(&status_line(&app, Theme::plain(), 60));
+        assert_eq!(status.trim(), "claude-2");
+    }
+
+    #[test]
+    fn an_offer_says_what_typing_would_start_rather_than_waiting_for_a_reply() {
+        // "waiting for the first reply…" was said over a pane that had no
+        // session behind it at all, so there was nothing to wait for.
+        let account = Account::new(Kind::Claude, 1, None);
+        let lines: Vec<String> = splash_lines(&account, Some("ada@clubria.com"), Theme::plain())
+            .iter()
+            .map(text_of)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "create a Claude session".to_string(),
+                "login: claude-1 · ada@clubria.com".to_string(),
+            ]
+        );
+        // and only the vendor's name is accented — the rest is prose
+        let brand = Theme::with_depth(Depth::TrueColor);
+        let first = splash_lines(&account, None, brand).remove(0);
+        assert_eq!(first.spans[1].content.as_ref(), "Claude");
+        assert_eq!(first.spans[1].style, brand.style(Role::Brand));
+        assert_eq!(first.spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn the_window_says_which_repository_it_is_scoped_to() {
+        let header = text_of(&header_line(plain_chrome()));
+        assert!(header.contains("Clubria/riabuild"), "{header}");
+        // A checkout with no remote says nothing rather than guessing.
+        let bare = text_of(&header_line(Chrome {
+            theme: Theme::plain(),
+            unicode: true,
+            repo: None,
+        }));
+        assert_eq!(bare, "riabuild agents");
     }
 
     #[test]
@@ -615,95 +770,37 @@ mod tests {
 
     #[test]
     fn the_footer_says_what_the_keyboard_is_talking_to() {
-        let mut app = App::new(Accounts::default());
-        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
-        // Reading is the resting state, and the arrows scroll what is being
-        // read. `pgup` is not advertised because it is not needed: a laptop
-        // reaches it only as a chord, which is the whole reason this moved.
-        let reading = text_of(&footer_line(&app, Theme::plain()));
-        assert!(reading.contains("scroll"), "{reading}");
-        assert!(reading.contains("sessions"), "{reading}");
-        assert!(!reading.contains("pgup"), "{reading}");
+        let mut app = App::new(every_account());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
+        app.cursor = 0;
+        app.focus = Focus::List;
+        let listing = text_of(&footer_line(&app, Theme::plain()));
+        assert!(listing.contains("move"), "{listing}");
+        assert!(listing.contains("quit"), "{listing}");
 
-        app.focus = Focus::Sessions;
-        let picking = text_of(&footer_line(&app, Theme::plain()));
-        assert!(picking.contains("session"), "{picking}");
-
-        app.focus = Focus::Compose;
+        app.focus = Focus::Session;
         let writing = text_of(&footer_line(&app, Theme::plain()));
         assert!(writing.contains("send"), "{writing}");
-        // `n` must not be advertised while typing: it is a letter then.
-        assert!(!writing.contains("new"), "{writing}");
-    }
-
-    /// One frame, as a terminal of that size would receive it.
-    ///
-    /// The one thing `*_lines` cannot answer: those functions say what the
-    /// screen *says*, and a popup is about what it *covers*.
-    fn frame_of(app: &App, width: u16, height: u16) -> Vec<String> {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| render(frame, app, Theme::plain(), true))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..height)
-            .map(|row| {
-                (0..width)
-                    .map(|column| buffer[(column, row)].symbol())
-                    .collect()
-            })
-            .collect()
+        assert!(writing.contains("scroll"), "{writing}");
+        // No letter is advertised while typing: each one is a character then.
+        assert!(!writing.contains("quit"), "{writing}");
     }
 
     #[test]
-    fn the_chooser_covers_the_transcript_rather_than_showing_through_it() {
-        // Ratatui writes differences, so a cell a widget does not set is a cell
-        // nobody wrote — which is the same reason the window has to clear the
-        // alternate screen it took, one box smaller.
-        let mut app = played(Kind::Claude, testing::CLAUDE);
-        let reading = frame_of(&app, 80, 24);
-        assert!(
-            reading.iter().any(|row| row.contains("All tests pass.")),
-            "{reading:#?}"
-        );
-
-        app.open_picker();
-        let choosing = frame_of(&app, 80, 24);
-        assert!(
-            choosing.iter().any(|row| row.contains("new session")),
-            "{choosing:#?}"
-        );
-        // Nothing from the transcript inside the box. Every row of it holds an
-        // account name and nothing else, which is what would not be true if the
-        // cells the list does not fill were left as they were found.
-        let boxed: Vec<&String> = choosing.iter().filter(|row| row.contains('│')).collect();
-        assert!(boxed.len() > 5, "{choosing:#?}");
-        for row in &boxed {
-            let inside = row.split('│').nth(1).unwrap_or_default();
-            assert!(
-                ["claude-", "codex-", "grok-"]
-                    .iter()
-                    .any(|name| inside.contains(name)),
-                "{inside:?} showed through the box\n{choosing:#?}"
-            );
+    fn a_half_written_prompt_survives_a_trip_to_the_rail() {
+        let mut app = App::new(every_account());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
+        app.focus = Focus::Session;
+        for ch in "hello".chars() {
+            app.compose.insert(ch);
         }
-        // The footer is still the window's, and says what the arrows do now.
-        assert!(
-            choosing.last().is_some_and(|row| row.contains("account")),
-            "{choosing:#?}"
-        );
-    }
-
-    #[test]
-    fn a_window_too_small_for_the_chooser_still_draws() {
-        // A split terminal on a laptop. Every dimension here is arithmetic on
-        // an area that can be smaller than the box it is centring.
-        let mut app = played(Kind::Claude, testing::CLAUDE);
-        app.open_picker();
-        for (width, height) in [(80, 24), (30, 8), (12, 6), (4, 4)] {
-            let _ = frame_of(&app, width, height);
-        }
+        assert!(text_of(&compose_line(&app, Theme::plain())).contains("hello"));
+        app.focus = Focus::List;
+        let from_rail = text_of(&compose_line(&app, Theme::plain()));
+        assert!(from_rail.contains("hello"), "{from_rail}");
+        // and an empty box says how to reach it rather than nothing at all
+        app.compose.take();
+        assert!(text_of(&compose_line(&app, Theme::plain())).contains("press →"));
     }
 
     #[test]
@@ -726,38 +823,6 @@ mod tests {
     }
 
     #[test]
-    fn a_long_title_never_pushes_the_sign_in_off_the_row() {
-        // What the column is for. The title is any length and the sign-in is
-        // what identifies the session, so the title is the half that gives way.
-        let mut app = App::new(every_account());
-        let mut pane = TestPane::new("s1".into(), Kind::Claude, String::new());
-        pane.account = 7;
-        pane.title = "work out why the nightly job has started timing out".into();
-        app.add(pane);
-        let row = frame_of(&app, 80, 8).remove(1);
-        let column: String = row.chars().take(LIST_WIDTH as usize).collect();
-        assert!(column.contains("claude-7"), "{column:?}");
-        assert!(column.contains('…'), "{column:?}");
-    }
-
-    #[test]
-    fn a_row_says_which_sign_in_it_is_running_under() {
-        // Two panes on the same harness are otherwise identical until one of
-        // them has been asked something.
-        let mut app = App::new(every_account());
-        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
-        let mut second = TestPane::new("s2".into(), Kind::Claude, String::new());
-        second.account = 4;
-        app.add(second);
-        let rows: Vec<String> = list_lines(&app, Theme::plain(), true)
-            .iter()
-            .map(text_of)
-            .collect();
-        assert!(rows[0].contains("claude-1"), "{rows:#?}");
-        assert!(rows[1].contains("claude-4"), "{rows:#?}");
-    }
-
-    #[test]
     fn a_machine_with_no_accounts_says_so_rather_than_offering_nothing() {
         let app = App::new(Accounts::default());
         let rows: String = picker_lines(&app, Theme::plain(), true)
@@ -765,31 +830,5 @@ mod tests {
             .map(text_of)
             .collect();
         assert!(rows.contains("no accounts"), "{rows}");
-    }
-
-    #[test]
-    fn a_session_can_always_be_written_to() {
-        // There is no ended state any more: a session is a thread id and a
-        // spool, and both outlive every process. Whatever happened to the last
-        // turn, the next one resumes it.
-        let mut app = App::new(Accounts::default());
-        app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
-        app.set_running("s1", true);
-        assert!(text_of(&compose_line(&app, Theme::plain())).contains("enter"));
-    }
-
-    #[test]
-    fn an_empty_screen_tells_the_developer_what_to_press() {
-        let app = App::new(Accounts::default());
-        let list: String = list_lines(&app, Theme::plain(), true)
-            .iter()
-            .map(text_of)
-            .collect();
-        assert!(list.contains("press n"), "{list}");
-        let body: String = transcript_lines(None, Theme::plain(), true)
-            .iter()
-            .map(text_of)
-            .collect();
-        assert!(body.contains("Press n"), "{body}");
     }
 }

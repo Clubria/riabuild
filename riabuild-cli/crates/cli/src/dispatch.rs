@@ -215,6 +215,10 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         // in full: it is the one tool riabuild does not put on `PATH`.
         riabuild: shims::running_binary()?,
         cwd,
+        // Said rather than assumed. Which sessions the window lists was already
+        // scoped to this checkout by the store; what was missing was the line
+        // that tells a developer so.
+        repo: ctx.repo().ok().map(|repo| repo.slug().to_string()),
         accounts: every_account(ctx),
         prompt,
         theme: ctx.ui.theme(),
@@ -223,8 +227,44 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         unicode: riabuild_ui::glyphs_render(),
     };
 
-    agents::run(ctx.runner.clone(), ctx.paths.as_ref(), request).await?;
+    let logins = ask_who_is_signed_in(ctx);
+    agents::run(ctx.runner.clone(), ctx.paths.as_ref(), request, logins).await?;
     Ok(0)
+}
+
+/// Asks each Claude account who it belongs to, without holding the window up.
+///
+/// `claude auth status --json` is a subprocess and costs about 450 ms, almost
+/// all of it the child's own startup — so nine of them in front of the first
+/// frame is a blank terminal for four seconds. They are started here and the
+/// answers arrive over the channel as they come; a sign-in nobody has answered
+/// for yet renders as nothing, never as "signed out".
+///
+/// Claude only. Codex and Grok Build keep their credentials in their own homes
+/// with no command that reports an address, so there is nothing to ask and
+/// inventing a probe for them would be guessing on a developer's behalf.
+fn ask_who_is_signed_in(ctx: &Ctx) -> tokio::sync::mpsc::UnboundedReceiver<agents::Login> {
+    let (into, out) = tokio::sync::mpsc::unbounded_channel();
+    let claude = ctx.claude();
+    for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
+        let runner = ctx.runner.clone();
+        let claude = claude.clone();
+        let dir = ctx.paths.claude_profile_dir(id);
+        let into = into.clone();
+        let number = index + 1;
+        tokio::spawn(async move {
+            if let accounts::status::Identity::LoggedIn(email) =
+                accounts::status::read_at(runner, claude, dir).await
+            {
+                let _ = into.send(agents::Login {
+                    kind: Kind::Claude,
+                    number,
+                    email,
+                });
+            }
+        });
+    }
+    out
 }
 
 /// Every sign-in a session in the agents window may run under.

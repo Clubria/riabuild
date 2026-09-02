@@ -104,6 +104,20 @@ impl Kind {
         }
     }
 
+    /// The vendor's name on its own, for a sentence that already says what it
+    /// is: *create a **Claude** session*.
+    ///
+    /// Not [`Kind::label`], which is the product ("Claude Code", "Grok Build")
+    /// and reads as a stutter mid-sentence; not [`Kind::tag`], which is the
+    /// wire spelling and is lower-case because a file name is.
+    pub fn short(self) -> &'static str {
+        match self {
+            Kind::Claude => "Claude",
+            Kind::Codex => "Codex",
+            Kind::Grok => "Grok",
+        }
+    }
+
     /// The short tag a dense list has room for, and the one written to disk.
     ///
     /// Both, deliberately: a session record has to survive a riabuild upgrade,
