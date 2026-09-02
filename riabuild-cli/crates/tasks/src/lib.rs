@@ -48,6 +48,7 @@ mod task;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod toolchain;
+pub mod typescript_language_server;
 
 pub use crate::ctx::Ctx;
 pub use crate::task::{Reason, Resource, Status, Task, TaskId};
@@ -72,6 +73,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(infisical_cli::INFISICAL_CLI),
         Box::new(ngrok::NGROK),
         Box::new(toolchain::Toolchain),
+        Box::new(typescript_language_server::TypescriptLanguageServer),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
         Box::new(codex_cli::CodexCli),

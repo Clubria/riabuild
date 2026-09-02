@@ -16,7 +16,7 @@ mod sign_in;
 use install::install_claude;
 use sign_in::sign_in;
 
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use crate::accounts::{self, status::Identity};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -77,6 +77,10 @@ impl Task for ClaudeAccounts {
         // Claude Code is installed with the Node riabuild owns, so the
         // toolchain has to exist first.
         &["toolchain"]
+    }
+
+    fn writes(&self) -> &[Resource] {
+        &["node_prefix"]
     }
 
     /// `claude auth login` opens a browser, and `sign_in` reads

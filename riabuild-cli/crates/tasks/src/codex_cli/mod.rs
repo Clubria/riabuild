@@ -19,7 +19,7 @@ mod probe;
 use install::install_codex;
 use probe::{install_needed, probe_options};
 
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, Resource, Status, Task, TaskId};
 use crate::shims;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -99,6 +99,10 @@ impl Task for CodexCli {
         // this task rather than leave a launcher pointing at a Node that is
         // gone.
         &["toolchain"]
+    }
+
+    fn writes(&self) -> &[Resource] {
+        &["node_prefix"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {
