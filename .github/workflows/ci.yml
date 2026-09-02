@@ -67,7 +67,7 @@ jobs:
       # action deepens the clone itself to find it, and that is the path that
       # breaks: not here, but on main, after the merge, where a filter that
       # cannot see the diff decides nothing changed.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -112,7 +112,7 @@ jobs:
       run:
         working-directory: riabuild-cli
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -254,7 +254,7 @@ jobs:
       run:
         working-directory: riabuild-cli
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
 
@@ -274,7 +274,7 @@ jobs:
       run:
         working-directory: riabuild-web
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-pnpm
 
@@ -328,7 +328,7 @@ jobs:
       run:
         working-directory: riabuild-web
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-pnpm
 
@@ -515,7 +515,7 @@ jobs:
     env:
       RIABUILD_E2E_GH_TOKEN: ${{ secrets.RIABUILD_E2E_GH_TOKEN }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
 
@@ -598,7 +598,7 @@ jobs:
     if: needs.changes.outputs.packaging == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Render and validate the formula
         run: |
