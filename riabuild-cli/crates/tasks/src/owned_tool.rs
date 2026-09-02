@@ -272,6 +272,13 @@ impl OwnedTool {
 }
 
 /// Every row, for the things that are true of all of them.
+///
+/// Gated exactly as `mod testing` is, and for the same reason: its only callers
+/// are that module and the assertions below it, so a build with neither has a
+/// genuinely dead function here. Nothing in a provisioning run walks the rows —
+/// each is reached as its own `Task` — which is why this is a `cfg` rather than
+/// an `allow`.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn table() -> Vec<&'static OwnedTool> {
     vec![
         &crate::github_cli::GH,

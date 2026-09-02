@@ -59,4 +59,16 @@ riabuild-runner = { workspace = true, features = ["testing"] }
 riabuild-theme = { workspace = true, features = ["testing"] }
 riabuild-ui = { workspace = true, features = ["testing"] }
 tar.workspace = true
+# Again, and as a plain dev-dependency this time. The five lines above turn the
+# `testing` feature on in the crates *below* this one, but nothing turns it on
+# in this one: `testing` is enabled only from downstream — that is the whole
+# point of it — so `cargo test -p riabuild-tasks` compiles `mod testing` under
+# `cfg(test)` with `dep:tempfile` still switched off, and every `Ctx` builder
+# fails to resolve the crate in its own signature. It was the only entry that
+# needed saying twice, because it is the only one that is a crate rather than a
+# feature toggle on a crate this file already names.
+#
+# This does not weaken what `ci.yml` asserts: a dev-dependency enables no
+# feature, and `cargo build` resolves no dev-dependency.
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "time"] }
