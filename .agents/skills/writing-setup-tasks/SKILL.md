@@ -119,7 +119,7 @@ machine that made it:
 keyring. `runner.which("secret-tool")` is **not** an answer to that question —
 `libsecret-tools` arrives as a transitive dependency on boxes with no D-Bus session bus
 at all — and reintroducing that test is how the bug comes back, looking correct and
-passing CI. Read "No secrets in `~/.riabuild/`" in `riabuild-cli/CLAUDE.md` before going
+passing CI. Read "No secrets in `~/.riabuild/`" in `riabuild-cli/AGENTS.md` before going
 near any of this; it is the authority, and duplicating it here would only give it a
 second place to drift.
 

@@ -2,7 +2,7 @@
 #
 # Creates the machine-local cargo config that shares one compiled dependency
 # graph across every checkout and worktree while leaving each of them its own
-# finished binaries. See riabuild-cli/CLAUDE.md for why the file is untracked
+# finished binaries. See riabuild-cli/AGENTS.md for why the file is untracked
 # and why it must live at the main checkout root.
 #
 # Run from a SessionStart hook, so a fresh clone is configured before anyone
@@ -44,7 +44,7 @@ write_config() {
 # Machine-local, deliberately untracked. Shares one compiled dependency graph
 # across the main checkout and every worktree under .claude/worktrees/, while
 # leaving each of them its own finished binaries. Rationale, and the reason
-# this must not be committed, are in riabuild-cli/CLAUDE.md.
+# this must not be committed, are in riabuild-cli/AGENTS.md.
 #
 # build-dir   resolved against the directory holding this .cargo, so every
 #             checkout and worktree shares <repo>/shared-build for deps/,
@@ -56,7 +56,7 @@ write_config() {
 #             the binary this worktree built and not whichever one finished
 #             last. Setting it here is what used to make them collide.
 #
-# Written by .claude/hooks/ensure-shared-cargo-build-dir.sh. Delete it to opt
+# Written by .agents/hooks/ensure-shared-cargo-build-dir.sh. Delete it to opt
 # out for this machine; it will be recreated on the next session start.
 [build]
 build-dir = "shared-build"
@@ -77,7 +77,7 @@ if [ -e "$config" ]; then
 		*target-dir*)
 			echo "riabuild: $config sets target-dir, which makes every worktree" >&2
 			echo "riabuild: write one shared riabuild-cli/target/debug/riabuild." >&2
-			echo "riabuild: Prefer build-dir — see riabuild-cli/CLAUDE.md." >&2
+			echo "riabuild: Prefer build-dir — see riabuild-cli/AGENTS.md." >&2
 			;;
 		esac
 		exit 0

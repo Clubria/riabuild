@@ -9,7 +9,7 @@ description: Use when verifying, testing, or claiming that any riabuild-web user
 viewport.** Not a sample. `tsc` passing and a component "looking right in the code" are not
 evidence about pixels.
 
-Design rules for the UI itself are in `.claude/skills/riabuild-ui/SKILL.md`.
+Design rules for the UI itself are in `.agents/skills/riabuild-ui/SKILL.md`.
 
 ## The loop
 

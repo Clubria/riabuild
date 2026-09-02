@@ -76,7 +76,7 @@ distribution or glibc requirement beyond what the packages declare.
 | `docs/superpowers/plans/` | the implementation plans those specs were built from — history, not instructions |
 | `docs/deploying.md` | putting it on the domain |
 | `docs/releasing.md` | cutting a CLI release |
-| `shared-build/` | the one cargo build directory every checkout and worktree compiles into — untracked, see `riabuild-cli/CLAUDE.md` |
+| `shared-build/` | the one cargo build directory every checkout and worktree compiles into — untracked, see `riabuild-cli/AGENTS.md` |
 
 ## Which repository
 
@@ -240,8 +240,8 @@ Point the CLI at a local backend with `RIABUILD_API_URL` and `RIABUILD_WEB_URL`.
 The dashboard is a fake TUI — one framed terminal, dark only, built from the
 component library in `riabuild-web/src/ui/`. Any data state renders without a
 backend via `?scenario=<name>`, and `/__ui` is the component gallery. See
-`.claude/skills/riabuild-ui/` and `.claude/skills/visual-testing/`;
-`.claude/skills/writing-setup-tasks/` and `.claude/skills/riabuild-api/` cover the
+`.agents/skills/riabuild-ui/` and `.agents/skills/visual-testing/`;
+`.agents/skills/writing-setup-tasks/` and `.agents/skills/riabuild-api/` cover the
 other two halves.
 
 Versions are release dates — `2026.08.04`, plus a fourth component for a second
@@ -256,7 +256,7 @@ virtual manifest with no version at all, and `riabuild-cli/crates/cli/Cargo.toml
 holds a permanent `0.0.0` placeholder. `docs/releasing.md` covers why, and the rest.
 
 All work goes through a pull request, and is not finished until CI has passed. See
-`CLAUDE.md`.
+`AGENTS.md`.
 
 MIT licensed — see `LICENSE`. The `.deb` carries it as
 `/usr/share/doc/riabuild/copyright` and the `.rpm` as `rpm -qL riabuild`, so the
