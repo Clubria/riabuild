@@ -25,7 +25,9 @@ pub use snapshot::SNAPSHOT_TTL;
 use crate::clipboard::Clipboard;
 use crate::opener::Opener;
 use crate::protocol::{ErrorCode, Request, Response};
+use riabuild_ui::StatusBar;
 use snapshot::Snapshot;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -58,6 +60,22 @@ pub struct Agent {
     /// Hands out `Snapshot::seq`. Never reset: a wrap at `u64` is not a thing
     /// a laptop reaches.
     snapshots: AtomicU64,
+    /// Where the agent says what it is doing — the same line on row two the
+    /// supervisor reports a dead channel on.
+    ///
+    /// **The agent has one for the reason the supervisor does.** Opening a link
+    /// is the one thing this laptop does that a developer wants told about, and
+    /// it happens *while* a full-screen Claude Code is drawing the screen from
+    /// the far end of a mosh session: an `eprintln!` from here arrives through a
+    /// terminal an interactive shell has put in raw mode, so it staircases down
+    /// the right-hand side and then sits in the middle of somebody else's
+    /// output for the rest of the session.
+    ///
+    /// Disabled by default, which is every run except a remote session — the
+    /// developer who ran `riabuild channel agent` by hand owns their terminal
+    /// and gets the ordinary printed line. Remote mode is the caller that knows
+    /// otherwise, and says so with [`speaking_on`](Self::speaking_on).
+    bar: Arc<StatusBar>,
 }
 
 impl Agent {
@@ -67,7 +85,24 @@ impl Agent {
             opener,
             snapshot: Mutex::new(None),
             snapshots: AtomicU64::new(0),
+            bar: Arc::new(StatusBar::disabled()),
         }
+    }
+
+    /// Hands the agent the line to speak on instead of printing.
+    ///
+    /// Taken here rather than in [`new`](Self::new) because of the order the
+    /// two are made in: what this laptop *can do* is settled by
+    /// `laptop_agent`, which can fail and takes the whole channel down with it
+    /// when it does, while the bar is started afterwards by `remote::channel` —
+    /// last, so that nothing can return early past a task left repainting a
+    /// line for a channel that never started. Consuming `self` is what keeps
+    /// that a construction rather than a setting: the agent is shared behind an
+    /// `Arc` the moment it is finished, and there is no later to change it in.
+    #[must_use]
+    pub fn speaking_on(mut self, bar: Arc<StatusBar>) -> Self {
+        self.bar = bar;
+        self
     }
 
     /// Answers one request. Bodies are passed and returned beside the header
@@ -244,6 +279,84 @@ pub(crate) mod tests {
         assert_eq!(response, Response::Opened);
         assert!(body.is_none());
         assert_eq!(opener.opened(), vec!["https://github.com/login/device"]);
+    }
+
+    /// Where the agent says what it is doing, when there is a line to say it
+    /// on: on the bar, and not printed into a screen mosh and Claude Code are
+    /// painting from the other end of the session.
+    #[tokio::test]
+    async fn opening_a_link_is_said_on_the_bar_where_there_is_one() {
+        let bar = Arc::new(StatusBar::recording());
+        let agent = agent_with(
+            FakeClipboard::holding(&[], b""),
+            Arc::new(FakeOpener::default()),
+        )
+        .speaking_on(Arc::clone(&bar));
+
+        let request = Request::OpenUrl {
+            url: "https://github.com/login/device".into(),
+        };
+        agent.handle(&request, None, Instant::now()).await;
+
+        let said = bar.painted();
+        assert!(
+            said.iter()
+                .any(|line| line.contains("opening https://github.com/login/device")),
+            "{said:?}"
+        );
+    }
+
+    /// …and so is a link that did not open, which is the case a developer most
+    /// needs told: the shim on the server exits non-zero and Claude Code prints
+    /// the URL, but nothing there says the laptop refused it.
+    #[tokio::test]
+    async fn a_link_that_would_not_open_is_said_on_the_bar_too() {
+        let bar = Arc::new(StatusBar::recording());
+        let agent = agent_with(
+            FakeClipboard::holding(&[], b""),
+            Arc::new(FakeOpener::default()),
+        )
+        .speaking_on(Arc::clone(&bar));
+
+        let request = Request::OpenUrl {
+            url: "https://unreachable.example.com".into(),
+        };
+        agent.handle(&request, None, Instant::now()).await;
+
+        let said = bar.painted();
+        assert!(
+            said.iter()
+                .any(|line| line.contains("could not open https://unreachable.example.com")),
+            "{said:?}"
+        );
+    }
+
+    /// The clipboard says nothing at all, and that is the whole reason the bar
+    /// is usable for the link: paste is high-volume and its content is the
+    /// developer's own, so a line per Ctrl+V would be both a flicker on row two
+    /// and their clipboard on their screen.
+    #[tokio::test]
+    async fn pasting_says_nothing_on_the_bar() {
+        let bar = Arc::new(StatusBar::recording());
+        let agent = agent_with(
+            FakeClipboard::holding(&[TEXT], b"a password, most likely"),
+            Arc::new(FakeOpener::default()),
+        )
+        .speaking_on(Arc::clone(&bar));
+        let now = Instant::now();
+
+        agent.handle(&Request::ClipboardTargets, None, now).await;
+        let read = Request::ClipboardRead { mime: TEXT.into() };
+        agent.handle(&read, None, now).await;
+        agent
+            .handle(
+                &write_of(TEXT, b"copied on the server"),
+                Some(b"copied on the server".to_vec()),
+                now,
+            )
+            .await;
+
+        assert!(bar.painted().is_empty(), "{:?}", bar.painted());
     }
 
     /// A laptop that cannot open the link says so rather than reporting

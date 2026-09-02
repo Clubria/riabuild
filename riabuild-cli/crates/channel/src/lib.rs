@@ -59,7 +59,12 @@ use std::sync::Arc;
 /// Fails only when the laptop has no clipboard tool at all. Remote mode turns
 /// that into a warning and carries on without a channel; `agent` reports it,
 /// because a developer who asked for the agent asked for exactly this.
-pub fn laptop_agent(runner: Arc<dyn CommandRunner>, bin: &Path) -> Result<Arc<agent::Agent>> {
+///
+/// Returned unwrapped, for the caller to finish and share. Remote mode has one
+/// more thing to tell it — the status bar it says what it is doing on, which
+/// only exists once the shell is about to take the terminal over — and an
+/// `Arc` handed out here would be an agent nobody could still add it to.
+pub fn laptop_agent(runner: Arc<dyn CommandRunner>, bin: &Path) -> Result<agent::Agent> {
     // The only platform decision here is supplying the real value; the
     // decision itself lives in `clipboard::detect`, which takes the OS as a
     // parameter and is tested for every platform. Same shape as
@@ -75,8 +80,8 @@ pub fn laptop_agent(runner: Arc<dyn CommandRunner>, bin: &Path) -> Result<Arc<ag
         .into());
     };
 
-    Ok(Arc::new(agent::Agent::new(
+    Ok(agent::Agent::new(
         clipboard::backend(runner.clone(), session),
         Box::new(opener::SystemOpener::new(runner, os, bin)),
-    )))
+    ))
 }

@@ -75,7 +75,12 @@ pub async fn channel(action: &ChannelAction, quiet: bool) -> Result<i32> {
             // `serve` unlinks whatever is in the way and binds.
             let socket = channel::socket_path_for_create(socket.as_deref()).await?;
             let bin = RealPaths::new()?.bin_dir();
-            channel::laptop_agent(runner, &bin)?.serve(&socket).await?;
+            // No status bar: a developer who ran this by hand owns the terminal
+            // it prints to, and the bar exists for the one case where somebody
+            // else is drawing on it.
+            Arc::new(channel::laptop_agent(runner, &bin)?)
+                .serve(&socket)
+                .await?;
             Ok(0)
         }
 

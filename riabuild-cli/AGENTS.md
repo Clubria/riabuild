@@ -1028,16 +1028,29 @@ no answer, it only obliges a frame back, and `serve_pipe` answers every frame in
 it cannot parse. Measure it against `tokio::time::Instant`, never `std`'s: the sleeps beside
 it are tokio's, and a deadline on the other clock is a test that cannot fail.
 
-**The supervisor is the one thing that prints beside a shell rather than in front of one, so
-it speaks on a status bar.** In a remote session the terminal is in raw mode — `\n` drops a
-row without returning to column one — and mosh and Claude Code are painting it, so a folded
-warning printed there arrives as a staircase and stays in the middle of somebody else's
-screen. `riabuild_ui::StatusBar` puts one line on row two (mosh owns row one) over
-`/dev/tty`, with the cursor saved and restored; `supervisor::StatusLine` redraws it on a
-tick because nothing announces a repaint underneath, and `remote::channel` owns its
-lifetime because the session's end is when the line comes off. A bar carries one line, so
-the detail and the remedy stay in `riabuild channel status`. With no bar — every non-remote
-run, `--quiet`, every test — `report` prints exactly as it always did.
+**The channel prints beside a shell rather than in front of one, so it speaks on a status
+bar.** In a remote session the terminal is in raw mode — `\n` drops a row without returning
+to column one — and mosh and Claude Code are painting it, so a folded warning printed there
+arrives as a staircase and stays in the middle of somebody else's screen.
+`riabuild_ui::StatusBar` puts one line on row two (mosh owns row one) over `/dev/tty`, with
+the cursor saved and restored; `supervisor::StatusLine` redraws it on a tick because nothing
+announces a repaint underneath, and `remote::channel` owns its lifetime because the
+session's end is when the line comes off. A bar carries one line, so the detail and the
+remedy stay in `riabuild channel status`. With no bar — every non-remote run, `--quiet`,
+every test — `report` prints exactly as it always did.
+
+**Both halves of the channel speak on that one line, which is why the bar has two kinds of
+line rather than one.** The supervisor's failures *stand*: paste is off until something
+changes, so the line stays until it is replaced or cleared. The agent's own messages —
+`opening <url>`, and the two ways opening it can go wrong — are *passing*: they say what
+riabuild is doing right now, and they cannot be `show` then `clear`, because clearing would
+take a standing failure off the screen that nobody has fixed. So a passing line sits over
+the standing one for `status_bar::PASSING` and then gives it back, and it expires inside
+`resolve` on the next repaint rather than on a timer, because `ui` has no async runtime and
+is not getting one to hold a sleep. `remote::channel` hands the agent the bar with
+`Agent::speaking_on` after `StatusLine::start`, since the agent is built before the bar
+exists; `riabuild channel agent` hands it none and keeps printing, because a developer who
+ran that by hand owns the terminal it prints to.
 
 Inside `archive`, `staging.rs` owns *how* a tree lands: unpack into a sibling
 directory and `rename` it into place, never `remove_dir_all` the target first.

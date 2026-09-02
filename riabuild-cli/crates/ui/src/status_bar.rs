@@ -22,6 +22,29 @@
 //! own bar sits on row one, which is why riabuild's is on row two rather than
 //! fighting it for the same cells.
 //!
+//! # Two kinds of line
+//!
+//! Everything the channel says arrives here, and the two things it says have
+//! different lifetimes:
+//!
+//! - **Standing** — the state of the channel. *Paste is off* stays true until
+//!   something changes it, so [`show`](StatusBar::show) leaves it up until a
+//!   caller takes it down.
+//! - **Passing** — something the channel just did. *Opening a link on this
+//!   laptop* is over in a second, and a developer who reads it a minute later
+//!   learns something false. [`flash`](StatusBar::flash) and
+//!   [`flash_warning`](StatusBar::flash_warning) stand for [`PASSING`] and then
+//!   fall away, leaving whatever was underneath.
+//!
+//! A passing line cannot be a `show` followed by a `clear`, which is what makes
+//! this two fields rather than one: the clear would take a standing failure off
+//! the screen with it, and the developer would be left pasting into a session
+//! that had stopped telling them paste was dead. Nor can it expire on a timer
+//! of its own — this crate deliberately has no runtime, and everything else in
+//! it is a `println!`. It expires on the next [`repaint`](StatusBar::repaint),
+//! which the channel's own painter already ticks; see
+//! `channel::supervisor::bar`.
+//!
 //! What this is not is a general printer. A bar holds one line and truncates
 //! it; the folded prose, the detail and the next action all belong to the runs
 //! that own their screen, and stay with `Ui`.
@@ -31,6 +54,7 @@ use riabuild_theme::{Role, Theme};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The row the bar is drawn on, counting from one.
 ///
@@ -40,6 +64,16 @@ use std::sync::Mutex;
 /// down is out of its way and still above everything the developer is reading.
 const ROW: u16 = 2;
 
+/// How long a passing line stands before the bar falls back to what is
+/// underneath it.
+///
+/// Long enough to be read by a developer whose eyes are on the middle of the
+/// screen rather than on row two, short enough that "opening a link" has
+/// stopped being a claim about now by the time it goes. A floor rather than a
+/// promise: the line comes off on the first repaint after it expires, so a bar
+/// ticked every couple of seconds holds it a little longer than this.
+pub const PASSING: Duration = Duration::from_secs(6);
+
 /// Save the cursor, including where it is and what it is painting with.
 ///
 /// `ESC 7`, not `CSI s`. They do the same thing on xterm and its descendants,
@@ -47,6 +81,56 @@ const ROW: u16 = 2;
 /// through mosh, is what the far end of a session may well be emulating.
 const SAVE: &str = "\x1b7";
 const RESTORE: &str = "\x1b8";
+
+/// One line, and what it is painted as.
+///
+/// The glyph is carried rather than derived from the role, so that the two
+/// constructors below are the whole vocabulary of the bar: a caller says what
+/// kind of thing it has to say and gets riabuild's glyph for it — the same `▲`
+/// and `◐` the reports in `report` use for the same two meanings.
+struct Note {
+    role: Role,
+    glyph: &'static str,
+    text: String,
+}
+
+impl Note {
+    /// Something that is wrong.
+    fn warning(text: &str) -> Self {
+        Self {
+            role: Role::Warn,
+            glyph: "▲",
+            text: text.to_string(),
+        }
+    }
+
+    /// Something happening now.
+    fn doing(text: &str) -> Self {
+        Self {
+            role: Role::Busy,
+            glyph: "◐",
+            text: text.to_string(),
+        }
+    }
+}
+
+/// What the bar has to say, in both of its lifetimes.
+#[derive(Default)]
+struct Line {
+    /// The state of the channel: up until a caller takes it down.
+    standing: Option<Note>,
+    /// Something the channel just did, and the moment it stops being worth
+    /// saying. Stands *over* `standing` rather than replacing it, which is what
+    /// lets a link open in a session that is already warning about paste
+    /// without either message losing the other.
+    passing: Option<(Note, Instant)>,
+    /// Whether the row has ink on it now.
+    ///
+    /// Held so that a bar with nothing to say writes nothing at all: without
+    /// it, every repaint of an empty bar would erase a row nobody has written
+    /// to, over and over, for the length of a session.
+    inked: bool,
+}
 
 pub struct StatusBar {
     /// The developer's terminal, or `None` when there is not one to draw on —
@@ -59,7 +143,7 @@ pub struct StatusBar {
     /// piped still has a developer looking at a screen.
     tty: Option<Mutex<File>>,
     theme: Theme,
-    /// The line that is on the screen now, or `None` when the row is clear.
+    /// What is on the screen now.
     ///
     /// Held rather than written and forgotten, because the program underneath
     /// repaints: a full-screen shell writing anything to row two erases the bar
@@ -70,7 +154,17 @@ pub struct StatusBar {
     /// repaint that has already read the line from painting it back *after* a
     /// clear — the one ordering that would leave a stale bar on the screen for
     /// the rest of the session.
-    showing: Mutex<Option<String>>,
+    line: Mutex<Line>,
+    /// Every line this bar has put on the row, for a test to read back.
+    ///
+    /// `Some` only for [`recording`](Self::recording), and it is also what
+    /// makes such a bar answer [`enabled`](Self::enabled): the whole of what a
+    /// caller asks the bar is *is there a line to speak on, or should I print?*,
+    /// and the callers that ask it — the supervisor and the channel's agent —
+    /// have no terminal under `cargo test` and would otherwise only ever be
+    /// tested down the branch that prints.
+    #[cfg(any(test, feature = "testing"))]
+    painted: Option<Mutex<Vec<String>>>,
 }
 
 impl StatusBar {
@@ -94,7 +188,9 @@ impl StatusBar {
         Self {
             theme: Theme::detect(tty.is_some()),
             tty,
-            showing: Mutex::new(None),
+            line: Mutex::new(Line::default()),
+            #[cfg(any(test, feature = "testing"))]
+            painted: None,
         }
     }
 
@@ -103,55 +199,140 @@ impl StatusBar {
         Self {
             tty: None,
             theme: Theme::detect(false),
-            showing: Mutex::new(None),
+            line: Mutex::new(Line::default()),
+            #[cfg(any(test, feature = "testing"))]
+            painted: None,
         }
+    }
+
+    /// A bar that answers `enabled()` and paints into memory instead of a
+    /// terminal, for the tests of whatever speaks on it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn recording() -> Self {
+        Self {
+            tty: None,
+            theme: Theme::detect(false),
+            line: Mutex::new(Line::default()),
+            painted: Some(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Every line this bar has put on the row, in order and whole.
+    ///
+    /// Recorded before it is cut to the terminal, the way `Ui::note` records
+    /// what it folds: a test asserting what the developer was told should not
+    /// have to know how wide the window was.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn painted(&self) -> Vec<String> {
+        self.painted
+            .as_ref()
+            .and_then(|painted| painted.lock().ok())
+            .map(|painted| painted.clone())
+            .unwrap_or_default()
     }
 
     /// Whether there is a line to hold — and therefore whether a caller should
     /// say what it has to say here rather than by printing it.
     pub fn enabled(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        if self.painted.is_some() {
+            return true;
+        }
         self.tty.is_some()
     }
 
-    /// Puts `text` on the bar and leaves it there.
+    /// Puts `text` on the bar as the state of things, and leaves it there.
     pub fn show(&self, text: &str) {
-        let Ok(mut showing) = self.showing.lock() else {
-            return;
-        };
-        *showing = Some(text.to_string());
-        self.paint(showing.as_deref());
+        self.change(|line| line.standing = Some(Note::warning(text)));
+    }
+
+    /// Says that something is happening, for as long as that is still true.
+    ///
+    /// Over the standing line rather than instead of it, and gone again after
+    /// [`PASSING`] — see the module doc for why those are two fields.
+    pub fn flash(&self, text: &str) {
+        self.passing(Note::doing(text));
+    }
+
+    /// The same, for something that has just gone wrong rather than something
+    /// happening.
+    ///
+    /// Passing rather than standing because it is about one attempt and not
+    /// about the channel: a link this laptop's browser refused says nothing
+    /// about the next one, and a line that stayed up would go on describing a
+    /// session that recovered a minute ago.
+    pub fn flash_warning(&self, text: &str) {
+        self.passing(Note::warning(text));
     }
 
     /// Draws the current line again, for a caller that suspects the program
-    /// underneath has painted over it. Nothing when the bar is clear.
+    /// underneath has painted over it — and the tick a passing line expires on.
+    /// Nothing when the bar is clear.
     pub fn repaint(&self) {
-        let Ok(showing) = self.showing.lock() else {
-            return;
-        };
-        if showing.is_some() {
-            self.paint(showing.as_deref());
-        }
+        self.change(|_| {});
     }
 
-    /// Takes the line off the screen. Idempotent, and safe on a bar that never
-    /// showed anything.
+    /// Takes the line off the screen, both kinds of it. Idempotent, and safe on
+    /// a bar that never showed anything.
     pub fn clear(&self) {
-        let Ok(mut showing) = self.showing.lock() else {
+        self.change(|line| {
+            line.standing = None;
+            line.passing = None;
+        });
+    }
+
+    fn passing(&self, note: Note) {
+        self.change(|line| line.passing = Some((note, Instant::now() + PASSING)));
+    }
+
+    /// Every write goes through here: change what the bar has to say, then put
+    /// the result on the screen, both under the one lock. Nothing paints
+    /// outside it, which is what stops a repaint and a clear interleaving into
+    /// a line that outlives the state it came from.
+    fn change(&self, change: impl FnOnce(&mut Line)) {
+        let Ok(mut line) = self.line.lock() else {
             return;
         };
-        if showing.take().is_some() {
-            self.paint(None);
+        change(&mut line);
+        match resolve(&mut line, Instant::now()) {
+            Some((role, text)) => {
+                #[cfg(any(test, feature = "testing"))]
+                self.record(&text);
+                let painted = self.theme.paint(role, &fit(&text, self.columns()));
+                self.paint(Some(&painted));
+                line.inked = true;
+            }
+            None => {
+                if line.inked {
+                    self.paint(None);
+                    line.inked = false;
+                }
+            }
         }
     }
 
-    /// The one write, called with `showing` held so that a repaint and a clear
+    /// Keeps what a recording bar has said, with a repaint of the line already
+    /// on the row collapsed into the one it repeats — the developer sees one
+    /// line either way, and a test should not have to count ticks.
+    #[cfg(any(test, feature = "testing"))]
+    fn record(&self, text: &str) {
+        let Some(painted) = &self.painted else {
+            return;
+        };
+        if let Ok(mut painted) = painted.lock()
+            && painted.last().is_none_or(|last| last != text)
+        {
+            painted.push(text.to_string());
+        }
+    }
+
+    /// The one write, called with the line held so that a repaint and a clear
     /// cannot interleave into a stale line.
-    fn paint(&self, line: Option<&str>) {
+    fn paint(&self, painted: Option<&str>) {
         let Some(tty) = &self.tty else {
             return;
         };
-        let painted = line.map(|line| self.theme.paint(Role::Warn, &fit(line, self.columns())));
-        let out = sequence(ROW, painted.as_deref());
+        let out = sequence(ROW, painted);
 
         if let Ok(mut tty) = tty.lock() {
             // One write, so a repaint cannot be interleaved with the terminal's
@@ -179,6 +360,33 @@ impl StatusBar {
             .or_else(wrap::terminal_columns)
             .unwrap_or(80)
     }
+}
+
+/// Retires a passing line that has had its time, and answers what belongs on
+/// the row now — `None` when nothing does.
+///
+/// The whole of the precedence rule, in one place a test can reach: a passing
+/// line stands over a standing one and then falls away leaving it, and nothing
+/// about that can be read back off a terminal riabuild has written to.
+///
+/// Expiry happens *here*, on a repaint, rather than on a timer, because this
+/// crate has no runtime to run one on. The cost is that a bar nobody repaints
+/// holds its passing line; every bar with a terminal to draw on is repainted by
+/// the channel's painter, and one without a terminal draws nothing anyway.
+fn resolve(line: &mut Line, now: Instant) -> Option<(Role, String)> {
+    if line
+        .passing
+        .as_ref()
+        .is_some_and(|(_, until)| now >= *until)
+    {
+        line.passing = None;
+    }
+    let note = line
+        .passing
+        .as_ref()
+        .map(|(note, _)| note)
+        .or(line.standing.as_ref())?;
+    Some((note.role, format!("{} {}", note.glyph, note.text)))
 }
 
 /// The whole write, as one string.
@@ -223,13 +431,16 @@ mod tests {
     use super::*;
 
     /// A bar with nowhere to draw must be usable, not merely survivable: every
-    /// run except a remote session gets one, and the supervisor calls it on a
-    /// path where a panic would take the developer's shell with it.
+    /// run except a remote session gets one, and the supervisor and the agent
+    /// both call it on paths where a panic would take the developer's shell
+    /// with it.
     #[test]
     fn a_disabled_bar_says_so_and_does_nothing() {
         let bar = StatusBar::disabled();
         assert!(!bar.enabled());
         bar.show("Clipboard channel — down");
+        bar.flash("opening https://github.com/login/device");
+        bar.flash_warning("this laptop could not open the link");
         bar.repaint();
         bar.clear();
     }
@@ -295,5 +506,65 @@ mod tests {
     fn an_impossibly_narrow_terminal_still_gets_a_character() {
         assert!(!fit("something", 0).is_empty());
         assert!(!fit("something", 1).is_empty());
+    }
+
+    fn standing(text: &str) -> Line {
+        Line {
+            standing: Some(Note::warning(text)),
+            ..Line::default()
+        }
+    }
+
+    /// Each kind of line carries riabuild's glyph for what it means, so the bar
+    /// reads as the same voice as the report the developer saw a minute
+    /// earlier.
+    #[test]
+    fn a_standing_line_is_a_warning_and_a_passing_one_says_what_it_is() {
+        let now = Instant::now();
+
+        let mut down = standing("Clipboard channel — down");
+        let (role, text) = resolve(&mut down, now).expect("a standing line");
+        assert_eq!(role, Role::Warn);
+        assert_eq!(text, "▲ Clipboard channel — down");
+
+        let mut opening = Line {
+            passing: Some((Note::doing("opening a link on this laptop"), now + PASSING)),
+            ..Line::default()
+        };
+        let (role, text) = resolve(&mut opening, now).expect("a passing line");
+        assert_eq!(role, Role::Busy);
+        assert_eq!(text, "◐ opening a link on this laptop");
+    }
+
+    /// The whole reason a passing line is a second field. A link opening in a
+    /// session that is already warning about paste must not take the warning
+    /// off the screen with it: it stands over it, and then gives it back.
+    #[test]
+    fn a_passing_line_stands_over_the_standing_one_and_gives_it_back() {
+        let now = Instant::now();
+        let mut line = standing("Clipboard channel — down");
+        line.passing = Some((Note::doing("opening a link"), now + PASSING));
+
+        let (_, over) = resolve(&mut line, now).expect("the passing line");
+        assert_eq!(over, "◐ opening a link");
+
+        let (_, after) = resolve(&mut line, now + PASSING).expect("the standing line, back");
+        assert_eq!(after, "▲ Clipboard channel — down");
+        // Retired rather than merely outranked, so it cannot come back.
+        assert!(line.passing.is_none());
+    }
+
+    /// A passing line with nothing underneath it leaves the row empty, which is
+    /// the case `inked` exists for: the bar has to erase what it wrote and then
+    /// stop writing.
+    #[test]
+    fn a_passing_line_with_nothing_under_it_leaves_the_row_empty() {
+        let now = Instant::now();
+        let mut line = Line {
+            passing: Some((Note::warning("this laptop could not open the link"), now)),
+            ..Line::default()
+        };
+        assert!(resolve(&mut line, now).is_none());
+        assert!(line.passing.is_none());
     }
 }

@@ -229,6 +229,13 @@ async fn try_start(plan: &Plan<'_>) -> Result<(Started, bool)> {
     // this call: an early return past this point would leave a task repainting
     // a line for a channel that never started.
     let line = StatusLine::start(plan.quiet);
+    // Both halves of the channel speak on that one line, and this is where the
+    // agent is told about it. The supervisor reports a connection that will not
+    // come up; the agent says what this laptop is doing on the server's behalf —
+    // opening a link, most of the time — and both are said from a process
+    // sitting beside a full-screen shell that owns the screen. An `eprintln!`
+    // from either lands in the middle of it, in raw mode, as a staircase.
+    let agent = Arc::new(agent.speaking_on(line.bar()));
     let holder = tokio::spawn(hold(Holder {
         dir,
         lease,

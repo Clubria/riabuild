@@ -119,8 +119,11 @@ pub(super) fn cannot_connect(stderr: &str) -> Failure {
 /// cannot carry, and `riabuild channel status` is where a developer gets them.
 pub(super) fn report(ui: &Ui, bar: &StatusBar, failure: Failure) -> Failure {
     if bar.enabled() {
+        // No glyph in the text: the bar puts riabuild's own `▲` on a standing
+        // line, which is what keeps this sentence and the agent's next door
+        // reading as one voice rather than two spellings of it.
         bar.show(&format!(
-            "▲ Clipboard channel — {} · paste is off",
+            "Clipboard channel — {} · paste is off",
             failure.attempting
         ));
         return failure;
