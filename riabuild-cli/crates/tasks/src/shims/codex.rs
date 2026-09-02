@@ -6,7 +6,7 @@
 //! when the binary it recorded has moved.
 //!
 //! ```sh
-//! CODEX_HOME=~/.riabuild/codex codex --yolo
+//! CODEX_HOME=~/.riabuild/codex codex --yolo --dangerously-bypass-hook-trust
 //! ```
 //!
 //! What decides all of that is [`handoff`], in Rust; the file in `bin/` is one
@@ -48,6 +48,12 @@ const YOLO_LONG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
 /// The flag riabuild adds where the developer named no policy of their own.
 const YOLO: &str = "--yolo";
+
+/// Runs the checkout's hooks without Codex stopping to ask whether it may trust
+/// them. The checkout is the one riabuild selected and provisioned, and its
+/// `.codex/hooks.json` is versioned code from that repository rather than a
+/// program supplied by riabuild-web.
+const TRUST_HOOKS: &str = "--dangerously-bypass-hook-trust";
 
 /// How many Codex profiles riabuild makes.
 ///
@@ -123,6 +129,13 @@ pub(super) fn handoff(
     let mut args = Vec::new();
     if !stands_aside {
         args.push(YOLO.to_string());
+    }
+    if !plan.args.iter().any(|arg| arg == TRUST_HOOKS) {
+        args.push(TRUST_HOOKS.to_string());
+    }
+    let bare_and_interactive = plan.args.is_empty() && world.stdin_is_tty && world.stdout_is_tty;
+    if bare_and_interactive {
+        args.push("agents".to_string());
     }
     args.extend(plan.args.iter().cloned());
     handoff.with_args(args)
@@ -267,7 +280,54 @@ mod tests {
 
     #[test]
     fn the_launcher_adds_yolo_by_default() {
-        assert_eq!(launch_handoff(&fixture(), &laptop()).args, vec![YOLO]);
+        assert_eq!(
+            launch_handoff(&fixture(), &laptop()).args,
+            vec![YOLO, TRUST_HOOKS]
+        );
+    }
+
+    #[test]
+    fn a_bare_interactive_launch_opens_the_agents_view() {
+        let interactive = World {
+            stdin_is_tty: true,
+            stdout_is_tty: true,
+            ..laptop()
+        };
+        assert_eq!(
+            launch_handoff(&fixture(), &interactive).args,
+            vec![YOLO, TRUST_HOOKS, "agents"]
+        );
+    }
+
+    #[test]
+    fn a_noninteractive_or_explicit_launch_does_not_open_the_agents_view() {
+        let stdin_is_a_pipe = World {
+            stdin_is_tty: false,
+            stdout_is_tty: true,
+            ..laptop()
+        };
+        assert_eq!(
+            launch_handoff(&fixture(), &stdin_is_a_pipe).args,
+            vec![YOLO, TRUST_HOOKS]
+        );
+
+        let interactive = World {
+            stdin_is_tty: true,
+            stdout_is_tty: true,
+            ..laptop()
+        };
+        assert_eq!(
+            launch_handoff(&carrying(&["resume"]), &interactive).args,
+            vec![YOLO, TRUST_HOOKS, "resume"]
+        );
+    }
+
+    #[test]
+    fn the_launcher_autotrusts_checkout_hooks_without_duplicating_the_flag() {
+        assert_eq!(
+            launch_handoff(&carrying(&[TRUST_HOOKS, "--version"]), &laptop()).args,
+            vec![YOLO, TRUST_HOOKS, "--version"]
+        );
     }
 
     #[test]
@@ -288,7 +348,9 @@ mod tests {
             let args = launch_handoff(&carrying(&chosen), &laptop()).args;
             assert_eq!(
                 args,
-                chosen.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                std::iter::once(TRUST_HOOKS.to_string())
+                    .chain(chosen.iter().map(|a| a.to_string()))
+                    .collect::<Vec<_>>(),
                 "riabuild added a flag beside the developer's own policy"
             );
         }
@@ -299,7 +361,7 @@ mod tests {
     #[test]
     fn a_launch_that_names_no_policy_still_gets_the_default() {
         let args = launch_handoff(&carrying(&["exec", "--full-auto"]), &laptop()).args;
-        assert_eq!(args, vec![YOLO, "exec", "--full-auto"]);
+        assert_eq!(args, vec![YOLO, TRUST_HOOKS, "exec", "--full-auto"]);
     }
 
     #[test]
