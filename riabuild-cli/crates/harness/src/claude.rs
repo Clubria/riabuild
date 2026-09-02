@@ -24,8 +24,9 @@ use super::{Decode, Event, Kind};
 /// end of that pipe.
 ///
 /// Verified against Claude Code 2.1.235: this exact argv, with `--resume`,
-/// answers inside the session the id names.
-pub(super) fn argv(thread: Option<&str>, prompt: &str) -> Vec<String> {
+/// answers inside the session the id names. `--settings` is a root option
+/// taking exactly one value, verified against 2.1.252.
+pub(super) fn argv(thread: Option<&str>, prompt: &str, org_settings: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-p".into(),
         "--output-format".into(),
@@ -36,6 +37,21 @@ pub(super) fn argv(thread: Option<&str>, prompt: &str) -> Vec<String> {
         "--verbose".into(),
     ];
     args.extend(Kind::Claude.bypass().iter().map(|flag| (*flag).to_string()));
+    // The team's Claude Code settings. An interactive session gets them because
+    // every account launcher passes `--settings`; `riabuild agents` runs the
+    // binary itself, so until this was passed org policy stopped at the edge of
+    // the window — the model the org chose and a lead's `permissions.deny`
+    // applied to `claude` and to nothing `riabuild agents` started.
+    //
+    // What this names is the *vetted* cache `org_settings` writes, never the
+    // server's payload, so it has already been through `vetting.rs` and carries
+    // no program. `bypass()` above still decides the permission mode: it is
+    // argv and this is a file, and a turn that stopped to ask permission would
+    // have nobody to ask.
+    if let Some(settings) = org_settings {
+        args.push("--settings".into());
+        args.push(settings.to_string());
+    }
     if let Some(thread) = thread {
         args.push("--resume".into());
         args.push(thread.to_string());
@@ -444,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_turn_asks_for_the_whole_stream_and_carries_the_bypass() {
-        let args = argv(None, "hello");
+        let args = argv(None, "hello", None);
         // `--verbose`, without which the stream is the final result and nothing
         // else — no tool calls, no subagents, no reasoning.
         assert!(
@@ -461,6 +477,10 @@ mod tests {
         // conversation reading stdin for ever, and a detached child has nobody
         // holding the write end of that pipe.
         assert!(!args.iter().any(|a| a == "--input-format"));
+        // A machine with no cached team settings names no file, rather than
+        // naming one that is not there. The account launchers drop `--settings`
+        // under exactly the same condition.
+        assert!(!args.iter().any(|a| a == "--settings"));
     }
 
     #[test]
@@ -468,11 +488,32 @@ mod tests {
         // `--resume` takes an *optional* value. With the id immediately before
         // the prompt, the prompt is the next positional and the id is the
         // option's value; any other order risks the prompt being read as the id.
-        let args = argv(Some("abc"), "hello");
+        let args = argv(Some("abc"), "hello", None);
         assert_eq!(args.last().unwrap(), "hello");
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
         let resume_at = args.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(args[resume_at + 1], "abc");
         assert_eq!(args[resume_at + 2], "hello");
+    }
+
+    /// The team's settings reach a headless turn, which is the only way the
+    /// model the org chose applies to `riabuild agents` at all: nothing else
+    /// here passes `--settings`, because nothing else has an account launcher
+    /// in front of it.
+    #[test]
+    fn the_team_settings_are_carried_and_still_leave_the_prompt_last() {
+        let args = argv(Some("abc"), "hello", Some("/home/dev/.riabuild/org.json"));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--settings", "/home/dev/.riabuild/org.json"])
+        );
+        // Ahead of `--resume`, and both ahead of the prompt. `--settings` takes
+        // exactly one value, so the danger is not that it swallows the id — it
+        // is an order in which the *prompt* becomes somebody's option value.
+        let settings_at = args.iter().position(|a| a == "--settings").unwrap();
+        let resume_at = args.iter().position(|a| a == "--resume").unwrap();
+        assert!(settings_at < resume_at);
+        assert_eq!(args.last().unwrap(), "hello");
+        assert_eq!(args.iter().filter(|a| *a == "hello").count(), 1);
     }
 }

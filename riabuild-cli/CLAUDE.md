@@ -1472,6 +1472,39 @@ thing on two of the three, silently *denies* whatever was not pre-approved and p
 an agent refusing its own tools. There is no approval round-trip anywhere in
 `riabuild-harness`, and that absence is what makes one event model possible.
 
+**A Claude Code turn carries the team's settings, because it is the one Claude Code
+riabuild starts with no launcher in front of it.** `internal agent-turn` passes
+`--settings ~/.riabuild/org-settings.json`, which every `claude`, `claude-1` … `claude-N`
+has always passed; without it org policy stopped at the edge of this window, and the
+symptom was not an error but a difference nobody could see — the model the org chose and a
+lead's `permissions.deny` applied to an interactive session and to nothing `riabuild
+agents` ran beside it.
+
+The file is resolved per turn for the reason the *binary* is, and recorded on the session
+for neither: both move with an upgrade. It is dropped where it is not on disk, exactly as
+the launchers drop it, so a machine nothing has provisioned still runs turns rather than
+failing to look up a policy it has never had. And it is the **vetted** cache
+`org_settings` writes rather than the server's payload, so this adds no route by which
+riabuild-web could put a program on the exec line — `vetting.rs` has already refused the
+keys that name one. `bypass()` still decides the permission mode: it is argv, the settings
+are a file, and a turn that stopped to ask permission would have nobody to ask.
+
+`Kind::argv` takes it for Claude Code alone. That is a fact about the other two rather
+than an omission — neither the Codex CLI nor Grok Build reads a file riabuild brokers on
+the org's behalf, and handing either the flag would not be inert: it would fail in their
+own parsers, killing every Codex and Grok turn on a provisioned machine at once.
+`only_claude_code_is_given_the_teams_settings_file` is the gate on that.
+
+**The model split rides on this and on nothing else.** `model: "opus"` with
+`env.CLAUDE_CODE_SUBAGENT_MODEL: "sonnet"` is the org's default: a session on Opus whose
+subagents default to Sonnet. The two halves are spelled differently because Claude Code
+spells them differently — the session's model is a settings key and the subagent default
+has **no settings key at all** (verified against 2.1.252), only that environment variable,
+which is why it travels inside `env` and why the paragraph above about checking a key is a
+key applies to it in reverse. A subagent whose `.claude/agents/*.md` names its own `model:`
+still wins, which is the right way round: that file arrives through a pull request and the
+dashboard does not.
+
 **Claude Code's `--bare` is deliberately not passed.** It is the flag that would suppress
 the remaining hook, plugin and MCP discovery, and its own `--help` says why it cannot be
 used here: *"Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via

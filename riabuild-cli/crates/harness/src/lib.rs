@@ -173,9 +173,22 @@ impl Kind {
     ///
     /// `thread` is what this harness answered with last time, and its absence is
     /// what makes a turn the *first* one. Nothing else distinguishes them.
-    pub fn argv(self, thread: Option<&str>, prompt: &str) -> Vec<String> {
+    ///
+    /// `org_settings` is the team's Claude Code settings file, and it reaches
+    /// **Claude Code only**. That is a fact about the other two rather than an
+    /// omission here: neither the Codex CLI nor Grok Build reads a file riabuild
+    /// brokers on the org's behalf, so there is nothing for the other two arms
+    /// to do with it. `None` where the file is not on disk — a machine nothing
+    /// has provisioned still runs turns, the same way the account launchers drop
+    /// `--settings` rather than naming a file that is not there.
+    pub fn argv(
+        self,
+        thread: Option<&str>,
+        prompt: &str,
+        org_settings: Option<&str>,
+    ) -> Vec<String> {
         match self {
-            Kind::Claude => claude::argv(thread, prompt),
+            Kind::Claude => claude::argv(thread, prompt, org_settings),
             Kind::Codex => codex::argv(thread, prompt),
             Kind::Grok => grok::argv(thread, prompt),
         }
@@ -298,12 +311,28 @@ mod tests {
         // nobody able to answer it.
         for kind in Kind::ALL {
             for thread in [None, Some("existing")] {
-                let argv = kind.argv(thread, "hello");
-                for flag in kind.bypass() {
-                    assert!(argv.iter().any(|arg| arg == flag), "{kind:?} {thread:?}");
+                for settings in [None, Some("/org.json")] {
+                    let argv = kind.argv(thread, "hello", settings);
+                    for flag in kind.bypass() {
+                        assert!(argv.iter().any(|arg| arg == flag), "{kind:?} {thread:?}");
+                    }
+                    assert!(argv.iter().any(|arg| arg == "hello"), "{kind:?}");
                 }
-                assert!(argv.iter().any(|arg| arg == "hello"), "{kind:?}");
             }
+        }
+    }
+
+    /// The team's settings are a Claude Code file, and handing the flag to a
+    /// harness that has never heard of it would not be inert — both of the
+    /// others would fail to parse their own command line, so every Codex and
+    /// Grok turn on a provisioned machine would die at once while every test
+    /// that passed `None` went on passing.
+    #[test]
+    fn only_claude_code_is_given_the_teams_settings_file() {
+        for kind in Kind::ALL {
+            let argv = kind.argv(Some("existing"), "hello", Some("/org.json"));
+            let carried = argv.iter().any(|arg| arg == "--settings");
+            assert_eq!(carried, kind == Kind::Claude, "{kind:?}");
         }
     }
 

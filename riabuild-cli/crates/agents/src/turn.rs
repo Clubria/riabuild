@@ -29,12 +29,20 @@ use crate::store::{Record, Store};
 
 /// Runs the turn whose prompt is waiting in `prompt_file`.
 ///
+/// `org_settings` is the team's Claude Code settings file, or `None` where this
+/// machine has none cached. It is resolved by the caller for the reason the
+/// binary is — both move with a riabuild upgrade, and neither may be recorded
+/// on a session written last week — and it is checked for existence there
+/// rather than here, so that a turn on an unprovisioned machine names no file
+/// instead of naming one that is not on disk.
+///
 /// Returns the harness's exit code.
 pub async fn run(
     runner: &dyn CommandRunner,
     store: &Store,
     id: &str,
     program: &str,
+    org_settings: Option<&Path>,
     prompt_file: &Path,
 ) -> Result<i32> {
     // Waits rather than refusing. Two prompts sent while a turn is in flight are
@@ -62,7 +70,7 @@ pub async fn run(
         .await
         .with_context(|| format!("no prompt at {}", prompt_file.display()))?;
 
-    let outcome = one_turn(runner, store, &record, program, &prompt).await;
+    let outcome = one_turn(runner, store, &record, program, org_settings, &prompt).await;
 
     // Whatever happened, the prompt is not run twice. A wrapper that failed and
     // left the file behind would replay that turn on the next window's tick.
@@ -86,12 +94,14 @@ async fn one_turn(
     store: &Store,
     record: &Record,
     program: &str,
+    org_settings: Option<&Path>,
     prompt: &str,
 ) -> Result<i32> {
     let Some(kind) = record.harness() else {
         anyhow::bail!("unknown harness");
     };
-    let args = kind.argv(record.thread.as_deref(), prompt);
+    let settings = org_settings.map(|path| path.to_string_lossy().into_owned());
+    let args = kind.argv(record.thread.as_deref(), prompt, settings.as_deref());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut env = Vec::new();
@@ -229,7 +239,7 @@ mod tests {
         let stream = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-1\",\"model\":\"m\"}\n";
         let runner = FakeRunner::new().piping("/opt/claude", stream, 0);
 
-        run(&runner, &store, &record.id, "/opt/claude", &file)
+        run(&runner, &store, &record.id, "/opt/claude", None, &file)
             .await
             .unwrap();
 
@@ -262,7 +272,7 @@ mod tests {
         let file = queued(&store, &record.id, "again").await;
 
         let runner = FakeRunner::new().piping("/opt/claude", "{}\n", 0);
-        run(&runner, &store, &record.id, "/opt/claude", &file)
+        run(&runner, &store, &record.id, "/opt/claude", None, &file)
             .await
             .unwrap();
 
@@ -274,6 +284,42 @@ mod tests {
         assert!(
             env.contains(&("CLAUDE_CONFIG_DIR".to_string(), "/r/claude/abc".to_string())),
             "{env:?}"
+        );
+    }
+
+    /// Org policy reaches a session `riabuild agents` started.
+    ///
+    /// This is the seam the feature lives on: every interactive Claude Code gets
+    /// the team's settings from its account launcher, and a turn has no launcher
+    /// in front of it — so before the file was passed here, the model the org
+    /// chose and a lead's `permissions.deny` applied to `claude` and to nothing
+    /// in this window.
+    #[tokio::test]
+    async fn a_turn_hands_claude_code_the_teams_settings() {
+        let (_dir, store) = store();
+        let record = store
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
+            .await
+            .unwrap();
+        let file = queued(&store, &record.id, "hello").await;
+
+        let runner = FakeRunner::new().piping("/opt/claude", "{}\n", 0);
+        run(
+            &runner,
+            &store,
+            &record.id,
+            "/opt/claude",
+            Some(Path::new("/r/org-settings.json")),
+            &file,
+        )
+        .await
+        .unwrap();
+
+        let calls = runner.calls();
+        assert!(
+            calls[0].contains("--settings /r/org-settings.json"),
+            "{}",
+            calls[0]
         );
     }
 
@@ -292,7 +338,7 @@ mod tests {
         let file = queued(&store, &record.id, "hello").await;
 
         let runner = FakeRunner::new().spawning("/opt/grok", 2, "not signed in");
-        let code = run(&runner, &store, &record.id, "/opt/grok", &file)
+        let code = run(&runner, &store, &record.id, "/opt/grok", None, &file)
             .await
             .unwrap();
         assert_eq!(code, 2);
@@ -317,7 +363,7 @@ mod tests {
 
         let runner = FakeRunner::new().piping("/opt/codex", "{\"type\":\"turn.completed\"}\n", 0);
         assert!(!store.running(&record.id).await);
-        run(&runner, &store, &record.id, "/opt/codex", &file)
+        run(&runner, &store, &record.id, "/opt/codex", None, &file)
             .await
             .unwrap();
         // Released, so the next window reads this session as idle rather than as
