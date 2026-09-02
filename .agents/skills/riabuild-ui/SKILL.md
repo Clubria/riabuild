@@ -8,7 +8,7 @@ description: Use when building, changing, styling or reviewing any user interfac
 `riabuild-web` is one framed terminal. Everything visual goes through
 `riabuild-web/src/ui/`. Design: `docs/superpowers/specs/2026-08-05-tui-console-design.md`.
 
-**Before claiming any UI works, read `.claude/skills/visual-testing/SKILL.md`.** Looking at
+**Before claiming any UI works, read `.agents/skills/visual-testing/SKILL.md`.** Looking at
 the rendered result is not optional here.
 
 ## The one rule people get wrong
