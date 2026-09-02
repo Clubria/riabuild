@@ -306,6 +306,28 @@ check_contains "the status line names the repository the developer is in" \
       | "$RIA_HOME/node/$NODE_VERSION/bin/node" "$RIA_HOME/claude-statusline.js" 2>&1)" \
   "(riabuild · $E2E_REPO_SLUG)"
 
+# And which account the window is, which is the same argument one step over. The
+# unit tests hand the script a `config.json` written for the occasion; this is
+# the one place it reads the one `riabuild` itself wrote, against the account
+# directory the run really created — so an `claude_accounts` that stopped being
+# the ordered list the number is counted from would be caught here and nowhere
+# else.
+#
+# `CLAUDE_CONFIG_DIR` is set explicitly rather than relied on, because this
+# script is not a launcher: on a laptop running the suite from inside Claude
+# Code the variable is already in the environment, naming a different account
+# entirely, and the assertion would be about the developer rather than the run.
+#
+# Only the number is asserted. The e2e account is never signed in to a real
+# Claude subscription, so there is no email to expect — and a check that
+# demanded one would be a check that can only pass by someone's credentials
+# leaking into CI.
+check_contains "the status line names which account the window is" \
+  "$(cd "$PROJECT_DIR" && printf '{}' \
+      | CLAUDE_CONFIG_DIR="$RIA_HOME/claude/$CLAUDE_ACCOUNT" \
+        "$RIA_HOME/node/$NODE_VERSION/bin/node" "$RIA_HOME/claude-statusline.js" 2>&1)" \
+  "claude-1"
+
 # The whole reason riabuild exists: a developer ends up with working secrets.
 ENV_DEV="$PROJECT_DIR/.env.dev"
 check "the project has a .env.dev" test -f "$ENV_DEV"
