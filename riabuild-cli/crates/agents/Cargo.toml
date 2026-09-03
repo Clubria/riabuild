@@ -18,6 +18,11 @@ anyhow.workspace = true
 # under a lock to avoid handing both the same directory.
 getrandom.workspace = true
 ratatui.workspace = true
+# The clipboard Ctrl-V reads. Depended on for the `Clipboard` trait and the MIME
+# names, never for a platform: which backend answers is decided in that crate,
+# and on a server the tool it runs is riabuild's own shim, so the clipboard this
+# window pastes from is the laptop's without anything here knowing it.
+riabuild-channel.workspace = true
 riabuild-harness.workspace = true
 riabuild-paths.workspace = true
 riabuild-runner.workspace = true

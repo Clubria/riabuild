@@ -233,7 +233,20 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
     };
 
     let logins = ask_who_is_signed_in(ctx);
-    agents::run(ctx.runner.clone(), ctx.paths.as_ref(), request, logins).await?;
+    // What Ctrl-V reads. Resolved here rather than in the window, because which
+    // backend this machine needs is the one platform question and
+    // `riabuild-channel` is where it is answered. On a server the `xclip` it
+    // finds is riabuild's own shim, so the clipboard pasted from is the
+    // developer's laptop and nothing had to be written for that to be true.
+    let clipboard = riabuild_channel::clipboard::for_this_machine(ctx.runner.clone());
+    agents::run(
+        ctx.runner.clone(),
+        ctx.paths.as_ref(),
+        request,
+        logins,
+        clipboard,
+    )
+    .await?;
     Ok(0)
 }
 

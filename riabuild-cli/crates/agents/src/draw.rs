@@ -400,6 +400,12 @@ fn whose(app: &App) -> Option<(String, riabuild_harness::Kind, usize)> {
 
 /// The key hints, which change with what the keyboard is talking to.
 pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
+    // A notice takes the whole line while it lasts. It is the answer to the key
+    // just pressed, and the hints it stands in front of are still true — showing
+    // both would make the one thing worth reading the shorter half of the line.
+    if let Some(notice) = &app.notice {
+        return Line::from(Span::styled(notice.clone(), theme.style(Role::Warn)));
+    }
     let keys: &[(&str, &str)] = match app.focus {
         Focus::List => &[
             ("↑↓", "move"),
@@ -411,6 +417,11 @@ pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
         Focus::Session => &[
             ("type", "to write"),
             ("enter", "send"),
+            // Advertised because it is the one key here a developer would
+            // otherwise assume their terminal had eaten: Ctrl-V reaching this
+            // window at all is unusual, and an image is the thing they cannot
+            // type.
+            ("^v", "paste"),
             ("↑↓", "scroll"),
             ("←", "sessions"),
         ],
@@ -531,6 +542,31 @@ pub(crate) mod tests {
         assert!(rendered.iter().any(|row| row == "All tests pass."));
     }
 
+    /// Ctrl-V is advertised because it is the one key here a developer would
+    /// otherwise assume their terminal had eaten, and a notice takes the line
+    /// while it lasts — the hints are still true, but they are not the thing
+    /// worth reading.
+    #[test]
+    fn the_footer_offers_paste_and_gives_the_line_up_for_a_notice() {
+        let theme = Theme::with_depth(Depth::Ansi16);
+        let mut app = App::new(Accounts::default());
+        app.focus = Focus::Session;
+        let hints: String = footer_line(&app, theme)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(hints.contains("^v paste"), "{hints}");
+
+        app.notice = Some("Nothing on the clipboard to paste.".into());
+        let notice: String = footer_line(&app, theme)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(notice, "Nothing on the clipboard to paste.");
+    }
+
     #[test]
     fn every_colour_on_screen_comes_from_the_palette() {
         // The rule the rest of riabuild follows, and the one ratatui makes easy
@@ -563,6 +599,12 @@ pub(crate) mod tests {
         lines.push(counts_line(&app, sixteen));
         lines.push(status_line(&app, sixteen, 60));
         lines.push(footer_line(&app, sixteen));
+        // The footer has two shapes and the notice is the one that only appears
+        // after a key was pressed — exactly the sort of line a palette check
+        // over one frame never reaches.
+        let mut noticed = App::new(Accounts::default());
+        noticed.notice = Some("Nothing on the clipboard to paste.".into());
+        lines.push(footer_line(&noticed, sixteen));
         lines.push(compose_line(&app, sixteen));
         lines.extend(picker_lines(&app, sixteen, true));
         lines.extend(splash_lines(

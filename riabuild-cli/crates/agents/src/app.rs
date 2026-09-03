@@ -329,6 +329,15 @@ pub struct App {
     pub scrollback: u16,
     /// Advanced on every redraw tick, for the one spinner.
     pub tick: usize,
+    /// One line the window has to say about the last key, shown where the hints
+    /// are and gone on the next keypress.
+    ///
+    /// It exists because Ctrl-V can succeed at nothing: an empty clipboard, a
+    /// laptop with no clipboard tool installed, a `wl-paste` that would not
+    /// run. None of those is worth taking the window down for, and all of them
+    /// are worse as silence — a key that does nothing and says nothing is
+    /// indistinguishable from one that is not bound.
+    pub notice: Option<String>,
 }
 
 impl App {
@@ -366,6 +375,7 @@ impl App {
             quit: false,
             scrollback: 0,
             tick: 0,
+            notice: None,
         }
     }
 

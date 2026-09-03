@@ -104,6 +104,36 @@ pub fn detect(
     None
 }
 
+/// The clipboard this machine can reach, or `None` where it has none.
+///
+/// The wrapper that supplies the real platform to [`detect`], the way
+/// `laptop_agent` does for the whole agent. Everything below that line takes
+/// the OS as a parameter and is tested for all three sessions; this is the one
+/// function here that answers *which machine is this*, and it exists so a
+/// caller outside this crate can read a clipboard without asking that question
+/// again with different rules.
+///
+/// On a server the `xclip` it finds is riabuild's own shim, so what comes back
+/// is the developer's laptop's clipboard. Nothing here has to know that: the
+/// shim is on `PATH` under the name the backend already runs.
+pub fn for_this_machine(runner: Arc<dyn CommandRunner>) -> Option<Box<dyn Clipboard>> {
+    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let session = detect(&runner, std::env::consts::OS, wayland.as_deref())?;
+    Some(backend(runner, session))
+}
+
+/// The install line for a machine [`for_this_machine`] found nothing on.
+///
+/// Beside it rather than inside its `None`, so the caller decides when to say
+/// it — a window that never has a clipboard read from it should not open with
+/// an installation instruction. It is here rather than at that caller for the
+/// same reason `for_this_machine` is: which tool to name is a question about
+/// this machine, and this crate is where those are answered.
+pub fn install_hint_for_this_machine() -> &'static str {
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    install_hint(!wayland.is_empty())
+}
+
 pub fn backend(runner: Arc<dyn CommandRunner>, session: Session) -> Box<dyn Clipboard> {
     match session {
         Session::X11 => Box::new(CliClipboard::x11(runner)),

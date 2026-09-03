@@ -60,6 +60,15 @@ use serde::{Deserialize, Serialize};
 /// genuinely stale.
 const KEEP: usize = 50;
 
+/// How many pasted images are kept, over the whole store.
+///
+/// A smaller number than [`KEEP`] because the units are not comparable: a
+/// session record is a few hundred bytes of JSON, and a pasted screenshot is a
+/// few megabytes. Unbounded, this is the one directory riabuild writes that
+/// grows with how much a developer works rather than with how much riabuild
+/// has to remember.
+const KEEP_IMAGES: usize = 20;
+
 /// What riabuild remembers about one session.
 ///
 /// Deliberately small, and deliberately not the transcript: the transcript is
@@ -140,6 +149,27 @@ fn new_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The name a pasted file is written under.
+///
+/// The clock first, so a directory listing is in the order the developer pasted
+/// and the oldest is the one [`Store::prune_images`] drops. [`new_id`] after it
+/// because the clock's resolution is a second: two pastes inside one second are
+/// two files, and a name that was only the clock would have the second
+/// overwrite the first while the compose line still pointed at it.
+pub fn stamped_name() -> String {
+    format!("{}-{}", now(), new_id())
+}
+
+/// The clock half of a [`stamped_name`], for ordering. Zero for a name that was
+/// not written by this — a developer's own file dropped in the directory sorts
+/// oldest and is dropped first, which is the safe end to be wrong at.
+fn stamped_at(name: &str) -> u64 {
+    name.split('-')
+        .next()
+        .and_then(|at| at.parse().ok())
+        .unwrap_or_default()
+}
+
 /// The sessions on this machine, for one developer.
 pub struct Store {
     root: PathBuf,
@@ -181,6 +211,22 @@ impl Store {
     /// see a session that simply never did anything.
     pub fn trouble_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join("errors.log")
+    }
+
+    /// Where a pasted image is written.
+    ///
+    /// One directory for the whole store rather than one per session, because
+    /// Ctrl-V is pressed while composing and the row under the cursor may still
+    /// be an *offer* — there is no session directory to put it in until the
+    /// prompt that names it has been sent. Splitting it across the two cases
+    /// would put half a developer's pasted images somewhere the other half is
+    /// not.
+    ///
+    /// It sits beside the sessions and is not one: [`Store::sessions`] reads
+    /// every entry here and keeps only those with a readable `meta.json`, so a
+    /// directory that has none is already skipped.
+    pub fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
     }
 
     /// The queue a turn takes its prompt from.
@@ -397,6 +443,30 @@ impl Store {
         Ok(())
     }
 
+    /// Drops the oldest pasted images past [`KEEP_IMAGES`].
+    ///
+    /// Not scoped by checkout the way [`Store::prune`] is, because the
+    /// directory is not: Ctrl-V happens before the prompt that names the image
+    /// exists, so nothing has yet said which repository it belongs to.
+    ///
+    /// A missing directory is not a failure. Most developers never paste an
+    /// image, and this runs on every window.
+    pub async fn prune_images(&self) -> Result<()> {
+        let dir = self.images_dir();
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            return Ok(());
+        };
+        let mut names: Vec<String> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort_by_key(|name| std::cmp::Reverse(stamped_at(name)));
+        for name in names.into_iter().skip(KEEP_IMAGES) {
+            let _ = tokio::fs::remove_file(dir.join(name)).await;
+        }
+        Ok(())
+    }
+
     /// Removes one session's directory. `riabuild agents forget`.
     pub async fn forget(&self, id: &str) -> Result<()> {
         if self.running(id).await {
@@ -427,6 +497,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::rooted_at(dir.path().join("agents"));
         (dir, store)
+    }
+
+    /// A pasted image lives beside the sessions and is not one. `sessions`
+    /// keeps only the directories with a readable `meta.json`, so a store with
+    /// an `images/` in it still lists exactly the sessions it has.
+    #[tokio::test]
+    async fn the_images_directory_is_not_mistaken_for_a_session() {
+        let (_dir, store) = store();
+        let account = Account::new(Kind::Claude, 1, None);
+        store.create(&account, Path::new("/work")).await.unwrap();
+        tokio::fs::create_dir_all(store.images_dir()).await.unwrap();
+        tokio::fs::write(store.images_dir().join("x.png"), b"x")
+            .await
+            .unwrap();
+
+        assert_eq!(store.sessions(Path::new("/work")).await.unwrap().len(), 1);
+    }
+
+    /// The cap is the whole reason this directory is safe to write into on a
+    /// keypress: a screenshot is megabytes, and nothing else riabuild stores
+    /// grows with how much a developer works.
+    #[tokio::test]
+    async fn pasted_images_are_capped_at_the_newest() {
+        let (_dir, store) = store();
+        let dir = store.images_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Named the way `stamped_name` names them, oldest second first.
+        for second in 0..(KEEP_IMAGES as u64 + 5) {
+            tokio::fs::write(dir.join(format!("{second}-{second:032x}.png")), b"x")
+                .await
+                .unwrap();
+        }
+
+        store.prune_images().await.unwrap();
+
+        let mut left = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            left.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(left.len(), KEEP_IMAGES);
+        // The newest survive, which is the half a compose line might still be
+        // pointing at.
+        assert!(left.iter().all(|name| stamped_at(name) >= 5), "{left:?}");
+    }
+
+    /// Called on every window, and most developers have never pasted anything.
+    #[tokio::test]
+    async fn pruning_images_that_were_never_pasted_is_not_a_failure() {
+        let (_dir, store) = store();
+        assert!(store.prune_images().await.is_ok());
     }
 
     #[tokio::test]

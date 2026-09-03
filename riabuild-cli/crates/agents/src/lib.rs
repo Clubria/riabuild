@@ -79,6 +79,7 @@ pub mod compose;
 pub mod draw;
 mod drive;
 pub mod frame;
+pub mod paste;
 pub mod store;
 pub mod turn;
 
@@ -145,6 +146,11 @@ pub enum Action {
     Nothing,
     Quit,
     Send(String),
+    /// Ctrl-V. Asked for here and performed in [`drive`], because reading a
+    /// clipboard is a subprocess and this function is a pure map from a
+    /// keypress to an intention — the same reason sending a prompt is
+    /// [`Action::Send`] rather than a turn started from inside the keymap.
+    Paste,
 }
 
 /// The keymap.
@@ -160,10 +166,15 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
     if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
         return Action::Quit;
     }
+    // A notice is the answer to the last key, so the next key is what it stops
+    // being true for. Cleared here rather than on a timer: a message that
+    // vanishes on its own is one a developer can miss entirely, and one that
+    // stays is still on screen after the thing it described was undone.
+    app.notice = None;
 
     match app.focus {
         Focus::List => list_key(app, event.code),
-        Focus::Session => session_key(app, event.code),
+        Focus::Session => session_key(app, event),
         Focus::Picker => picker_key(app, event.code),
     }
 }
@@ -211,8 +222,23 @@ fn list_key(app: &mut App, code: KeyCode) -> Action {
 
 /// A session, or an offer about to become one. Every character typed here goes
 /// into the box; the arrows keep their meanings around it.
-fn session_key(app: &mut App, code: KeyCode) -> Action {
-    match code {
+///
+/// The one sub-keymap given the whole [`KeyEvent`] rather than its `KeyCode`,
+/// because it is the only one with a text field: everywhere else a modifier
+/// changes nothing, and here dropping it is the difference between Ctrl-V and
+/// a literal `v` typed into the developer's prompt.
+fn session_key(app: &mut App, event: KeyEvent) -> Action {
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        return match event.code {
+            KeyCode::Char('v') => Action::Paste,
+            // Every other control key inserts nothing. Without this arm the
+            // bare letter goes in the box, so a developer reaching for their
+            // terminal's own Ctrl-something finds it typed into their prompt
+            // instead of ignored.
+            _ => Action::Nothing,
+        };
+    }
+    match event.code {
         KeyCode::Esc => {
             app.focus = Focus::List;
             Action::Nothing
@@ -344,16 +370,24 @@ fn keys() -> UnboundedReceiver<TermEvent> {
 }
 
 /// Takes the terminal, runs until the developer leaves, and gives it back.
+///
+/// `clipboard` is passed in rather than found here, for the rule that keeps
+/// every platform decision in the four crates allowed to make one: which
+/// backend this machine needs is `riabuild-channel`'s question, already
+/// answered by `clipboard::for_this_machine`. `None` is a Linux laptop with
+/// neither `xclip` nor `wl-clipboard`, and Ctrl-V says so rather than failing.
 pub async fn run(
     runner: Arc<dyn CommandRunner>,
     paths: &dyn riabuild_paths::Paths,
     request: Request,
     logins: UnboundedReceiver<Login>,
+    clipboard: Option<Box<dyn riabuild_channel::clipboard::Clipboard>>,
 ) -> Result<()> {
     let store = Store::new(paths);
     // Before anything is listed, so the cap is enforced by using the window
     // rather than by a command nobody remembers to run.
     let _ = store.prune(&request.cwd).await;
+    let _ = store.prune_images().await;
 
     let mut app = App::new(request.accounts.clone());
     let mut readers = drive::restore(&store, &request, &mut app).await?;
@@ -378,7 +412,10 @@ pub async fn run(
     let outcome = drive::drive(
         &mut terminal,
         &store,
-        runner.as_ref(),
+        drive::Reach {
+            runner: runner.as_ref(),
+            clipboard: clipboard.as_deref(),
+        },
         &request,
         &mut app,
         &mut readers,
@@ -741,5 +778,66 @@ mod tests {
         let homes: Vec<_> = accounts.all().iter().map(|a| a.home.clone()).collect();
         assert_eq!(homes[0], Some(PathBuf::from("/r/claude/abc")));
         assert_ne!(homes[0], homes[1]);
+    }
+
+    fn hold(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_v_in_a_session_asks_for_the_clipboard() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        assert_eq!(key(&mut app, hold(KeyCode::Char('v'))), Action::Paste);
+        // and nothing was typed: the box is what it was.
+        assert!(app.compose.is_empty());
+    }
+
+    /// The bug this arm exists to prevent. `session_key` was given the key
+    /// *code* alone, so a modifier was not merely ignored — it was invisible,
+    /// and Ctrl-V arrived as the letter `v` in the developer's prompt.
+    #[test]
+    fn a_plain_v_is_still_a_letter() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        type_into(&mut app, "give");
+        assert_eq!(key(&mut app, hold(KeyCode::Char('v'))), Action::Paste);
+        assert_eq!(app.compose.text(), "give");
+    }
+
+    /// Every other control key is ignored rather than half-typed. A developer
+    /// reaching for their terminal's own Ctrl-W should not find a `w` in their
+    /// prompt when the terminal did not take it.
+    #[test]
+    fn other_control_keys_type_nothing() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        for ch in ['w', 'u', 'a', 'e', 'l'] {
+            assert_eq!(key(&mut app, hold(KeyCode::Char(ch))), Action::Nothing);
+        }
+        assert!(app.compose.is_empty());
+    }
+
+    /// Ctrl-C still leaves from inside the box, which is checked before the
+    /// control arm above could swallow it.
+    #[test]
+    fn ctrl_c_still_leaves_from_the_compose_line() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        assert_eq!(key(&mut app, hold(KeyCode::Char('c'))), Action::Quit);
+    }
+
+    /// A notice is the answer to one key, so the next key is what it stops
+    /// being true for — never a timer, which either takes the message away
+    /// before it is read or leaves it up after it is wrong.
+    #[test]
+    fn a_notice_lasts_until_the_next_keypress() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Enter));
+        app.notice = Some("Nothing on the clipboard to paste.".into());
+        // Not cleared by the redraw tick, which does not go through the keymap.
+        assert!(app.notice.is_some());
+        key(&mut app, press(KeyCode::Char('a')));
+        assert_eq!(app.notice, None);
     }
 }

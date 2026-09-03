@@ -716,7 +716,7 @@ crates form a straight line, each depending only on those above it:
 | `tasks` | the `Task` trait, the registry, the DAG runner, one file per task; `owned_tool` (the table of tools riabuild downloads whole — one row per tool, carrying its release, digest, probe and shim); `accounts` (the Claude Code accounts), `repo` (which repository a run is about: the `gh` listing, the box, and the picker), `shell` (zsh, bash, fish), `shims` (`~/.riabuild/bin` generation, and `launch` — what those one-line launchers do, in Rust), `scope` (laptop vs. server) | all of the above |
 | `remote` | remote mode: identity, host-key trust, authorising a key, installing the server's own binary, minting its session, seeding a GitHub sign-in, and the mosh/ssh handoff. `askpass` answers the password prompt when the key cannot sign in; `pick` is the prompt a bare `riabuild remote` puts, and `render` the box it and `list` show; `repo` is the question straight after it — which repository, asked here rather than on the server, and forwarded as `--repo`; `shared` folds the team's servers in from riabuild-web on every run; `ssh` is the one place an `ssh` invocation is composed, and all thirteen call sites go through it. `channel` is where the clipboard channel is attached to a session — `lease` decides which of this laptop's sessions serves it, `hold` waits for a turn and takes one | all of the above |
 | `harness` | what to run for each agent harness and how to read what it says. `claude`, `codex` and `grok` build one turn's argv and decode that harness's NDJSON. Starts nothing and reads nothing | — |
-| `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure), with `compose` the one text field in it; `draw` turns that into ratatui lines and `frame` puts those lines into areas; `drive` is the loop, and the one place a session is created | harness, paths, runner, theme, ui |
+| `agents` | the `riabuild agents` window. `store` is the sessions on disk — records, spools, locks; `turn` is what `internal agent-turn` runs; `app` is what is on screen and how an event changes it (pure), with `compose` the one text field in it; `draw` turns that into ratatui lines and `frame` puts those lines into areas; `paste` is what Ctrl-V puts in that field, which for an image is a file it wrote and the path to it; `drive` is the loop, and the one place a session is created | channel, harness, paths, runner, theme, ui |
 | `cli` | the binary. `main` (parse argv, assemble `Ctx`, dispatch), `dispatch` (argv → library calls), `provision` (the default flow), `internal`, `reset`, `move_project`, `fs_move`, `update` | all of the above |
 
 **The graph is the point, not the file count.** `riabuild-runner` cannot name a `Task`;
@@ -1507,6 +1507,47 @@ it leave for the rail (`compose.at_start()` is what that branches on). Enter sen
 *stays*, since a conversation is a sequence of prompts. `PageUp`/`PageDown` still work and
 nothing depends on them — they are `Fn` and an arrow on every laptop keyboard in the room,
 which is why the plain arrows scroll.
+
+**Ctrl-V pastes, and a pasted image becomes a file whose path goes in the prompt.** An
+agent reads *files*; a clipboard holds bytes with no name; and a turn is a detached child
+started with argv, with nobody left holding its stdin — the same constraint that ruled out
+Claude Code's `--input-format stream-json` below. So `agents::paste` writes the bytes to
+`<root>/agents/images/` and puts the path in the compose line, as text the developer can
+see and edit. Not behind an `[image #1]` placeholder: that is a second copy of "which
+attachment is this" to keep in step with a line they can backspace through, and this way
+what is on screen is exactly what the agent is given.
+
+The directory is one for the whole store rather than one per session, because Ctrl-V is
+pressed while composing and the row under the cursor may still be an **offer** — there is
+no session directory until the prompt naming the image has been sent. It sits beside the
+sessions and is not one: `Store::sessions` keeps only entries with a readable `meta.json`.
+`Store::prune_images` caps it at `KEEP_IMAGES`, lower than `KEEP` because a session record
+is bytes of JSON and a screenshot is megabytes, and this is the one directory riabuild
+writes that grows with how much a developer *works*. PNG is preferred over TIFF, which is
+what a macOS screenshot is on the pasteboard as both — for the same pixels, ten times the
+bytes to carry back from the laptop.
+
+**Text pastes too, deliberately.** Ctrl-V reaching this window at all means the terminal
+did not handle it — Cmd-V and Ctrl-Shift-V are the terminal's own bindings — so binding it
+to images alone would make the key dead for the commonest clipboard there is. It arrives
+flattened to one line, because `Compose` is a single-line editor with a character-indexed
+caret and a newline has no spelling in it.
+
+**And it works on a server because nothing in it knows it is on one.** `agents::paste`
+names no platform and no tool: it asks a `Clipboard` what it holds and reads one type.
+Which backend answers is `riabuild-channel`'s question, resolved in `dispatch.rs` by
+`clipboard::for_this_machine` and handed to `agents::run` — the platform rule above, with
+`laptop_agent` as the precedent. On a server the `xclip` that `detect` finds is riabuild's
+own shim, so the clipboard being read is the developer's laptop's. The remote case needed
+no code; it needed this code not to care.
+
+Every way it can fail is `App::notice` — one line where the key hints are, gone on the next
+keypress — rather than an error that closes the window: an empty clipboard, a `wl-paste`
+that would not run, or a Linux laptop with neither tool installed, which is named with
+`install_hint` rather than described, because "paste does not work" is not something a
+developer can act on. That is also why `session_key` is the one sub-keymap handed the whole
+`KeyEvent` rather than its `KeyCode`: it is the only one with a text field, and a dropped
+modifier is not an ignored key there, it is a literal `v` typed into somebody's prompt.
 
 **Separation is a background, not a line.** The session pane sits on `Theme::surface`, one
 step off the terminal's own background; the rail sits on the terminal's. No borders, no
