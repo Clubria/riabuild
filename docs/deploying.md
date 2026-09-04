@@ -9,7 +9,7 @@
 | Convex project | `lowerkinded / riabuild` |
 | `/api/v1` | **live**, returning 401 to anonymous callers |
 | Secret brokering | **working** — verified end to end through Convex's network |
-| Infisical | `https://clubria.infisical.com`, project `AI Builders`, paths `/tenant/aibuilders/frontend` and `/tenant/aibuilders/convex` |
+| Infisical | `https://infisical.clubria.com`, project `AI Builders`, paths `/tenant/aibuilders/frontend` and `/tenant/aibuilders/convex` |
 | Dashboard | **live** — <https://riabuild.clubria.com> (Cloudflare Pages, `riabuild-web`) |
 | GitHub sign-in | configured — verify the OAuth callback URL matches §2 |
 | Org membership checks | working — `GITHUB_ORG_TOKEN` verified against the live org |
@@ -155,11 +155,29 @@ export rather than degrading quietly. An org with no staging environment sets
 
 `INFISICAL_SITE_URL` must be set — the code otherwise defaults to `app.infisical.com`,
 where these identities do not exist and the login returns 401. It is
-`https://clubria.infisical.com`. Convex's servers can reach it; that was verified rather
+`https://infisical.clubria.com`. Convex's servers can reach it; that was verified rather
 than assumed, since an instance reachable from a developer laptop is not necessarily
 reachable from eu-west-1. Moving instances moves `INFISICAL_PROJECT_ID` and all three
 identity pairs with it — they are per instance, and a client id from the old one
 authenticates against the new one exactly as well as a wrong password does.
+
+**Read that hostname twice.** It is the service under our domain —
+`infisical.clubria.com` — and not a tenancy of Infisical's own SaaS, which is what
+`clubria.infisical.com` would be. Both spellings are plausible English and only one has a
+DNS record. The wrong one was set on production on 2026-09-04 and every developer's pull
+failed the same way for hours: `POST /api/v1/secrets/token` answered `upstream_error`, the
+CLI reported `riabuild could not broker an Infisical credential`, and **nothing anywhere
+said "that host does not exist"** — a name that fails to resolve and an instance that
+refuses a login are one error message here. The check that names it in one line, before
+touching anything else:
+
+```sh
+curl -sS https://$(npx convex env get INFISICAL_SITE_URL --prod | sed 's|https\?://||')/api/status
+```
+
+`{"message":"Ok",…}` means the host is right and the failure is the credential; a DNS
+error means it is the host. → `ai-builders-hub/docs/infra-domains-clubria-move.md`, which
+is the authority for every one of these subdomains.
 
 ### Deploying the dev/staging split onto an existing deployment
 
