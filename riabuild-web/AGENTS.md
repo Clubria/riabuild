@@ -11,11 +11,29 @@ Root conventions and the PR workflow rule are in `../AGENTS.md`. Design is in
 
 ```sh
 pnpm dev       # convex dev + vite
-pnpm lint      # tsc -b + eslint, zero warnings tolerated
+pnpm lint      # tsc -b + convex typecheck + eslint, zero warnings tolerated
 pnpm test      # vitest — Convex functions
 pnpm ui:check  # the whole Playwright suite — see below
 pnpm build
 ```
+
+**`tsc -b` does not typecheck `convex/`, and `pnpm lint` runs a second `tsc` because of
+it.** The root `tsconfig.json` references `tsconfig.app.json`, `tsconfig.node.json` and
+`tsconfig.e2e.json` — `convex/tsconfig.json` is in none of them, and it is the config
+Convex's own deploy typechecks against. So for the whole life of this repository, a type
+error in `convex/**` passed every pull-request gate and failed at **`convex deploy`**,
+which runs on `main` *after* the merge — in `deploy.yml`, whose failure blocks nothing and
+which nobody is watching.
+
+That is not a hypothetical. `orgConfig.test.ts` asserted `settings.model` when the opus
+/sonnet split landed, `ClaudeSettings` in `testing.fixtures.ts` never gained the key, and
+production Convex stopped updating on 2026-09-02 and stayed stale for two days while every
+PR went green. The dashboard and the functions behind it simply stopped moving, and the
+next change to notice was one whose whole point was a value the *server* sends.
+
+`typecheck:convex` is that gate moved to where a pull request can fail on it. Do not drop
+it back out of `lint` on the grounds that `tsc -b` looks like it already covers the
+directory.
 
 `pnpm ui:check` runs **every** Playwright spec, not only the visual one: each `src/dev`
 scenario at 380, 768 and 1440, and `smoke.spec.ts` signing in for real against a local
