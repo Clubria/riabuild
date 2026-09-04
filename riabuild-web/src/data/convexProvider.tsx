@@ -55,6 +55,10 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
     api.sharedServers.list,
     isLead ? {} : "skip",
   );
+  const repoSecretPaths = useLoadable(
+    api.secretPaths.list,
+    isLead ? {} : "skip",
+  );
   const issuedKeys = useLoadable(api.issuedKeys.list, isLead ? {} : "skip");
   // The window the panel says it is showing. Named here rather than defaulted
   // silently on the server, so the two cannot disagree about what "last 7 days"
@@ -75,6 +79,8 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
   const addSharedServer = useMutation(api.sharedServers.add);
   const updateSharedServer = useMutation(api.sharedServers.update);
   const removeSharedServer = useMutation(api.sharedServers.remove);
+  const setRepoSecretPaths = useMutation(api.secretPaths.set);
+  const removeRepoSecretPaths = useMutation(api.secretPaths.remove);
   const addIssuedKey = useMutation(api.issuedKeys.create);
   const replaceIssuedKey = useMutation(api.issuedKeys.replaceKey);
   const setIssuedKeyMembers = useMutation(api.issuedKeys.setIssuedTo);
@@ -141,6 +147,16 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       ) => {
         await removeSharedServer(p);
       },
+      setRepoSecretPaths: async (
+        p: Parameters<Data["setRepoSecretPaths"]>[0],
+      ) => {
+        await setRepoSecretPaths(p);
+      },
+      removeRepoSecretPaths: async (
+        p: Parameters<Data["removeRepoSecretPaths"]>[0],
+      ) => {
+        await removeRepoSecretPaths(p);
+      },
       addIssuedKey: async (p: Parameters<Data["addIssuedKey"]>[0]) => {
         await addIssuedKey(p);
       },
@@ -184,10 +200,12 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       inviteMember,
       listOrgMembers,
       removeIssuedKey,
+      removeRepoSecretPaths,
       removeSharedServer,
       replaceIssuedKey,
       revoke,
       setIssuedKeyMembers,
+      setRepoSecretPaths,
       setRole,
       setStatus,
       signIn,
@@ -211,6 +229,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       sessions,
       members,
       sharedServers,
+      repoSecretPaths,
       issuedKeys,
       auditLog,
       usage,
@@ -228,6 +247,7 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
       membership,
       now,
       orgConfig,
+      repoSecretPaths,
       sessions,
       sharedServers,
       usage,

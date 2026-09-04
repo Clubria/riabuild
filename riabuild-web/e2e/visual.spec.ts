@@ -201,6 +201,52 @@ test.describe("interaction states", () => {
     });
   });
 
+  test("a folder riabuild-web refuses says how to spell it instead", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // The rule a lead is most likely to hit, because it is what the Infisical
+    // UI shows them: a path copied with its trailing slash. Refused rather
+    // than trimmed, so the sentence has to say which spelling to use — "not
+    // saved" alone leaves them retyping the same thing.
+    await page.goto("/?scenario=secret-path-refused");
+    // Exact: "repository" alone also matches org config's "default
+    // repository" box, and filling that one instead would be a screenshot of
+    // something other than what this test says it is.
+    await page
+      .getByLabel("repository", { exact: true })
+      .fill("Clubria/payments");
+    await page.getByLabel("infisical folders").fill("/apps/payments/");
+    await page.getByRole("button", { name: /map repository/i }).click();
+    await expect(
+      page.getByText("Leave the trailing slash off", { exact: false }),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "secret-path-refused-after-map",
+    });
+  });
+
+  test("editing a mapping warns that every developer's files are rewritten", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    // Moving a repository to another folder is what makes every `.env.<name>`
+    // on the team stale, and the warning only exists once a lead has actually
+    // changed the list — a scenario rendering it at rest would claim it
+    // appears before they touched anything.
+    await page.goto("/?scenario=lead");
+    await page
+      .getByRole("button", { name: "Edit the folders for Clubria/payments" })
+      .click();
+    await page.getByLabel("infisical folders").fill("/apps/somewhere-else");
+    await expect(
+      page.getByText("Every developer's files are rewritten"),
+    ).toBeVisible();
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "secret-path-moved-before-save",
+    });
+  });
+
   test(
     "Enter in the hostname box does what the button does",
     {

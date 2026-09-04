@@ -231,6 +231,92 @@ export default defineSchema({
   }).index("by_name", ["name"]),
 
   /**
+   * Which Infisical folder a repository's secrets come from — one row per
+   * repository, typed by a lead.
+   *
+   * Holds no secret and cannot hold one: a path names where secrets live, and
+   * every value at that path is fetched by the CLI with a credential brokered
+   * for the one command. What a dump of this table gives away is the shape of
+   * the team's Infisical project, which its own members can already see.
+   *
+   * **A repository with no row gets no environment files at all.** That is the
+   * meaning of "unset" and it is a decision rather than an omission — a
+   * repository that is supposed to have no environment variables had no way to
+   * say so, and `env_local` failed its run on every one of them. So absence is
+   * the answer here, and nothing falls back to `INFISICAL_SECRET_PATH`; that
+   * variable is read only by `secretPaths.seedFromDeploymentPath` and by the
+   * legacy no-`repo` path in `infisical.brokerToken`, both of which exist for
+   * CLIs and deployments released before this table.
+   *
+   * `repoSlug` is stored as a lead typed it, checked for *shape* only —
+   * `owner/name`, the rules `api::Repo::parse` applies. It is deliberately not
+   * checked against GitHub: which repositories exist is a question the CLI asks
+   * through the developer's own `gh`, so that riabuild holds no permission
+   * logic that could be wrong about it (see "the server ships data, never
+   * logic" in `../../AGENTS.md`). A row naming a repository nobody has is
+   * inert, because no run is ever about it.
+   *
+   * `updatedAt` is not bookkeeping. `.env.dev` filled from `/apps/hub` is wrong
+   * the moment this row says `/apps/payments`, and nothing on the laptop can
+   * see that; `env_local::check()` compares this against the file's mtime the
+   * same way it already compares `orgConfig.secretsUpdatedAt`. It is per row
+   * rather than org-wide precisely so that editing one repository's path does
+   * not restage every other repository's files.
+   *
+   * Which environments those folders have is **not** stored. It is read from
+   * Infisical on demand, because it is a fact about the team's project rather
+   * than a thing anybody types here, and a copy kept in this row would be wrong
+   * from the first folder somebody adds.
+   *
+   * Design: `docs/superpowers/specs/2026-09-04-per-repository-secret-paths-design.md`.
+   */
+  repoSecretPaths: defineTable({
+    /** `owner/name`, exactly as the CLI's `Repo::slug()` spells it. */
+    repoSlug: v.string(),
+    /**
+     * The absolute Infisical folders this repository's secrets come from, in
+     * the order they are exported and therefore merged: **later wins**, exactly
+     * as a dotenv loader reads the finished file.
+     *
+     * A list rather than one string for the reason `secretPaths()` already
+     * gives about `INFISICAL_SECRET_PATH`: one environment's secrets are not
+     * always in one folder, and a `.env.dev` carrying either half alone does
+     * not start the app. Never empty — a repository with nothing to pull has no
+     * row at all, which is a different statement and the one that means "write
+     * no env files".
+     */
+    secretPaths: v.array(v.string()),
+    updatedBy: v.id("members"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_repo", ["repoSlug"]),
+
+  /**
+   * Which environments a set of folders was last found in — a cache, and
+   * nothing here is authoritative about anything.
+   *
+   * `env_local::check()` asks for a repository's scope on **every** run,
+   * including every `riabuild --check`, and answering from Infisical costs a
+   * universal-auth login, a project fetch and one folder listing per
+   * environment per folder. That is a fine price to pay when the answer has
+   * changed and an absurd one to pay when a team of ten provisions the same
+   * morning.
+   *
+   * The row is keyed by the question, not by the repository — the role and the
+   * exact ordered folder list — so a lead editing a path invalidates it by
+   * asking a different question rather than by remembering to clear anything,
+   * and two repositories that happen to name the same folders share one entry.
+   * Stale rows are simply ignored past their age and overwritten in place;
+   * there is no reaper, because the number of distinct questions a team asks is
+   * bounded by its repositories.
+   */
+  infisicalEnvCache: defineTable({
+    key: v.string(),
+    environments: v.array(v.string()),
+    fetchedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  /**
    * SSH keys the org issues: a private key a lead pastes once, and the members
    * it is issued to.
    *

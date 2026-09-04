@@ -21,6 +21,41 @@ impl Ctx {
         }
     }
 
+    /// Asks riabuild-web which Infisical folders this run's repository uses,
+    /// and records the answer on the `Ctx` for `env_local` to read.
+    ///
+    /// Called once, by `provision`, after the picker has settled which
+    /// repository the run is about — and never by a task. That placement is the
+    /// point: a `check()` that made its own request would be a `check()` no
+    /// test could run without a network, which is the rule `CommandRunner`
+    /// already enforces for every subprocess. It is also why this is one
+    /// request per run rather than the two a `check()`/`apply()` pair would
+    /// make.
+    ///
+    /// A failure is recorded rather than raised. This runs before the task
+    /// engine, and a provisioning run that stopped here would be one where a
+    /// flaky network took out the toolchain, the launchers and the Claude
+    /// settings as well — so `env_local` is left to report it, which is the
+    /// task the answer belongs to.
+    pub async fn load_secret_scope(&mut self) {
+        let Ok(repo) = self.repo() else {
+            // Nothing has said which repository this is about, so there is no
+            // question to ask. The org-wide answer is what the run would have
+            // used anyway.
+            return;
+        };
+        self.secret_scope = match riabuild_api::secrets::scope_for(&self.api, repo.slug()).await {
+            // No such route: this deployment predates the mapping table.
+            Ok(None) => crate::SecretScope::OrgWide,
+            Ok(Some(scope)) if !scope.configured => crate::SecretScope::Unmapped,
+            Ok(Some(scope)) => crate::SecretScope::Mapped {
+                environments: scope.environments,
+                updated_at: scope.updated_at,
+            },
+            Err(error) => crate::SecretScope::Unavailable(error.to_string()),
+        };
+    }
+
     /// Takes the repository this machine recorded, so a command that never puts
     /// the picker's question — `status`, `env`, `shell`, anything under
     /// `--check` — still reads the checkout of the repository the developer was

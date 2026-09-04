@@ -276,8 +276,10 @@ nobody recorded.
 - **Every checkout gets its own copy of the brokered secrets.** `env_local` writes
   `.env.<name>` into the active checkout, so two repositories mean two copies on disk.
   That is today's model unchanged rather than a new hole, but N repositories multiply it.
-  The environments stay org-level: `secretEnvironments` does not become per-repository,
-  and nothing about brokering changes.
+  ~~The environments stay org-level: `secretEnvironments` does not become per-repository,
+  and nothing about brokering changes.~~ **Superseded on 2026-09-04** — see
+  `2026-09-04-per-repository-secret-paths-design.md`. The folders *and* the environments
+  are per-repository now, and a repository with no row gets no `.env` files at all.
 - **A new repository asks the path question once.** `choose_dir` runs for a repository
   with no recorded path, and never again for that one.
 - **The first run on a machine cannot show a list**, because `gh` is installed by a task
@@ -308,8 +310,12 @@ permissions for.
 
 ## Out of scope
 
-No lead-curated repository list — the dashboard names the default and nothing more. No
-per-repository secret environments. No `riabuild repo` subcommand: the every-run prompt
+No lead-curated repository list — the dashboard names the default and nothing more.
+~~No per-repository secret environments.~~ **Superseded on 2026-09-04** — see
+`2026-09-04-per-repository-secret-paths-design.md`. Sharing one set of secrets across
+every repository was the half of this design that did not survive contact with a second
+repository: an unmapped one either took the first one's variables or hard-failed
+`env_local` on every laptop at once. No `riabuild repo` subcommand: the every-run prompt
 *is* the switch, and a command to do the same thing is a second way to learn the same
 idea. ~~No working on two repositories in one shell.~~ **Superseded on 2026-08-27** — see
 the addendum below.

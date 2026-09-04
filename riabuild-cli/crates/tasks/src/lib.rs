@@ -51,7 +51,7 @@ pub mod testing;
 pub mod toolchain;
 pub mod typescript_language_server;
 
-pub use crate::ctx::Ctx;
+pub use crate::ctx::{Ctx, SecretScope};
 pub use crate::task::{Reason, Resource, Status, Task, TaskId};
 
 /// Every task riabuild knows how to perform, in declaration order. The engine

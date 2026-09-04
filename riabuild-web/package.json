@@ -11,7 +11,7 @@
     "lint": "tsc -b && pnpm typecheck:convex && eslint .  --ext ts,tsx --report-unused-disable-directives --max-warnings 0 && pnpm format:check",
     "typecheck:convex": "tsc -p convex/tsconfig.json --noEmit",
     "format": "prettier --write",
-    "format:check": "prettier --check src/App.tsx src/main.tsx src/components/Invite.tsx src/components/IssuedKeys.tsx src/components/LeadPanel.tsx src/components/LeadPanel.test.tsx src/components/SharedServers.tsx src/components/Usage.tsx src/components/Usage.test.tsx src/data src/dev src/lib src/routes/CliAuthorize.tsx convex e2e eslint.config.js",
+    "format:check": "prettier --check src/App.tsx src/main.tsx src/components/Invite.tsx src/components/IssuedKeys.tsx src/components/LeadPanel.tsx src/components/LeadPanel.test.tsx src/components/SecretPaths.tsx src/components/SharedServers.tsx src/components/Usage.tsx src/components/Usage.test.tsx src/data src/dev src/lib src/routes/CliAuthorize.tsx convex e2e eslint.config.js",
     "preview": "vite preview",
     "test": "vitest run",
     "deploy:web": "vite build && wrangler pages deploy dist --project-name riabuild-web --branch main",

@@ -24,6 +24,7 @@ pub(crate) async fn provision(ctx: &mut Ctx, cli: &Cli) -> Result<i32> {
     describe_session(ctx);
     ask_which_repository(ctx, cli).await?;
     describe_repo(ctx);
+    load_secret_scope(ctx).await;
 
     // The update check that used to stand here now runs for *every* command,
     // from `main::keep_current`, before this function is reached. It has not
@@ -133,6 +134,25 @@ async fn ask_which_repository(ctx: &mut Ctx, cli: &Cli) -> Result<()> {
     }
     riabuild_tasks::repo::choose(ctx).await?;
     Ok(())
+}
+
+/// Which Infisical folders this run's repository takes its secrets from, asked
+/// once, here.
+///
+/// It has to be after `ask_which_repository` — the answer is about the
+/// repository the picker settled on — and before the task engine, because
+/// `env_local::check()` reads it and a `check()` that fetched for itself would
+/// be a `check()` no test could run without a network. One request per run
+/// rather than the two a `check()`/`apply()` pair would make.
+///
+/// A machine with no session asks nothing: `scope_for` would 401, and the
+/// org-wide default this leaves in place is what the first run on every machine
+/// already uses.
+async fn load_secret_scope(ctx: &mut Ctx) {
+    if ctx.org.is_none() {
+        return;
+    }
+    ctx.load_secret_scope().await;
 }
 
 /// The Claude Code launchers, written unless this run promised to change nothing.

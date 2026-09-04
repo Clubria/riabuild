@@ -147,6 +147,7 @@ async fn build(runner: FakeRunner, keychain: MemoryKeychain) -> (Ctx, TempDir, A
         state: State::default(),
         org: Some(org_config()),
         repo: None,
+        secret_scope: crate::SecretScope::OrgWide,
         member: None,
         server: None,
         cli_version: "0.1.0".into(),

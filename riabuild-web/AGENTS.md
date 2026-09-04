@@ -199,9 +199,11 @@ CLI-facing endpoints live in `convex/http.ts` and are versioned. Breaking one st
 every developer on an older Homebrew build until they upgrade — add fields, do not change
 or remove them, and bump the version prefix for anything incompatible.
 
-Three endpoints answer differently for different roles, and in every case the dependence
+Four endpoints answer differently for different roles, and in every case the dependence
 is a **smaller list rather than a refusal** — a candidate gets a 200 with less in it,
-never a 403.
+never a 403. `GET /api/v1/secrets/scope` is the fourth, and it narrows the same way the
+other three do: a candidate is offered the base environment alone, which is the same
+narrowing `identityForRole` already makes rather than a second copy of Infisical's RBAC.
 
 `GET /api/v1/remotes/shared` gives a candidate `{ servers: [] }`. The same command is how
 they reach the server they set up themselves, and refusing the request would take that
@@ -219,6 +221,41 @@ token to learn that, since brokering calls Infisical and writes an audit row.
 
 The names are environment names, never filenames. Deciding that `dev` becomes `.env.dev`
 is the CLI's job, so a value chosen on the server can never name a location on a laptop.
+
+**A CLI that names a repository is answered from `repoSecretPaths` instead, and both
+those lists become fallbacks.** `POST /api/v1/secrets/token` takes an optional `repo`,
+and `GET /api/v1/secrets/scope` answers the same question without minting anything —
+which is what `check()` reads, for the reason in the paragraph above. A CLI that names no
+repository gets exactly what it always got, because that is what the add-only rule means
+applied to a field.
+
+Three things about that table are load-bearing, and each of them is a thing a reasonable
+change would undo:
+
+- **No row means no environment files.** Not "fall back to `INFISICAL_SECRET_PATH`" —
+  that is the whole point of the feature, and a fallback would fill an unmapped
+  repository from another repository's folders with nothing said on the terminal.
+  `/api/v1/secrets/scope` therefore answers **200 with `configured: false`**, never a
+  404: a 404 is what an older deployment returns, and the CLI reads that as "this
+  deployment has no table" and uses the org-wide list.
+- **The environments come from Infisical, and are never stored.** `discoverEnvironments`
+  lists the folders and keeps an environment only when it holds **every** folder the
+  repository names — every, not any, because `env_local` exports them as a fold and one
+  missing folder fails the whole pull. `infisicalEnvCache` holds the answer for five
+  minutes, keyed by the *question* (role plus the ordered folder list), so a lead's edit
+  invalidates it without anything having to remember to purge.
+- **`repoSecretPaths.updatedAt` is a second kind of staleness beside a rotation.** A
+  `.env.dev` filled from the folder a row named yesterday is as wrong as one filled
+  before the team rotated, and the file cannot tell the difference. `secretPaths:set`
+  therefore returns early when the list is unchanged rather than touching `updatedAt` —
+  a lead pressing save on a row they did not edit must not restage the whole team's
+  files.
+
+The order of `secretPaths` is dotenv's own contract: a key two folders both hold takes
+the value of the folder named **later**. So the validator drops a duplicate keeping its
+*last* mention, and re-ordering a list is a change even though the set is the same.
+
+Design: `../docs/superpowers/specs/2026-09-04-per-repository-secret-paths-design.md`.
 
 Read `.agents/skills/riabuild-api/SKILL.md` before adding an endpoint. It covers session
 authentication, org re-verification, audit logging, and the error shape the CLI expects.

@@ -32,6 +32,13 @@ print(json.dumps({
 }))
 PY
 )"
+
+# The same migration `docs/deploying.md` tells a maintainer to run, run the
+# same way. A repository with no row in `repoSecretPaths` gets no `.env` files
+# at all — that is the feature — so a throwaway backend that skipped this would
+# fail stage 11 on the missing `.env.dev`, and seeding the row by hand instead
+# would leave the one command production depends on untested.
+run_convex secretPaths:seedFromDeploymentPath '{}'
 pass "seeded @$E2E_LOGIN as a developer, org pointed at $E2E_REPO_SLUG"
 
 # The seeded session has to survive the real authentication path before the CLI
@@ -43,4 +50,15 @@ pass "seeded @$E2E_LOGIN as a developer, org pointed at $E2E_REPO_SLUG"
 # at — and this assertion would blame the seed for it.
 ME="$(api_curl -H "authorization: Bearer $SESSION_TOKEN" "$API_URL/api/v1/me")"
 check_contains "the seeded session authenticates against /api/v1/me" "$ME" "\"githubLogin\":\"$E2E_LOGIN\""
+
+# The migration's own answer goes to /dev/null with every other seed's, so ask
+# the endpoint the CLI will ask instead. `configured:true` is the difference
+# between a run that
+# writes `.env.dev` and one that correctly writes nothing at all — and the
+# second failure would surface four stages later as a missing file.
+SCOPE="$(api_curl -H "authorization: Bearer $SESSION_TOKEN" \
+  "$API_URL/api/v1/secrets/scope?repo=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$E2E_REPO_SLUG")")"
+check_contains "$E2E_REPO_SLUG takes its secrets from the deployment's folders" \
+  "$SCOPE" '"configured":true'
+
 

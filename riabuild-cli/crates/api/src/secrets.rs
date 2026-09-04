@@ -44,6 +44,17 @@ pub struct BrokeredToken {
     pub site_url: String,
     #[serde(rename = "secretsUpdatedAt", default)]
     pub secrets_updated_at: u64,
+    /// Whether the repository this credential was asked for is mapped to any
+    /// Infisical folder.
+    ///
+    /// `None` from a deployment released before per-repository paths, and from
+    /// every request that named no repository — both mean "the deployment-wide
+    /// answer", which is what the fields above already carry. `Some(false)` is
+    /// the narrow case of a lead removing the mapping between the scope call
+    /// and this one; the credential fields are then present and empty, so this
+    /// must be read *before* the token rather than after it.
+    #[serde(default)]
+    pub configured: Option<bool>,
 }
 
 fn root_path() -> String {
@@ -102,9 +113,92 @@ pub fn is_safe_environment_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
+/// What a repository's secrets are, before any credential is minted.
+///
+/// This is the cheap half of what `/secrets/token` answers, and it exists
+/// because `env_local::check()` runs on every `riabuild --check` and must not
+/// broker a credential to learn which `.env.<name>` files ought to be there —
+/// brokering reaches Infisical and writes an audit row saying somebody read the
+/// team's secrets. The same reasoning that put `secretEnvironments` on
+/// `/api/v1/org/config`, one step further along: the answer is per repository
+/// now, and `/org/config` is fetched before a run knows which repository it is
+/// about.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretScope {
+    /// Whether a lead has mapped this repository at all.
+    ///
+    /// `false` is the answer riabuild acts on rather than an error: it is how a
+    /// lead says "this repository has no environment variables", and it leaves
+    /// the checkout alone.
+    #[serde(default)]
+    pub configured: bool,
+    /// The folders to export, in order, for each environment: **later wins**.
+    #[serde(rename = "secretPaths", default)]
+    pub secret_paths: Vec<String>,
+    /// The environments those folders were actually found in.
+    #[serde(default)]
+    pub environments: Vec<String>,
+    /// When a lead last edited the mapping. Compared against a file's mtime the
+    /// same way `secrets_updated_at` is, because a `.env.dev` filled from the
+    /// folder this row named yesterday is as stale as one filled before a
+    /// rotation.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: u64,
+    #[serde(rename = "secretsUpdatedAt", default)]
+    pub secrets_updated_at: u64,
+}
+
+/// A credential for one repository's folders.
+///
+/// The scope travels with the credential rather than being looked up beside it,
+/// so the two can never describe different folders — which is the failure mode
+/// worth designing out here: a token minted for one repository and used to fill
+/// another repository's checkout leaves the wrong team's secrets on disk, and
+/// nothing on the laptop could tell.
+pub async fn broker_for(api: &ApiClient, repo: &str) -> Result<BrokeredToken> {
+    api.post_json("/api/v1/secrets/token", serde_json::json!({ "repo": repo }))
+        .await
+}
+
 pub async fn broker(api: &ApiClient) -> Result<BrokeredToken> {
     api.post_json("/api/v1/secrets/token", serde_json::json!({}))
         .await
+}
+
+/// What this repository's secrets look like, without minting anything.
+///
+/// `Ok(None)` means the **deployment** predates per-repository paths — the
+/// route is not there — which is a different fact from "nobody mapped this
+/// repository" and has to stay different: the first falls back to the org-wide
+/// environment list, and the second writes no files at all. Collapsing them
+/// would either strand a team on an older riabuild-web with no secrets, or
+/// quietly fill an unmapped repository from the hub's folders, and neither
+/// failure says anything on the terminal.
+pub async fn scope_for(api: &ApiClient, repo: &str) -> Result<Option<SecretScope>> {
+    let path = format!("/api/v1/secrets/scope?repo={}", urlencode(repo));
+    match api.get_json::<SecretScope>(&path).await {
+        Ok(scope) => Ok(Some(scope)),
+        Err(error) => {
+            if let Some(api_error) = error.downcast_ref::<crate::ApiError>()
+                && api_error.status == 404
+            {
+                return Ok(None);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Percent-encodes the two characters a repository slug can carry that a query
+/// string reads as punctuation.
+///
+/// `Repo::parse` has already refused everything else — the halves are
+/// `[A-Za-z0-9._-]` and there is exactly one separator — so this is a short
+/// list rather than a general encoder, and a general one would be a claim that
+/// arbitrary strings reach here. They do not, and if they ever do the parse is
+/// the bug.
+fn urlencode(slug: &str) -> String {
+    slug.replace('%', "%25").replace('/', "%2F")
 }
 
 #[cfg(test)]
@@ -193,6 +287,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(brokered.environments, ["dev", "staging"]);
+    }
+
+    #[test]
+    fn an_unmapped_repository_parses_as_configured_false_and_nothing_else() {
+        // The reply a repository nobody mapped gets. Nothing here may read as
+        // "one environment called nothing" — the empty lists are the answer.
+        let scope: SecretScope = serde_json::from_str(
+            r#"{"repo":"Clubria/design-system","configured":false,
+                "secretPaths":[],"environments":[],"updatedAt":0}"#,
+        )
+        .unwrap();
+        assert!(!scope.configured);
+        assert!(scope.environments.is_empty());
+        assert!(scope.secret_paths.is_empty());
+    }
+
+    #[test]
+    fn a_mapped_repository_carries_its_folders_and_environments_in_order() {
+        let scope: SecretScope = serde_json::from_str(
+            r#"{"repo":"Clubria/hub","configured":true,
+                "secretPaths":["/tenant/aibuilders/frontend","/tenant/aibuilders/convex"],
+                "environments":["dev","prod"],"updatedAt":1730000000000}"#,
+        )
+        .unwrap();
+        assert!(scope.configured);
+        assert_eq!(scope.environments, ["dev", "prod"]);
+        assert_eq!(
+            scope.secret_paths,
+            ["/tenant/aibuilders/frontend", "/tenant/aibuilders/convex"]
+        );
+        assert_eq!(scope.updated_at, 1_730_000_000_000);
+    }
+
+    #[test]
+    fn a_reply_missing_configured_is_not_read_as_a_mapped_repository() {
+        // `configured` defaults to `false`, and that direction is deliberate:
+        // filling a checkout from folders nobody confirmed is worse than
+        // writing nothing and saying so.
+        let scope: SecretScope = serde_json::from_str(r#"{"repo":"Clubria/hub"}"#).unwrap();
+        assert!(!scope.configured);
+    }
+
+    #[test]
+    fn a_brokered_token_from_a_deployment_without_the_table_says_nothing_either_way() {
+        // `None` is what every deployment released before per-repository
+        // folders sends, and it must not read as `Some(false)` — that would
+        // stop `env_local` writing any files at all against a deployment that
+        // is working perfectly.
+        let brokered: BrokeredToken = serde_json::from_str(
+            r#"{"token":"inf_x","projectId":"p1","environment":"dev","expiresAt":1}"#,
+        )
+        .unwrap();
+        assert_eq!(brokered.configured, None);
+    }
+
+    #[test]
+    fn a_repository_slug_reaches_the_query_string_with_its_slash_encoded() {
+        // A bare `/` would make `repo=Clubria/payments` a different path, and
+        // the route would 404 — which `scope_for` reads as "this deployment has
+        // no mapping table", quietly filling every checkout from the org-wide
+        // folders. A wrong answer rather than an error is the reason this is
+        // encoded rather than trusted.
+        assert_eq!(urlencode("Clubria/payments"), "Clubria%2Fpayments");
+        assert_eq!(urlencode("a%b/c"), "a%25b%2Fc");
     }
 
     #[test]

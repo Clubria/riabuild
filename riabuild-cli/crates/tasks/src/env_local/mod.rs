@@ -25,7 +25,7 @@ pub use file::parses_as_dotenv;
 
 use file::{env_file, env_file_name, is_ignored, is_world_or_group_readable, write_private};
 
-use super::{Ctx, Status, Task, TaskId};
+use super::{Ctx, SecretScope, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
 use riabuild_api::secrets::{self, is_safe_environment_name};
@@ -60,17 +60,50 @@ impl Task for EnvLocal {
         let Some(org) = ctx.org.as_ref() else {
             return Ok(Status::needs("waiting for sign-in"));
         };
-        if org.secret_environments.is_empty() {
+        // Read off the `Ctx` rather than fetched: `provision` asked once,
+        // before the engine started. See `Ctx::load_secret_scope`.
+        let environments = match &ctx.secret_scope {
             // Not a fallback to the single `.env.local` this task used to
             // write: a deployment that names no environments is one nobody has
             // updated, and quietly taking the old path would leave a developer
             // with a file riabuild has stopped refreshing and no sign of it.
-            return Ok(Status::needs(
-                "riabuild.clubria.com has not published its secret environments yet",
-            ));
-        }
+            SecretScope::OrgWide if org.secret_environments.is_empty() => {
+                return Ok(Status::needs(
+                    "riabuild.clubria.com has not published its secret environments yet",
+                ));
+            }
+            SecretScope::OrgWide => &org.secret_environments,
+            // The whole point of the mapping table: a lead said this
+            // repository has no environment variables, so a checkout with no
+            // `.env.*` in it is provisioned rather than broken. Anything
+            // already in the developer's checkout is left where it is —
+            // riabuild does not delete a developer's files out from under them.
+            SecretScope::Unmapped => return Ok(Status::Satisfied),
+            // "We could not tell" never renders as "you have no secrets".
+            SecretScope::Unavailable(_) => {
+                return Ok(Status::needs(
+                    "riabuild could not ask which secrets this repository uses",
+                ));
+            }
+            // A mapped repository whose folders are in no environment this
+            // developer can reach is a path nobody can act on from here.
+            // `needs` sends it to `apply()`, which says so and stops the run —
+            // rather than `Satisfied`, which would quietly hand somebody an
+            // empty checkout on every run for ever.
+            SecretScope::Mapped { environments, .. } if environments.is_empty() => {
+                return Ok(Status::needs(
+                    "no Infisical environment holds the folders this repository is mapped to",
+                ));
+            }
+            SecretScope::Mapped { environments, .. } => environments,
+        };
 
-        for environment in &org.secret_environments {
+        // A folder moved is as stale as a secret rotated, and the file cannot
+        // tell the difference — both leave contents that were right when they
+        // were written and are not now.
+        let stale_before = org.secrets_updated_at.max(ctx.secret_scope.mapped_at());
+
+        for environment in environments {
             if !is_safe_environment_name(environment) {
                 return Ok(Status::needs(format!(
                     "{environment:?} is not a usable environment name"
@@ -100,11 +133,12 @@ impl Task for EnvLocal {
                     "{name} holds brokered secrets and is readable by other accounts"
                 )));
             }
-            // Rotation the file cannot see by itself: the team rotated secrets
-            // after this file was written.
-            if modified_millis(&file).await < org.secrets_updated_at {
+            // Rotation the file cannot see by itself: the team rotated
+            // secrets, or moved this repository to another folder, after this
+            // file was written.
+            if modified_millis(&file).await < stale_before {
                 return Ok(Status::needs(format!(
-                    "the team rotated secrets after {name} was written"
+                    "the team changed these secrets after {name} was written"
                 )));
             }
             if !is_ignored(ctx, &project, &name).await? {
@@ -119,8 +153,55 @@ impl Task for EnvLocal {
         let project = ctx
             .project_dir()
             .ok_or_else(|| anyhow::anyhow!("no project directory chosen"))?;
+        let repo = ctx.repo()?;
 
-        let brokered = secrets::broker(&ctx.api).await?;
+        match &ctx.secret_scope {
+            SecretScope::Unmapped => {
+                ctx.note(format!(
+                    "{} has no Infisical folder in the riabuild dashboard, so riabuild wrote no .env files for it",
+                    repo.slug()
+                ));
+                return Ok(());
+            }
+            SecretScope::Unavailable(detail) => {
+                return Err(Failure::new(
+                    "fetching your project secrets",
+                    "Run `riabuild` again. If it keeps failing, ask your team lead whether riabuild.clubria.com is up.",
+                )
+                .detail(format!(
+                    "riabuild could not ask which secrets {} uses: {detail}",
+                    repo.slug()
+                ))
+                .into());
+            }
+            SecretScope::Mapped { environments, .. } if environments.is_empty() => {
+                return Err(Failure::new(
+                    "fetching your project secrets",
+                    "Ask your team lead to check this repository's Infisical folders in the riabuild dashboard.",
+                )
+                .detail(format!(
+                    "no Infisical environment holds every folder mapped to {}",
+                    repo.slug()
+                ))
+                .into());
+            }
+            SecretScope::Mapped { .. } | SecretScope::OrgWide => {}
+        }
+
+        let brokered = match &ctx.secret_scope {
+            SecretScope::OrgWide => secrets::broker(&ctx.api).await?,
+            _ => secrets::broker_for(&ctx.api, repo.slug()).await?,
+        };
+        // Read before the token, because an unmapped reply carries the
+        // credential fields present and empty. This is the race `check()`
+        // cannot close: a lead removing the mapping between the two calls.
+        if brokered.configured == Some(false) {
+            ctx.note(format!(
+                "{} was unmapped while riabuild was running, so it wrote no .env files for it",
+                repo.slug()
+            ));
+            return Ok(());
+        }
         let environments = &brokered.environments;
         if environments.is_empty() {
             return Err(Failure::new(
@@ -467,7 +548,147 @@ mod tests {
             org.secrets_updated_at = u64::MAX / 2;
         }
         let status = EnvLocal.check(&ctx).await.unwrap();
-        assert!(format!("{status:?}").contains("rotated"), "{status:?}");
+        assert!(format!("{status:?}").contains("changed"), "{status:?}");
+    }
+
+    /// A lead moving a repository to another Infisical folder is the same kind
+    /// of staleness as a rotation, and the file can see neither.
+    ///
+    /// Without this the contents stay perfectly parseable, current-looking and
+    /// wrong: `.env.dev` goes on holding the folder's secrets from before the
+    /// move, on every run, for ever.
+    #[tokio::test]
+    async fn moving_a_repository_to_another_folder_makes_its_files_stale() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &["dev"]).await;
+        ctx.secret_scope = SecretScope::Mapped {
+            environments: vec!["dev".into()],
+            updated_at: u64::MAX / 2,
+        };
+
+        let status = EnvLocal.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("changed"), "{status:?}");
+    }
+
+    /// The whole point of the mapping table: a repository a lead gave no
+    /// Infisical folder is provisioned, not broken.
+    ///
+    /// Before this, such a repository got the org's folders copied into its
+    /// checkout, or — where Infisical had nothing to give — a hard failure on
+    /// every single run, on a machine with nothing wrong with it.
+    #[tokio::test]
+    async fn an_unmapped_repository_wants_no_env_files_at_all() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &[]).await;
+        ctx.secret_scope = SecretScope::Unmapped;
+
+        assert_eq!(EnvLocal.check(&ctx).await.unwrap(), Status::Satisfied);
+    }
+
+    /// And the files it already has are left alone rather than reported.
+    ///
+    /// riabuild stopping refreshing a file is not riabuild deleting it, and a
+    /// `check()` that complained about one would be asking `apply()` to remove
+    /// a developer's file — which it does not do.
+    #[tokio::test]
+    async fn unmapping_a_repository_does_not_disturb_files_already_there() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        let project = provisioned_project(&mut ctx, &home, &["dev", "staging"]).await;
+        ctx.secret_scope = SecretScope::Unmapped;
+
+        assert_eq!(EnvLocal.check(&ctx).await.unwrap(), Status::Satisfied);
+        assert!(
+            tokio::fs::try_exists(env_file(&project, "dev"))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The environments come from the repository's folders, not from the org.
+    ///
+    /// `sees` still says dev and staging — the org-wide list — and this
+    /// repository is mapped to folders that live in dev and prod. A `check()`
+    /// reading the wrong one of those two would report a satisfied checkout
+    /// with no `.env.prod` in it.
+    #[tokio::test]
+    async fn a_mapped_repository_expects_the_environments_its_own_folders_have() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &["dev"]).await;
+        ctx.secret_scope = SecretScope::Mapped {
+            environments: vec!["dev".into(), "prod".into()],
+            updated_at: 0,
+        };
+
+        let status = EnvLocal.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains(".env.prod is missing"),
+            "{status:?}"
+        );
+    }
+
+    /// And it is satisfied by exactly those, with no `.env.staging` in sight —
+    /// the org-wide list would have demanded one.
+    #[tokio::test]
+    async fn a_mapped_repository_is_satisfied_without_the_orgs_environments() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &["dev", "prod"]).await;
+        ctx.secret_scope = SecretScope::Mapped {
+            environments: vec!["dev".into(), "prod".into()],
+            updated_at: 0,
+        };
+
+        assert_eq!(EnvLocal.check(&ctx).await.unwrap(), Status::Satisfied);
+    }
+
+    /// "We could not tell" never renders as "you have no secrets".
+    ///
+    /// This is the distinction that makes `SecretScope::Unavailable` worth
+    /// having as its own variant rather than folding into `Unmapped`: a laptop
+    /// that could not reach riabuild-web would otherwise report a repository as
+    /// deliberately having no environment variables, and go on doing so every
+    /// run until somebody noticed the missing files themselves.
+    #[tokio::test]
+    async fn a_scope_riabuild_could_not_fetch_is_never_read_as_no_secrets() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &[]).await;
+        ctx.secret_scope = SecretScope::Unavailable("riabuild-web is down".into());
+
+        let status = EnvLocal.check(&ctx).await.unwrap();
+        assert_ne!(status, Status::Satisfied, "{status:?}");
+        assert!(
+            format!("{status:?}").contains("could not ask"),
+            "{status:?}"
+        );
+    }
+
+    /// A mapped repository whose folders are in no environment is a typo
+    /// somebody has to fix, and `check()` must not settle into reporting a
+    /// satisfied machine with an empty checkout.
+    #[tokio::test]
+    async fn folders_no_environment_holds_are_reported_rather_than_accepted() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &[]).await;
+        ctx.secret_scope = SecretScope::Mapped {
+            environments: Vec::new(),
+            updated_at: 0,
+        };
+
+        let status = EnvLocal.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("no Infisical environment"),
+            "{status:?}"
+        );
+    }
+
+    /// A deployment with no mapping table behaves exactly as it did before it
+    /// existed. This is the whole compatibility story in one assertion.
+    #[tokio::test]
+    async fn a_deployment_without_the_mapping_table_still_uses_the_org_list() {
+        let (mut ctx, home) = ctx_with(ignored_runner()).await;
+        provisioned_project(&mut ctx, &home, &["dev", "staging"]).await;
+        assert_eq!(ctx.secret_scope, SecretScope::OrgWide, "the default");
+
+        assert_eq!(EnvLocal.check(&ctx).await.unwrap(), Status::Satisfied);
     }
 
     #[tokio::test]

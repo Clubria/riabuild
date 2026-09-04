@@ -16,7 +16,14 @@ import {
   versionGate,
   type MemberView,
 } from "./lib/guard";
-import { brokerToken, environmentsForRole } from "./infisical";
+import {
+  brokerToken,
+  discoverEnvironments,
+  environmentsForRole,
+  type Role,
+  type Scope,
+} from "./infisical";
+import { envCacheKey, validateRepoSlug } from "./secretPaths";
 import { MAX_SAMPLES_PER_REQUEST } from "./usage";
 import { RETIRED_DEFAULT_PROJECT_PATH } from "./org";
 
@@ -584,6 +591,171 @@ http.route({
 });
 
 /* -------------------------------------------------------------------------- */
+/* Which folders and environments a repository has                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The repository a request is about, or `undefined` when it did not name one.
+ *
+ * Every CLI released before per-repository paths omits the field, and that has
+ * to keep meaning "the deployment's own answer" rather than becoming an error —
+ * the compatibility rule in `.agents/skills/riabuild-api/SKILL.md`. So an
+ * absent, null or non-string value is `undefined`, and only a present one that
+ * is *malformed* is a 400: a laptop that named a repository and got the wrong
+ * folder's secrets is the failure worth being loud about.
+ */
+function repoFromBody(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const raw = (body as { repo?: unknown }).repo;
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  try {
+    return validateRepoSlug(raw);
+  } catch {
+    // The lead's own wording is not shown here: it is written for somebody
+    // editing the dashboard, and the person reading this is a developer whose
+    // run just stopped.
+    fail(
+      400,
+      "bad_request",
+      "riabuild asked for the secrets of a repository whose name it could not read.",
+      "Run `riabuild` again; if it keeps happening, tell your team lead.",
+    );
+  }
+}
+
+/** A repository's mapping and the environments its folders are actually in. */
+type RepoScope =
+  { state: "unmapped" } | { state: "ok"; scope: Scope; updatedAt: number };
+
+/**
+ * Resolve one repository's scope, through the discovery cache.
+ *
+ * `unmapped` is a first-class answer and not a failure: it is how a lead says
+ * "this repository has no environment variables", and both callers turn it into
+ * a CLI that writes no files rather than into an error.
+ */
+async function repoScope(
+  ctx: ActionCtx,
+  role: Role,
+  repoSlug: string,
+): Promise<RepoScope> {
+  const row = await ctx.runQuery(internal.secretPaths.forRepo, { repoSlug });
+  if (row === null) return { state: "unmapped" };
+
+  const key = envCacheKey(role, row.secretPaths);
+  const cached = await ctx.runQuery(internal.secretPaths.cachedEnvironments, {
+    key,
+  });
+  if (cached !== null) {
+    return {
+      state: "ok",
+      scope: { secretPaths: row.secretPaths, environments: cached },
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  const found = await discoverEnvironments(role, row.secretPaths);
+  if (found.status === "not_configured") {
+    console.error("infisical not configured:", found.detail);
+    fail(
+      503,
+      "not_configured",
+      "riabuild is not connected to the team's secret store yet.",
+      "Tell your team lead — the riabuild deployment needs its Infisical credentials.",
+    );
+  }
+  if (found.status === "upstream_error") {
+    console.error("infisical discovery error:", found.detail);
+    fail(
+      503,
+      "upstream_error",
+      "riabuild could not ask Infisical which environments this repository has.",
+      "Try again in a minute; if it persists, tell your team lead.",
+    );
+  }
+
+  await ctx.runMutation(internal.secretPaths.cacheEnvironments, {
+    key,
+    environments: found.environments,
+  });
+  return {
+    state: "ok",
+    scope: { secretPaths: row.secretPaths, environments: found.environments },
+    updatedAt: row.updatedAt,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* GET /api/v1/secrets/scope — which folders and environments a repo has      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The cheap half of the question `/secrets/token` answers, and the one asked on
+ * every run.
+ *
+ * `env_local::check()` has to know which `.env.<name>` files ought to exist
+ * before it can say whether the checkout is provisioned, and brokering a
+ * credential to find out would reach Infisical for a token nobody asked for and
+ * write an audit row saying somebody read the team's secrets when nobody did.
+ * That is the same reasoning that puts `secretEnvironments` on `/org/config`,
+ * one step further along: the answer is now per repository, and `/org/config`
+ * is fetched before the run knows which repository it is about.
+ *
+ * It carries no credential — folder names, environment names, and when a lead
+ * last edited the row — so there is no fetch to audit here. What it does
+ * disclose is the shape of the team's Infisical project, which is why it still
+ * re-verifies org membership like everything else secret-adjacent.
+ */
+http.route({
+  path: "/api/v1/secrets/scope",
+  method: "GET",
+  handler: httpAction(
+    endpoint(async (ctx, req) => {
+      const { member, config } = await guard(ctx, req, {
+        version: true,
+        org: true,
+      });
+
+      const asked = new URL(req.url).searchParams.get("repo") ?? "";
+      const repoSlug = repoFromBody({ repo: asked });
+      if (repoSlug === undefined) {
+        fail(
+          400,
+          "bad_request",
+          "riabuild did not say which repository it was asking about.",
+          "Run `riabuild` again; if it keeps happening, tell your team lead.",
+        );
+      }
+
+      const resolved = await repoScope(ctx, member.role, repoSlug);
+      if (resolved.state === "unmapped") {
+        // Not a 404. "Nobody mapped this repository" is an answer about the
+        // team's configuration, and the CLI acts on it — a status code would
+        // make it indistinguishable from a deployment that has no such route,
+        // which is exactly the case an older riabuild-web presents.
+        return jsonResponse({
+          repo: repoSlug,
+          configured: false,
+          secretPaths: [],
+          environments: [],
+          updatedAt: 0,
+          secretsUpdatedAt: config.secretsUpdatedAt,
+        });
+      }
+
+      return jsonResponse({
+        repo: repoSlug,
+        configured: true,
+        secretPaths: resolved.scope.secretPaths,
+        environments: resolved.scope.environments,
+        updatedAt: resolved.updatedAt,
+        secretsUpdatedAt: config.secretsUpdatedAt,
+      });
+    }),
+  ),
+});
+
+/* -------------------------------------------------------------------------- */
 /* POST /api/v1/secrets/token — short-lived Infisical access token             */
 /* -------------------------------------------------------------------------- */
 
@@ -598,7 +770,50 @@ http.route({
         org: true,
       });
 
-      const broker = await brokerToken(member.role);
+      // A CLI that names no repository gets the deployment-wide answer it has
+      // always got. `req.json()` on an absent or unparseable body is not an
+      // error here for the same reason: every riabuild in the field posts `{}`.
+      let body: unknown = {};
+      try {
+        body = await req.json();
+      } catch {
+        body = {};
+      }
+      const repoSlug = repoFromBody(body);
+
+      let scope: Scope | undefined;
+      if (repoSlug !== undefined) {
+        const resolved = await repoScope(ctx, member.role, repoSlug);
+        if (resolved.state === "unmapped") {
+          // No credential is minted and no audit row is written, because
+          // nothing was read. A repository nobody mapped is one riabuild leaves
+          // alone, and saying so costs less than a token that opens nothing.
+          //
+          // The CLI asks `/secrets/scope` before it gets here, so this branch
+          // is the race — a lead removing the mapping between the two calls —
+          // rather than the normal path. It is still shaped like every other
+          // reply from this route, with the credential fields present and
+          // empty, so that an older CLI meets a token that opens nothing
+          // instead of a body it cannot parse. `configured` is what a current
+          // one reads, and it reads it before the token.
+          return jsonResponse({
+            token: "",
+            expiresAt: 0,
+            projectId: "",
+            environment: "",
+            environments: [],
+            secretPath: "",
+            secretPaths: [],
+            siteUrl: "",
+            secretsUpdatedAt: config.secretsUpdatedAt,
+            repo: repoSlug,
+            configured: false,
+          });
+        }
+        scope = resolved.scope;
+      }
+
+      const broker = await brokerToken(member.role, scope);
       if (broker.status === "not_configured") {
         console.error("infisical not configured:", broker.detail);
         fail(
@@ -628,6 +843,10 @@ http.route({
           // Which environments one credential opened is the part worth being
           // able to answer later; `environment` alone cannot say "and staging".
           environments: broker.environments.join(","),
+          // And which repository it was for. Without it every row on a team
+          // with several repositories reads identically, and "who read the
+          // payments secrets" has no answer.
+          repo: repoSlug ?? "",
         },
       });
 
@@ -643,6 +862,12 @@ http.route({
         secretPaths: broker.secretPaths,
         siteUrl: broker.siteUrl,
         secretsUpdatedAt: config.secretsUpdatedAt,
+        // Echoed so the CLI never has to assume the server understood which
+        // repository it meant. A deployment released before this field answers
+        // with neither, which is how the CLI tells "your repository is mapped"
+        // apart from "this deployment does not know about repositories".
+        repo: repoSlug ?? "",
+        configured: repoSlug === undefined ? undefined : true,
       });
     }),
   ),
