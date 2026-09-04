@@ -7,12 +7,14 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use ratatui::crossterm::event::Event as TermEvent;
+use riabuild_channel::clipboard::Clipboard;
 use riabuild_harness::Reader;
 use riabuild_runner::CommandRunner;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{App, Pane, Row};
 use crate::draw::Chrome;
+use crate::paste::{self, Pasted};
 use crate::store::{self, Store};
 use crate::{Action, Login, Request, Screen, frame, key, keys};
 
@@ -94,10 +96,24 @@ pub async fn first_prompt(
     app.cursor = 0;
 }
 
+/// Everything outside the window it can reach while it is open.
+///
+/// Grouped rather than passed one by one because they are the same kind of
+/// thing — the two ways this crate touches the machine it is running on — and
+/// because a loop with eight parameters is one nobody can add the ninth to.
+#[derive(Clone, Copy)]
+pub struct Reach<'a> {
+    /// How every external process is started, without exception.
+    pub runner: &'a dyn CommandRunner,
+    /// What Ctrl-V reads. `None` is a Linux laptop with no clipboard tool
+    /// installed, which is a notice rather than a window that will not open.
+    pub clipboard: Option<&'a dyn Clipboard>,
+}
+
 pub async fn drive(
     terminal: &mut Screen,
     store: &Store,
-    runner: &dyn CommandRunner,
+    reach: Reach<'_>,
     request: &Request,
     app: &mut App,
     readers: &mut HashMap<String, Reader>,
@@ -141,8 +157,43 @@ pub async fn drive(
         match action {
             Action::Nothing => {}
             Action::Quit => app.quit = true,
-            Action::Send(text) => send(store, runner, request, app, readers, &text).await,
+            Action::Send(text) => send(store, reach.runner, request, app, readers, &text).await,
+            Action::Paste => paste_into_compose(store, app, reach.clipboard).await,
         }
+    }
+}
+
+/// Ctrl-V: what the clipboard holds, in the box.
+///
+/// Every way this can fail is a notice rather than an error returned. The
+/// window is the developer's session with three agents; a clipboard tool that
+/// would not run is not a reason to close it, and the message is one keypress
+/// from being gone.
+async fn paste_into_compose(store: &Store, app: &mut App, clipboard: Option<&dyn Clipboard>) {
+    let Some(clipboard) = clipboard else {
+        // Named rather than described, the way `install_hint` is: "paste does
+        // not work" is not something a developer can act on.
+        app.notice = Some(riabuild_channel::clipboard::install_hint_for_this_machine().to_string());
+        return;
+    };
+    match paste::read(clipboard, &store.images_dir()).await {
+        Ok(Pasted::Image(path)) => {
+            // The path, in the line, as text the developer can see and edit —
+            // there is no hidden attachment list for a backspace to
+            // desynchronise. A space after it because the next thing typed is a
+            // sentence about the image.
+            for ch in path.display().to_string().chars() {
+                app.compose.insert(ch);
+            }
+            app.compose.insert(' ');
+        }
+        Ok(Pasted::Text(text)) => {
+            for ch in text.chars() {
+                app.compose.insert(ch);
+            }
+        }
+        Ok(Pasted::Nothing) => app.notice = Some("Nothing on the clipboard to paste.".to_string()),
+        Err(error) => app.notice = Some(format!("{error:#}")),
     }
 }
 
@@ -348,5 +399,86 @@ mod tests {
         restore(&store, &request, &mut app).await.unwrap();
         assert_eq!(app.panes.len(), 1);
         assert_eq!(app.panes[0].label(), "a real conversation");
+    }
+
+    /// A clipboard holding one PNG, however this machine spells that.
+    fn with_an_image() -> Arc<FakeRunner> {
+        Arc::new(
+            FakeRunner::new()
+                .with(
+                    "xclip -selection clipboard -t TARGETS -o",
+                    0,
+                    "image/png\n",
+                    "",
+                )
+                .with_bytes(
+                    "xclip -selection clipboard -t image/png -o",
+                    0,
+                    &[0x89, b'P', b'N', b'G'],
+                    "",
+                ),
+        )
+    }
+
+    /// The whole feature, end to end and one layer below the terminal: a
+    /// pasted image is a *file* the agent can open, and its path is in the
+    /// prompt as text the developer can see and edit. There is no hidden
+    /// attachment list a backspace could put out of step with the line.
+    #[tokio::test]
+    async fn pasting_an_image_puts_a_readable_path_in_the_box() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::rooted_at(temp.path());
+        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let runner: Arc<dyn riabuild_runner::CommandRunner> = with_an_image();
+        let clipboard = riabuild_channel::clipboard::CliClipboard::x11(runner);
+
+        app.compose.insert('?');
+        app.compose.start();
+        paste_into_compose(&store, &mut app, Some(&clipboard)).await;
+
+        let text = app.compose.text().to_string();
+        // Inserted at the caret like anything else typed, so the character that
+        // was already there is after it.
+        let path = text.trim_end_matches('?').trim_end();
+        assert!(
+            path.starts_with(&store.images_dir().display().to_string()),
+            "{text}"
+        );
+        assert!(tokio::fs::metadata(path).await.is_ok(), "{path}");
+        assert_eq!(app.notice, None);
+    }
+
+    /// An empty clipboard is the ordinary case. It says so and takes nothing
+    /// down: a key that does nothing and says nothing reads as one that is not
+    /// bound at all.
+    #[tokio::test]
+    async fn an_empty_clipboard_is_said_out_loud_and_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::rooted_at(temp.path());
+        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let runner: Arc<dyn riabuild_runner::CommandRunner> =
+            Arc::new(FakeRunner::new().with("xclip -selection clipboard -t TARGETS -o", 1, "", ""));
+        let clipboard = riabuild_channel::clipboard::CliClipboard::x11(runner);
+
+        paste_into_compose(&store, &mut app, Some(&clipboard)).await;
+        assert!(app.compose.is_empty());
+        assert!(app.notice.is_some());
+    }
+
+    /// A Linux laptop with neither `xclip` nor `wl-clipboard`. The window opens
+    /// and works; Ctrl-V names the package to install, because "paste does not
+    /// work" is not something a developer can act on.
+    #[tokio::test]
+    async fn a_laptop_with_no_clipboard_tool_is_told_what_to_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::rooted_at(temp.path());
+        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+
+        paste_into_compose(&store, &mut app, None).await;
+        let notice = app.notice.unwrap_or_default();
+        assert!(
+            notice.contains("xclip") || notice.contains("wl-clipboard"),
+            "{notice}"
+        );
     }
 }
