@@ -142,7 +142,18 @@ an incomplete pair buys a 401 from Infisical instead of a working developer cred
 
 riabuild asks for `dev` and `staging` on behalf of a developer or a lead, and for `dev`
 alone on behalf of a candidate — one `.env.<environment>` per environment, in the
-checkout. That list is unchanged by `mi-lead`: what a lead's credential *may* reach is
+checkout.
+
+**That is now the answer for a CLI that names no repository.** Since 2026-09-04 a lead
+maps each repository to its own Infisical folders in the dashboard, and riabuild writes
+one file per environment that actually holds **every** folder that repository names —
+read from Infisical, not from the two variables below. So a project with a `prod`
+environment gets `.env.prod` without anybody setting anything here, and a project with no
+staging needs no variable blanked. `INFISICAL_ENVIRONMENT` still names the *base*
+environment: it is the one a candidate is limited to, and the one ordered first so
+`.env.dev` stays the file the CLI's notes lead with. See
+`superpowers/specs/2026-09-04-per-repository-secret-paths-design.md`, and the migration
+below — which is not optional on a deployment that predates the table. That list is unchanged by `mi-lead`: what a lead's credential *may* reach is
 now the whole project, but what riabuild pulls into a checkout on their behalf is still
 the two environments every developer gets. A lead reaching further does it by hand —
 `infisical secrets --env=prod` through the shim — which is a command they typed rather
@@ -178,6 +189,30 @@ curl -sS https://$(npx convex env get INFISICAL_SITE_URL --prod | sed 's|https\?
 `{"message":"Ok",…}` means the host is right and the failure is the credential; a DNS
 error means it is the host. → `ai-builders-hub/docs/infra-domains-clubria-move.md`, which
 is the authority for every one of these subdomains.
+
+### Deploying per-repository secret paths onto an existing deployment
+
+One step, and it is **not optional** on a deployment that has ever brokered a secret:
+
+```sh
+npx convex run secretPaths:seedFromDeploymentPath --prod
+```
+
+A repository with no row in `repoSecretPaths` gets **no environment files at all** — that
+is the feature, not a gap, and it is how a lead says "this repository has no environment
+variables". Applied to a deployment that has never had a row, it means every developer
+loses their `.env.dev` on the day this ships and finds out at once.
+
+The migration writes the one row that reproduces today's behaviour: the org's default
+repository, pointed at the deployment's own `INFISICAL_SECRET_PATH`, in the deployment's
+own order — so it keeps the folder that currently wins a key both of them hold. It writes
+nothing when the table already holds anything, so it is safe to re-run and it never argues
+with a decision a lead has already made. It says which of those it did — the row it wrote,
+or why it wrote none — so read the line it prints rather than assuming.
+
+Then map the team's other repositories in the dashboard, under **where secrets come
+from**. That panel is also how you confirm the seed landed: `secretPaths:list` is
+lead-only and `npx convex run` carries no identity, so it throws rather than answering.
 
 ### Deploying the dev/staging split onto an existing deployment
 

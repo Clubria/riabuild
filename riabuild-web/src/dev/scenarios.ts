@@ -987,6 +987,30 @@ export const SCENARIOS: Record<string, () => Data> = {
 
   overflow: () => ({
     ...base({ ...LEAD, ...HOSTILE, role: "lead", status: "active" }),
+    // The mapping table's hostile row: a slug with no space to break at, and
+    // the maximum ten folders — which is where the numbered list inside a cell
+    // pushes the row taller than the actions beside it, and where a folder too
+    // long to wrap would widen the page.
+    repoSecretPaths: {
+      state: "ready",
+      value: [
+        {
+          _id: id("rp_hostile"),
+          repoSlug: `${"a".repeat(39)}/${"b".repeat(60)}`,
+          secretPaths: Array.from(
+            { length: 10 },
+            (_, index) => `/${"deeply-nested-folder/".repeat(3)}leaf-${index}`,
+          ),
+          updatedAt: NOW - MINUTE,
+        },
+        {
+          _id: id("rp_unicode"),
+          repoSlug: "Clubria/田中さんのリポジトリ",
+          secretPaths: ["/アプリ/支払い"],
+          updatedAt: NOW - DAY,
+        },
+      ],
+    },
     members: {
       state: "ready",
       value: [

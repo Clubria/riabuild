@@ -4,7 +4,16 @@
  * Two different clients talk to it, and it is worth being explicit about which:
  *
  *   riabuild-web  POST /api/v1/auth/universal-auth/login   (convex/infisical.ts)
+ *   riabuild-web  GET  /api/v1/workspace/<id>              (convex/infisical.ts)
+ *   riabuild-web  GET  /api/v1/folders                     (convex/infisical.ts)
  *   infisical CLI GET  /api/v4/secrets                     (tasks/env_local.rs)
+ *
+ * The middle two are how riabuild-web finds out which environments a
+ * repository's folders are actually in, rather than being told by a constant.
+ * They are answered *from the same table* as the exports below, deliberately:
+ * a stub that listed an environment it then had no secrets for would let a run
+ * pass while promising a `.env.<name>` no export can fill, which is the exact
+ * failure discovery exists to prevent.
  *
  * The second one arrives once per environment *per folder* — riabuild pulling
  * `.env.<environment>` — and once more in stage 13, from the other end of the
@@ -152,6 +161,56 @@ const server = createServer((req, res) => {
         expiresIn: TOKEN_TTL_SECONDS,
         accessTokenMaxTTL: TOKEN_TTL_SECONDS,
         tokenType: "Bearer",
+      });
+    }
+
+    if (req.method === "GET" && path.startsWith("/api/v1/workspace/")) {
+      if (bearer(req) !== ACCESS_TOKEN) {
+        return json(res, 401, { message: "stub: not the token this stub brokered" });
+      }
+      // Under a `workspace` key rather than at the top level, because that is
+      // the shape riabuild-web has to keep accepting and the one a reader is
+      // least likely to guess.
+      return json(res, 200, {
+        workspace: {
+          id: path.slice("/api/v1/workspace/".length),
+          environments: Object.keys(SECRETS_BY_ENVIRONMENT).map((slug) => ({
+            slug,
+            name: slug,
+          })),
+        },
+      });
+    }
+
+    if (req.method === "GET" && path === "/api/v1/folders") {
+      if (bearer(req) !== ACCESS_TOKEN) {
+        return json(res, 401, { message: "stub: not the token this stub brokered" });
+      }
+      const query = new URL(req.url, "http://stub").searchParams;
+      const environment = query.get("environment");
+      const folders = SECRETS_BY_ENVIRONMENT[environment ?? ""];
+      if (folders === undefined) {
+        // An environment nobody configured has no folders rather than an
+        // error: riabuild-web asks about every environment the project lists,
+        // and this stub lists only the ones it can serve.
+        return json(res, 200, { folders: [] });
+      }
+      // Infisical's listing describes what is *inside* a path, which is why
+      // riabuild-web lists the parent and looks for the leaf: a listing of a
+      // folder that does not exist and a listing of an empty one are the same
+      // empty array. Deriving the tree from the secret paths above is what
+      // keeps the two halves of this stub from drifting apart.
+      const parent = query.get("path") ?? "/";
+      const prefix = parent === "/" ? "/" : `${parent}/`;
+      const names = new Set();
+      for (const folder of Object.keys(folders)) {
+        if (!folder.startsWith(prefix)) continue;
+        const rest = folder.slice(prefix.length);
+        if (rest === "") continue;
+        names.add(rest.split("/")[0]);
+      }
+      return json(res, 200, {
+        folders: [...names].map((name) => ({ id: name, name })),
       });
     }
 
