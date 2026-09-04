@@ -31,7 +31,7 @@ pub struct ClaudeTrust;
 /// The shape Claude Code gives a project entry it creates itself. Writing the
 /// whole thing keeps riabuild's entries indistinguishable from Claude's own,
 /// rather than betting that every field is optional.
-fn new_project_entry() -> Value {
+pub(crate) fn new_project_entry() -> Value {
     json!({
         "allowedTools": [],
         "mcpContextUris": [],

@@ -310,10 +310,14 @@ turns are not this process's children, and there is no pipe to hold.
   which per-turn respawning cannot. Blocked on their schemas stabilising; both are marked
   experimental or beta by their own vendors. The decoders are already written against ACP's
   own names so that adopting one replaces a transport and keeps a decoder.
-- **Cross-provider delegation.** `Event::Delegated` exists and Claude Code populates it
-  through `parent_tool_use_id`, the only attribution any of the three emits. An agent in one
-  provider spawning a subagent in another would be an MCP server that opens a session here.
-  Nothing is built for it; the event model is the part that would have been hard.
+- ~~**Cross-provider delegation.**~~ **Answered, 2026-09-04**, by the mechanism this
+  paragraph guessed at: `riabuild internal mcp-codex` is an MCP server that opens a session
+  here, and Claude Code reaches Codex through it. The event model was indeed not the hard
+  part — the hard part was that MCP carries no way for a server to ask which session is
+  calling it, which `RIABUILD_AGENT_SESSION` in the turn's environment answers. Sessions now
+  record a `parent` and the rail draws one level of children. `Event::Delegated` is
+  unchanged and still means Claude's own subagents inside one pane; the two do not interact.
+  See `2026-09-04-codex-subagents-design.md`.
 - **Interrupts.** There is no key that stops a running turn. Doing it properly means killing
   a process this window deliberately does not own, which needs the lock to carry something
   more than "held". Left out rather than half-built.

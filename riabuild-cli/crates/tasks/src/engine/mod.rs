@@ -1076,7 +1076,8 @@ mod tests {
                 "claude_trust",
                 "claude_onboarding",
                 "claude_agents_view",
-                "claude_plugins"
+                "claude_plugins",
+                "claude_codex_mcp"
             ],
         );
     }

@@ -1580,6 +1580,7 @@ dependencies = [
  "riabuild-gh-session",
  "riabuild-harness",
  "riabuild-keychain",
+ "riabuild-mcp",
  "riabuild-paths",
  "riabuild-remote",
  "riabuild-runner",
@@ -1638,6 +1639,21 @@ dependencies = [
  "riabuild-paths",
  "riabuild-runner",
  "riabuild-ui",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "riabuild-mcp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "riabuild-agents",
+ "riabuild-harness",
+ "riabuild-paths",
+ "riabuild-runner",
+ "riabuild-version",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

@@ -105,8 +105,9 @@ The other thing the missing sign-in reaches is the `applied=[]` idempotency
 invariant, and that is substituted rather than lost.
 Its run log is written after the tasks, so an aborted run produces none; `--check`
 completes where a real run cannot and writes the same line, and it must report
-exactly `claude_accounts,claude_trust,claude_onboarding,claude_agents_view`
-outstanding and nothing else — the latter three each write into a `.claude.json`
+exactly
+`claude_accounts,claude_trust,claude_onboarding,claude_agents_view,claude_codex_mcp`
+outstanding and nothing else — the latter four each write into a `.claude.json`
 that only exists once an account does, so the missing sign-in blocks all of them.
 The line is read a field at a time rather than matched whole, and `failed` and
 `skipped` have to be empty as well: the engine carries on past a failed task, so

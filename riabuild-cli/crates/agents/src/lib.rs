@@ -87,6 +87,19 @@ pub use account::{Account, Accounts};
 use app::{App, Focus};
 use store::Store;
 
+/// The environment variable a turn tells its harness which session it is.
+///
+/// riabuild's own name, not a vendor's, and it is set by [`turn`] on every turn
+/// of every harness. What reads it is `riabuild internal mcp-codex`: Claude Code
+/// passes its whole environment to the stdio MCP servers it spawns, so a server
+/// started inside a session can name the session that started it, which the MCP
+/// protocol itself provides no way to ask.
+///
+/// A session started outside this window — `~/.riabuild/bin/claude` in a
+/// terminal — carries no such variable, and a delegation from one is a root
+/// rather than a failure.
+pub const DELEGATING_SESSION: &str = "RIABUILD_AGENT_SESSION";
+
 /// What `riabuild agents` was asked to do.
 #[derive(Debug, Clone)]
 pub struct Request {

@@ -252,6 +252,7 @@ riabuild-fetch = { path = "crates/fetch" }
 riabuild-gh-session = { path = "crates/gh-session" }
 riabuild-harness = { path = "crates/harness" }
 riabuild-keychain = { path = "crates/keychain" }
+riabuild-mcp = { path = "crates/mcp" }
 riabuild-paths = { path = "crates/paths" }
 riabuild-remote = { path = "crates/remote" }
 riabuild-runner = { path = "crates/runner" }

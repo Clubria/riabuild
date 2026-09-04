@@ -111,6 +111,20 @@ async fn one_turn(
         // starts a new conversation under the same pane.
         env.push((kind.home_env().to_string(), home.display().to_string()));
     }
+    // What makes a delegated session knowable, and the only thing that does.
+    // Claude Code hands its whole environment to the stdio MCP servers it
+    // spawns — verified against 2.1.260 — so `riabuild internal mcp-codex`
+    // reads this out of its own environment and records the session that asked
+    // for the work as the new one's parent. There is no field in the MCP
+    // protocol that would carry it: `initialize` tells a server the client's
+    // name and version and nothing about which conversation it is serving.
+    //
+    // Set for every harness rather than for Claude alone. The variable names
+    // *this* session, so a Codex turn that is itself a subagent overwrites what
+    // it inherited instead of passing its own parent's id further down — which
+    // is what would attach a grandchild to the wrong session on the day a
+    // second harness is given the server.
+    env.push((crate::DELEGATING_SESSION.to_string(), record.id.clone()));
 
     let child = runner
         .spawn_piped(
