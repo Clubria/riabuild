@@ -28,6 +28,12 @@ set_env INFISICAL_ENVIRONMENT dev
 # A candidate would get `dev` alone; that split is unit-tested rather than run
 # here, because this suite has one seeded member and one checkout.
 set_env INFISICAL_STAGING_ENVIRONMENT staging
-set_env INFISICAL_SECRET_PATH /
+# Two folders, comma-separated, because one environment's secrets are not
+# always in one folder — AI Builders' are in two. The order is the contract:
+# riabuild exports them in it and merges later-wins, so the stub puts one key
+# in both folders with a value the first one must lose. A single-folder
+# deployment is still the ordinary case and is unit-tested; this run covers the
+# case that has no other coverage anywhere.
+set_env INFISICAL_SECRET_PATH /tenant/e2e/frontend,/tenant/e2e/convex
 pass "deployment configured"
 

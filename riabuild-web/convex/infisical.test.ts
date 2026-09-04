@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { environmentsForRole, identityForRole } from "./infisical";
+import { environmentsForRole, identityForRole, secretPaths } from "./infisical";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -76,5 +76,33 @@ describe("which environments a role may pull", () => {
     // fail every developer's run rather than degrade.
     vi.stubEnv("INFISICAL_STAGING_ENVIRONMENT", "");
     expect(environmentsForRole("lead")).toEqual(["dev"]);
+  });
+});
+
+describe("which folders a credential is minted to export", () => {
+  test("one folder is the ordinary case and stays one", () => {
+    vi.stubEnv("INFISICAL_SECRET_PATH", "/apps");
+    expect(secretPaths()).toEqual(["/apps"]);
+  });
+
+  test("a deployment whose environment is several folders names them all", () => {
+    // AI Builders since 2026-08-29: the VITE_* in one folder, the admin key
+    // and the developer-only secrets in another, and a `.env.dev` carrying
+    // either half alone does not start the app.
+    vi.stubEnv(
+      "INFISICAL_SECRET_PATH",
+      "/tenant/aibuilders/frontend, /tenant/aibuilders/convex",
+    );
+    expect(secretPaths()).toEqual([
+      "/tenant/aibuilders/frontend",
+      "/tenant/aibuilders/convex",
+    ]);
+  });
+
+  test("a deployment that names nothing gets the root it always got", () => {
+    // Both spellings of "nothing": unset, and set to separators alone.
+    expect(secretPaths()).toEqual(["/"]);
+    vi.stubEnv("INFISICAL_SECRET_PATH", " , ");
+    expect(secretPaths()).toEqual(["/"]);
   });
 });

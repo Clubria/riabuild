@@ -29,8 +29,17 @@ pub struct BrokeredToken {
     /// the test beside this type for why that is not defaulted to anything.
     #[serde(default)]
     pub environments: Vec<String>,
+    /// The primary folder alone — what a bare `infisical` command through the
+    /// shim defaults to. It is the last of `secret_paths`, so a deployment
+    /// released before that field is still answering the same question.
     #[serde(rename = "secretPath", default = "root_path")]
     pub secret_path: String,
+    /// Every folder this credential was minted to export, in the order they
+    /// are exported and therefore merged: **later wins**, exactly as a dotenv
+    /// loader reads the finished file. Empty means the deployment predates the
+    /// field, which `export_paths` answers with the primary alone.
+    #[serde(rename = "secretPaths", default)]
+    pub secret_paths: Vec<String>,
     #[serde(rename = "siteUrl", default)]
     pub site_url: String,
     #[serde(rename = "secretsUpdatedAt", default)]
@@ -39,6 +48,33 @@ pub struct BrokeredToken {
 
 fn root_path() -> String {
     "/".to_string()
+}
+
+impl BrokeredToken {
+    /// The folders to export, in order, for one environment.
+    ///
+    /// Unlike `environments` — which is empty on an old deployment and is left
+    /// empty, because guessing which environments a laptop may pull would be
+    /// this CLI inventing an authorization answer — an absent `secret_paths`
+    /// has a correct answer already in hand: the single folder that deployment
+    /// has always named. So this falls back rather than failing, and a
+    /// deployment nobody has updated keeps working exactly as it did.
+    pub fn export_paths(&self) -> Vec<String> {
+        let named: Vec<String> = if self.secret_paths.is_empty() {
+            vec![self.secret_path.clone()]
+        } else {
+            self.secret_paths.clone()
+        };
+        // An empty string is not a folder, and `--path=` is not the root: it
+        // is an argument infisical answers nothing for. A deployment that
+        // sends one is misconfigured, and the root is what riabuild brokered
+        // before either field existed.
+        let named: Vec<String> = named.into_iter().filter(|path| !path.is_empty()).collect();
+        if named.is_empty() {
+            return vec![root_path()];
+        }
+        named
+    }
 }
 
 /// Whether an environment name is safe to turn into a filename and an argument.
@@ -83,6 +119,57 @@ mod tests {
         .unwrap();
         assert_eq!(brokered.secret_path, "/");
         assert_eq!(brokered.environment, "dev");
+    }
+
+    #[test]
+    fn a_deployment_that_names_no_folders_still_exports_the_one_it_named() {
+        // Unlike `environments`, an absent `secretPaths` has a correct answer
+        // already in hand — the folder that deployment has always sent — so
+        // this falls back rather than failing. A deployment nobody has
+        // updated goes on pulling exactly what it pulled before.
+        let brokered: BrokeredToken = serde_json::from_str(
+            r#"{"token":"inf_x","projectId":"p1","environment":"dev","secretPath":"/dev-env"}"#,
+        )
+        .unwrap();
+        assert!(brokered.secret_paths.is_empty());
+        assert_eq!(brokered.export_paths(), ["/dev-env"]);
+    }
+
+    #[test]
+    fn every_folder_the_deployment_names_is_exported_in_order() {
+        // Order is the contract: the credential folder is last, so a key both
+        // folders hold takes its value, and `secretPath` — the shim's default
+        // and all an older CLI reads — is that same last folder.
+        let brokered: BrokeredToken = serde_json::from_str(
+            r#"{"token":"inf_x","projectId":"p1","environment":"dev",
+                "secretPath":"/tenant/aibuilders/convex",
+                "secretPaths":["/tenant/aibuilders/frontend","/tenant/aibuilders/convex"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            brokered.export_paths(),
+            ["/tenant/aibuilders/frontend", "/tenant/aibuilders/convex"]
+        );
+        assert_eq!(brokered.secret_path, "/tenant/aibuilders/convex");
+    }
+
+    #[test]
+    fn an_empty_folder_name_is_never_passed_as_a_path() {
+        // `--path=` is not the root, it is an argument infisical answers
+        // nothing for. A deployment that sends one is misconfigured, and the
+        // root is what riabuild brokered before either field existed.
+        let brokered: BrokeredToken = serde_json::from_str(
+            r#"{"token":"inf_x","projectId":"p1","environment":"dev",
+                "secretPath":"","secretPaths":["","/apps",""]}"#,
+        )
+        .unwrap();
+        assert_eq!(brokered.export_paths(), ["/apps"]);
+
+        let empty: BrokeredToken = serde_json::from_str(
+            r#"{"token":"inf_x","projectId":"p1","environment":"dev","secretPath":""}"#,
+        )
+        .unwrap();
+        assert_eq!(empty.export_paths(), ["/"]);
     }
 
     #[test]

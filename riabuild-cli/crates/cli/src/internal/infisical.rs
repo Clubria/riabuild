@@ -306,7 +306,13 @@ mod tests {
             project_id: "p1".into(),
             environment: "dev".into(),
             environments: vec!["dev".into(), "staging".into()],
+            // The shim fills in the *primary* folder — the last one the
+            // deployment named — and never the whole list: a command the
+            // developer typed is scoped, not assembled. Merging several
+            // folders belongs to `env_local`, which writes a file that has to
+            // be complete.
             secret_path: "/apps".into(),
+            secret_paths: vec!["/apps/frontend".into(), "/apps".into()],
             site_url: "https://app.infisical.com".into(),
             secrets_updated_at: 0,
         }
