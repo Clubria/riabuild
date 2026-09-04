@@ -87,7 +87,32 @@ async fn credential_for_one_command(ctx: &mut Ctx) -> Option<BrokeredToken> {
         );
         return None;
     }
-    match riabuild_api::secrets::broker(&ctx.api).await {
+    // Scoped to the repository this machine is working on, so `infisical
+    // export` in a checkout defaults to *that* repository's folder rather than
+    // to whichever one the deployment names. A machine that has not chosen yet
+    // asks org-wide, which is what every riabuild before the mapping table did.
+    let brokered = match ctx.repo() {
+        Ok(repo) => riabuild_api::secrets::broker_for(&ctx.api, repo.slug()).await,
+        Err(_) => riabuild_api::secrets::broker(&ctx.api).await,
+    };
+    match brokered {
+        // A repository a lead gave no Infisical folder still gets a working
+        // `infisical`. The mapping decides what riabuild *writes* into a
+        // checkout, which is a statement about files; whether the developer's
+        // own command is signed in is a statement about a tool they are
+        // entitled to use, and answering the first with the second would leave
+        // them unable to look at anything at all.
+        Ok(brokered) if brokered.configured == Some(false) => {
+            match riabuild_api::secrets::broker(&ctx.api).await {
+                Ok(brokered) => Some(brokered),
+                Err(error) => {
+                    ctx.ui.warn(&format!(
+                        "riabuild could not broker an Infisical credential, so infisical is running signed out ({error})"
+                    ));
+                    None
+                }
+            }
+        }
         Ok(brokered) => Some(brokered),
         Err(error) => {
             ctx.ui.warn(&format!(
@@ -315,6 +340,7 @@ mod tests {
             secret_paths: vec!["/apps/frontend".into(), "/apps".into()],
             site_url: "https://app.infisical.com".into(),
             secrets_updated_at: 0,
+            configured: Some(true),
         }
     }
 

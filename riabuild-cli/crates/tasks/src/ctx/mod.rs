@@ -22,6 +22,53 @@ use riabuild_ui::Ui;
 use std::sync::Arc;
 
 /// Everything a task is allowed to touch.
+/// What riabuild is going to do about one repository's secrets.
+///
+/// Four answers rather than two, and the ones worth naming are the third and
+/// the fourth. A deployment that has never heard of per-repository folders is a
+/// *different* fact from a lead deciding a repository has no environment
+/// variables: collapsing them would either strand a team on an older
+/// riabuild-web with no secrets at all, or quietly fill an unmapped repository
+/// from another repository's folders, and neither failure says anything on the
+/// terminal. And "we could not find out" is a third thing again — the
+/// distinction `github.ts` draws with `unavailable`, for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SecretScope {
+    /// Nothing has asked, or this deployment has no mapping table. The org-wide
+    /// environment list on `/api/v1/org/config` is the answer, which is what
+    /// riabuild did for its whole life until the table existed.
+    #[default]
+    OrgWide,
+    /// A lead mapped this repository to one or more Infisical folders.
+    Mapped {
+        /// The environments those folders were actually found in.
+        environments: Vec<String>,
+        /// When the mapping last changed. A second kind of staleness beside a
+        /// rotation: a `.env.dev` filled from the folder this row named
+        /// yesterday is as wrong as one filled before the team rotated, and the
+        /// file cannot tell the difference either way.
+        updated_at: u64,
+    },
+    /// A lead deliberately did not map it. riabuild writes no `.env` files.
+    Unmapped,
+    /// Asked, and riabuild-web could not say. Carries what to tell the
+    /// developer, because "we could not tell" must never render as "you have no
+    /// secrets".
+    Unavailable(String),
+}
+
+impl SecretScope {
+    /// When the mapping this scope came from last moved, or `0` where the
+    /// question does not apply. Compared against a secrets file's mtime beside
+    /// `OrgConfig::secrets_updated_at`.
+    pub fn mapped_at(&self) -> u64 {
+        match self {
+            SecretScope::Mapped { updated_at, .. } => *updated_at,
+            _ => 0,
+        }
+    }
+}
+
 pub struct Ctx {
     pub paths: Arc<dyn Paths>,
     pub runner: Arc<dyn CommandRunner>,
@@ -39,6 +86,21 @@ pub struct Ctx {
     /// offers, and reading it in a task is how a run ends up cloning one
     /// repository and provisioning another.
     pub repo: Option<Repo>,
+    /// Which Infisical folders this run's repository takes its secrets from,
+    /// and which environments they are in.
+    ///
+    /// Loaded once, by `provision`, after the picker has settled which
+    /// repository the run is about — never by a task. It is here for the same
+    /// reason `org` is: `env_local::check()` runs on every `riabuild --check`
+    /// and has to know which `.env.<name>` files ought to exist, and a `check()`
+    /// that made its own HTTP request would be a `check()` no test could run
+    /// without a network. That is the rule `CommandRunner` already enforces for
+    /// subprocesses, applied to the one task that also talks to riabuild-web.
+    ///
+    /// `SecretScope::OrgWide` is the default rather than an "unknown", because
+    /// it is what every deployment released before the mapping table answers
+    /// and what riabuild did for its whole life until now.
+    pub secret_scope: SecretScope,
     pub member: Option<Member>,
     /// The server this riabuild is managed from, when it is on one.
     ///
@@ -89,6 +151,7 @@ impl Ctx {
             state,
             org: None,
             repo: None,
+            secret_scope: SecretScope::OrgWide,
             member: None,
             server: scope.server.clone(),
             cli_version: riabuild_version::VERSION.to_string(),
@@ -140,6 +203,10 @@ impl Ctx {
             state: self.state.clone(),
             org: self.org.clone(),
             repo: self.repo.clone(),
+            // Carried, and load-bearing: `env_local` runs in a wave, so it is
+            // forked, and a fork that took the default would quietly fill an
+            // unmapped repository from the org-wide folders.
+            secret_scope: self.secret_scope.clone(),
             member: self.member.clone(),
             server: self.server.clone(),
             cli_version: self.cli_version.clone(),

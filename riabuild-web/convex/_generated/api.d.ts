@@ -25,6 +25,7 @@ import type * as lib_version from "../lib/version.js";
 import type * as members from "../members.js";
 import type * as org from "../org.js";
 import type * as release from "../release.js";
+import type * as secretPaths from "../secretPaths.js";
 import type * as sessions from "../sessions.js";
 import type * as sharedServers from "../sharedServers.js";
 import type * as usage from "../usage.js";
@@ -53,6 +54,7 @@ declare const fullApi: ApiFromModules<{
   members: typeof members;
   org: typeof org;
   release: typeof release;
+  secretPaths: typeof secretPaths;
   sessions: typeof sessions;
   sharedServers: typeof sharedServers;
   usage: typeof usage;

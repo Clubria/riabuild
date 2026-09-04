@@ -8,6 +8,7 @@ import {
   OrgCandidate,
   OrgConfig,
   Session,
+  RepoSecretPath,
   SharedServer,
   UsageRollup,
   UsageRow,
@@ -479,6 +480,43 @@ const REJECT = async (): Promise<never> => {
   );
 };
 
+/**
+ * Where each repository's secrets come from.
+ *
+ * Three rows because they are three different answers, not three examples of
+ * one. The default repository takes the whole project — the honest spelling of
+ * "these secrets are everyone's". `payments` layers a folder of its own over
+ * the shared one, which is the case the ordering rule exists for: a key both
+ * hold takes the second line's value. And the third is the adversarial row — a
+ * slug and a folder both long enough that the table runs out of room at 380px,
+ * which is where a missing `wrap-value` widens the page.
+ *
+ * What is *not* here is as much of the fixture as what is: `Clubria/marketing`
+ * is a real repository in this org's GitHub, it has no row, and a lead reading
+ * this table has to be able to tell that means "no environment variables"
+ * rather than "nobody got round to it".
+ */
+const REPO_SECRET_PATHS: RepoSecretPath[] = [
+  {
+    _id: id("rp_hub"),
+    repoSlug: "Clubria/ai-builders-hub",
+    secretPaths: ["/"],
+    updatedAt: NOW - 21 * DAY,
+  },
+  {
+    _id: id("rp_payments"),
+    repoSlug: "Clubria/payments",
+    secretPaths: ["/", "/apps/payments"],
+    updatedAt: NOW - 240 * MINUTE,
+  },
+  {
+    _id: id("rp_long"),
+    repoSlug: `Clubria/${"a".repeat(48)}`,
+    secretPaths: [`/${"deeply-nested-folder/".repeat(4)}leaf`],
+    updatedAt: NOW - 2 * DAY,
+  },
+];
+
 function base(viewer: Member | null): Data {
   return {
     auth: viewer === null ? "signed-out" : "signed-in",
@@ -493,6 +531,7 @@ function base(viewer: Member | null): Data {
       value: [LEAD, DEVELOPER, CANDIDATE, SUSPENDED],
     },
     sharedServers: { state: "ready", value: SHARED_SERVERS },
+    repoSecretPaths: { state: "ready", value: REPO_SECRET_PATHS },
     issuedKeys: { state: "ready", value: ISSUED_KEYS },
     auditLog: { state: "ready", value: AUDIT },
     usage: { state: "ready", value: USAGE },
@@ -509,6 +548,8 @@ function base(viewer: Member | null): Data {
     addSharedServer: NOOP,
     updateSharedServer: NOOP,
     removeSharedServer: NOOP,
+    setRepoSecretPaths: NOOP,
+    removeRepoSecretPaths: NOOP,
     addIssuedKey: NOOP,
     replaceIssuedKey: NOOP,
     setIssuedKeyMembers: NOOP,
@@ -856,6 +897,41 @@ export const SCENARIOS: Record<string, () => Data> = {
     },
   }),
 
+  /**
+   * No repository is mapped — which is not an empty table waiting to be filled
+   * in, it is a team whose runs write no environment files at all. The empty
+   * state has to say that, because the reading a lead arrives with is the other
+   * one.
+   */
+  "secret-paths-empty": () => ({
+    ...base(LEAD),
+    repoSecretPaths: { state: "ready", value: [] },
+  }),
+
+  "secret-paths-error": () => ({
+    ...base(LEAD),
+    repoSecretPaths: {
+      state: "error",
+      message:
+        "[CONVEX Q(secretPaths:list)] Uncaught Error: Server Error — the deployment is not answering.",
+    },
+  }),
+
+  /**
+   * The mapping a lead typed came back refused. The message is the real one for
+   * the rule most likely to be hit — a folder pasted with the trailing slash
+   * the Infisical UI shows — because that is the sentence they have to act on.
+   */
+  "secret-path-refused": () => ({
+    ...base(LEAD),
+    setRepoSecretPaths: async (): Promise<never> => {
+      throw new Error(
+        "[CONVEX M(secretPaths:set)] Uncaught Error: Leave the trailing slash off — " +
+          "/apps/payments, not /apps/payments/.",
+      );
+    },
+  }),
+
   /** No issued keys yet — what a lead sees before they paste the first one. */
   "issued-keys-empty": () => ({
     ...base(LEAD),
@@ -901,6 +977,8 @@ export const SCENARIOS: Record<string, () => Data> = {
     addSharedServer: REJECT,
     updateSharedServer: REJECT,
     removeSharedServer: REJECT,
+    setRepoSecretPaths: REJECT,
+    removeRepoSecretPaths: REJECT,
     addIssuedKey: REJECT,
     replaceIssuedKey: REJECT,
     setIssuedKeyMembers: REJECT,

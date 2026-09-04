@@ -7,6 +7,7 @@ import { Install } from "../components/Install";
 import { AuditLog, Members, OrgSettings } from "../components/LeadPanel";
 import { Invite } from "../components/Invite";
 import { IssuedKeys } from "../components/IssuedKeys";
+import { SecretPaths } from "../components/SecretPaths";
 import { SharedServers } from "../components/SharedServers";
 import { Usage } from "../components/Usage";
 import { Alert, Badge, Command, Panel, Tab } from "../ui";
@@ -186,6 +187,11 @@ export function Dashboard({ member }: { member: Member }) {
           <Panel index="lead" title="the team's servers" tone="accent">
             <ErrorBoundary label="the team's servers">
               <SharedServers />
+            </ErrorBoundary>
+          </Panel>
+          <Panel index="lead" title="where secrets come from" tone="accent">
+            <ErrorBoundary label="the secret paths">
+              <SecretPaths />
             </ErrorBoundary>
           </Panel>
           <Panel index="lead" title="issued SSH keys" tone="accent">

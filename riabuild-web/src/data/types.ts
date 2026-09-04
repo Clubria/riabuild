@@ -27,6 +27,7 @@ import type { Id } from "../../convex/_generated/dataModel";
 export type MemberId = Id<"members">;
 export type SessionId = Id<"cliSessions">;
 export type SharedServerId = Id<"sharedServers">;
+export type RepoSecretPathId = Id<"repoSecretPaths">;
 export type IssuedKeyId = Id<"issuedKeys">;
 export type AuditEntryId = Id<"auditLog">;
 
@@ -148,6 +149,31 @@ export type SharedServerAddress = {
 };
 
 /**
+ * Where one repository's secrets come from, as a lead sees it.
+ *
+ * The absence of a row is a decision rather than a gap: a repository nobody has
+ * mapped gets no `.env.<name>` files at all, and its `env_local` task reports
+ * satisfied instead of failing. So the table is read as "these are the
+ * repositories that have environment variables", not "these are the ones
+ * somebody remembered to configure".
+ *
+ * `secretPaths` is ordered and the order is the contract — dotenv's own. A key
+ * two folders both hold takes the value of the folder named *later*, because
+ * that is the order the CLI exports and merges them in.
+ *
+ * What is deliberately not here is the environment list. Which environments
+ * exist is Infisical's answer about these folders, asked at brokering time and
+ * never stored, so a dashboard that displayed one would be displaying a guess
+ * that goes stale the moment somebody adds a folder.
+ */
+export type RepoSecretPath = {
+  _id: RepoSecretPathId;
+  repoSlug: string;
+  secretPaths: string[];
+  updatedAt: number;
+};
+
+/**
  * An SSH key the org issues, as a lead sees it.
  *
  * Note what is not here and never will be: the private key. Nothing returns one
@@ -248,6 +274,11 @@ export type Data = {
    * act on them.
    */
   sharedServers: Loadable<SharedServer[]>;
+  /**
+   * Lead-only, like `sharedServers`. Every developer's CLI reads the one row
+   * for the repository its run is about, and nothing else in this list.
+   */
+  repoSecretPaths: Loadable<RepoSecretPath[]>;
   /** Lead-only, like `sharedServers`. A developer receives these through their CLI. */
   issuedKeys: Loadable<IssuedKey[]>;
   auditLog: Loadable<AuditEntry[]>;
@@ -315,6 +346,26 @@ export type Data = {
     p: SharedServerAddress & { id: SharedServerId },
   ) => Promise<void>;
   removeSharedServer: (p: { id: SharedServerId }) => Promise<void>;
+  /**
+   * Maps a repository to its folders, or moves one already mapped.
+   *
+   * Keyed on the slug rather than on a row id, because the repository *is* the
+   * key: two rows for one repository would be two answers to a question that
+   * has one. Saving the list a repository already has changes nothing — not
+   * even `updatedAt`, which would restage every developer's files for a save
+   * that moved no folder.
+   */
+  setRepoSecretPaths: (p: {
+    repoSlug: string;
+    secretPaths: string[];
+  }) => Promise<void>;
+  /**
+   * Unmapping is how a lead says "this repository has no environment
+   * variables", not merely how they undo a typo. The next run writes no
+   * `.env.<name>` for it and reports the task satisfied; files already in a
+   * developer's checkout stay where they are.
+   */
+  removeRepoSecretPaths: (p: { id: RepoSecretPathId }) => Promise<void>;
   addIssuedKey: (p: { label: string; privateKey: string }) => Promise<void>;
   /**
    * Rotation. The row, its name and the people it is issued to all survive;
