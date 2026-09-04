@@ -27,7 +27,12 @@ export type BrokerResult =
        */
       environment: string;
       environments: string[];
+      /**
+       * The primary folder alone, kept for CLIs released before `secretPaths`
+       * existed. It is always the LAST of `secretPaths` — see `secretPaths()`.
+       */
       secretPath: string;
+      secretPaths: string[];
       siteUrl: string;
     }
   | { status: "not_configured"; detail: string }
@@ -113,6 +118,39 @@ export function environmentsForRole(role: Role): string[] {
   return [base, staging];
 }
 
+/**
+ * The folders a credential is minted to export, in the order the CLI exports
+ * them.
+ *
+ * `INFISICAL_SECRET_PATH` carries one folder or a comma-separated list of them,
+ * because a team's secrets for one environment are not always in one folder. AI
+ * Builders' are in two: since 2026-08-29 they live at
+ * `/tenant/aibuilders/frontend` (the `VITE_*` the image bakes in) and
+ * `/tenant/aibuilders/convex` (the admin key and the developer-only secrets),
+ * and a `.env.dev` carrying either half alone does not start the app.
+ *
+ * **Order is the contract, and it is dotenv's own: later wins.** A key both
+ * folders hold takes the value of the folder named later, which is why the
+ * credential folder goes last — and why `secretPath`, which is what a bare
+ * `infisical` command through the shim defaults to and all that a CLI released
+ * before this field can read, is the last entry rather than the first. That
+ * leaves an old CLI with the credential folder and without the frontend one,
+ * which is the right half to keep: the `VITE_*` are client-public and
+ * derivable, the admin key is neither.
+ *
+ * This is data and not a path on a laptop: the CLI still decides what file an
+ * export lands in, the same way it does for an environment name.
+ */
+export function secretPaths(): string[] {
+  const paths = (process.env.INFISICAL_SECRET_PATH ?? "/")
+    .split(",")
+    .map((path) => path.trim())
+    .filter((path) => path.length > 0);
+  // A variable holding nothing but separators is a misconfiguration, and the
+  // root is what this brokered before the variable existed at all.
+  return paths.length > 0 ? paths : ["/"];
+}
+
 export function siteUrl(): string {
   return (
     process.env.INFISICAL_SITE_URL?.replace(/\/+$/, "") ??
@@ -126,7 +164,7 @@ export async function brokerToken(role: Role): Promise<BrokerResult> {
   const clientSecret = process.env[identity.clientSecretVar];
   const projectId = process.env.INFISICAL_PROJECT_ID;
   const environments = environmentsForRole(role);
-  const secretPath = process.env.INFISICAL_SECRET_PATH ?? "/";
+  const paths = secretPaths();
 
   if (!clientId || !clientSecret || !projectId) {
     return {
@@ -182,7 +220,8 @@ export async function brokerToken(role: Role): Promise<BrokerResult> {
     projectId,
     environment: environments[0],
     environments,
-    secretPath,
+    secretPath: paths[paths.length - 1],
+    secretPaths: paths,
     siteUrl: siteUrl(),
   };
 }

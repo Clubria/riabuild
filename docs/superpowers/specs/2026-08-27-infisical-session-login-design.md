@@ -82,6 +82,13 @@ first cut of this change produced an `infisical export` that authenticated perfe
 exited `0`, and printed nothing. An empty answer that looks like a working command is
 worse than the sign-in error it replaced.
 
+`INFISICAL_SECRET_PATH` can name **several** folders, and the shim fills in one: the
+**primary**, which is the last one named and the folder holding the team's credentials.
+`env_local` is the caller that exports them all and merges the results, because a file it
+writes has to be complete; a command the developer typed is scoped rather than assembled,
+and one they were explicit about is never rewritten. A developer who wants another folder
+names it, and their `--path` wins as it always did.
+
 So the scope is passed the way `env_local` passes it, as flags, for the three subcommands
 that take them:
 

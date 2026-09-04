@@ -336,6 +336,23 @@ check_contains "the secrets came through the broker" \
 check ".env.dev is ignored by git" \
   git -C "$PROJECT_DIR" check-ignore -q .env.dev
 
+# One environment's secrets live in two folders, and either half alone is an
+# env file that does not start the app. This is the assertion that a folder
+# riabuild-web named was actually exported rather than quietly dropped.
+check_contains "both of the environment's folders are in the file" \
+  "$(cat "$ENV_DEV" 2>/dev/null)" "CLUBRIA_E2E_VITE_MARKER"
+# Order is the contract: the folders are exported in the order riabuild-web
+# named them and the later one wins a key both hold, which is what every
+# dotenv loader does with the finished file. Merging them the other way round
+# passes every other check here.
+check_missing "the folder named later won the key both hold" \
+  "$(cat "$ENV_DEV" 2>/dev/null)" "overridden-by-the-frontend-folder"
+# And it says so once. A concatenation would also be *read* correctly and
+# would leave a developer looking at two lines with nothing to say which the
+# app gets, which is the confusion the tenant layout exists to end.
+check "the merged file assigns each key once" \
+  test "$(grep -c '^CLUBRIA_E2E_MARKER=' "$ENV_DEV" 2>/dev/null)" = 1
+
 # A developer may see staging, so the same run must have pulled it as well —
 # into its own file, from its own environment.
 ENV_STAGING="$PROJECT_DIR/.env.staging"

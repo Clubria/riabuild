@@ -151,59 +151,88 @@ impl Task for EnvLocal {
             ensure_ignored(ctx, &project, &env_file_name(&environment)).await?;
         }
 
+        // One environment's secrets can live in more than one folder, so a pull
+        // is a fold over folders rather than a single export. The order is
+        // riabuild-web's, and it is the order they are merged in: later wins.
+        let paths = brokered.export_paths();
+
         ctx.ui.note("Fetching your secrets from Infisical…");
         for environment in environments {
-            let output = ctx
-                .runner
-                .run(
-                    &ctx.infisical(),
-                    &[
-                        "export",
-                        "--format=dotenv",
-                        &format!("--projectId={}", brokered.project_id),
-                        &format!("--env={environment}"),
-                        &format!("--path={}", brokered.secret_path),
-                    ],
-                    &RunOptions {
-                        cwd: Some(project.clone()),
-                        // In the environment, not the argument list.
-                        env: vec![
-                            ("INFISICAL_TOKEN".into(), brokered.token.clone()),
-                            (
-                                "INFISICAL_API_URL".into(),
-                                format!("{}/api", brokered.site_url),
-                            ),
+            let mut exports: Vec<String> = Vec::with_capacity(paths.len());
+
+            for path in &paths {
+                // Every failure below names the folder as well as the
+                // environment. A 404 on a folder that has been moved or
+                // renamed is the likeliest way this task fails, and a message
+                // that says only `--env=dev` leaves the one fact that would
+                // explain it in nobody's hands.
+                let attempted =
+                    format!("infisical export --format=dotenv --env={environment} --path={path}");
+
+                let output = ctx
+                    .runner
+                    .run(
+                        &ctx.infisical(),
+                        &[
+                            "export",
+                            "--format=dotenv",
+                            &format!("--projectId={}", brokered.project_id),
+                            &format!("--env={environment}"),
+                            &format!("--path={path}"),
                         ],
-                        ..Default::default()
-                    },
-                )
-                .await?;
+                        &RunOptions {
+                            cwd: Some(project.clone()),
+                            // In the environment, not the argument list.
+                            env: vec![
+                                ("INFISICAL_TOKEN".into(), brokered.token.clone()),
+                                (
+                                    "INFISICAL_API_URL".into(),
+                                    format!("{}/api", brokered.site_url),
+                                ),
+                            ],
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
 
-            if !output.ok() {
-                return Err(Failure::new(
-                    format!("fetching your {environment} secrets"),
-                    "Run `riabuild` again. If it keeps failing, ask your team lead to check your Infisical access.",
-                )
-                .command(format!("infisical export --format=dotenv --env={environment}"))
-                .detail(output.stderr)
-                .into());
+                if !output.ok() {
+                    return Err(Failure::new(
+                        format!("fetching your {environment} secrets"),
+                        "Run `riabuild` again. If it keeps failing, ask your team lead to check your Infisical access.",
+                    )
+                    .command(attempted)
+                    .detail(output.stderr)
+                    .into());
+                }
+
+                // Per folder rather than over the merged file: a folder that
+                // answers with nothing is a folder that has moved, and saying
+                // so beats writing the half that did answer and leaving the
+                // developer to find out which half at `pnpm dev`.
+                if !parses_as_dotenv(&output.stdout) {
+                    return Err(Failure::new(
+                        format!("fetching your {environment} secrets"),
+                        "Ask your team lead to check the team's Infisical project has secrets in it.",
+                    )
+                    .command(attempted)
+                    .detail(format!(
+                        "Infisical returned no secrets for the {environment} environment at {path}"
+                    ))
+                    .into());
+                }
+
+                exports.push(output.stdout);
             }
 
-            if !parses_as_dotenv(&output.stdout) {
-                return Err(Failure::new(
-                    format!("fetching your {environment} secrets"),
-                    "Ask your team lead to check the team's Infisical project has secrets in it.",
-                )
-                .command(format!(
-                    "infisical export --format=dotenv --env={environment}"
-                ))
-                .detail(format!(
-                    "Infisical returned no secrets for the {environment} environment"
-                ))
-                .into());
-            }
+            // One folder writes back exactly what Infisical returned, which is
+            // what every deployment before this got and what its developers'
+            // files already look like. Merging is for the case that needs it.
+            let contents = match exports.as_slice() {
+                [only] => only.clone(),
+                many => file::merge_dotenv(many),
+            };
 
-            write_private(&env_file(&project, environment), &output.stdout).await?;
+            write_private(&env_file(&project, environment), &contents).await?;
         }
 
         // The token itself is gone the moment this function returns; only the
@@ -289,6 +318,45 @@ mod tests {
         assert!(!parses_as_dotenv("<html><body>Access denied</body></html>"));
         assert!(!parses_as_dotenv(""));
         assert!(!parses_as_dotenv("# only comments\n"));
+    }
+
+    #[test]
+    fn folders_are_merged_the_way_a_dotenv_loader_reads_them() {
+        // The Infisical layout AI Builders moved to on 2026-08-29: the
+        // `VITE_*` in one folder, the credentials in another, and one key in
+        // both. The credential folder is exported last, so it is the one that
+        // survives — the same rule the checkout's own pull script applies.
+        let frontend =
+            "VITE_SITE_URL='https://aib.club'\nVITE_CONVEX_URL='https://api.convex.dev.aib.club'\n"
+                .to_string();
+        let convex = "CONVEX_SELF_HOSTED_ADMIN_KEY='key'\nVITE_SITE_URL='https://dev.aib.club'\n"
+            .to_string();
+
+        let merged = file::merge_dotenv(&[frontend, convex]);
+
+        assert_eq!(
+            merged,
+            "VITE_SITE_URL='https://dev.aib.club'\n\
+             VITE_CONVEX_URL='https://api.convex.dev.aib.club'\n\
+             CONVEX_SELF_HOSTED_ADMIN_KEY='key'\n",
+        );
+        // And the file a developer opens says each thing once, rather than
+        // twice with nothing to say which the app gets.
+        assert_eq!(merged.matches("VITE_SITE_URL=").count(), 1);
+        assert!(parses_as_dotenv(&merged));
+    }
+
+    #[test]
+    fn merging_keeps_the_order_the_folders_were_named_in() {
+        // First appearance, so the folders stay recognisable in the result:
+        // a key the second folder overrides keeps the first folder's position
+        // rather than jumping to the end.
+        let merged = file::merge_dotenv(&[
+            "A=1\nB=2\n".to_string(),
+            "B=3\nC=4\n".to_string(),
+            "# a comment\n\nA=5\n".to_string(),
+        ]);
+        assert_eq!(merged, "A=5\nB=3\nC=4\n");
     }
 
     /// A checkout with a current, parseable file for each named environment.

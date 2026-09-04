@@ -638,7 +638,9 @@ http.route({
         // The base environment alone, for CLIs released before `environments`.
         environment: broker.environment,
         environments: broker.environments,
+        // The primary folder alone, for CLIs released before `secretPaths`.
         secretPath: broker.secretPath,
+        secretPaths: broker.secretPaths,
         siteUrl: broker.siteUrl,
         secretsUpdatedAt: config.secretsUpdatedAt,
       });

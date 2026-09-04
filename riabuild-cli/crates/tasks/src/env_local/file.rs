@@ -32,6 +32,55 @@ pub fn parses_as_dotenv(text: &str) -> bool {
     assignments > 0
 }
 
+/// Joins one environment's folders into the file a loader would read.
+///
+/// A team's secrets for one environment can live in several Infisical folders
+/// — AI Builders' are in two, `/tenant/aibuilders/frontend` and
+/// `/tenant/aibuilders/convex` — and riabuild exports each in the order
+/// riabuild-web named them. Concatenating the exports would already be
+/// *correct*, because every dotenv loader takes the last assignment of a key.
+/// It would also leave a developer opening `.env.dev` on two lines saying
+/// different things about `VITE_SITE_URL` with nothing to say which one the app
+/// gets — which is the confusion the tenant layout was introduced to end, and
+/// not worth reproducing in the file riabuild writes.
+///
+/// So the last assignment wins *here*, and the file says once what it means.
+/// Order is first appearance, so the folders stay recognisable in the result
+/// rather than being sorted into one flat list.
+///
+/// Only assignments survive: a blank line or a comment is per-export framing,
+/// and two exports' worth of it interleaved says nothing about any key. Every
+/// export reaching this has already passed `parses_as_dotenv`, so a line that
+/// is neither is nothing this needs to preserve.
+pub(super) fn merge_dotenv(exports: &[String]) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut assignments: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for export in exports {
+        for line in export.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().trim_start_matches("export ").trim().to_string();
+            if assignments.insert(key.clone(), line.to_string()).is_none() {
+                order.push(key);
+            }
+        }
+    }
+
+    let mut merged = String::new();
+    for key in &order {
+        merged.push_str(&assignments[key]);
+        merged.push('\n');
+    }
+    merged
+}
+
 /// The filename an environment lands in — `dev` becomes `.env.dev`.
 ///
 /// Deriving it here rather than reading it from the reply is deliberate: the

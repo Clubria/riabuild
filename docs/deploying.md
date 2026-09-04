@@ -9,7 +9,7 @@
 | Convex project | `lowerkinded / riabuild` |
 | `/api/v1` | **live**, returning 401 to anonymous callers |
 | Secret brokering | **working** — verified end to end through Convex's network |
-| Infisical | self-hosted at `https://infisical.aib.club`, project `AI Builders`, path `/dev-env` |
+| Infisical | `https://clubria.infisical.com`, project `AI Builders`, paths `/tenant/aibuilders/frontend` and `/tenant/aibuilders/convex` |
 | Dashboard | **live** — <https://riabuild.clubria.com> (Cloudflare Pages, `riabuild-web`) |
 | GitHub sign-in | configured — verify the OAuth callback URL matches §2 |
 | Org membership checks | working — `GITHUB_ORG_TOKEN` verified against the live org |
@@ -148,16 +148,18 @@ the two environments every developer gets. A lead reaching further does it by ha
 `infisical secrets --env=prod` through the shim — which is a command they typed rather
 than a file riabuild wrote.
 
-`mi-developer` needs `INFISICAL_SECRET_PATH` readable in the
-`staging` environment as well; if it is not, a developer's run fails on the staging
+`mi-developer` needs **every** folder in `INFISICAL_SECRET_PATH` readable in the
+`staging` environment as well; if one is not, a developer's run fails on the staging
 export rather than degrading quietly. An org with no staging environment sets
 `INFISICAL_STAGING_ENVIRONMENT` to the empty string, and every role gets `dev` alone.
 
-This deployment points at the **self-hosted** instance, so `INFISICAL_SITE_URL` must be
-set — the code otherwise defaults to Infisical Cloud, where these identities do not
-exist and the login returns 401. Convex's servers can reach it; that was verified rather
+`INFISICAL_SITE_URL` must be set — the code otherwise defaults to `app.infisical.com`,
+where these identities do not exist and the login returns 401. It is
+`https://clubria.infisical.com`. Convex's servers can reach it; that was verified rather
 than assumed, since an instance reachable from a developer laptop is not necessarily
-reachable from eu-west-1.
+reachable from eu-west-1. Moving instances moves `INFISICAL_PROJECT_ID` and all three
+identity pairs with it — they are per instance, and a client id from the old one
+authenticates against the new one exactly as well as a wrong password does.
 
 ### Deploying the dev/staging split onto an existing deployment
 
@@ -195,17 +197,45 @@ Without this the edit reaches fresh deployments and nowhere else, and the sympto
 an error: every session simply goes on using whatever model it defaulted to, with nothing
 on any screen naming one.
 
-### `INFISICAL_SECRET_PATH` is not `/`
+### `INFISICAL_SECRET_PATH` is not `/`, and is two folders
 
-The `dev` environment has **no secrets at its root** — they live in folders (`convex`,
-`convex-runtime`, `dev-env`, `services`, `vercel`), and `infisical export` in this CLI
-version has no recursive flag, only `--path`. Left at the default `/`, brokering
-succeeds and exports **zero** secrets, which surfaces as riabuild's "Infisical returned
-no secrets" failure rather than anything mentioning paths.
+The `dev` environment has **no secrets at its root** — they live in folders, and
+`infisical export` in this CLI version has no recursive flag, only `--path`. Left at the
+default `/`, brokering succeeds and exports **zero** secrets, which surfaces as
+riabuild's "Infisical returned no secrets" failure rather than anything mentioning
+paths.
 
-It is set to `/dev-env`, which holds the 15 entries that make up a developer's
-`.env.dev`. The same path is read in each environment, so `mi-developer` needs
-`/dev-env` readable in `staging` too.
+It is set to two of them, comma-separated:
+
+```sh
+npx convex env set INFISICAL_SECRET_PATH \
+  /tenant/aibuilders/frontend,/tenant/aibuilders/convex
+```
+
+riabuild exports each in the order they are named and merges the results into one
+`.env.<environment>`, **later winning** a key both folders hold — which is dotenv's own
+rule and the same one `dev-env/pull-dev-env.sh` in the checkout applies. So the
+credential folder goes last. `secretPath`, the single folder the API still returns, is
+that last entry: it is what a bare `infisical export` through the shim defaults to, and
+all that a riabuild released before this can read.
+
+Why two. On **2026-08-29** AI Builders moved out of the root-level folders into a tenant
+tree — *the environment picks the tier, the path picks the tenant* — and on 2026-08-30
+the old ones were deleted, so `/dev-env` is not stale, it is a **404**:
+
+| Path | Holds |
+|---|---|
+| `/tenant/aibuilders/frontend` | every `VITE_*` the image build bakes in |
+| `/tenant/aibuilders/convex` | `CONVEX_SELF_HOSTED_URL` + `_ADMIN_KEY`, the stack's own vars, and the developer-only secrets |
+| `/tenant/aibuilders/convex-runtime` | what `deploy-convex.mjs` pushes into the deployment — **not** part of a developer's env file |
+
+A developer needs the first two: either half alone writes a `.env.dev` that does not
+start the app, and the failure lands later, at `pnpm run dev`, rather than here. Both
+paths are the same in `dev` and in `staging` — the flagship has no `prod` environment —
+so `mi-developer` needs both readable in `staging` too. The layout is
+`ai-builders-hub`'s `docs/secrets-storage.md#tenant-infisical-layout`, and
+`scripts/lib/envTier.mjs` there is its registry; a `pnpm run guards` in that repository
+fails a commit that names a retired path.
 
 ### Shorten the access token TTL
 
