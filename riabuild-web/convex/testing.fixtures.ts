@@ -103,6 +103,16 @@ export type ClaudeSettings = {
   skipDangerousModePermissionPrompt: boolean;
   statusLine: { type: string; command: string };
   env: Record<string, string>;
+  /**
+   * The session's model — `opus`, with `env.CLAUDE_CODE_SUBAGENT_MODEL` set to
+   * `sonnet` beside it.
+   *
+   * Optional because a row stored before `backfillClaudeDefaults` ran genuinely
+   * has no `model` at its top level, which is the state the backfill tests seed
+   * and the reason that key arrives through `fillMissing` rather than being
+   * present on every row the way `env` is.
+   */
+  model?: string;
 };
 
 /** `JSON.parse` is `any` for the same reason `Response.json()` is. */
