@@ -83,6 +83,30 @@ pub fn clip(text: &str, width: usize) -> String {
     format!("{}…", &text[..cut])
 }
 
+/// What the rail calls a delegated session.
+const SUBAGENT: &str = "(subagent)";
+
+/// The mark that puts a delegated session under the one that asked for it.
+///
+/// The same glyph `transcript_lines` indents a subagent's *work* with, so the
+/// rail and the transcript make the same claim the same way. `store::arrange`
+/// is what makes the row above it the right one.
+fn child_mark(unicode: bool) -> &'static str {
+    if unicode { "↳ " } else { "> " }
+}
+
+/// `(subagent)` with the space before it, or nothing where the rail is too
+/// narrow to carry it and a title.
+///
+/// The floor is a title, not the tag: a row reading `↳ codex-1  (subagent)` with
+/// the prompt clipped away says which kind of thing it is and nothing about
+/// which one, and the indent already said the first part.
+fn tag_for(inner: usize, indent: usize) -> Option<String> {
+    const TITLE_FLOOR: usize = 8;
+    let room = inner.saturating_sub(2 + ACCOUNT_WIDTH + indent);
+    (room >= SUBAGENT.chars().count() + 1 + TITLE_FLOOR).then(|| format!(" {SUBAGENT}"))
+}
+
 /// A group heading in the rail.
 fn heading(text: &str, theme: Theme) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), theme.style(Role::Muted)))
@@ -127,22 +151,67 @@ pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static
         // The sign-in leads, and at a fixed width: it is what tells two sessions
         // on one harness apart before either has been asked anything, and a
         // title is any length, so a title placed first is what pushes it off.
-        let title_width = inner.saturating_sub(2 + ACCOUNT_WIDTH);
-        lines.push(Line::from(vec![
+        let child = pane.parent.is_some();
+        let indent = if child {
+            child_mark(chrome.unicode)
+        } else {
+            ""
+        };
+        // Characters and never bytes: `↳` is one column and three bytes, and a
+        // width computed from `len()` would take a column off the title on
+        // every child row.
+        let indent_width = indent.chars().count();
+        // The tag is dropped rather than truncated where the rail is narrow,
+        // for the reason the offer row below drops an email: `rail_width` goes
+        // down to twenty-two columns, and half of "(subagent)" beside a title
+        // clipped to nothing identifies neither. The indent survives as the
+        // signal, which is what it is there for.
+        let tag = child.then(|| tag_for(inner, indent_width)).flatten();
+        let title_width = inner
+            .saturating_sub(2 + ACCOUNT_WIDTH + indent_width)
+            .saturating_sub(tag.as_ref().map(|tag| tag.chars().count()).unwrap_or(0));
+        let title = clip(&pane.label(), title_width);
+        let mut spans = vec![
             Span::styled(
                 cursor_mark(selected, chrome.unicode),
                 theme.style(Role::Brand),
             ),
-            Span::styled(format!("{mark} "), state_style(pane.state(), theme)),
+            // Dimmed for a child that is *idle*, and only then. A subagent
+            // sitting quietly beside its parent is the row this whole treatment
+            // exists to push into the background — but one that is working or
+            // has failed keeps the hue every other row uses for that, because a
+            // failed subagent a developer cannot see is the same bug as a failed
+            // session they cannot see.
+            Span::styled(
+                format!("{mark} "),
+                if child && pane.state() == State::Idle {
+                    theme.style(Role::Muted)
+                } else {
+                    state_style(pane.state(), theme)
+                },
+            ),
+            Span::styled(indent.to_string(), theme.style(Role::Muted)),
             Span::styled(
                 format!("{:<ACCOUNT_WIDTH$}", pane.account_name()),
                 theme.style(Role::Muted),
             ),
             Span::styled(
-                clip(&pane.label(), title_width),
+                title.clone(),
                 theme.style(if selected { Role::Strong } else { Role::Muted }),
             ),
-        ]));
+        ];
+        if let Some(tag) = tag {
+            // Padded out to the right edge here rather than by a second
+            // `Line`-level alignment, because a `Line` carries one alignment for
+            // all of its spans and this row is left-aligned everywhere else.
+            let used = title.chars().count();
+            let gap = title_width.saturating_sub(used);
+            spans.push(Span::styled(
+                format!("{}{tag}", " ".repeat(gap)),
+                theme.style(Role::Muted),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(String::new()));
@@ -691,6 +760,91 @@ pub(crate) mod tests {
         app.sent("do the thing");
         let busy = text_of(&counts_line(&app, Theme::plain()));
         assert!(busy.contains("1 working"), "{busy}");
+    }
+
+    /// A Claude session with a Codex subagent under it, which is the shape
+    /// `store::arrange` hands the window.
+    fn with_a_subagent() -> App {
+        let mut app = App::new(every_account());
+        app.add(TestPane::new(
+            "parent".into(),
+            Kind::Claude,
+            "port the parser".into(),
+        ));
+        // Short enough to survive the clip at forty columns, so a test looking
+        // for it is testing the indent rather than the ellipsis.
+        let mut child = TestPane::new("child".into(), Kind::Codex, "write tests".into());
+        child.parent = Some("parent".into());
+        app.add(child);
+        app.cursor = 0;
+        app
+    }
+
+    fn rows_of(app: &App, width: u16) -> Vec<String> {
+        rail_lines(app, plain_chrome(), width)
+            .iter()
+            .map(text_of)
+            .collect()
+    }
+
+    #[test]
+    fn a_subagent_is_indented_and_tagged_and_its_parent_is_neither() {
+        let rows = rows_of(&with_a_subagent(), 40);
+        let parent = rows
+            .iter()
+            .find(|row| row.contains("port the parser"))
+            .cloned()
+            .unwrap_or_default();
+        let child = rows
+            .iter()
+            .find(|row| row.contains("write tests"))
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(child.contains('↳'), "{child}");
+        assert!(child.contains("(subagent)"), "{child}");
+        assert!(!parent.contains('↳'), "{parent}");
+        assert!(!parent.contains("(subagent)"), "{parent}");
+        // Right-aligned: the tag ends the row, and the row fills the rail.
+        assert!(child.ends_with("(subagent)"), "{child}");
+        assert_eq!(child.chars().count(), 39, "{child}");
+    }
+
+    #[test]
+    fn the_tag_is_dropped_on_a_narrow_rail_and_the_indent_is_not() {
+        // Twenty-two is `rail_width`'s floor, where "(subagent)" beside a title
+        // clipped to nothing would identify neither.
+        let rows = rows_of(&with_a_subagent(), 22);
+        let child = rows
+            .iter()
+            .find(|row| row.contains("codex"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(child.contains('↳'), "{child}");
+        assert!(!child.contains("(subagent)"), "{child}");
+    }
+
+    #[test]
+    fn an_idle_subagent_is_dimmed_and_a_failed_one_keeps_its_colour() {
+        let theme = Theme::with_depth(Depth::TrueColor);
+        let chrome = Chrome {
+            theme,
+            unicode: true,
+            repo: None,
+        };
+        let mut app = with_a_subagent();
+
+        // Row 0 is the SESSIONS heading, 1 the parent, 2 the child. Span 1 of a
+        // row is the state mark.
+        let quiet = rail_lines(&app, chrome, 40);
+        assert_eq!(quiet[2].spans[1].style, theme.style(Role::Muted));
+        // The parent beside it is untouched: only a *child* recedes.
+        assert_eq!(quiet[1].spans[1].style, theme.style(Role::Ok));
+
+        // A subagent that failed is not something to push into the background.
+        app.panes[1].troubled = true;
+        let failed = rail_lines(&app, chrome, 40);
+        assert_eq!(failed[2].spans[1].style, theme.style(Role::Danger));
     }
 
     #[test]
