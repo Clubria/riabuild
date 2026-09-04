@@ -325,6 +325,25 @@ pub enum InternalAction {
         #[arg(long = "prompt-file", value_name = "PATH")]
         prompt_file: String,
     },
+    /// Serve Codex to Claude Code as a subagent, over MCP on stdio.
+    ///
+    /// Started by Claude Code, never by a person: `claude_codex_mcp` writes the
+    /// entry that names it into each account's config, and Claude Code spawns
+    /// one of these per session and talks JSON-RPC to it over a pipe.
+    ///
+    /// **Nothing it runs may print.** Its stdout is the wire, and one line of
+    /// `riabuild-ui` on it is a parse error in Claude Code with nothing to say
+    /// where it came from — which is why this returns before `connect` and
+    /// touches no part of riabuild that reports progress.
+    McpCodex {
+        /// Which Codex sign-in the subagent runs under, 1-based.
+        ///
+        /// The same number the launcher carries: 3 is `codex-3`. Nine profiles
+        /// exist from the first run, and the first is the one a developer who
+        /// has never made a second has.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        profile: usize,
+    },
     /// Answer an `ssh` password prompt. Run by `ssh` itself, via SSH_ASKPASS.
     ///
     /// `trailing_var_arg` because the one argument is `ssh`'s own prompt text

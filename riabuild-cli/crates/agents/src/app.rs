@@ -101,6 +101,13 @@ pub struct Pane {
     /// scoped to one checkout, so the directory never could.
     pub title: String,
     pub thread: Option<String>,
+    /// The session that delegated this one, by store id, or `None` for one a
+    /// developer started themselves.
+    ///
+    /// The rail draws a pane with this set as a child of the pane above it —
+    /// see `draw::rail_lines` — and `store::arrange` is what guarantees the one
+    /// above it is the right pane.
+    pub parent: Option<String>,
     pub model: Option<String>,
     /// Whether a turn holds the session's lock right now.
     pub running: bool,
@@ -136,6 +143,7 @@ impl Pane {
             account: 1,
             title,
             thread: None,
+            parent: None,
             model: None,
             running: false,
             troubled: false,

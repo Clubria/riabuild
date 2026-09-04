@@ -164,10 +164,11 @@ else
   fail "the bare grok launcher is not grok-1"
 fi
 
-# The four tasks the sign-in gates. `claude_accounts` is only recorded once
-# account 1 is actually signed in; `claude_trust`, `claude_onboarding` and
-# `claude_agents_view` all write per-account state into a `.claude.json` that has
-# no account to belong to yet, so none of them runs at all.
+# The five tasks the sign-in gates. `claude_accounts` is only recorded once
+# account 1 is actually signed in; `claude_trust`, `claude_onboarding`,
+# `claude_agents_view` and `claude_codex_mcp` all write per-account state into a
+# `.claude.json` that has no account to belong to yet, so none of them runs at
+# all.
 #
 # Short of the sign-in this asserts their *absence*, which is the more valuable
 # half of the pair: "never record a success we have not verified" is the invariant
@@ -177,7 +178,7 @@ fi
 # sign-in and left the developer with an account they cannot use — and a recorded
 # claude_onboarding would mean it skipped the one write that keeps Claude Code
 # from interviewing them on first launch.
-for task in claude_accounts claude_trust claude_onboarding claude_agents_view; do
+for task in claude_accounts claude_trust claude_onboarding claude_agents_view claude_codex_mcp; do
   if [ "$SIGN_IN" = done ]; then
     check_contains "task recorded: $task" "$STATE" "\"$task\""
   else

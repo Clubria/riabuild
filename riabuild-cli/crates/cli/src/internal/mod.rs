@@ -274,6 +274,37 @@ pub(crate) async fn agent_turn(ctx: &mut Ctx, session: &str, prompt_file: &str) 
     .await
 }
 
+/// `riabuild internal mcp-codex` — Codex, offered to one Claude Code session as
+/// a subagent.
+///
+/// Started by Claude Code and by nothing else. It runs for as long as that
+/// session does, answering JSON-RPC on stdin and stdout, and each `tools/call`
+/// it serves opens or continues a Codex session in the store `riabuild agents`
+/// reads — so the developer watches the whole delegation in the window while the
+/// calling agent is handed one paragraph.
+///
+/// The binary and the org settings are resolved here rather than recorded, for
+/// the reason `agent_turn` resolves them here: both move with every riabuild
+/// upgrade, and a server started this morning must run this afternoon's Codex.
+///
+/// Deliberately not behind `connect`. Codex is already installed, the checkout
+/// is already cloned, and — the reason that is sharper here than for a turn —
+/// this process's stdout is a pipe Claude Code is parsing, so anything that
+/// prints a line of progress onto it breaks the session it is serving.
+pub(crate) async fn mcp_codex(ctx: &mut Ctx, profile: usize) -> Result<i32> {
+    let org_settings = ctx.paths.org_settings_file();
+    let org_settings = tokio::fs::try_exists(&org_settings)
+        .await
+        .unwrap_or(false)
+        .then_some(org_settings);
+    let delegate =
+        riabuild_mcp::Delegate::new(ctx.paths.as_ref(), ctx.codex(), profile, org_settings);
+    riabuild_mcp::serve(ctx.runner.as_ref(), delegate).await?;
+    // EOF on stdin is Claude Code closing the pipe at the end of its session,
+    // which is the ordinary way this ends rather than a failure.
+    Ok(0)
+}
+
 fn not_signed_in() -> riabuild_ui::Failure {
     riabuild_ui::Failure::new(
         "fetching the team's ngrok authtoken",
@@ -492,7 +523,13 @@ mod tests {
         // the top-level list and cannot be removed through clap's builder.
         for shell in PACKAGED_SHELLS {
             let script = script_for(shell);
-            for hidden in ["ngrok-token", "seed-github", "gh-sweep", "agent-turn"] {
+            for hidden in [
+                "ngrok-token",
+                "seed-github",
+                "gh-sweep",
+                "agent-turn",
+                "mcp-codex",
+            ] {
                 assert!(
                     !script.contains(hidden),
                     "{shell}'s script offers the hidden `{hidden}`"

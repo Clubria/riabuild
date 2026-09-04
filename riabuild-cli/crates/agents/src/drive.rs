@@ -18,6 +18,16 @@ use crate::paste::{self, Pasted};
 use crate::store::{self, Store};
 use crate::{Action, Login, Request, Screen, frame, key, keys};
 
+/// How many ticks apart the window looks for sessions it did not open.
+///
+/// Twenty-five of the 120ms tick below, so about three seconds. `follow` reads
+/// two files per pane and is cheap enough for every tick; this is a `read_dir`
+/// and a small read per session, which is not — and what it is watching for is
+/// a subagent *appearing*, where three seconds is imperceptible. Its output is
+/// live from the moment it does, because `follow` picks the pane up on the very
+/// next tick.
+const RESCAN_TICKS: usize = 25;
+
 /// Loads this checkout's sessions and replays what they have already said.
 ///
 /// It creates nothing. The window used to open a session per harness here, so a
@@ -30,49 +40,153 @@ pub async fn restore(
     app: &mut App,
 ) -> Result<HashMap<String, Reader>> {
     let mut readers = HashMap::new();
-    for record in store.sessions(&request.cwd).await.unwrap_or_default() {
-        let Some(kind) = record.harness() else {
-            continue;
-        };
-        // Replayed through the same decoder a live turn is read with, so a
-        // reopened pane shows what was on screen when the work happened rather
-        // than a reconstruction of it.
-        let mut reader = Reader::new(kind);
-        let spool = store.spool(&record.id).await.unwrap_or_default();
-        let (trouble, trouble_at) = store.trouble_since(&record.id, 0).await.unwrap_or_default();
-        let running = store.running(&record.id).await;
-
-        // A session an older riabuild opened on the way in and nobody ever
-        // spoke to. Nothing was said, nothing failed and nothing is running, so
-        // there is no conversation to lose — and leaving them listed would carry
-        // the bug this redesign removes onto every machine that already has
-        // three of them per checkout.
-        if record.title.is_empty() && spool.is_empty() && trouble.is_empty() && !running {
+    // Grouped before anything is drawn, because the rail says "this pane is a
+    // child of the one above it" by indenting it — a claim only the *order* can
+    // make true. Sorting at draw time instead would leave `App::cursor`, which
+    // indexes `App::panes` directly, selecting whichever session happened to sit
+    // at that position before the rearrangement.
+    for record in crate::store::arrange(store.sessions(&request.cwd).await.unwrap_or_default()) {
+        let Some((pane, reader)) = hydrate(store, &record).await else {
+            // A session an older riabuild opened on the way in and nobody ever
+            // spoke to. Nothing was said, nothing failed and nothing is
+            // running, so there is no conversation to lose — and leaving them
+            // listed would carry the bug this redesign removes onto every
+            // machine that already has three of them per checkout.
+            //
+            // Only *here*. `adopt` meets the same shape a few milliseconds
+            // after `riabuild internal mcp-codex` made the directory and before
+            // its first turn has written a byte, and deleting that would take
+            // the session out from under a delegation that is already running.
             let _ = store.forget(&record.id).await;
             continue;
-        }
-
-        let mut pane = Pane::new(record.id.clone(), kind, record.title.clone());
-        pane.thread = record.thread.clone();
-        pane.account = record.account;
-        pane.offset = spool.len() as u64;
-        for line in spool.lines() {
-            for event in reader.read(line) {
-                pane.observe(&event);
-            }
-        }
-        // Replayed like the spool, so a failure from yesterday's turn is still
-        // on screen when the window comes back.
-        for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
-            pane.observe(&riabuild_harness::Event::Trouble(line.to_string()));
-        }
-        pane.trouble_offset = trouble_at;
-        pane.running = running;
+        };
         readers.insert(record.id.clone(), reader);
         app.add(pane);
     }
     app.cursor = 0;
     Ok(readers)
+}
+
+/// One record, read off the disk and replayed into a pane.
+///
+/// `None` for a session nobody has spoken to — no title, no spool, no failure
+/// and no turn holding its lock. What the caller does about that differs, which
+/// is why this reports it rather than deciding: [`restore`] forgets it, and
+/// [`adopt`] leaves it alone for the next rescan.
+async fn hydrate(store: &Store, record: &store::Record) -> Option<(Pane, Reader)> {
+    let kind = record.harness()?;
+    // Replayed through the same decoder a live turn is read with, so a reopened
+    // pane shows what was on screen when the work happened rather than a
+    // reconstruction of it.
+    let mut reader = Reader::new(kind);
+    let spool = store.spool(&record.id).await.unwrap_or_default();
+    let (trouble, trouble_at) = store.trouble_since(&record.id, 0).await.unwrap_or_default();
+    let running = store.running(&record.id).await;
+
+    if record.title.is_empty() && spool.is_empty() && trouble.is_empty() && !running {
+        return None;
+    }
+
+    let mut pane = Pane::new(record.id.clone(), kind, record.title.clone());
+    pane.thread = record.thread.clone();
+    pane.parent = record.parent.clone();
+    pane.account = record.account;
+    pane.offset = spool.len() as u64;
+    for line in spool.lines() {
+        for event in reader.read(line) {
+            pane.observe(&event);
+        }
+    }
+    // Replayed like the spool, so a failure from yesterday's turn is still on
+    // screen when the window comes back.
+    for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
+        pane.observe(&riabuild_harness::Event::Trouble(line.to_string()));
+    }
+    pane.trouble_offset = trouble_at;
+    pane.running = running;
+    Some((pane, reader))
+}
+
+/// Puts sessions this window did not open onto the rail.
+///
+/// There is exactly one thing that makes them: `riabuild internal mcp-codex`,
+/// started by a Claude Code session inside this window, which creates a Codex
+/// session of its own and runs a turn in it. Without this the developer would
+/// watch Claude sit on a tool call for two minutes with nothing to look at, and
+/// the subagent would appear only the next time the window was opened — which
+/// is precisely when its output has stopped being interesting.
+///
+/// Every rescan re-groups, because a child that arrives has to land under its
+/// parent rather than at the end of the list.
+async fn adopt(
+    store: &Store,
+    request: &Request,
+    app: &mut App,
+    readers: &mut HashMap<String, Reader>,
+) {
+    let records = store.sessions(&request.cwd).await.unwrap_or_default();
+    let known: std::collections::HashSet<String> =
+        app.panes.iter().map(|pane| pane.id.clone()).collect();
+    let mut arrived = false;
+    for record in &records {
+        if known.contains(&record.id) {
+            continue;
+        }
+        let Some((pane, reader)) = hydrate(store, record).await else {
+            continue;
+        };
+        readers.insert(record.id.clone(), reader);
+        app.add(pane);
+        arrived = true;
+    }
+    if arrived {
+        regroup(app, &records);
+    }
+}
+
+/// Puts the panes back in `store::arrange` order, keeping the cursor where the
+/// developer left it.
+///
+/// By id and never by index: the whole point of this function is that indices
+/// have just changed, and a cursor restored to its old number would select
+/// whatever moved into that row.
+fn regroup(app: &mut App, records: &[store::Record]) {
+    let held = match app.row() {
+        Some(Row::Session(index)) => app.panes.get(index).map(|pane| pane.id.clone()),
+        _ => None,
+    };
+    let offered = matches!(app.row(), Some(Row::Offer(_)));
+    let offer_at = match app.row() {
+        Some(Row::Offer(index)) => index,
+        _ => 0,
+    };
+
+    let order: Vec<String> = crate::store::arrange(records.to_vec())
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    // A pane with no record — one created a moment ago by this window's own
+    // `begin` and not yet on disk when the listing was taken — sorts to the
+    // end rather than being dropped. `sort_by_key` is stable, so several of
+    // them keep the order they were added in.
+    app.panes.sort_by_key(|pane| {
+        order
+            .iter()
+            .position(|id| id == &pane.id)
+            .unwrap_or(usize::MAX)
+    });
+
+    if let Some(id) = held {
+        if let Some(at) = app.panes.iter().position(|pane| pane.id == id) {
+            app.cursor = at;
+        }
+    } else if offered {
+        // An offer is identified by its position in a list this never touches,
+        // but the *rail* puts the offers after the sessions — so a session
+        // arriving moves every offer down one, and a cursor left where it was
+        // would jump to a different sign-in.
+        app.cursor = app.panes.len() + offer_at;
+    }
 }
 
 /// `riabuild agents "do the thing"` — asked of every harness at once.
@@ -150,6 +264,9 @@ pub async fn drive(
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 follow(store, app, readers).await;
+                if app.tick.is_multiple_of(RESCAN_TICKS) {
+                    adopt(store, request, app, readers).await;
+                }
                 Action::Nothing
             }
         };

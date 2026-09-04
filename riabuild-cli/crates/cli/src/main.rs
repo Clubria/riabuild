@@ -280,6 +280,12 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
                     prompt_file,
                 },
         }) => return internal::agent_turn(ctx, session, prompt_file).await,
+        // Not behind `connect` either, and for a second reason on top of the
+        // one above: this process's stdout is a JSON-RPC pipe Claude Code is
+        // parsing, and `connect` prints.
+        Some(Command::Internal {
+            action: cli::InternalAction::McpCodex { profile },
+        }) => return internal::mcp_codex(ctx, *profile).await,
         Some(Command::MoveProject { path }) => {
             return move_project::run(ctx, path.as_deref()).await;
         }

@@ -40,6 +40,7 @@
 //! harness is a third-party binary that knows nothing about riabuild, and the
 //! wrapper is a riabuild process whose whole life is that one turn.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,6 +84,25 @@ pub struct Record {
     /// What this session resumes under. `None` until the harness has said.
     #[serde(default)]
     pub thread: Option<String>,
+    /// The session that delegated this one, by store id.
+    ///
+    /// Set only by `riabuild internal mcp-codex`, which is the one thing that
+    /// creates a session on another session's behalf. `None` is every session a
+    /// developer started themselves, which is almost all of them.
+    ///
+    /// Presence *is* the "this is a subagent" flag, and there is deliberately no
+    /// boolean beside it: two fields describing one fact are two fields that can
+    /// come to disagree, and the one that would be believed is whichever the
+    /// rail happened to read.
+    ///
+    /// **One level, by construction.** Only Claude Code is given the MCP server,
+    /// so a Codex session created here has no way to delegate in turn. The
+    /// server refuses a parent that already has one anyway — see
+    /// `riabuild-mcp`, where the reasoning is written out — so a future release
+    /// that hands the server to a second harness cannot silently grow a tree the
+    /// rail has no way to draw.
+    #[serde(default)]
+    pub parent: Option<String>,
     /// Which of that harness's nine sign-ins made this session, 1-based.
     ///
     /// Beside `home` and not instead of it: the home is what a turn runs under
@@ -287,6 +307,21 @@ impl Store {
     /// signature that lets a session be recorded as `claude-2` while running out
     /// of `claude-1`'s store.
     pub async fn create(&self, account: &Account, cwd: &Path) -> Result<Record> {
+        self.create_under(account, cwd, None).await
+    }
+
+    /// The same, for a session another session asked for.
+    ///
+    /// Separate from [`Store::create`] rather than a fourth argument on it
+    /// because a delegated session is created by exactly one caller and every
+    /// other call site would have to pass `None` for ever. The window's own
+    /// path is the one that should stay short.
+    pub async fn create_under(
+        &self,
+        account: &Account,
+        cwd: &Path,
+        parent: Option<&str>,
+    ) -> Result<Record> {
         let id = new_id();
         tokio::fs::create_dir_all(self.session_dir(&id))
             .await
@@ -296,6 +331,7 @@ impl Store {
             id,
             kind: account.kind.tag().to_string(),
             thread: None,
+            parent: parent.map(str::to_string),
             account: account.number,
             home: account.home.clone(),
             cwd: cwd.to_path_buf(),
@@ -477,6 +513,44 @@ impl Store {
     }
 }
 
+/// The same records, with every delegated session moved under the one that
+/// asked for it.
+///
+/// Both groups keep the order they arrived in, so "newest first" still decides
+/// which parent leads the rail and which child leads its parent's group. Only
+/// the *grouping* is new.
+///
+/// A free function rather than something [`Store::sessions`] does, because
+/// [`Store::prune`] reads that list too and drops everything past [`KEEP`]:
+/// against a list rearranged like this, "past fifty" would stop meaning "the
+/// fifty least recent", and a parent would push older sessions off the end by
+/// having children rather than by being newer.
+///
+/// **A child whose parent is not in the list is a root.** Parents are pruned on
+/// age like anything else, and a subagent that outlives its parent has to stay
+/// reachable: losing a conversation because the session that started it aged out
+/// is a worse outcome than an indent that turns out flat.
+pub fn arrange(records: Vec<Record>) -> Vec<Record> {
+    let present: HashSet<&str> = records.iter().map(|record| record.id.as_str()).collect();
+    let is_root = |record: &Record| match record.parent.as_deref() {
+        None => true,
+        Some(parent) => !present.contains(parent),
+    };
+
+    let mut arranged: Vec<Record> = Vec::with_capacity(records.len());
+    for root in records.iter().filter(|record| is_root(record)) {
+        arranged.push(root.clone());
+        arranged.extend(
+            records
+                .iter()
+                .filter(|child| !is_root(child))
+                .filter(|child| child.parent.as_deref() == Some(root.id.as_str()))
+                .cloned(),
+        );
+    }
+    arranged
+}
+
 /// One line of a prompt, for the session list.
 pub fn title_of(prompt: &str) -> String {
     const MAX: usize = 60;
@@ -497,6 +571,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::rooted_at(dir.path().join("agents"));
         (dir, store)
+    }
+
+    /// A record with only the fields `arrange` reads.
+    fn listed(id: &str, parent: Option<&str>) -> Record {
+        Record {
+            id: id.to_string(),
+            kind: "codex".to_string(),
+            thread: None,
+            parent: parent.map(str::to_string),
+            account: 1,
+            home: None,
+            cwd: PathBuf::from("/work"),
+            title: String::new(),
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    fn ids(records: Vec<Record>) -> Vec<String> {
+        records.into_iter().map(|record| record.id).collect()
+    }
+
+    #[test]
+    fn a_subagent_is_listed_under_the_session_that_asked_for_it() {
+        // Newest first, which is the order `sessions` hands over: the child ran
+        // most recently, then an unrelated session, then its parent.
+        let listing = vec![
+            listed("child", Some("parent")),
+            listed("other", None),
+            listed("parent", None),
+        ];
+        assert_eq!(ids(arrange(listing)), ["other", "parent", "child"]);
+    }
+
+    #[test]
+    fn two_subagents_keep_the_order_they_arrived_in() {
+        let listing = vec![
+            listed("second", Some("parent")),
+            listed("first", Some("parent")),
+            listed("parent", None),
+        ];
+        assert_eq!(ids(arrange(listing)), ["parent", "second", "first"]);
+    }
+
+    #[test]
+    fn a_subagent_whose_parent_was_pruned_is_still_listed() {
+        // The parent aged past `KEEP` and is gone. Losing the child with it
+        // would lose a conversation the harness still has.
+        let listing = vec![listed("orphan", Some("gone")), listed("other", None)];
+        assert_eq!(ids(arrange(listing)), ["orphan", "other"]);
+    }
+
+    #[test]
+    fn a_listing_with_no_subagents_is_unchanged() {
+        let listing = vec![listed("a", None), listed("b", None), listed("c", None)];
+        assert_eq!(ids(arrange(listing)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_delegated_session_records_its_parent() {
+        let child = listed("child", Some("parent"));
+        let text = serde_json::to_string(&child).unwrap();
+        let read: Record = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.parent.as_deref(), Some("parent"));
+
+        // And a record written before this field existed still loads, which is
+        // every session on every machine that upgrades into this release.
+        let older = r#"{"id":"s","kind":"claude","cwd":"/work","created":0,"updated":0}"#;
+        let read: Record = serde_json::from_str(older).unwrap();
+        assert!(read.parent.is_none());
     }
 
     /// A pasted image lives beside the sessions and is not one. `sessions`

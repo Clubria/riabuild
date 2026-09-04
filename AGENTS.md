@@ -23,7 +23,7 @@ anything structural.
 
 | Path | What |
 |---|---|
-| `riabuild-cli/` | Rust CLI — a cargo workspace of fifteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
+| `riabuild-cli/` | Rust CLI — a cargo workspace of sixteen crates under `crates/`, the binary in `crates/cli/`. Shipped via Homebrew, apt, and dnf |
 | `riabuild-web/` | Convex + Vite + React + Tailwind dashboard at `riabuild.clubria.com` |
 | `e2e/` | the CLI and the backend tested together — `run.sh` on macOS, and `remote/` driving `riabuild remote` against a real Debian container. `e2e/README.md` |
 | `packaging/` | the Homebrew, deb, and rpm templates — edit these, never the rendered copies; `ngrok/` and `grok/` hold the mirror scripts for the two tools nobody publishes a digest for |
@@ -86,6 +86,19 @@ is compiled in with `include_str!`, and is installed by the `claude_statusline` 
 Editing that string in the dashboard cannot change what runs on a laptop — only an
 upgrade can. A settings key whose value the server chose the *contents* of would
 be the manifest again under another name.
+
+**An MCP server is that rule met head-on, because an MCP entry is a command and an argv.**
+Claude Code reaches another agent through one, so offering Codex as a subagent means
+putting a program in a config file — and `mcpServers` is on
+`org_settings::vetting::EXECUTES_A_PROGRAM`, refused loudly rather than stripped, precisely
+so riabuild-web can never be the thing that chooses it. That leaves exactly two legal
+sources, and they are the two the rest of this section already names: the **checkout**,
+which arrives through a pull request and is what `claude_plugins` reads, and the **binary**,
+which is what `claude_codex_mcp` writes — `riabuild internal mcp-codex`, riabuild naming
+itself by the path it is running from, with no argument any server chose. A third answer
+that looks convenient — a dashboard field for "the team's MCP servers" — is the task
+manifest with the serial numbers filed off, and it is worth saying so now rather than
+arguing about it later. See `docs/superpowers/specs/2026-09-04-codex-subagents-design.md`.
 
 **riabuild owns every tool it installs.** Node, pnpm, Claude Code, the Codex CLI, Grok
 Build, `gh`, `infisical` and `ngrok` are downloaded by riabuild and verified against a

@@ -1,0 +1,38 @@
+[package]
+name = "riabuild-mcp"
+version = "0.0.0"
+edition.workspace = true
+description = "Codex, offered to Claude Code as a subagent over MCP"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# The session store, the turn wrapper, and the name of the environment variable
+# that says which session asked. Everything this crate does to a Codex session
+# is something `riabuild agents` already knew how to do — the new part is the
+# protocol in front of it and the decision about what not to send back.
+riabuild-agents.workspace = true
+riabuild-harness.workspace = true
+riabuild-paths.workspace = true
+riabuild-runner.workspace = true
+riabuild-version.workspace = true
+# JSON-RPC is JSON, and there is no MCP crate here on purpose: `initialize`,
+# `notifications/initialized`, `tools/list` and `tools/call` are the whole
+# surface a stdio server needs. `riabuild-harness` next door has exactly one
+# dependency for the same reason.
+serde_json.workspace = true
+# `io-util` is the line reader on stdin and the writer on stdout; `fs` is the
+# prompt file a turn takes its work from. Nothing here needs `process` — the
+# child belongs to `riabuild-runner`, like every other child riabuild starts.
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
+
+[dev-dependencies]
+riabuild-runner = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
