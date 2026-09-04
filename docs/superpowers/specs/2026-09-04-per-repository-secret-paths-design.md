@@ -109,13 +109,43 @@ The same split `secretEnvironments` already lives under, for the same stated rea
 
 | Caller | Endpoint | Why not the other one |
 |---|---|---|
-| `env_local::check()` | `GET /api/v1/secrets/scope?repo=…` | runs on every `riabuild --check`; must not broker a credential and write an audit row to learn which files ought to exist |
+| `provision`, once per run | `GET /api/v1/secrets/scope?repo=…` | `env_local::check()` runs on every `riabuild --check` and must not broker a credential — and write an audit row saying somebody read the team's secrets — to learn which files ought to exist |
 | `env_local::apply()` | `POST /api/v1/secrets/token` (with `repo`) | the credential and the scope it was minted for arrive together, so the two can never describe different folders |
 | `riabuild internal infisical` | `POST /api/v1/secrets/token` (with `repo`) | the shim fills in `--path` and `--env` for the repository the developer is standing in |
 
 `GET /api/v1/secrets/scope` is new and carries no credential — a path, a list of
 environment names, and when the row last changed. It is the cheap question, and it is the
 one asked on every run.
+
+**`check()` does not ask it. `provision` does, once, and puts the answer on `Ctx`.** The
+first cut had `check()` make the request itself, which is the obvious shape and is wrong
+for a reason worth writing down, because nothing catches it: `testing::ctx()` builds a
+real `ApiClient` against the real `DEFAULT_API_URL`, so a `check()` that calls
+riabuild-web does not fail in a unit test — **it passes, against production**. The suite
+went green because production 404s a route that does not exist there yet, which the CLI
+reads as "old deployment" and falls back. On a runner with no network the same tests fail,
+and on a runner with one they assert whatever production happens to answer that day.
+
+So `Ctx::load_secret_scope` runs after the picker has settled which repository the run is
+about, and `check()` reads `ctx.secret_scope` as a plain field. That is the rule
+`CommandRunner` already enforces for subprocesses — everything external goes through
+something a test can substitute — applied to the one task that also talks to a server. It
+costs one request per run instead of two, and `Ctx::fork` carries it, because `env_local`
+runs in a wave and a fork taking the default would fill an unmapped repository from the
+org-wide folders.
+
+`SecretScope` has four variants rather than two, and the last two are why:
+
+| | Means | Comes from |
+|---|---|---|
+| `OrgWide` | this deployment has no mapping table | a 404 from `/secrets/scope`, or no repository named |
+| `Mapped` | a lead named folders; these are the environments they are in | `configured: true` |
+| `Unmapped` | a lead decided: no environment files | `configured: false` |
+| `Unavailable` | riabuild could not find out | the request failed |
+
+Collapsing the first two strands a team on an older riabuild-web with no secrets at all.
+Collapsing the last two reports a network failure as a decision — the distinction
+`github.ts` already draws with `unavailable`, for the same reason.
 
 ### A path change is staleness
 
@@ -136,8 +166,10 @@ before this reads neither new thing and is not stranded — the rule in
 `.agents/skills/riabuild-api/SKILL.md` about required fields, applied.
 
 **New CLIs against an old deployment** get a 404 from `/secrets/scope`, which
-`env_local::check()` reads as "this deployment predates per-repository paths" and falls
-back to `org.secret_environments`. The fallback is named and temporary; it is not a
+`load_secret_scope` reads as `SecretScope::OrgWide` — "this deployment predates
+per-repository paths" — so `env_local` falls back to `org.secret_environments`. That is
+also why an *unmapped* repository is a 200 with `configured: false` rather than a 404: the
+two answers have to be told apart, and a status code cannot carry the difference. The fallback is named and temporary; it is not a
 silent guess, because a silent guess here fills a checkout from the wrong folder.
 
 **The migration is the part that would otherwise strand everybody.** "No row means no
@@ -163,11 +195,16 @@ for nothing else.
 | `convex/infisical.ts` | `discoverEnvironments` — the project's environments, filtered to the ones holding every one of the repository's folders, narrowed for a candidate |
 | `convex/http.ts` | `GET /api/v1/secrets/scope`; `POST /api/v1/secrets/token` takes an optional `repo` |
 | `src/components/SecretPaths.tsx` | the table and its form, `DataTable` + `Field`, the `SharedServers` shape |
-| `src/data/` | `secretPaths` on the context, the three mutations, a fixture state |
-| `crates/api/src/secrets.rs` | `SecretScope`; `broker_for(repo)`; `scope_for(repo)` |
-| `crates/tasks/src/env_local/` | `check()` and `apply()` read the run's repository; an unmapped repository is satisfied and says so |
-| `crates/cli/src/internal/infisical.rs` | the shim's `--path`/`--env` come from the active repository |
-| docs | this spec; the picker spec's "out of scope" line; both `AGENTS.md` |
+| `src/data/` | `repoSecretPaths` on the context, `setRepoSecretPaths` and `removeRepoSecretPaths`, and the offline shape |
+| `src/dev/scenarios.ts` | three states — nothing mapped, the query failed, the mutation refused — plus the hostile rows in `overflow` |
+| `crates/api/src/secrets.rs` | `SecretScope`; `broker_for(repo)`; `scope_for(repo)`, whose 404 is `Ok(None)` |
+| `crates/tasks/src/ctx/` | `SecretScope` on `Ctx`, carried by `fork`; `load_secret_scope` |
+| `crates/cli/src/provision.rs` | asks once, after the picker has settled the repository |
+| `crates/tasks/src/env_local/` | `check()` reads `ctx.secret_scope` and makes no request; an unmapped repository is satisfied and says so |
+| `crates/cli/src/internal/infisical.rs` | the shim's `--path`/`--env` come from the active repository, and fall back to the org-wide broker when the mapping is gone — the mapping decides what riabuild *writes*, not whether a tool is signed in |
+| `e2e/stages/07-seed.sh` | runs the migration, so the throwaway backend maps its repository the way production does |
+| `e2e/infisical-stub.mjs` | answers `/api/v1/workspace/<id>` and `/api/v1/folders`, derived from the secrets it already serves |
+| docs | this spec; the picker spec's two superseded lines; both `AGENTS.md`; `deploying.md`; one line in the setup-task skill |
 
 ## What it costs, said out loud
 

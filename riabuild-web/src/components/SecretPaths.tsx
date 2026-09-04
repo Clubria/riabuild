@@ -87,34 +87,47 @@ export function SecretPaths() {
       .finally(() => setSaving(false));
   }
 
+  /**
+   * The repository and its folders in **one** column, rather than two.
+   *
+   * Both values here can be long — a 100-character slug is a real GitHub name,
+   * and a nested Infisical folder is longer still — and `DataTable` is shaped
+   * for exactly one of those per table: the `grow` column wraps and every other
+   * column is `whitespace-nowrap`. Two of them means the nowrap one sets the
+   * table's width, the growing one collapses to its 14ch floor, and at 380px a
+   * folder path stacks two characters per line down a column six wide. That is
+   * visible in the shipped shared-servers table on adversarial data, and it is
+   * not something to reproduce on purpose.
+   *
+   * Nesting them says what the row means anyway. A folder list is not a
+   * property of a repository the way a port is of a server — it is what the
+   * repository *resolves to*, and reading it as an indented list under the name
+   * is how anybody would write it down.
+   */
   const columns: Column<RepoSecretPath>[] = [
     {
       key: "repo",
-      header: "repository",
-      render: (row) => (
-        <span className="text-fg wrap-value">{row.repoSlug}</span>
-      ),
-    },
-    {
-      key: "paths",
-      header: "infisical folders",
+      header: "repository, and its infisical folders",
       grow: true,
       render: (row) => (
-        <ol className="min-w-0">
-          {row.secretPaths.map((path, index) => (
-            <li key={path} className="flex items-baseline gap-2">
-              {/* The ordinal is the whole point of showing these as a list:
-                  a key two folders hold takes the value of the later one, so
-                  which line a folder is on is a fact about the file that
-                  lands. Decorative to a screen reader — `<ol>` already
-                  announces the position. */}
-              <span aria-hidden="true" className="shrink-0 text-fg-faint">
-                {index + 1}
-              </span>
-              <span className="min-w-0 text-fg-dim wrap-value">{path}</span>
-            </li>
-          ))}
-        </ol>
+        <div className="min-w-0">
+          <span className="text-fg wrap-value">{row.repoSlug}</span>
+          <ol className="mt-0.5 min-w-0">
+            {row.secretPaths.map((path, index) => (
+              <li key={path} className="flex items-baseline gap-2">
+                {/* The ordinal is the whole point of showing these as a list:
+                    a key two folders hold takes the value of the later one, so
+                    which line a folder is on is a fact about the file that
+                    lands. Decorative to a screen reader — `<ol>` already
+                    announces the position. */}
+                <span aria-hidden="true" className="shrink-0 text-fg-faint">
+                  {index + 1}
+                </span>
+                <span className="min-w-0 text-fg-dim wrap-value">{path}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
       ),
     },
     {
