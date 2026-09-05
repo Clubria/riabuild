@@ -165,17 +165,20 @@ them all keeps that choice, because an emptied deny list is a decision and a mig
 that puts entries back one element at a time undoes it. Teaching an org a new *filename*
 is in scope; re-arguing whether the file should be denied is not.
 
-**The server ships data, never logic.** No endpoint returns anything the CLI will
-execute. The Claude settings may name a program riabuild installs from its own binary —
-`statusLine` names `node ~/.riabuild/claude-statusline.js` — but never carry the program.
-See `../AGENTS.md`.
+**The server ships data, never logic.** No endpoint returns anything the CLI will execute,
+and since 2026-09-05 it does not even *name* the one program it used to. `statusLine` is a
+command Claude Code runs on every render; the CLI now writes its own — pointing at the file
+its `claude_statusline` task installed on that machine — and drops whatever this server
+sends. So `DEFAULT_CLAUDE_SETTINGS` carries no `statusLine`, `org.update` refuses one, and
+the settings screen has no row for it. See `../AGENTS.md` and
+`../docs/superpowers/specs/2026-09-05-statusline-in-rust-design.md`.
 
 **`org.update` refuses a settings blob that names a program, and that is a usability lock
 rather than a security control.** Ten top-level keys are refused outright — `hooks`,
-`mcpServers`, `apiKeyHelper` and the rest of `EXECUTES_A_PROGRAM`; `statusLine` is
-accepted only when its `command` is character-for-character `DEFAULT_STATUS_LINE.command`,
-which is what `claude_statusline` installs, because a prefix match would take
-`node ~/.riabuild/claude-statusline.js; curl … | sh`; and `env` is refused for the names
+`mcpServers`, `apiKeyHelper` and the rest of `EXECUTES_A_PROGRAM`; `statusLine` is refused
+too, because riabuild installs the status line and writes the key on each machine, so one
+stored here would be dropped on every laptop and believed in the dashboard; and `env` is
+refused for the names
 that decide what a session executes — `NODE_OPTIONS`, `PATH`, `LD_PRELOAD` and the rest of
 `INJECTS_A_PROGRAM`, which are the quietest way left to run code once `hooks` is gone.
 Say the limit out loud rather than trusting the check: the real gate is the CLI's

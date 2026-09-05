@@ -1,6 +1,6 @@
 //! `riabuild internal usage-flush` — sends what the status line spooled.
 //!
-//! Started **detached** by `claude-statusline.js`, at most once a minute, and
+//! Started **detached** by `internal statusline`, at most once a minute, and
 //! never by a person. Nothing waits for it and nothing reads its output, which
 //! shapes every decision in this file:
 //!
@@ -59,11 +59,15 @@ pub(crate) async fn flush(ctx: &mut Ctx) -> Result<i32> {
 
 /// Every `<account>.ndjson` in the usage directory.
 ///
-/// Read from the directory rather than from `config.tracked_accounts`, so that
-/// an account the developer has since *untracked* still has its already-written
-/// samples sent and its file removed. Deciding from the config instead would
-/// leave that spool on disk for ever, which is the one outcome worse than
-/// sending it: samples nobody collected any more, kept indefinitely.
+/// Read from the directory rather than from the account list, so that a spool
+/// belonging to an account `riabuild claude delete` has since removed is still
+/// sent and its file cleaned up. Deciding from `config.json` instead would leave
+/// that spool on disk for ever, which is the one outcome worse than sending it:
+/// samples nobody collects any more, kept indefinitely.
+///
+/// This is also what carried the fleet across the end of opt-in collection: a
+/// spool written for an account somebody had marked was flushed by the riabuild
+/// that stopped asking, because it never consulted the mark.
 async fn spools(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {

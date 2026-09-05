@@ -344,7 +344,6 @@ mod tests {
             number: 1,
             id: "id-1".into(),
             identity: Identity::LoggedIn("clubria@proton.me".into()),
-            tracked: false,
         }]
     }
 

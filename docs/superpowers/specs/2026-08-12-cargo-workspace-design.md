@@ -78,7 +78,6 @@ riabuild-cli/
     gh-session/   riabuild-gh-session   731   paths, runner, ui
     channel/      riabuild-channel    4,918   gh-session, paths, runner, ui
     tasks/        riabuild-tasks     10,608   all of the above
-      assets/                               claude-statusline.js
     remote/       riabuild-remote     9,402   all of the above
     cli/          riabuild-cli        3,488   all of the above  [[bin]] name = "riabuild"
 ```

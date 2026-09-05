@@ -79,13 +79,19 @@ riabuild holds no permission logic that could be wrong about it. A
 server-driven task manifest would be a remote code execution channel onto every
 developer's laptop. Do not cross this boundary for convenience.
 
-The org settings may **name** a program and never **carry** one. The default status line
-is `node ~/.riabuild/claude-statusline.js`; the script lives in
-`riabuild-cli/crates/tasks/assets/`,
-is compiled in with `include_str!`, and is installed by the `claude_statusline` task.
-Editing that string in the dashboard cannot change what runs on a laptop — only an
-upgrade can. A settings key whose value the server chose the *contents* of would
-be the manifest again under another name.
+The org settings may **name** a program and never **carry** one. A settings key whose value
+the server chose the *contents* of would be the manifest again under another name.
+
+**The status line is how that rule was tested, and the answer is that the server does not
+name it either.** It is a command Claude Code runs on every render, so it was the one key
+allowed to name a program — held open by an equality check the dashboard and the CLI both
+had to make against the same string, in two repositories, for a path that differs between a
+laptop and a shared server. Since 2026-09-05 riabuild writes it itself: `vetting` drops any
+`statusLine` the server sends and `org_settings` writes the command the
+`claude_statusline` task installed on *that* machine, which is one `exec` into `riabuild
+internal statusline`. Nothing in the dashboard can change what runs on a laptop, because
+nothing in the dashboard is consulted — only an upgrade can. See
+`docs/superpowers/specs/2026-09-05-statusline-in-rust-design.md`.
 
 **An MCP server is that rule met head-on, because an MCP entry is a command and an argv.**
 Claude Code reaches another agent through one, so offering Codex as a subagent means

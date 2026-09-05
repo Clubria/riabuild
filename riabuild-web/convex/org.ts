@@ -10,23 +10,6 @@ import { viewerMember, writeAudit } from "./members";
 import { compareVersions } from "./lib/version";
 
 /**
- * The context-window bar every Clubria developer gets by default.
- *
- * This is a pointer, not a program. The script it names is compiled into the
- * riabuild binary and written to `~/.riabuild/claude-statusline.js` by the
- * `claude_statusline` setup task, so what actually executes on a laptop arrives
- * through a signed Homebrew release. Changing this string cannot make a
- * developer's machine run something new — only `brew upgrade` can.
- *
- * `node` resolves to the Node riabuild installed: it shares `PATH` with the `c`
- * launcher inside the Clubria environment shell.
- */
-export const DEFAULT_STATUS_LINE = {
-  type: "command",
-  command: "node ~/.riabuild/claude-statusline.js",
-};
-
-/**
  * Defaults exist so a fresh deployment serves a coherent config before any lead
  * has opened the settings screen. A CLI that gets a 404 for org config cannot do
  * anything useful, and "set this up first" is a worse first run than sane
@@ -37,9 +20,15 @@ export const DEFAULT_STATUS_LINE = {
  * `flagSettings`, verified against 2.1.223). Nothing here is written into
  * anyone's own `settings.json`.
  *
- * `statusLine` is the one key that names a program, and it still carries none:
- * the script it points at ships inside the riabuild binary. See
- * `DEFAULT_STATUS_LINE`.
+ * **No `statusLine`, and its absence is deliberate.** A status line is a command
+ * Claude Code runs on every render — a program — and this deployment used to
+ * name one here, guarded by an equality check on both sides. The CLI now writes
+ * its own into the settings file it caches, pointing at the file its own
+ * `claude_statusline` task installed, so the key never travels. That is the
+ * architecture rule with one fewer exception to police, and it removes a string
+ * two repositories had to agree on character for character: a path that differs
+ * between a laptop and a server, spelled in a dashboard that has never seen
+ * either.
  *
  * `skipDangerousModePermissionPrompt` is what accepting the bypass-permissions
  * disclaimer sets. Without it Claude Code silently downgrades the mode —
@@ -96,7 +85,6 @@ export const DEFAULT_CLAUDE_SETTINGS = JSON.stringify(
     },
     skipDangerousModePermissionPrompt: true,
     env: { CLUBRIA_ORG: "1", CLAUDE_CODE_SUBAGENT_MODEL: "sonnet" },
-    statusLine: DEFAULT_STATUS_LINE,
   },
   null,
   2,
@@ -361,10 +349,9 @@ function refuse(key: string, why: string): never {
  * accepted, stored, and dropped on the laptop with a note, which is the
  * behaviour the CLI already documents.
  *
- * `statusLine` is checked against `DEFAULT_STATUS_LINE.command`, which is the
- * command `claude_statusline` installs. The CLI compares against the path it
- * actually wrote on *that* machine rather than against a constant, so this
- * check is the weaker of the two by construction.
+ * `statusLine` is refused outright: riabuild installs it and writes it into the
+ * settings on each machine, so a command stored here would be dropped on the
+ * laptop and believed in the dashboard.
  */
 function checkClaudeSettings(raw: string): void {
   let parsed: unknown;
@@ -386,39 +373,27 @@ function checkClaudeSettings(raw: string): void {
     if (EXECUTES_A_PROGRAM.includes(key)) {
       refuse(key, "it names a program for Claude Code to run");
     }
-    if (key === "statusLine") checkStatusLine(value);
+    if (key === "statusLine") checkStatusLine();
     if (key === "env") checkEnv(value);
   }
 }
 
 /**
- * The one key allowed to name a program, and only the program riabuild put
- * there itself.
+ * A status line is not a team setting, because a status line is a program.
  *
- * Equality, not a prefix: `node ~/.riabuild/claude-statusline.js; curl … | sh`
- * starts with the right thing and is a shell command Claude Code runs on every
- * render.
+ * The CLI writes its own into the file it caches — pointing at the file its own
+ * `claude_statusline` task installed on that machine — and ignores whatever
+ * arrives here. Refusing it at save time is the dashboard saying so out loud,
+ * rather than storing a key that would be silently dropped and leaving a lead
+ * to believe they had configured something.
  */
-function checkStatusLine(value: unknown): void {
-  if (!isSettingsObject(value)) {
-    refuse(
-      "statusLine",
-      "riabuild only writes the status line it installs itself",
-    );
-  }
-  if (value.type !== "command") {
-    refuse("statusLine", "riabuild only writes a `command` status line");
-  }
-  if (value.command === undefined) {
-    refuse("statusLine", "it carries no `command`");
-  }
-  if (value.command !== DEFAULT_STATUS_LINE.command) {
-    refuse(
-      "statusLine.command",
-      "the only one riabuild writes is the command the `claude_statusline` task " +
-        `installs, \`${DEFAULT_STATUS_LINE.command}\``,
-    );
-  }
+function checkStatusLine(): void {
+  refuse(
+    "statusLine",
+    "riabuild installs the status line itself and writes it into the settings " +
+      "on each machine — a command typed here would be a program the server " +
+      "chose, running on every laptop at every render",
+  );
 }
 
 function checkEnv(value: unknown): void {
@@ -610,78 +585,6 @@ export const setLatestCliVersion = internalMutation({
 });
 
 /**
- * Adds the status line to an org that saved its settings before riabuild had
- * one.
- *
- * `DEFAULT_CLAUDE_SETTINGS` is only ever read by a deployment with no
- * `orgConfig` row, so on any org where a lead has pressed save even once, a new
- * default reaches nobody. Run this once per deployment:
- *
- *     npx convex run org:backfillStatusLine --prod
- *
- * Internal on purpose, like `setLatestCliVersion`: reachable from CI and the
- * Convex dashboard, and from no browser client.
- *
- * Conservative by design. An org that already names a status line is left
- * alone, whichever one it names. Overwriting a lead's deliberate choice because
- * a migration ran a second time is worse than the migration doing nothing.
- */
-export const backfillStatusLine = internalMutation({
-  args: {},
-  returns: v.object({ updated: v.boolean(), reason: v.string() }),
-  handler: async (ctx) => {
-    const row = await ctx.db.query("orgConfig").first();
-    if (row === null) {
-      return {
-        updated: false,
-        reason: "No stored config — the served default already carries it.",
-      };
-    }
-
-    let settings: Record<string, unknown>;
-    try {
-      const parsed: unknown = JSON.parse(row.claudeSettings);
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      )
-        throw new Error("not an object");
-      settings = parsed as Record<string, unknown>;
-    } catch {
-      // `org.update` rejects invalid JSON, so this means the row predates that
-      // check or was written by hand. Guessing at a repair here would replace
-      // settings nobody can see with settings nobody chose.
-      return {
-        updated: false,
-        reason:
-          "Stored settings are not a JSON object. Fix them in the dashboard first.",
-      };
-    }
-
-    if (settings.statusLine !== undefined) {
-      return { updated: false, reason: "A status line is already configured." };
-    }
-
-    settings.statusLine = DEFAULT_STATUS_LINE;
-    await ctx.db.patch("orgConfig", row._id, {
-      claudeSettings: JSON.stringify(settings, null, 2),
-      // Moving this is the point: the CLI decides whether to re-fetch by
-      // comparing it, so a settings change that leaves it alone never lands.
-      claudeSettingsUpdatedAt: Date.now(),
-    });
-
-    // No actorId: this is a migration, not a person.
-    await writeAudit(ctx, {
-      action: "org.config_updated",
-      meta: { fields: "claudeSettings", via: "backfillStatusLine" },
-    });
-
-    return { updated: true, reason: "Status line added." };
-  },
-});
-
-/**
  * Whether a value is settings *structure* rather than a settings answer.
  *
  * Arrays are answers, not structure. `permissions.deny` is the case that
@@ -724,7 +627,8 @@ function fillMissing(
 /**
  * Gives an org the team settings that were added after it last pressed save.
  *
- * The general form of `backfillStatusLine`, and the reason that one existed:
+ * The general form of the one-key migrations this has needed, and the reason
+ * they existed at all:
  * `loadConfig` serves `DEFAULT_CLAUDE_SETTINGS` only to a deployment with
  * **no** `orgConfig` row, so on any org where a lead has saved once — or where
  * a CLI release published a version, which inserts the same row — a new default

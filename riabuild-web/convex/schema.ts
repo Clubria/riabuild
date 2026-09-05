@@ -160,10 +160,10 @@ export default defineSchema({
      * structure lives inside the string, and it is worth being explicit that
      * this is **not** the gate. The CLI is: `tasks::org_settings::vetting`
      * refuses any key that names a program — `hooks`, `apiKeyHelper`,
-     * `awsCredentialExport`, `mcpServers` and the rest — and accepts
-     * `statusLine.command` only when it is the exact command the
-     * `claude_statusline` task installs. Whatever this column holds, that is
-     * what reaches `claude --settings`.
+     * `awsCredentialExport`, `mcpServers` and the rest — and drops any
+     * `statusLine` stored here, writing the command its own `claude_statusline`
+     * task installed on that machine instead. Whatever this column holds, that
+     * is what reaches `claude --settings`.
      *
      * Keeping the real check there rather than here is deliberate. This row is
      * data the CLI treats as untrusted: a hand-edited document, a compromised

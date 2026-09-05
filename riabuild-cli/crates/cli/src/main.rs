@@ -131,6 +131,15 @@ async fn run(cli: Cli) -> Result<i32> {
                 let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
                 return internal::launch(runner.as_ref(), action).await;
             }
+            // And the status line for the same reason at a higher volume than
+            // anything else here: this runs on every render of every session,
+            // several times a minute, and its stdout *is* the line Claude Code
+            // draws — so a banner on it would be printed into the developer's
+            // status bar.
+            cli::InternalAction::Statusline => {
+                let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
+                return internal::statusline(runner.as_ref()).await;
+            }
             // And `completions` for the same two reasons at once: its stdout
             // is a script a shell sources, and it runs inside Homebrew's build
             // sandbox and a `dpkg-deb` staging tree, where there is no
@@ -310,6 +319,7 @@ async fn run_inner(cli: &Cli, ctx: &mut Ctx) -> Result<i32> {
                 | cli::InternalAction::UdpEcho
                 | cli::InternalAction::MoshTcp2Udp { .. }
                 | cli::InternalAction::Launch { .. }
+                | cli::InternalAction::Statusline
                 | cli::InternalAction::Completions { .. },
         }) => unreachable!("the stdout-is-a-payload subcommands answer before a Ctx is built"),
         Some(Command::Status) | None => {}

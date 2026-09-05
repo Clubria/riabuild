@@ -45,6 +45,7 @@ pub mod repo_status;
 pub mod scope;
 pub mod shell;
 pub mod shims;
+pub mod statusline;
 mod task;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

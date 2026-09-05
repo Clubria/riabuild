@@ -101,7 +101,11 @@ export type ClaudeSettings = {
   theme: string;
   permissions: { defaultMode: string; deny: string[] };
   skipDangerousModePermissionPrompt: boolean;
-  statusLine: { type: string; command: string };
+  /**
+   * Never sent any more — the CLI writes its own — and kept here as optional so
+   * a test can assert its *absence* without reaching for `any`.
+   */
+  statusLine?: { type: string; command: string };
   env: Record<string, string>;
   /**
    * The session's model — `opus`, with `env.CLAUDE_CODE_SUBAGENT_MODEL` set to

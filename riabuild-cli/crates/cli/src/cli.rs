@@ -311,10 +311,16 @@ pub enum InternalAction {
         #[arg(long = "default-checkout", value_name = "PATH")]
         default_checkout: Option<String>,
 
-        /// Where this account's status line writes usage samples. Claude Code
-        /// only, and written only for an account `riabuild claude track` has
-        /// marked — its absence is what stops collection.
-        #[arg(long = "usage-spool", value_name = "PATH")]
+        /// Where an older riabuild's launcher told the status line to spool.
+        ///
+        /// Accepted and ignored, and that is the whole of it: the status line
+        /// derives the spool from `CLAUDE_CONFIG_DIR` itself now. It stays
+        /// parseable because a launcher written before this release is still on
+        /// disk until the next provisioning run rewrites it, and on an
+        /// unversioned install (apt, dnf) that old script runs the *new*
+        /// binary — where an unrecognised flag would not be a missing sample, it
+        /// would be `claude` refusing to start.
+        #[arg(long = "usage-spool", value_name = "PATH", hide = true)]
         usage_spool: Option<String>,
 
         /// The developer's own arguments, verbatim.
@@ -327,9 +333,22 @@ pub enum InternalAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Draw the Claude Code status line, and spool this render's usage sample.
+    ///
+    /// What `~/.riabuild/claude-statusline` execs, so it runs on **every
+    /// render** of every session — several times a minute, in a process Claude
+    /// Code cancels when a newer render supersedes it. The payload arrives on
+    /// stdin and the line goes to stdout, which is the whole interface.
+    ///
+    /// Dispatched before a `Ctx` exists, like `launch` and for the same reason
+    /// at a higher volume still: no banner, no `state.json`, no API, and no
+    /// self-update check — which `update::applies_to` already excepts every
+    /// `internal` subcommand from.
+    Statusline,
+
     /// Send the usage samples the Claude status line has spooled.
     ///
-    /// Started detached by `claude-statusline.js`, at most once a minute, and
+    /// Started detached by `internal statusline`, at most once a minute, and
     /// never by a person. It takes the flush lock non-blocking and gives up
     /// rather than queueing — three windows on one laptop reach for it in the
     /// same second and the winner's work makes the others unnecessary — and it
@@ -477,21 +496,6 @@ pub enum ClaudeAction {
         /// Remove it without asking.
         #[arg(long)]
         yes: bool,
-    },
-    /// Report this account's usage to the team dashboard.
-    ///
-    /// Off for every account until it is asked for. A developer's accounts
-    /// include personal subscriptions, and collecting from one nobody marked
-    /// would ship a person's private usage to their employer.
-    Track {
-        /// Which account, as shown by `riabuild claude`.
-        #[arg(value_name = "NUMBER")]
-        number: usize,
-    },
-    /// Stop reporting this account's usage.
-    Untrack {
-        #[arg(value_name = "NUMBER")]
-        number: usize,
     },
     /// Make an account the one `claude` runs.
     Primary {
@@ -1000,9 +1004,6 @@ mod tests {
                         all: std::slice::from_ref(&checkout),
                         default: Some(&checkout),
                     },
-                    // A tracked account, so `--usage-spool` crosses the seam
-                    // too — and with a space in it, like every other path here.
-                    Some(Path::new("/Users/Ada Smith/.riabuild/usage/abc.ndjson")),
                 ),
             ),
             (
@@ -1039,7 +1040,6 @@ mod tests {
                         binary,
                         bin_dir,
                         args,
-                        usage_spool,
                         ..
                     },
             }) = parsed.command
@@ -1048,16 +1048,6 @@ mod tests {
             };
             assert_eq!(harness, expected);
 
-            // Claude Code is the only harness that writes one today, so the
-            // other two prove the flag is genuinely optional rather than
-            // silently defaulted.
-            let expected_spool = match expected {
-                LaunchHarness::Claude => {
-                    Some("/Users/Ada Smith/.riabuild/usage/abc.ndjson".to_string())
-                }
-                _ => None,
-            };
-            assert_eq!(usage_spool, expected_spool, "{argv:?}");
             assert!(home.contains("Ada Smith"), "{home}");
             assert!(binary.contains("Ada Smith"), "{binary}");
             assert_eq!(bin_dir, bin.to_string_lossy());
@@ -1066,6 +1056,45 @@ mod tests {
             // `trailing_var_arg` and `allow_hyphen_values`.
             assert_eq!(args, vec!["--resume", "a prompt with spaces"]);
         }
+    }
+
+    /// A launcher written before the status line moved into riabuild still
+    /// starts Claude Code.
+    ///
+    /// `~/.riabuild/bin/claude` is only rewritten by a provisioning run, and on
+    /// an apt or dnf install the *new* binary is what that old script execs in
+    /// the meantime. An unrecognised `--usage-spool` there would not be a
+    /// missing usage sample — clap exits 2, and `claude` stops working for
+    /// everyone who has upgraded and not yet re-run `riabuild`.
+    #[test]
+    fn a_launcher_written_before_the_status_line_moved_still_launches() {
+        let argv = [
+            "/opt/riabuild/2026.09.04/riabuild",
+            "internal",
+            "launch",
+            "claude",
+            "--home",
+            "/home/ada/.riabuild/claude/abc",
+            "--binary",
+            "/home/ada/.riabuild/node/22.23.1/bin/claude",
+            "--bin-dir",
+            "/home/ada/.riabuild/bin",
+            "--usage-spool",
+            "/home/ada/.riabuild/usage/abc.ndjson",
+            "--",
+        ];
+
+        let parsed = Cli::parse_from(argv);
+
+        assert!(
+            matches!(
+                parsed.command,
+                Some(Command::Internal {
+                    action: InternalAction::Launch { .. }
+                })
+            ),
+            "{parsed:?}"
+        );
     }
 
     /// The `exec` line of a generated script, split into argv the way `/bin/sh`

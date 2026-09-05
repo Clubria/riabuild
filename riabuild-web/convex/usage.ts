@@ -1,10 +1,13 @@
 /**
  * What Claude Code cost a developer, as their own status line already knew.
  *
- * The collector is `claude-statusline.js`, which appends a line to a spool and
- * exits; `riabuild internal usage-flush` sends the spool on. Nothing here
- * reaches a laptop, and nothing here decides what runs on one — this module
- * only receives, merges and reports.
+ * The collector is `riabuild internal statusline`, which appends a line to a
+ * spool and exits; `riabuild internal usage-flush` sends the spool on, at most
+ * once a minute and only while somebody is working. Every Claude Code account
+ * riabuild manages reports — it was opt-in per account until 2026-09-05, and
+ * what that produced was this table staying empty. Nothing here reaches a
+ * laptop, and nothing here decides what runs on one: this module only receives,
+ * merges and reports.
  *
  * Design: `docs/superpowers/specs/2026-08-29-usage-tracking-design.md`.
  */

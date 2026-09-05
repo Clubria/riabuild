@@ -1136,7 +1136,9 @@ agents view instead. Before adding anything to the dashboard's settings JSON, ch
 is a settings key at all: one that is not gets served to every laptop and read by nobody.
 
 **A settings value that names a path names it on every machine, so what it names goes in
-`tools_root()`.** The org settings carry `node ~/.riabuild/claude-statusline.js`. Claude
+`tools_root()`.** The settings carry `~/.riabuild/claude-statusline` — written by riabuild
+itself since 2026-09-05, not sent by the server, and one `exec` into `riabuild internal
+statusline` rather than the JavaScript it names below. Claude
 Code runs that through a shell, so the `~` is the *account's* home wherever it lands —
 and on a server that is the shared account, not the developer's namespace.
 `claude_statusline` built its path on `root()` instead, which is the same directory on a
@@ -1281,14 +1283,24 @@ percentages rather than tokens, and is barred to third-party tools by the Consum
 attached to the credential. So the data comes off the laptop, out of a surface Anthropic
 publishes for the purpose.
 
-**`claude-statusline.js` writes a line and `riabuild` sends it. Never the other way round.**
-The script must not open a socket — Claude Code debounces status line updates at 300ms and
-*cancels the in-flight script*, so a network round-trip there stalls the bar whenever the
-network is slow — and it must not hold a credential, because every way of giving it one is
-already forbidden: in Claude Code's environment the model can read it with `env` (the
-stated reason `ngrok` is a shim), in a file it breaks "No secrets in `~/.riabuild/`", and
-out of the keychain it is `riabuild-keychain` reimplemented in JavaScript on the render
-path. `riabuild internal usage-flush` already holds the token and already speaks `/api/v1`.
+**`internal statusline` writes a line and `internal usage-flush` sends it. Never the other
+way round.** The render must not open a socket — Claude Code debounces status line updates
+at 300ms and *cancels the in-flight process*, so a network round-trip there stalls the bar
+whenever the network is slow — and it must not hold a credential, because every way of
+giving it one is already forbidden: in Claude Code's environment the model can read it with
+`env` (the stated reason `ngrok` is a shim), in a file it breaks "No secrets in
+`~/.riabuild/`", and out of the keychain on the render path it is `riabuild-keychain`
+called several times a minute for a token the flush already has. `riabuild internal
+usage-flush` holds it and already speaks `/api/v1`, and it is started detached so that
+Claude Code killing a superseded render cannot kill a POST.
+
+**And it is Rust, not JavaScript, since 2026-09-05.** `~/.riabuild/claude-statusline` is
+one `exec` into `riabuild internal statusline`, the same shape as every launcher in
+`bin/` — see `docs/superpowers/specs/2026-09-05-statusline-in-rust-design.md`. What it
+draws is unchanged; what went with the five hundred lines of JavaScript is a `node`
+process on every render, a test suite that needed a subprocess and an interpreter to
+assert anything, and a language where `?.` on the wrong side of a `??` draws
+`undefined%` rather than failing to compile.
 
 **The spool is `root()`, the script is `tools_root()`, and the script finds one from the
 other.** Same split as `agents_dir()`: a sample names one person's session, so it must not
@@ -1297,23 +1309,25 @@ constant on every machine and cannot have the path compiled in, so it derives it
 `CLAUDE_CONFIG_DIR` — `<root>/claude/<uuid>`, whose `basename` is the account and whose
 grandparent is the root. That is also why the marker and the lock live beside the spools.
 
-**Collection is opt-in per account, and empty by default.** `UserConfig::tracked_accounts`
-holds uuids, `riabuild claude track <n>` adds one, and the account box shows which are in
-it. A developer's nine accounts include personal subscriptions —
-`../docs/superpowers/specs/2026-08-06-claude-accounts-design.md` describes the list as "a
-personal subscription and one or more work accounts" — so defaulting to on would collect
-from exactly the developer who never read the release note. The mark is stored against the
-**uuid** rather than the number, so deleting account 2 does not silently begin tracking
-whatever moves up into its place.
+**Collection is automatic, and the only gate is a fact rather than a setting.** It was
+opt-in per account until 2026-09-05 — `riabuild claude track <n>`, uuids in
+`UserConfig::tracked_accounts`, a launcher that handed an unmarked account no spool path —
+and what that produced was a fleet reporting nothing, because the developer who never reads
+the release note also never runs the command. What remains is
+`statusline::usage::spool_target`: only an account under `<root>/claude/<uuid>`, one
+riabuild created and numbered, is ever spooled. A `CLAUDE_CONFIG_DIR` pointing anywhere
+else — a developer's own `~/.claude` install — writes nothing at all, and that is an
+absence rather than a filter applied later. Say the cost out loud: a personal subscription
+signed in through `riabuild claude new` **is** collected now. What is collected is volume
+and never content, which is the paragraph two below this one.
 
-An untracked account is handed no `--usage-spool` on its launcher line, so the script
-returns before writing anything. That is the whole mechanism: not a filter applied later,
-an absence.
-
-**`RIABUILD_SELF`, never `RIABUILD_BIN`.** The second is already how `e2e/run.sh`,
-`e2e/remote/run.sh` and `ci.yml` name the binary under test — and those run *inside* Claude
-Code sessions on this repository, so setting it in a launcher would point them at a
-provisioned riabuild instead of the build they meant to exercise.
+**Nothing about usage is in a launcher's environment any more.** `RIABUILD_USAGE_SPOOL` was
+a path riabuild passed to itself and `RIABUILD_SELF` was a copy of its own `argv[0]`; the
+status line is riabuild now, so it derives the first from `CLAUDE_CONFIG_DIR` and asks
+`current_exe()` for the second. **`RIABUILD_BIN` must still never appear there**: it is
+already how `e2e/run.sh`, `e2e/remote/run.sh` and `ci.yml` name the binary under test — and
+those run *inside* Claude Code sessions on this repository, so setting it in a launcher
+would point them at a provisioned riabuild instead of the build they meant to exercise.
 `the_launcher_never_sets_riabuild_bin` is the gate.
 
 **Merge by maximum, never by sum.** `cost.total_cost_usd` and the session counters are

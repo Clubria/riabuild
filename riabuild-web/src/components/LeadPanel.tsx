@@ -12,7 +12,6 @@ import {
   DataTable,
   Empty,
   Field,
-  KeyValue,
   Loading,
   Select,
   TextArea,
@@ -192,23 +191,6 @@ export function Members({ viewerId }: { viewerId: string }) {
   );
 }
 
-/**
- * The status line riabuild writes, and the only one it will.
- *
- * A fourth copy of one string, and each of the three others is load-bearing:
- * `riabuild-cli/crates/tasks/src/org_settings/vetting.rs` is the authority and
- * the real gate, `claude_statusline` installs the script it names, and
- * `DEFAULT_STATUS_LINE` in `convex/org.ts` is what `org.update` refuses to
- * store anything but. This one exists because a browser bundle cannot import a
- * Convex server module — and it cannot drift silently: `LeadPanel.test.tsx`
- * pins it against `convex/org.ts`, and a copy that got past that would be
- * refused by `org.update` on the next save rather than shipped.
- */
-const STATUS_LINE = {
-  type: "command",
-  command: "node ~/.riabuild/claude-statusline.js",
-};
-
 /** The settings blob as an object, or `null` if it is not one. */
 function parseSettings(raw: string): Record<string, unknown> | null {
   let parsed: unknown;
@@ -225,27 +207,20 @@ function parseSettings(raw: string): Record<string, unknown> | null {
 /**
  * What the lead types in: the stored blob with `statusLine` taken out.
  *
- * Unchanged when the stored settings do not parse, or carry no status line —
- * a lead repairing broken JSON has to see exactly what is stored, and
- * reformatting a blob that needed no edit would show a diff nobody made.
+ * A row saved before 2026-09-05 still carries one, and it is no longer a
+ * setting — riabuild installs the status line and writes the key into the
+ * settings file on each machine. Showing it would invite a lead to edit a value
+ * every CLI now replaces, and `org.update` refuses it on the next save.
+ *
+ * Unchanged when the stored settings do not parse, or carry no status line — a
+ * lead repairing broken JSON has to see exactly what is stored, and reformatting
+ * a blob that needed no edit would show a diff nobody made.
  */
 function withoutStatusLine(raw: string): string {
   const parsed = parseSettings(raw);
   if (parsed === null || parsed.statusLine === undefined) return raw;
   const { statusLine: _statusLine, ...rest } = parsed;
   return JSON.stringify(rest, null, 2);
-}
-
-/**
- * What gets saved: the same blob with riabuild's status line put back.
- *
- * Unparseable text is sent as it stands so the server is what says "must be
- * valid JSON" — one error message for that, from one place.
- */
-function withStatusLine(raw: string): string {
-  const parsed = parseSettings(raw);
-  if (parsed === null) return raw;
-  return JSON.stringify({ ...parsed, statusLine: STATUS_LINE }, null, 2);
 }
 
 export function OrgSettings() {
@@ -302,7 +277,7 @@ export function OrgSettings() {
     setSaving(true);
     void data
       .updateOrg({
-        claudeSettings: withStatusLine(settings),
+        claudeSettings: settings,
         repoSlug: slug,
         latestCliVersion: latest.trim(),
         minCliVersion: floor.trim(),
@@ -337,22 +312,13 @@ export function OrgSettings() {
           rows={12}
           onChange={setDraft}
         />
-        <div className="mt-3">
-          <KeyValue
-            rows={[
-              {
-                label: "status line",
-                value: <span className="text-fg">{STATUS_LINE.command}</span>,
-              },
-            ]}
-          />
-        </div>
         <p className="mt-1 text-xs text-fg-faint wrap-value">
-          Saved with the settings above, and not editable here. riabuild
-          installs that script from inside its own binary, and every
-          developer&rsquo;s CLI refuses team settings naming a different command
-          &mdash; a command typed on this page would be a program the server
-          chose, running on every laptop at every render. Changing what the
+          The status line is not here, and cannot be: riabuild installs it from
+          inside its own binary and writes the setting on each machine, where
+          the path differs between a laptop and a shared server. A command typed
+          on this page would be a program the server chose, running on every
+          laptop at every render &mdash; so this page cannot name one, and every
+          developer&rsquo;s CLI replaces whatever it finds. Changing what the
           status line does is a riabuild release.
         </p>
       </div>

@@ -349,28 +349,13 @@ pub(in crate::shims) fn handoff(handoff: Handoff, plan: &Plan, world: &World) ->
         false => handoff,
     };
 
-    // Where the status line writes usage samples, and what it starts a flush
-    // with. Both are absent unless this account is one the developer marked
-    // with `riabuild claude track`, and their absence is the whole of "collect
-    // nothing here" — the script returns before it writes rather than filling a
-    // spool that nothing would ever send.
-    //
-    // A path and not a credential, which is why it may sit in Claude Code's
-    // environment at all. The session token does not: the flush is a separate
-    // riabuild process that reads the keychain itself, precisely so that
-    // nothing reachable from `env` inside a Claude Code session is worth
-    // reading.
-    let handoff = match (&plan.usage_spool, &world.riabuild) {
-        (Some(spool), Some(riabuild)) => handoff
-            .env("RIABUILD_USAGE_SPOOL", spool.to_string_lossy().into_owned())
-            .env("RIABUILD_SELF", riabuild.to_string_lossy().into_owned()),
-        // No `RIABUILD_SELF` still spools; only the one-a-minute flush is lost,
-        // and the next `riabuild` run picks the samples up.
-        (Some(spool), None) => {
-            handoff.env("RIABUILD_USAGE_SPOOL", spool.to_string_lossy().into_owned())
-        }
-        (None, _) => handoff,
-    };
+    // Nothing about usage collection is set here, and the absence is worth a
+    // note because two variables used to be. `RIABUILD_USAGE_SPOOL` told the
+    // status line where to spool and `RIABUILD_SELF` told it which riabuild to
+    // start a flush with; the status line *is* riabuild now, so it knows its own
+    // path, and it derives the spool from the `CLAUDE_CONFIG_DIR` this launcher
+    // already sets — one variable instead of three, and the one Claude Code
+    // needs anyway. See `statusline::usage::spool_target`.
 
     let mut args = Vec::new();
     // `--settings` first, and only where the file is there. Every machine
@@ -460,13 +445,11 @@ pub fn plan(
     org_settings: &Path,
     bin_dir: &Path,
     checkouts: Checkouts<'_>,
-    usage_spool: Option<&Path>,
 ) -> Plan {
     Plan {
         settings: Some(org_settings.to_path_buf()),
         checkouts: checkouts.all.to_vec(),
         default_checkout: checkouts.default.map(Path::to_path_buf),
-        usage_spool: usage_spool.map(Path::to_path_buf),
         ..Plan::new(
             Harness::Claude,
             config_dir.to_path_buf(),
@@ -485,10 +468,6 @@ pub fn plan(
 /// single path, which is what a machine with one repository looks like;
 /// `default` is `None` only where there is no checkout at all yet to fall back
 /// to — every machine before its first clone.
-///
-/// `usage_spool` is `Some` only for an account the developer marked with
-/// `riabuild claude track`. `None` writes no `--usage-spool` on the exec line,
-/// so the status line for that account is handed no path and collects nothing.
 pub fn launcher_script(
     riabuild: &Path,
     config_dir: &Path,
@@ -496,18 +475,10 @@ pub fn launcher_script(
     org_settings: &Path,
     bin_dir: &Path,
     checkouts: Checkouts<'_>,
-    usage_spool: Option<&Path>,
 ) -> String {
     launch::script(
         riabuild,
-        &plan(
-            config_dir,
-            claude,
-            org_settings,
-            bin_dir,
-            checkouts,
-            usage_spool,
-        ),
+        &plan(config_dir, claude, org_settings, bin_dir, checkouts),
     )
 }
 
@@ -545,22 +516,6 @@ mod tests {
                 all: checkouts,
                 default,
             },
-            None,
-        )
-    }
-
-    /// An account the developer has marked for usage tracking.
-    fn tracked_plan_for(spool: &str) -> Plan {
-        plan(
-            Path::new(CONFIG_DIR),
-            BINARY,
-            Path::new(SETTINGS),
-            Path::new(BIN_DIR),
-            Checkouts {
-                all: &[PathBuf::from(PROJECT)],
-                default: Some(Path::new(PROJECT)),
-            },
-            Some(Path::new(spool)),
         )
     }
 
@@ -1132,65 +1087,38 @@ mod tests {
     /// The launcher on disk is one `exec` and carries the values riabuild
     /// resolved — which is what `claude_accounts::check` compares against, so a
     /// launcher naming last week's Node or a deleted account is still drift.
-    /// The whole of "collect nothing from this account".
+    /// The status line reads one variable and the launcher already sets it.
     ///
-    /// An untracked account's launcher writes no `--usage-spool`, so the status
-    /// line it starts is handed no path and returns before writing anything.
-    /// This is the default and it is what keeps a developer's *personal* Claude
-    /// subscription out of their employer's dashboard.
+    /// `CLAUDE_CONFIG_DIR` is what Claude Code needs anyway, and it is what
+    /// `statusline` derives the account, the launcher number, the config it
+    /// reads and the spool it writes from. The two variables that used to be
+    /// here — `RIABUILD_USAGE_SPOOL` and `RIABUILD_SELF` — were a path riabuild
+    /// was telling itself and a copy of its own argv[0]; naming this
+    /// deliberately is what stops either coming back the next time the status
+    /// line needs something.
     #[test]
-    fn an_untracked_account_hands_the_status_line_no_spool() {
+    fn the_status_line_is_handed_the_account_directory_and_nothing_else() {
         let world = World {
             settings_present: true,
-            riabuild: Some(PathBuf::from("/opt/riabuild/riabuild")),
             ..World::default()
         };
 
-        let handoff = launch_handoff(&plan_for(&[], None), &world);
-
-        assert!(
-            !handoff
-                .env
-                .iter()
-                .any(|(key, _)| key == "RIABUILD_USAGE_SPOOL"),
-            "an untracked account must carry no spool: {:?}",
-            handoff.env
-        );
-        assert!(
-            !handoff.env.iter().any(|(key, _)| key == "RIABUILD_SELF"),
-            "and nothing to start a flush with either: {:?}",
-            handoff.env
-        );
-    }
-
-    /// A tracked account gets both — the spool to write to, and riabuild's own
-    /// path to start a flush with.
-    #[test]
-    fn a_tracked_account_carries_the_spool_and_riabuilds_own_path() {
-        let spool = "/home/ada/.riabuild/usage/abc.ndjson";
-        let world = World {
-            settings_present: true,
-            riabuild: Some(PathBuf::from("/opt/riabuild/2026.08.29/riabuild")),
-            ..World::default()
-        };
-
-        let handoff = launch_handoff(&tracked_plan_for(spool), &world);
+        let handoff = launch_handoff(&fixture(), &world);
 
         assert!(
             handoff
                 .env
-                .contains(&("RIABUILD_USAGE_SPOOL".to_string(), spool.to_string())),
+                .contains(&("CLAUDE_CONFIG_DIR".to_string(), CONFIG_DIR.to_string())),
             "{:?}",
             handoff.env
         );
-        assert!(
-            handoff.env.contains(&(
-                "RIABUILD_SELF".to_string(),
-                "/opt/riabuild/2026.08.29/riabuild".to_string()
-            )),
-            "{:?}",
-            handoff.env
-        );
+        for gone in ["RIABUILD_USAGE_SPOOL", "RIABUILD_SELF"] {
+            assert!(
+                !handoff.env.iter().any(|(key, _)| key == gone),
+                "{gone} is derived now, not passed: {:?}",
+                handoff.env
+            );
+        }
     }
 
     /// `RIABUILD_BIN` is already how e2e and CI name the binary under test.
@@ -1204,46 +1132,16 @@ mod tests {
     fn the_launcher_never_sets_riabuild_bin() {
         let world = World {
             settings_present: true,
-            riabuild: Some(PathBuf::from("/opt/riabuild/riabuild")),
             ..World::default()
         };
 
-        let handoff = launch_handoff(
-            &tracked_plan_for("/home/ada/.riabuild/usage/abc.ndjson"),
-            &world,
-        );
+        let handoff = launch_handoff(&fixture(), &world);
 
         assert!(
             !handoff.env.iter().any(|(key, _)| key == "RIABUILD_BIN"),
             "RIABUILD_BIN belongs to e2e and CI: {:?}",
             handoff.env
         );
-    }
-
-    /// A machine whose platform will not say where riabuild is still spools.
-    ///
-    /// Losing the one-a-minute cadence is a cost; losing the samples is not
-    /// acceptable, and the next ordinary `riabuild` run sends them.
-    #[test]
-    fn a_tracked_account_still_spools_when_riabuilds_own_path_is_unknown() {
-        let world = World {
-            settings_present: true,
-            riabuild: None,
-            ..World::default()
-        };
-
-        let handoff = launch_handoff(
-            &tracked_plan_for("/home/ada/.riabuild/usage/abc.ndjson"),
-            &world,
-        );
-
-        assert!(
-            handoff
-                .env
-                .iter()
-                .any(|(key, _)| key == "RIABUILD_USAGE_SPOOL")
-        );
-        assert!(!handoff.env.iter().any(|(key, _)| key == "RIABUILD_SELF"));
     }
 
     #[test]
@@ -1258,7 +1156,6 @@ mod tests {
                 all: &[PathBuf::from(PROJECT), PathBuf::from(OTHER_PROJECT)],
                 default: Some(Path::new(PROJECT)),
             },
-            None,
         );
         for value in [
             CONFIG_DIR,

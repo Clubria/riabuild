@@ -8,7 +8,6 @@ import { Members, OrgSettings } from "./LeadPanel";
 // The status line the CLI installs, read from the one place a browser bundle
 // can still reach: `LeadPanel` keeps its own copy because it cannot import a
 // Convex server module, and this is what stops the two drifting.
-import { DEFAULT_STATUS_LINE } from "../../convex/org";
 
 describe("Members", () => {
   test("a lead sees a member id column, and it drops on a narrow viewport", () => {
@@ -75,23 +74,21 @@ type ClaudeSettings = Record<string, unknown> & {
 
 describe("OrgSettings — the status line", () => {
   /**
-   * The whole point of the read-only line. Until it existed the status line
-   * was inside the free-text settings box, so a lead could save a command the
-   * CLI now hard-refuses — and the first people to find out were every
-   * developer in the org, on their next run.
+   * It is not a team setting at all any more. riabuild installs the status line
+   * and writes the key into the settings file on each machine — where the path
+   * differs between a laptop and a shared server — so there is nothing here for
+   * a lead to see or type, and `org.update` refuses one that is typed anyway.
    */
-  test("the command is shown, and there is no box to type another one in", () => {
+  test("there is no status line on the settings screen", () => {
     renderSettings(SCENARIOS.lead());
 
-    expect(screen.getByText(DEFAULT_STATUS_LINE.command)).toBeInTheDocument();
-    // Read-only means read-only: not a disabled input, not a field at all.
     expect(screen.queryByLabelText(/status line/i)).not.toBeInTheDocument();
     expect(settingsBox().value).not.toContain("statusLine");
   });
 
   test("a status line already stored is taken out of the box a lead edits", () => {
-    // This is what an org that saved one before the gate existed holds. The
-    // lead never sees it, cannot retype it, and loses it the moment they save.
+    // What every row saved before 2026-09-05 holds. The lead never sees it,
+    // cannot retype it, and loses it the moment they save.
     const lead = SCENARIOS.lead();
     if (lead.orgConfig.state !== "ready") throw new Error("fixture invariant");
     renderSettings({
@@ -112,21 +109,10 @@ describe("OrgSettings — the status line", () => {
     expect(settingsBox().value).toContain("claude-opus-5");
   });
 
-  test("saving puts riabuild's own status line back", async () => {
-    const { calls, data } = recordingLead();
-    renderSettings(data);
-
-    await userEvent.click(
-      screen.getByRole("button", { name: /save org config/i }),
-    );
-    // Pinned against `convex/org.ts` rather than a literal: `org.update`
-    // refuses every other value, so a copy that drifted would refuse the save.
-    expect(sentSettings(calls[0]).statusLine).toEqual(DEFAULT_STATUS_LINE);
-  });
-
-  test("a non-conforming status line is replaced by saving, not preserved", async () => {
-    // The recovery path for an org that already stored one: open the settings
-    // screen, press save. No CLI release, no hand-edited row.
+  test("saving sends no status line at all", async () => {
+    // The recovery path for an org that stored one: open the settings screen,
+    // press save. No CLI release, no hand-edited row. Putting one back would
+    // save a key `org.update` now refuses.
     const lead = SCENARIOS.lead();
     if (lead.orgConfig.state !== "ready") throw new Error("fixture invariant");
     const { calls, data } = recordingLead();
@@ -146,7 +132,8 @@ describe("OrgSettings — the status line", () => {
     await userEvent.click(
       screen.getByRole("button", { name: /save org config/i }),
     );
-    expect(sentSettings(calls[0]).statusLine).toEqual(DEFAULT_STATUS_LINE);
+
+    expect(sentSettings(calls[0]).statusLine).toBeUndefined();
   });
 
   test("settings that do not parse are sent as they stand", async () => {
