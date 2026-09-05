@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { customFetch } from "@auth/core";
 import { GITHUB_ISSUER, GitHubProvider } from "./auth";
 
 /**
@@ -53,5 +54,41 @@ describe("the GitHub provider", () => {
     expect(scope?.split(/\s+/)).toEqual(
       expect.arrayContaining(["read:user", "user:email", "read:org"]),
     );
+  });
+});
+
+/**
+ * Regression test for a fix that deployed successfully and did nothing.
+ *
+ * The diagnostic in `lib/oauthDiagnostics.ts` is wired to the provider through
+ * `@auth/core`'s `customFetch` symbol. Passing it to `GitHub()` looks right,
+ * typechecks, deploys, and is silently ignored: the provider does not spread
+ * the config it is given, it stores it under `options`, and the merge that
+ * folds `options` back in walks its source with `for...in` — which skips symbol
+ * keys. The symbol has to sit on the provider object itself.
+ *
+ * Nothing else would notice. A dropped `customFetch` changes no behaviour and
+ * raises nothing; it just means the one line that says why sign-in failed never
+ * appears, which is the failure mode this whole area keeps having.
+ */
+describe("the OAuth failure diagnostic", () => {
+  test("is reachable where the library looks for it", () => {
+    expect(typeof GitHubProvider[customFetch]).toBe("function");
+  });
+
+  test("is not left in `options`, where the merge would drop it", () => {
+    const options = (GitHubProvider as { options?: Record<symbol, unknown> })
+      .options;
+    expect(options?.[customFetch]).toBeUndefined();
+  });
+
+  // The precise reason it would be dropped, pinned so the claim above is not
+  // just a comment: this is the enumeration `merge` uses.
+  test("would be invisible to a `for...in` merge of `options`", () => {
+    const source: Record<string, unknown> = {};
+    Object.assign(source, { [customFetch]: () => undefined });
+    const copied: string[] = [];
+    for (const key in source) copied.push(key);
+    expect(copied).toEqual([]);
   });
 });
