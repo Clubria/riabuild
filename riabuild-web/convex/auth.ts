@@ -23,7 +23,7 @@ export const GITHUB_ISSUER = "https://github.com/login/oauth";
  * `read:org` is required: without it the token cannot answer membership
  * questions and every secret-brokering request fails closed.
  */
-export const GitHubProvider = GitHub({
+const githubProvider = GitHub({
   // GitHub implements RFC 9207: its authorization response carries an `iss`
   // parameter, and `oauth4webapi` rejects any `iss` that does not equal the
   // issuer the provider was configured with. `@convex-dev/auth` has no issuer
@@ -53,11 +53,6 @@ export const GitHubProvider = GitHub({
   authorization: {
     params: { scope: "read:user user:email read:org" },
   },
-  // Say what GitHub answered when the token exchange fails, instead of letting
-  // `oauth4webapi` reword every cause into the same sentence. See
-  // `lib/oauthDiagnostics.ts` for what is and is not written down — a
-  // successful exchange, the one that carries a token, is not logged at all.
-  [customFetch]: loggingOAuthFetch(),
   async profile(githubProfile, tokens) {
     const login = String(githubProfile.login);
     const email = await resolveEmail(githubProfile.email, tokens.access_token);
@@ -73,6 +68,27 @@ export const GitHubProvider = GitHub({
       // re-checked with a server-held org token instead.
     } as unknown as { id: string };
   },
+});
+
+/**
+ * Say what GitHub answered when the token exchange fails, instead of letting
+ * `oauth4webapi` reword every cause into the same sentence. See
+ * `lib/oauthDiagnostics.ts` for what is and is not written down — a successful
+ * exchange, the one that carries a token, is not logged at all.
+ *
+ * This is attached to the provider *object*, and passing it to `GitHub()` above
+ * instead does nothing at all — which is worth the sentence, because it fails
+ * by being quietly ignored rather than by erroring. Auth.js's GitHub provider
+ * does not spread the config it is handed; it returns a fixed object carrying
+ * the caller's config under `options`. `@convex-dev/auth` folds that back in
+ * with `merge(provider, provider.options)`, and `merge` walks its source with
+ * `for...in`, which does not enumerate symbol keys. So a `[customFetch]` given
+ * to `GitHub()` reaches `options` and is dropped there, while one set here
+ * survives: `merge` only ever adds keys to its target, and every later step is
+ * an object spread, which does copy symbols.
+ */
+export const GitHubProvider = Object.assign(githubProvider, {
+  [customFetch]: loggingOAuthFetch(),
 });
 
 /**
