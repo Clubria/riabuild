@@ -35,6 +35,7 @@ export default defineConfig([
           "./tsconfig.app.json",
           "./convex/tsconfig.json",
           "./tsconfig.e2e.json",
+          "./tsconfig.functions.json",
         ],
       },
     },

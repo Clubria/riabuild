@@ -263,6 +263,21 @@ export type OrgUpdate = {
 
 export type Data = {
   auth: "loading" | "signed-in" | "signed-out";
+  /**
+   * GitHub sent this developer back and they are still signed out — an OAuth
+   * round trip that started and did not finish.
+   *
+   * Distinct from `auth: "signed-out"`, which is the ordinary state of anybody
+   * who has not tried yet. Telling the two apart is not something the dashboard
+   * can work out for itself: `@convex-dev/auth` answers a failed callback with a
+   * bare redirect that is byte-identical to a first visit, which is why this bug
+   * has been diagnosed from nothing more than once. `functions/_proxy.ts` marks
+   * the URL from the one position that can see the difference, and
+   * `src/lib/authFailure.ts` reads the mark.
+   *
+   * True for one page load. A reload is an ordinary visit again.
+   */
+  signInFailed: boolean;
   viewer: Loadable<Member | null>;
   membership: Membership;
   sessions: Loadable<Session[]>;

@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.functions.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  /* `DOM` is in `lib` for `Request`, `Response`, `Headers` and `URL` — the
+     Cloudflare Workers runtime implements the same interfaces, and taking
+     `@cloudflare/workers-types` instead would be a dependency for six names.
+     Nothing under `functions/` touches `window` or `document`, and the check
+     that keeps it that way is that no such reference appears; a `lib` narrow
+     enough to enforce it would also lose `Request`.
+
+     `src/lib/authCallbackParam.ts` is included because the proxy imports the
+     query-parameter name from it, for the reason `tsconfig.e2e.json` includes
+     `src/dev/scenarios.ts`: the two ends of a contract must not each keep their
+     own copy of it. */
+  "include": ["functions", "src/lib/authCallbackParam.ts"]
+}

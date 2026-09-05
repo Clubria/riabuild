@@ -127,3 +127,37 @@ jobs:
           done
           echo "::error::riabuild.clubria.com did not return 200 after the deploy."
           exit 1
+
+      # The step above proves the static site is up. It says nothing about the
+      # one path that is *not* static, and that path is sign-in.
+      #
+      # `/api/auth/*` is served by a Pages Function proxying Convex, because the
+      # OAuth cookies have to belong to this origin rather than to convex.site —
+      # riabuild-web/functions/_proxy.ts has the reasoning. If `_routes.json` or
+      # the Function fails to deploy, the `_redirects` catch-all answers instead
+      # and every one of these URLs returns the SPA's index.html with a cheerful
+      # 200. Nothing else in this pipeline would notice, and the symptom on a
+      # laptop is a sign-in screen that says nothing, which is exactly the
+      # failure this design exists to end.
+      #
+      # A callback with no cookies is the shape the proxy marks: Convex bounces
+      # it to the dashboard with no `code`, and the proxy adds `authFailed`.
+      # Asking for it costs one request and proves the whole chain is wired.
+      - name: Verify sign-in is served from this origin
+        run: |
+          set -euo pipefail
+          url=https://riabuild.clubria.com/api/auth/callback/github
+          for attempt in $(seq 1 10); do
+            headers=$(curl -s -D- -o /dev/null "$url" || true)
+            if printf '%s' "$headers" | grep -qi '^location:.*authFailed'; then
+              echo "The OAuth proxy is serving $url."
+              exit 0
+            fi
+            echo "attempt $attempt: not routed to the Function yet, retrying…"
+            sleep 6
+          done
+          echo "::error::$url is not being served by the Pages Function."
+          echo "::error::A 200 text/html there means the _redirects catch-all answered:"
+          echo "::error::check riabuild-web/public/_routes.json and functions/ deployed."
+          printf '%s\n' "$headers"
+          exit 1

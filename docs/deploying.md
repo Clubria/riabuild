@@ -11,7 +11,7 @@
 | Secret brokering | **working** — verified end to end through Convex's network |
 | Infisical | `https://infisical.clubria.com`, project `AI Builders`, paths `/tenant/aibuilders/frontend` and `/tenant/aibuilders/convex` |
 | Dashboard | **live** — <https://riabuild.clubria.com> (Cloudflare Pages, `riabuild-web`) |
-| GitHub sign-in | configured — verify the OAuth callback URL matches §2 |
+| GitHub sign-in | configured — served from `riabuild.clubria.com/api/auth/*`; the OAuth callback URL and `CUSTOM_AUTH_SITE_URL` must both name that origin, see §2 |
 | Org membership checks | working — `GITHUB_ORG_TOKEN` verified against the live org |
 | DNS | `riabuild.clubria.com` CNAME → `riabuild-web.pages.dev`, DNS-only |
 
@@ -51,6 +51,11 @@ npx convex deploy -y                            # creates the production deploym
 npx convex env set AUTH_GITHUB_ID       <oauth app client id>
 npx convex env set AUTH_GITHUB_SECRET   <oauth app client secret>
 npx convex env set SITE_URL             https://riabuild.clubria.com
+# Where the OAuth routes are reachable from a browser. Same host as SITE_URL on
+# purpose — see "Sign-in runs on the dashboard's own origin" below, which is
+# also the one variable whose absence the Pages Function refuses out loud
+# rather than letting sign-in fail silently.
+npx convex env set CUSTOM_AUTH_SITE_URL https://riabuild.clubria.com
 npx convex env set RIABUILD_BOOTSTRAP_LEADS "ilya,<other lead logins>"
 npx convex env set RIABUILD_GITHUB_ORG  Clubria
 npx convex env set GITHUB_ORG_TOKEN     <PAT with read:org, held by a Clubria member>
@@ -89,10 +94,79 @@ publishes and nobody is offered it — see `releasing.md`.
 Create it at <https://github.com/organizations/Clubria/settings/applications>.
 
 - Homepage URL: `https://riabuild.clubria.com`
-- Authorization callback URL: `https://<deployment>.convex.site/api/auth/callback/github`
+- Authorization callback URL: `https://riabuild.clubria.com/api/auth/callback/github`
 
 The provider requests `read:user user:email read:org`. `read:org` is not optional — the
 sign-in gate and the profile prefill both depend on it.
+
+**The callback URL is on the dashboard, not on `convex.site`.** It used to be
+`https://<deployment>.convex.site/api/auth/callback/github`, and moving it is the
+whole of the fix described in the next section. A GitHub OAuth app has exactly one
+callback URL, so this and `CUSTOM_AUTH_SITE_URL` change together or sign-in is
+broken between them — see the cutover order below.
+
+### Sign-in runs on the dashboard's own origin
+
+`@convex-dev/auth` carries the OAuth `state` and the PKCE code verifier between the two
+legs of a sign-in in cookies, and sets them on whichever host serves `/api/auth/*`. While
+that host was `<deployment>.convex.site`, those were cookies belonging to a registrable
+domain that is third-party to `riabuild.clubria.com`, set with `SameSite=None` during a
+redirect chain, on a site no developer ever renders. That is the exact shape browser
+tracking-prevention exists to catch, and Safari's is both the strictest and the one whose
+verdict is stored **per browser profile, outside cookies and outside local storage** — so
+it survives clearing site data, a fresh profile does not have it yet, and the same laptop
+disagrees with itself indefinitely.
+
+What made it expensive is that the failure says nothing. With the cookies missing, the
+callback answers a bare redirect that is byte-identical to an ordinary visit:
+
+```sh
+curl -sD- -o/dev/null \
+  'https://handsome-vulture-127.eu-west-1.convex.site/api/auth/callback/github?code=x&state=y'
+# HTTP/2 302
+# location: https://riabuild.clubria.com          <- no `code`, no error
+```
+
+The developer authorises on GitHub, lands back on the dashboard, and is shown the sign-in
+screen. Twice before this the symptom was chased to a different cause (#51, #98) because
+there was nothing on the page, in the console or in the URL to read.
+
+So `riabuild-web/functions/api/auth/[[path]].ts` — a Cloudflare Pages Function — serves
+`/api/auth/*` from `riabuild.clubria.com` and hands each request to Convex unchanged, and
+`CUSTOM_AUTH_SITE_URL` is what makes the library name that origin in both legs. The
+cookies then belong to the origin the developer uses every day, and the flow is shaped
+like any other first-party OAuth app. No browser is asked to relax anything.
+
+It is a proxy rather than a Convex custom domain because a custom domain is the thing §5
+already priced and declined. This needs no new hostname, no new certificate and no plan
+change.
+
+**Cutting over, in this order.** Each step is safe on its own; the pair in the middle is
+not, which is why it is one deploy and one dashboard edit back to back.
+
+1. Deploy the dashboard (`pnpm deploy:web`, or merge to `main`). Sign-in still runs on
+   `convex.site` and is unaffected — the Function is live but nothing points at it yet.
+   Check it is actually being served, rather than swallowed by the SPA fallback:
+
+   ```sh
+   curl -sD- -o/dev/null 'https://riabuild.clubria.com/api/auth/callback/github'
+   # HTTP/2 302, and `location` carries `authFailed=1`.
+   # A 200 with text/html means `_routes.json` or the Function did not deploy.
+   ```
+
+2. Set `CUSTOM_AUTH_SITE_URL` (§2) **and** change the GitHub OAuth app's callback URL to
+   `https://riabuild.clubria.com/api/auth/callback/github`. Between these two, sign-in
+   fails; do them together.
+3. Sign in once, in a browser that has never signed in, to confirm.
+
+If step 2 is half-done, the Function says so rather than bouncing anybody: a sign-in leg
+whose `redirect_uri` names another origin is answered with a 500 naming the variable.
+
+**Two things must not be quietly undone.** `riabuild-web/public/_routes.json` is what
+makes Pages invoke the Function for `/api/auth/*` and leave every other path to the SPA
+fallback in `_redirects`; widening either is the same mistake from two directions. And
+`/api/v1` is deliberately *not* proxied — the CLI calls it directly, holds no cookies and
+is not a browser, so none of the above applies to it.
 
 ## 3. Infisical machine identities
 
@@ -375,6 +449,13 @@ one line in `riabuild-cli/src/api/mod.rs`, and `RIABUILD_API_URL` overrides it m
 A single-label name like `riabuild-api.clubria.com` would get an edge certificate, but
 Convex routes HTTP actions by hostname and would not recognise it, so it still needs the
 custom-domain feature.
+
+**Sign-in no longer waits on any of this.** It used to be the one part of the system that
+genuinely needed a first-party hostname, because browsers judge auth cookies by the domain
+that sets them. `/api/auth/*` is served from `riabuild.clubria.com` by a Pages Function
+instead — an origin that already has a certificate — so the constraint above costs nothing
+a developer can see. See §2, "Sign-in runs on the dashboard's own origin". `/api/v1` is
+unaffected and still goes straight to `convex.site`.
 
 ## 6. Homebrew tap
 

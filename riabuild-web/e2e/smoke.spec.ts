@@ -290,6 +290,42 @@ test.describe("against a real backend", { tag: "@viewport-agnostic" }, () => {
     await expect(signedIn(page)).toBeVisible();
   });
 
+  /**
+   * The failure that used to render as a blank sign-in screen.
+   *
+   * When the OAuth cookies do not reach `/api/auth/callback/*`,
+   * `@convex-dev/auth` swallows the error and answers a bare redirect to
+   * `SITE_URL` — no `code`, no error, byte-identical to somebody typing the
+   * address in. `functions/_proxy.ts` marks that redirect and this is the other
+   * end of the mark.
+   *
+   * Against a real backend rather than a fixture on purpose. The
+   * `signin-round-trip-failed` scenario proves the alert *renders*; only a real
+   * page load proves the part that cannot be faked — that `authFailure.ts`
+   * captures the parameter before `ConvexAuthProvider` mounts, and hands the
+   * developer a clean URL afterwards so a reload is an ordinary visit again.
+   */
+  test("a callback that produced no code says so", async ({
+    page,
+    consoleErrors,
+  }, info) => {
+    await page.goto("/?authFailed=1");
+
+    await expect(
+      page.getByText("Sign-in did not complete", { exact: true }),
+    ).toBeVisible();
+    // Still a door, not a dead end.
+    await expect(page.getByRole("button", { name: SIGN_IN })).toBeVisible();
+    // Stripped in the same breath it was read, so this is not the page's
+    // permanent opinion of itself.
+    expect(page.url()).not.toContain("authFailed");
+
+    await settled(page);
+    await checkPage(page, info, consoleErrors, {
+      screenshot: "smoke-signin-failed",
+    });
+  });
+
   test("the authorize page renders for a signed-in machine", async ({
     page,
     consoleErrors,
