@@ -119,7 +119,7 @@ sorts by declared dependencies, so it is not necessarily the order they run in.
 | 14 | `claude_onboarding` | every account past Claude Code's first-run questions |
 | 15 | `claude_agents_view` | the agents view offered as each account's default, and never imposed on one that answered |
 | 16 | `env_local` | one `.env.<environment>` per environment you may see — `.env.dev`, plus `.env.staging` for developers and leads — freshly brokered, parseable, and git-ignored |
-| 17 | `claude_statusline` | the status line script the org settings name |
+| 17 | `claude_statusline` | the status line every Claude Code session draws — installed by riabuild, named by riabuild, and never by the dashboard |
 | 18 | `claude_plugins` | the marketplaces and plugins the checkout's own settings declare, installed before your first session rather than during it |
 
 Then it drops you into your own shell with the environment applied, opening with a box
@@ -147,6 +147,31 @@ Build profile against its `CODEX_HOME` and `GROK_HOME`, and riabuild's own tree 
 them. You need it when something riabuild did not write has to be pointed at one of those
 logins; the launchers set the variable themselves, so `claude`, `codex-3` and the rest
 never do.
+
+### What the team dashboard sees
+
+**Every account here reports its own usage, and there is nothing to switch on.** The status
+line riabuild installs writes a line to a spool on each render; about once a minute, while
+you are working, riabuild sends what it has collected to riabuild.clubria.com. Nothing runs
+when you are not using Claude Code — there is no daemon and no background service.
+
+What a sample carries is **volume, and never content**: the session's cumulative
+list-price-equivalent cost, how long it ran, how many lines changed, and how much of your
+five-hour and seven-day rate-limit windows is used. Not the repository, not a prompt, not a
+file path, not the model's output. The status line has your repository in hand when it
+writes a sample — it is on the line in front of you — and deliberately does not send it.
+
+Two things follow that are worth knowing rather than discovering:
+
+- **This includes a personal subscription** you added with `riabuild claude new`. These are
+  personal Pro and Max accounts, so cost is a measure of relative effort against the public
+  price sheet and not money anyone spent; your team's dashboard labels it that way.
+  Collection was opt-in per account until 2026-09-05, and what that produced was a
+  dashboard with nothing in it — the person who never reads a release note is also the
+  person who never runs the command that turns it on.
+- **A `claude` riabuild did not create is untouched.** Only the accounts in riabuild's own
+  tree are collected from — the ones `riabuild paths` lists — so a Claude Code you
+  installed yourself writes nothing anywhere, whatever else is on the machine.
 
 ## Other agents, tunnels, and keys
 
