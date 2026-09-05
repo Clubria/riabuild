@@ -27,6 +27,63 @@ use riabuild_harness::{Event, Kind};
 use crate::account::{Account, Accounts};
 use crate::compose::Compose;
 
+/// What riabuild knows about one sign-in.
+///
+/// Three states and not two, and the third is the one that matters: **absent**
+/// is "nobody has answered yet", which is rendered as nothing. Asking a harness
+/// who is signed in costs a subprocess each, so the window opens before any of
+/// them have replied — and a missing answer drawn as "signed out" would accuse
+/// every account of being logged out for the first second of every run, and
+/// would refuse to start a session under one that was fine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signin {
+    /// Signed in, as this address.
+    In(String),
+    /// Signed out. A session started here has nowhere to go.
+    Out,
+}
+
+/// Whether a harness said, in its own words, that it is not signed in.
+///
+/// The one thing riabuild can do about an expired OAuth session is name it.
+/// Claude Code's wording is the case this exists for — it exits non-zero with
+/// `Failed to authenticate: OAuth session expired and could not be refreshed`,
+/// which reaches a pane through `errors.log` as one more line of red text among
+/// however many the turn produced, indistinguishable from a compile error.
+///
+/// Matched on the *phrases* rather than the whole sentence, because the whole
+/// sentence is a vendor's and changes without notice, and matched
+/// case-insensitively for the same reason.
+///
+/// Every phrase here names authentication and nothing else. `401` and
+/// `unauthorized` are deliberately **not** among them: an agent that ran a
+/// `curl` against a staging API prints both, and a window that answered a tool
+/// result by telling the developer to sign in again would be worse than one
+/// that said nothing.
+pub fn reads_as_signed_out(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "oauth session expired",
+        "failed to authenticate",
+        "not logged in",
+        "not authenticated",
+        "please run /login",
+        "authentication_error",
+        "invalid api key",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// What to tell a developer whose sign-in has nowhere to go.
+///
+/// One sentence, in one place, because it is said in three: on the rail's
+/// splash, in the notice when Enter is refused, and in the transcript when a
+/// turn came back saying it. Three wordings of one fact read as three problems.
+pub fn signed_out_hint(name: &str) -> String {
+    format!("{name} is not signed in \u{2014} run `{name} auth login` in a terminal.")
+}
+
 /// Where a session has got to.
 ///
 /// Not stored — computed from two facts that are each answerable on their own:
@@ -115,6 +172,13 @@ pub struct Pane {
     /// instant after it failed is the one bug this screen exists to prevent, so
     /// the turn ending is not what clears this — asking it something else is.
     pub troubled: bool,
+    /// Whether the last failure was this session's harness saying it is not
+    /// signed in.
+    ///
+    /// Sticky like [`Pane::troubled`] and cleared by the same thing — the next
+    /// prompt — because a developer who has signed in again finds out by asking
+    /// for something, and nothing else riabuild can watch changes in between.
+    pub signed_out: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub entries: Vec<Entry>,
@@ -147,6 +211,7 @@ impl Pane {
             model: None,
             running: false,
             troubled: false,
+            signed_out: false,
             input_tokens: 0,
             output_tokens: 0,
             entries: Vec::new(),
@@ -262,6 +327,21 @@ impl Pane {
             Event::Trouble(text) => {
                 self.push(Entry::Trouble(text.clone()), delegated);
                 self.troubled = true;
+                // Said once, in riabuild's own words, under the vendor's. The
+                // harness's sentence stays — it is the evidence — and this is
+                // the line that says what to do about it, which no wording of
+                // "Failed to authenticate" ever does.
+                if reads_as_signed_out(text) && !self.signed_out {
+                    self.signed_out = true;
+                    let name = self.account_name();
+                    self.push(
+                        Entry::Trouble(format!(
+                            "{name} is not signed in \u{2014} run `{name} auth login` in a \
+                             terminal, then send this again."
+                        )),
+                        false,
+                    );
+                }
             }
             // The turn saying it is done. Not what decides whether this pane is
             // busy — the lock does, because a turn can also end by being killed,
@@ -321,12 +401,16 @@ pub struct App {
     /// caller and carried here so the chooser is drawable and testable without
     /// a filesystem.
     pub accounts: Accounts,
-    /// Who each sign-in belongs to, as riabuild learns it.
+    /// What riabuild knows about each sign-in, as it learns it.
     ///
     /// Beside [`Account`] rather than inside it: an account is compared by
     /// identity all over this crate, and an email that arrives half a second
     /// after the window opened would make two of the same account unequal.
-    logins: Vec<(Kind, usize, String)>,
+    ///
+    /// A sign-in nobody has answered for is **absent** rather than [`Signin::Out`]
+    /// — see the type. That distinction is what keeps the window from refusing
+    /// to start anything during the second it takes the probes to come back.
+    logins: Vec<(Kind, usize, Signin)>,
     /// Which row the chooser is on, while it is open.
     pub picking: usize,
     pub focus: Focus,
@@ -450,25 +534,54 @@ impl App {
         self.scrollback = 0;
     }
 
-    /// Records who a sign-in belongs to.
-    pub fn set_login(&mut self, kind: Kind, number: usize, email: String) {
+    /// Records what riabuild has learned about a sign-in.
+    pub fn set_login(&mut self, kind: Kind, number: usize, signin: Signin) {
         match self
             .logins
             .iter_mut()
             .find(|(held, at, _)| *held == kind && *at == number)
         {
-            Some(entry) => entry.2 = email,
-            None => self.logins.push((kind, number, email)),
+            Some(entry) => entry.2 = signin,
+            None => self.logins.push((kind, number, signin)),
         }
     }
 
-    /// `None` where nobody has said yet, which is rendered as nothing rather
-    /// than as a claim that the account is signed out.
-    pub fn login_of(&self, kind: Kind, number: usize) -> Option<&str> {
+    /// What riabuild knows about a sign-in, or `None` where nobody has said
+    /// yet — which is rendered as nothing rather than as a claim either way.
+    pub fn signin_of(&self, kind: Kind, number: usize) -> Option<&Signin> {
         self.logins
             .iter()
             .find(|(held, at, _)| *held == kind && *at == number)
-            .map(|(_, _, email)| email.as_str())
+            .map(|(_, _, signin)| signin)
+    }
+
+    /// The address a sign-in belongs to, where riabuild knows one.
+    pub fn login_of(&self, kind: Kind, number: usize) -> Option<&str> {
+        match self.signin_of(kind, number) {
+            Some(Signin::In(email)) => Some(email.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether riabuild has been *told* this sign-in is signed out.
+    ///
+    /// False for an account nobody has answered for, which is the whole reason
+    /// [`Signin`] has no `Unknown`: silence is not an accusation.
+    pub fn is_signed_out(&self, kind: Kind, number: usize) -> bool {
+        matches!(self.signin_of(kind, number), Some(Signin::Out))
+    }
+
+    /// The sentence to show instead of starting a session under a sign-in that
+    /// has nowhere to go, or `None` where there is nothing in the way.
+    ///
+    /// Asked by the keymap *before* the box is emptied, so a developer who has
+    /// just typed a paragraph into a signed-out account still has it. Only an
+    /// offer is refused: a session that already exists has a conversation in it,
+    /// and the harness's own answer is a better report than a guess made here.
+    pub fn blocked_offer(&self) -> Option<String> {
+        let account = self.offered()?;
+        self.is_signed_out(account.kind, account.number)
+            .then(|| signed_out_hint(&account.name()))
     }
 
     /// Opens the chooser, on the sign-in the cursor is already on.
@@ -541,8 +654,11 @@ impl App {
         {
             pane.push(Entry::Note(format!("› {text}")), false);
             pane.running = true;
-            // A new question is the developer acting on whatever went wrong.
+            // A new question is the developer acting on whatever went wrong,
+            // sign-in included: they cannot have fixed it any other way riabuild
+            // could see, so asking again is what re-tests it.
             pane.troubled = false;
+            pane.signed_out = false;
             if pane.title.is_empty() {
                 pane.title = crate::store::title_of(text);
             }
@@ -590,6 +706,107 @@ mod tests {
             app.observe("s1", &event);
         }
         app
+    }
+
+    #[test]
+    fn an_expired_oauth_session_is_named_rather_than_left_as_red_text() {
+        // Claude Code's own wording, verbatim, which reaches a pane through
+        // `errors.log` as one more red line among however many the turn
+        // produced. Without this it is indistinguishable from a compile error,
+        // and the developer spends the afternoon on their code.
+        let mut app = play(Kind::Claude, "");
+        app.observe(
+            "s1",
+            &Event::Trouble(
+                "Claude Code exited 1: Failed to authenticate: OAuth session expired \
+                 and could not be refreshed"
+                    .into(),
+            ),
+        );
+        let pane = app.selected().unwrap();
+        assert!(pane.signed_out);
+        assert_eq!(pane.state(), State::Trouble);
+
+        let said: Vec<&str> = pane
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Trouble(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The harness's sentence stays — it is the evidence — and riabuild's is
+        // under it, naming the account and the command.
+        assert!(
+            said.iter()
+                .any(|text| text.contains("OAuth session expired"))
+        );
+        assert!(
+            said.iter().any(|text| text.contains("claude-1 auth login")),
+            "{said:#?}"
+        );
+
+        // Said once, however many more times the harness says it: a turn that
+        // retries three times must not stack three copies of riabuild's advice.
+        app.observe("s1", &Event::Trouble("Failed to authenticate".into()));
+        let again = app.selected().unwrap();
+        assert_eq!(
+            again
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, Entry::Trouble(text) if text.contains("auth login"))
+                )
+                .count(),
+            1
+        );
+
+        // and asking again is what clears it, because signing in is a thing
+        // riabuild cannot watch happen.
+        app.cursor = 0;
+        app.sent("try again");
+        assert!(!app.selected().unwrap().signed_out);
+    }
+
+    #[test]
+    fn a_tool_result_that_merely_mentions_a_401_is_not_a_sign_in_problem() {
+        // The false positive worth refusing: an agent that ran a `curl` against
+        // a staging API prints both `401` and `unauthorized`, and a window that
+        // answered that by telling the developer to sign in again would be
+        // worse than one that said nothing.
+        assert!(!reads_as_signed_out("HTTP/2 401 Unauthorized"));
+        assert!(!reads_as_signed_out(
+            "thread 'main' panicked at src/lib.rs:12"
+        ));
+        // and the ones that are, however they are cased
+        assert!(reads_as_signed_out(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        ));
+        assert!(reads_as_signed_out(
+            "Error: Not logged in. Please run /login"
+        ));
+        assert!(reads_as_signed_out("invalid api key"));
+    }
+
+    #[test]
+    fn a_sign_in_nobody_has_answered_for_is_neither_in_nor_out() {
+        // Three states, and the third is the one the window depends on: the
+        // probes take a second and a half to come back, and silence read as
+        // "signed out" would accuse every account on the way in.
+        let mut app = App::new(Accounts::default());
+        assert!(app.signin_of(Kind::Claude, 1).is_none());
+        assert!(!app.is_signed_out(Kind::Claude, 1));
+        assert_eq!(app.login_of(Kind::Claude, 1), None);
+
+        app.set_login(Kind::Claude, 1, Signin::Out);
+        assert!(app.is_signed_out(Kind::Claude, 1));
+        // and a signed-out account has no address to show, rather than a stale
+        // one from before it expired
+        assert_eq!(app.login_of(Kind::Claude, 1), None);
+
+        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
+        assert!(!app.is_signed_out(Kind::Claude, 1));
+        assert_eq!(app.login_of(Kind::Claude, 1), Some("ada@clubria.com"));
     }
 
     #[test]
@@ -838,10 +1055,10 @@ mod tests {
         // the half second before `claude auth status` answers.
         let mut app = App::new(Accounts::default());
         assert_eq!(app.login_of(Kind::Claude, 1), None);
-        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
+        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
         assert_eq!(app.login_of(Kind::Claude, 1), Some("ada@clubria.com"));
         // Re-signing in replaces rather than appends.
-        app.set_login(Kind::Claude, 1, "grace@clubria.com".into());
+        app.set_login(Kind::Claude, 1, Signin::In("grace@clubria.com".into()));
         assert_eq!(app.login_of(Kind::Claude, 1), Some("grace@clubria.com"));
         assert_eq!(app.login_of(Kind::Claude, 2), None);
         assert_eq!(app.login_of(Kind::Codex, 1), None);

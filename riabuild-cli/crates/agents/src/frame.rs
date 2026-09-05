@@ -37,6 +37,16 @@ use crate::draw::{self, Chrome};
 /// The margin down each edge of the window, and inside the pane.
 const MARGIN: u16 = 2;
 
+/// The columns between the rail and the pane's raised background.
+///
+/// One rather than two, and that is what a developer counting the gap sees as
+/// **two**: `draw::rail_lines` already keeps a column spare at the rail's own
+/// right edge, so the blank between the last glyph of a session's title and the
+/// first cell of the pane is this plus that. Three read as a seam rather than a
+/// join. The rail's own spare column is what stops a long title touching the
+/// pane, which is why the width came off here instead of there.
+const GUTTER: u16 = 1;
+
 /// `area` with `MARGIN` columns taken off each side.
 fn inset(area: Rect) -> Rect {
     let width = area.width.saturating_sub(MARGIN * 2);
@@ -77,18 +87,15 @@ pub fn render(frame: &mut Frame, app: &App, chrome: Chrome<'_>) {
     let rail_width = draw::rail_width(body.width);
     let split = Layout::horizontal([
         Constraint::Length(rail_width),
-        Constraint::Length(MARGIN),
+        Constraint::Length(GUTTER),
         Constraint::Min(1),
     ])
     .split(body);
-    frame.render_widget(
-        Paragraph::new(draw::rail_lines(app, chrome, rail_width)),
-        split[0],
-    );
+    render_rail(frame, app, chrome, rail_width, split[0]);
     render_pane(frame, app, chrome, split[1], split[2]);
 
     frame.render_widget(
-        Paragraph::new(draw::footer_line(app, chrome.theme)),
+        Paragraph::new(draw::footer_line(app, chrome.theme, inset(rows[5]).width)),
         inset(rows[5]),
     );
 
@@ -97,6 +104,25 @@ pub fn render(frame: &mut Frame, app: &App, chrome: Chrome<'_>) {
     if app.focus == Focus::Picker {
         render_picker(frame, app, chrome, rows[3]);
     }
+}
+
+/// The rail, scrolled so the row under the cursor is on screen.
+///
+/// It needed no scrolling while a session was one line: ten of them fitted in
+/// the body of a laptop terminal. Two lines each halves that, and a cursor the
+/// developer cannot see is worse than a rail that does not show everything — so
+/// the list follows the cursor, the way the chooser already does.
+///
+/// Both of a row's lines are kept in view rather than just its first, because
+/// the second is where a long title finishes and where `(subagent)` is said.
+fn render_rail(frame: &mut Frame, app: &App, chrome: Chrome<'_>, width: u16, area: Rect) {
+    let lines = draw::rail_lines(app, chrome, width);
+    let cursor = draw::rail_cursor_line(app) as u16;
+    let offset = (cursor + draw::ROW_LINES as u16).saturating_sub(area.height);
+    // Never past the end: scrolling a short list off the top would leave the
+    // rail blank on a window that had room for all of it.
+    let last = (lines.len() as u16).saturating_sub(area.height);
+    frame.render_widget(Paragraph::new(lines).scroll((offset.min(last), 0)), area);
 }
 
 /// The session pane, on its own background.
@@ -117,13 +143,24 @@ fn render_pane(frame: &mut Frame, app: &App, chrome: Chrome<'_>, gutter: Rect, a
         );
     }
 
+    // The box takes as many rows as the prompt in it needs, and the transcript
+    // gives them up. A cap, because a developer who pastes a page must not be
+    // left with a conversation they cannot see — past it the box scrolls itself,
+    // which `render_compose` does by dropping the rows above the caret.
+    let inner_width = inset(area).width;
+    let wanted =
+        app.compose
+            .height((inner_width as usize).saturating_sub(draw::COMPOSE_INDENT)) as u16;
+    let room = area.height.saturating_sub(6).max(1);
+    let box_height = wanted.clamp(1, room.min(BOX_LINES));
+
     let rows = Layout::vertical([
         Constraint::Length(1), // a blank row inside the pane's own edge
         Constraint::Length(1), // whose sign-in this is
         Constraint::Length(1),
         Constraint::Min(1),    // the conversation, or what would start one
         Constraint::Length(1), // the newline above the box
-        Constraint::Length(1), // the box
+        Constraint::Length(box_height), // the box
         Constraint::Length(1),
     ])
     .split(area);
@@ -144,11 +181,33 @@ fn render_pane(frame: &mut Frame, app: &App, chrome: Chrome<'_>, gutter: Rect, a
         None => render_splash(frame, app, theme, middle),
     }
 
+    render_compose(frame, app, theme, inset(rows[5]));
+}
+
+/// The tallest the prompt box may grow before it starts scrolling itself.
+///
+/// A developer who pastes a page of logs into it must still be able to see the
+/// conversation they are pasting them into.
+const BOX_LINES: u16 = 8;
+
+/// The box, with the caret's row always in it.
+///
+/// Scrolled from the bottom rather than the top: the caret is where the typing
+/// is happening, so a prompt taller than the box shows its end, and moving the
+/// caret back up brings the earlier rows with it.
+fn render_compose(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
+    let lines = draw::compose_lines(app, theme, area.width);
+    let caret = app
+        .compose
+        .wrap((area.width as usize).saturating_sub(draw::COMPOSE_INDENT))
+        .caret
+        .0 as u16;
+    let offset = (caret + 1).saturating_sub(area.height);
     paint(
         frame,
         theme,
-        Paragraph::new(draw::compose_line(app, theme)),
-        inset(rows[5]),
+        Paragraph::new(lines).scroll((offset, 0)),
+        area,
     );
 }
 
@@ -184,8 +243,17 @@ fn render_splash(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         return;
     };
     let email = app.login_of(account.kind, account.number);
-    let lines: Vec<Line<'static>> = draw::splash_lines(account, email, theme);
-    let height = lines.len() as u16;
+    let signed_out = app.is_signed_out(account.kind, account.number);
+    let lines: Vec<Line<'static>> = draw::splash_lines(account, email, signed_out, theme);
+    // Wrapped, and measured *after* wrapping. The sentence a signed-out sign-in
+    // shows is a whole one — it names the account and the command that fixes it
+    // — and it is longer than a pane beside a rail on a laptop. Unwrapped it was
+    // simply cut at the edge, which took the command off the end of the only
+    // line that was any use.
+    let height: u16 = lines
+        .iter()
+        .map(|line| wrapped_height(line, area.width))
+        .sum();
     let middle = Rect {
         x: area.x,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -195,9 +263,26 @@ fn render_splash(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     paint(
         frame,
         theme,
-        Paragraph::new(lines).alignment(Alignment::Center),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .alignment(Alignment::Center),
         middle,
     );
+}
+
+/// How many rows one line takes once it has been wrapped to `width`.
+///
+/// By character rather than by byte, because an em-dash is one column and three
+/// bytes and a height computed from `len()` would leave a sentence with a row
+/// too few — which is the same cut this exists to prevent, one row further down.
+fn wrapped_height(line: &Line<'_>, width: u16) -> u16 {
+    let columns: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    let width = width.max(1) as usize;
+    (columns.div_ceil(width)).max(1) as u16
 }
 
 /// The chooser, centred over the body.
@@ -231,6 +316,7 @@ fn render_picker(frame: &mut Frame, app: &App, chrome: Chrome<'_>, area: Rect) {
 mod tests {
     use super::*;
     use crate::account::Account;
+    use crate::app::Pane;
     use crate::draw::tests::every_account;
     use riabuild_harness::{Kind, testing};
     use riabuild_theme::{Depth, Tone};
@@ -344,6 +430,70 @@ mod tests {
             screen.iter().any(|row| row.contains('│')),
             "no rule where there is no surface\n{screen:#?}"
         );
+    }
+
+    #[test]
+    fn two_columns_separate_the_rail_from_the_pane_and_no_more() {
+        // Three read as a seam rather than a join. The gap is the rail's own
+        // spare column plus `GUTTER`, so this asserts what a developer counts
+        // rather than either constant on its own.
+        let mut app = App::new(every_account());
+        app.add(Pane::new(
+            "s1".into(),
+            Kind::Claude,
+            // Long enough to fill the rail's title column, which is the only
+            // row that can prove where the rail's text actually stops.
+            "a title long enough to run the whole way along the rail".into(),
+        ));
+        app.cursor = 0;
+
+        let buffer = painted(&app, 100, 24);
+        let theme = Theme::with_depth_and_tone(Depth::TrueColor, Tone::Dark);
+        let surface = theme.surface().bg.expect("a raised pane");
+        let row = 1 + 1 + 1 + 1; // the top blank, the header, its gap, the rail's first line
+        let pane_at = (0..100)
+            .find(|column| buffer[(*column, row)].bg == surface)
+            .expect("the pane is on screen");
+        let last_glyph = (0..pane_at)
+            .rfind(|column| buffer[(*column, row)].symbol() != " ")
+            .expect("the rail has text on it");
+        assert_eq!(
+            pane_at - last_glyph - 1,
+            2,
+            "the gap between the rail and the pane is not two columns"
+        );
+    }
+
+    #[test]
+    fn a_prompt_longer_than_the_pane_wraps_instead_of_running_off_it() {
+        // The bug: a single-line box took the caret off the right edge with it,
+        // so the half of a paragraph a developer had just written was somewhere
+        // they could not see.
+        let mut app = with_a_session();
+        app.focus = Focus::Session;
+        let prompt = "why is the nightly job so slow when the cache is warm and nothing else \
+                      on the box is doing anything at all";
+        for ch in prompt.chars() {
+            app.compose.insert(ch);
+        }
+        let screen = frame_of(&app, Theme::plain(), 100, 24);
+
+        let box_rows: Vec<&String> = screen
+            .iter()
+            .filter(|row| row.contains("why is the nightly") || row.contains("on the box is doing"))
+            .collect();
+        assert_eq!(box_rows.len(), 2, "{screen:#?}");
+        // The caret is on the last of them, which is where the typing is.
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("anything at all") && row.contains('▏')),
+            "{screen:#?}"
+        );
+        // Every row of it stays inside the window's own margin.
+        for row in &screen {
+            assert_eq!(row.chars().count(), 100, "{row:?}");
+        }
     }
 
     #[test]

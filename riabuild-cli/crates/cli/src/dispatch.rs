@@ -261,6 +261,13 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
 /// Claude only. Codex and Grok Build keep their credentials in their own homes
 /// with no command that reports an address, so there is nothing to ask and
 /// inventing a probe for them would be guessing on a developer's behalf.
+///
+/// `LoggedOut` is sent as well as `LoggedIn`, and [`Identity::Unknown`] is sent
+/// as neither. That is the whole of the three-state distinction the window
+/// depends on: a probe that could not answer must not become "signed out", or
+/// every account is accused of it on a machine whose `claude` will not start —
+/// and the window would then refuse to create the session that would have said
+/// why.
 fn ask_who_is_signed_in(ctx: &Ctx) -> tokio::sync::mpsc::UnboundedReceiver<agents::Login> {
     let (into, out) = tokio::sync::mpsc::unbounded_channel();
     let claude = ctx.claude();
@@ -271,15 +278,16 @@ fn ask_who_is_signed_in(ctx: &Ctx) -> tokio::sync::mpsc::UnboundedReceiver<agent
         let into = into.clone();
         let number = index + 1;
         tokio::spawn(async move {
-            if let accounts::status::Identity::LoggedIn(email) =
-                accounts::status::read_at(runner, claude, dir).await
-            {
-                let _ = into.send(agents::Login {
-                    kind: Kind::Claude,
-                    number,
-                    email,
-                });
-            }
+            let signin = match accounts::status::read_at(runner, claude, dir).await {
+                accounts::status::Identity::LoggedIn(email) => agents::Signin::In(email),
+                accounts::status::Identity::LoggedOut => agents::Signin::Out,
+                accounts::status::Identity::Unknown(_) => return,
+            };
+            let _ = into.send(agents::Login {
+                kind: Kind::Claude,
+                number,
+                signin,
+            });
         });
     }
     out
