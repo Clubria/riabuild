@@ -352,3 +352,52 @@ the sentence still holds. What changed is narrower and was also the part that bi
 practice: the one artifact riabuild writes that outlives a single run and is read on every
 subsequent `claude` invocation now looks at every checkout it knows about instead of the
 one most recently active.
+
+## Addendum: the question can be answered for good
+
+**Date:** 2026-09-05
+
+"No `riabuild repo` subcommand: the every-run prompt *is* the switch" was the right
+reading of a prompt a developer meets once a week. It is the wrong one for a developer who
+works on exactly one repository and meets it every morning: a question with the same
+answer every time is not an offer, it is a toll. So the picker now asks a second question
+after the first — **`Always use <owner>/<repo>?`** — and a yes is recorded in
+`UserConfig::always_repo`. A run that finds one draws no box and asks nothing.
+
+Three things keep that from becoming a machine nobody can steer.
+
+**`riabuild --repo` with nothing after it puts the question back.** It is the same flag
+that already changes repository, given an optional value rather than a second flag beside
+it: a developer who has forgotten how to change repository reaches for the flag that
+changes repository, and there is one of those. Declining at the prompt (`n`) clears the
+pin as well as refusing one, so the way back to being asked every run is the same two
+words as the way to stop being asked.
+
+**A named `--repo` replaces a pin and never creates one.** On a pinned machine the next
+bare run puts no question, so a `--repo` that left the pin alone would move this run onto
+one repository and the next silently back — the switch nobody could see happening. On a
+machine that never pinned, `--repo payments` still means one run about `payments` and
+nothing more, which is what every script and CI job passing it relies on.
+
+**GitHub can undo it, and only GitHub.** `list::access` asks `gh api repos/<slug>` about
+the pinned repository before honouring it, and **only a 404 unpins**: a repository that was
+archived, renamed, or that this developer has been taken off. Everything else — a token
+that expired overnight, a 403 from an org that has just turned SAML on, a 500, a `gh` that
+is not installed yet on a machine's first run — is `Access::Unknown`, which leaves the pin
+exactly where it was and says why on one line. That asymmetry is the whole of the design:
+guessing wrong towards "still yours" costs one run that provisions a repository the clone
+will fail on, with GitHub's own words; guessing wrong towards "gone" silently moves a
+developer off the repository they are in the middle of. An unattended run skips the check
+altogether, because the check exists to decide whether to *ask* and there is nobody there.
+
+The box also grew a second line per repository — GitHub's own description, dimmed, under
+the name — which is what makes a list of ten slugs a list a developer new to the org can
+actually choose from. `SHOWN` stays at ten; a box that scrolls one screen has still named
+every repository they work with, and one cut to five has quietly stopped. A repository
+that describes itself as nothing takes one line, as before. `riabuild remote`'s server box
+gained the same second line from `sharedServers.description`, which a lead types in the
+dashboard — the first field on that table that is prose rather than an address, and so the
+first that goes through `riabuild_ui::one_line` before it is printed. A description cannot
+be *wrong* the way an address can, so it is defused rather than refused: an escape sequence
+in one must not repaint the picker, and a server must not vanish from the box over the
+sentence beside it.

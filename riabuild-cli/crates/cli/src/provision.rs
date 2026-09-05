@@ -119,8 +119,10 @@ async fn after_the_tasks(ctx: &mut Ctx, outcome: &engine::Outcome, ran: Result<(
 ///
 /// Three runs go straight past it:
 ///
-/// - `--repo` was given, so the answer is already on the command line and
-///   `main::remember_repo` has recorded it.
+/// - `--repo <owner/repo>` was given, so the answer is already on the command
+///   line and `main::remember_repo` has recorded it. `--repo` with nothing after
+///   it is the opposite of that and does not go past: it is how a developer who
+///   answered `Always use <repo>?` asks for the box back.
 /// - `--check` and `riabuild status`, which report and change nothing —
 ///   `config.json` is part of "nothing", and a question is a poor thing to put to
 ///   somebody who asked for a report.
@@ -129,10 +131,14 @@ async fn after_the_tasks(ctx: &mut Ctx, outcome: &engine::Outcome, ran: Result<(
 ///   first run on every machine: it provisions the org default, and the run after
 ///   it — which has both — puts the question.
 async fn ask_which_repository(ctx: &mut Ctx, cli: &Cli) -> Result<()> {
-    if cli.repo.is_some() || ctx.dry_run || ctx.org.is_none() {
+    if cli.named_repo().is_some() || ctx.dry_run || ctx.org.is_none() {
         return Ok(());
     }
-    riabuild_tasks::repo::choose(ctx).await?;
+    let ask = match cli.asks_which_repo() {
+        true => riabuild_tasks::repo::Ask::Always,
+        false => riabuild_tasks::repo::Ask::IfNotPinned,
+    };
+    riabuild_tasks::repo::choose(ctx, ask).await?;
     Ok(())
 }
 
@@ -362,6 +368,17 @@ mod tests {
             .expect("asks nothing");
 
         assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+    }
+    #[tokio::test]
+    async fn a_bare_repo_flag_is_the_opposite_of_a_named_one() {
+        // `--repo` with nothing after it arrives as an empty value, and it is a
+        // request to be asked rather than an answer. Sharing the flag is what
+        // makes the way back to the question the same flag that changes
+        // repository — but the empty half must not read as "already answered",
+        // which is what the `is_some()` this replaced did.
+        let cli = cli_with(false, Some(""));
+        assert!(cli.named_repo().is_none());
+        assert!(cli.asks_which_repo());
     }
     #[tokio::test]
     async fn a_machine_with_no_session_yet_is_not_asked() {

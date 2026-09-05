@@ -123,7 +123,9 @@ pub(crate) async fn remember_project(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
 /// was typed on this command line, and silently provisioning a different
 /// repository than the one asked for is the one outcome nobody could debug.
 pub(crate) async fn remember_repo(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
-    let Some(named) = &cli.repo else {
+    // `--repo` with nothing after it names no repository: it is a request to be
+    // asked, which `provision::ask_which_repository` acts on and this does not.
+    let Some(named) = cli.named_repo() else {
         return Ok(());
     };
     if matches!(cli.command, Some(Command::Remote { .. })) {

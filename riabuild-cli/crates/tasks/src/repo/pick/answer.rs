@@ -78,6 +78,7 @@ pub fn rows_for(
                 pushed_at: entry.pushed_at,
                 cloned: known.contains_key(entry.repo.slug()),
                 default: entry.repo == *org_default,
+                description: entry.description.clone(),
             },
         );
     }
@@ -95,6 +96,9 @@ pub fn rows_for(
                 default: repo == *org_default,
                 repo,
                 pushed_at: 0,
+                // Nothing has asked GitHub about this one, so nothing here
+                // knows what it says it is.
+                description: String::new(),
             });
         }
     }

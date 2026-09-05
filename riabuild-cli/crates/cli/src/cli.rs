@@ -23,12 +23,25 @@ pub struct Cli {
     pub project: Option<String>,
 
     /// Which repository to work on, as `owner/repo` or a bare name in the org.
+    /// On its own, ask which — even on a machine that answered "always".
     ///
-    /// Skips the question `riabuild` otherwise asks, which is what an
-    /// unattended run or a script wants. Global rather than scoped to the
-    /// default flow because `riabuild remote --repo payments build-01` has to
-    /// reach the server's own riabuild, the same way `--project` does.
-    #[arg(long, global = true, value_name = "OWNER/REPO")]
+    /// With a value it skips the question `riabuild` otherwise asks, which is
+    /// what an unattended run or a script wants. Global rather than scoped to
+    /// the default flow because `riabuild remote --repo payments build-01` has
+    /// to reach the server's own riabuild, the same way `--project` does.
+    ///
+    /// Bare, it is the way back from `Always use <repo>?` — the question that
+    /// otherwise stops being asked once a developer has answered it. That is
+    /// why it is this flag rather than a second one: a developer who has
+    /// forgotten how to change repository reaches for the flag that changes
+    /// repository, and there is one of those.
+    #[arg(
+        long,
+        global = true,
+        value_name = "OWNER/REPO",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub repo: Option<String>,
 
     /// Check everything and report, changing nothing.
@@ -54,6 +67,26 @@ pub struct Cli {
     /// the way to tell a concurrency problem apart from a task's own.
     #[arg(long, global = true, value_name = "N", value_parser = at_least_one)]
     pub jobs: Option<usize>,
+}
+
+impl Cli {
+    /// The repository named on the command line, if one was.
+    ///
+    /// `--repo` on its own arrives as `Some("")` — clap's
+    /// `default_missing_value` — and an empty string names no repository. Every
+    /// site that used to read `cli.repo` reads this instead, so that the two
+    /// meanings of one flag are separated in one place rather than at four.
+    pub fn named_repo(&self) -> Option<&str> {
+        self.repo
+            .as_deref()
+            .filter(|named| !named.trim().is_empty())
+    }
+
+    /// Whether `--repo` was given with nothing after it: put the question, even
+    /// on a machine that answered "always" to it once.
+    pub fn asks_which_repo(&self) -> bool {
+        self.repo.is_some() && self.named_repo().is_none()
+    }
 }
 
 /// Rejects `--jobs 0`, which otherwise reads as "run nothing" and silently
@@ -585,6 +618,37 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(!cli.check);
         assert!(!cli.no_shell);
+    }
+
+    #[test]
+    fn a_named_repository_and_a_bare_flag_are_two_different_requests() {
+        let named = Cli::parse_from(["riabuild", "--repo", "payments"]);
+        assert_eq!(named.named_repo(), Some("payments"));
+        assert!(!named.asks_which_repo());
+
+        // `--repo` on its own: no repository named, and the question put back.
+        let asking = Cli::parse_from(["riabuild", "--repo"]);
+        assert_eq!(asking.named_repo(), None);
+        assert!(asking.asks_which_repo());
+
+        // Neither: the ordinary run, which honours a pin and asks otherwise.
+        let ordinary = Cli::parse_from(["riabuild"]);
+        assert_eq!(ordinary.named_repo(), None);
+        assert!(!ordinary.asks_which_repo());
+    }
+
+    #[test]
+    fn a_bare_repo_flag_does_not_swallow_the_flag_after_it() {
+        // The risk an optional value carries: `--repo --check` reading `--check`
+        // as the repository would silently provision nothing and report on it.
+        let cli = Cli::parse_from(["riabuild", "--repo", "--check"]);
+        assert!(cli.asks_which_repo());
+        assert!(cli.check);
+
+        let cli = Cli::parse_from(["riabuild", "--repo", "--no-shell", "status"]);
+        assert!(cli.asks_which_repo());
+        assert!(cli.no_shell);
+        assert!(matches!(cli.command, Some(Command::Status)));
     }
 
     #[test]

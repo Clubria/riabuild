@@ -224,6 +224,23 @@ is `Ctx::repo`, set by the picker or by `--repo`; a task that reaches for the or
 instead will clone one repository and provision another, on a machine where every test
 still passes because the two are the same value until somebody picks.
 
+**A pinned repository is undone by GitHub and by nothing else.** `Always use <repo>?` after
+the picker writes `UserConfig::always_repo`, and a run that finds one draws no box and asks
+nothing — which is the feature, and also why the one thing that clears it on its own has to
+be narrow. `repo::list::access` asks `gh api repos/<slug>` and **only a 404 unpins**;
+`Access::Unknown` covers an expired token, a 403 from an org that just turned SAML on, a
+500, and a machine whose first run has not installed `gh` yet, and every one of those leaves
+the pin exactly where it was. The asymmetry is the point: guessing wrong towards "still
+yours" costs one run that fails at the clone in GitHub's own words, and guessing wrong
+towards "gone" silently moves a developer off the repository they are in the middle of. An
+unattended run skips the check entirely — it exists to decide whether to *ask*.
+
+`--repo` carries both halves of that: with a value it names a repository and **replaces** a
+pin (never creates one), and bare — `num_args(0..=1)`, arriving as `Some("")` — it is a
+request to be asked, which is the only way back to the box. Read it through
+`Cli::named_repo()` and `Cli::asks_which_repo()` rather than matching on `cli.repo`, or the
+empty half reads as "already answered" and the question is never put.
+
 **A remote run asks both of its questions on the laptop, before the first `ssh`.** Which
 server, then which repository, back to back — and the answer travels to the server as
 `--repo`, which is the flag that already existed for naming one and which the server's own
@@ -245,6 +262,24 @@ move a server onto whatever the laptop was doing. Design:
 Where the checkout *goes* is still asked on the server, by the server, and that is correct
 rather than an omission: `project::choose_dir` is a question about a filesystem this laptop
 cannot see.
+
+**A sentence somebody else typed goes through `riabuild_ui::one_line` before it reaches a
+terminal.** riabuild prints two of those now — a repository's description, which GitHub
+serves and any member of the org can set, and a shared server's, which a lead types into
+the dashboard — and a terminal is not a text box: `\x1b[2J` clears the screen, `\x1b[1;1H`
+moves the cursor, and `\r` rewrites the line just printed, so a description carrying one of
+those does not appear in a box, it *edits* the box. A newline does the same thing more
+quietly, because a box's alignment is computed over rows and one value spanning two of them
+shifts every row under it. `one_line` keeps the printable text, drops the control and
+zero-width characters, collapses whitespace and cuts to the column it was given.
+
+It runs at the **boundary**, not at the point of printing: `repo::list::parse` for GitHub's
+answer and `api::remotes::usable` for riabuild-web's, so what riabuild holds is what
+riabuild would print and there is one place to be right. Note the difference from the
+address beside it in `usable`: an address that would be read as an `ssh` option is
+**refused**, because riabuild must not connect there, and a description is **defused**,
+because it cannot be wrong in that way and a server that vanished from the picker over the
+prose beside it is the support ticket `Fetched::refused` exists to prevent.
 
 **Every prompt has a default.** `Ui::ask` returns `None` when there is no terminal — in
 CI, over a pipe, under `cargo test` — so a question is how riabuild offers a choice, never
@@ -706,7 +741,7 @@ crates form a straight line, each depending only on those above it:
 | `theme` | the Clubria palette, by role, and the depth ladder under it — expressed in ratatui's `Color`/`Style`/`Modifier`, so the printed line and the drawn frame share one palette | `ratatui-core` |
 | `version` | riabuild's own `VERSION`, and version parsing and comparison | — |
 | `fetch` | `download` (where bytes come from, and whether they match a published digest), `archive` (unpacking what download fetched, and `staging` for landing a tree atomically), `tools` (the gh, infisical, ngrok and Grok Build releases riabuild owns) | ui |
-| `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner | theme, version |
+| `ui` | output, prompts, and the `Failure` every error becomes; `art` is the riabuild mark and the banner; `foreign` is the boundary text riabuild did not write crosses on its way to a terminal | theme, version |
 | `runner` | `CommandRunner` — all subprocesses. `subdue` is the line filter a subdued child's output goes through; `pty` is the terminal it gets instead of riabuild's own | theme |
 | `paths` | path resolution (trait), `config` (`~/.riabuild` and state), `filelock` (the lock both are read and written under) | ui |
 | `keychain` | secret storage: the trait, the two platform CLIs, the file store for machines with no keyring, and `keyring_answers` — whether a Secret Service actually replies | paths, runner, ui |

@@ -265,3 +265,82 @@ describe("what the audit log records", () => {
     expect(await lead.query(api.sharedServers.list, {})).toEqual([]);
   });
 });
+
+describe("what a server is for", () => {
+  test("a lead's description comes back with the server", async () => {
+    const t = setup();
+    const lead = await asRole(t, "lead");
+
+    await lead.mutation(api.sharedServers.add, {
+      ...GPU,
+      description: "The 4×A100 box. Ask before starting a long training run.",
+    });
+
+    const [stored] = await lead.query(api.sharedServers.list, {});
+    expect(stored.description).toBe(
+      "The 4×A100 box. Ask before starting a long training run.",
+    );
+  });
+
+  test("a server saved without one has no description rather than a made-up one", async () => {
+    // Every row that existed before this field, and every save from a
+    // dashboard build older than it.
+    const t = setup();
+    const lead = await asRole(t, "lead");
+
+    await lead.mutation(api.sharedServers.add, GPU);
+
+    const [stored] = await lead.query(api.sharedServers.list, {});
+    expect(stored.description).toBe("");
+  });
+
+  test("a description pasted out of a document is collapsed, not refused", async () => {
+    const t = setup();
+    const lead = await asRole(t, "lead");
+
+    await lead.mutation(api.sharedServers.add, {
+      ...GPU,
+      description: "  staging.\nDo not run\tmigrations here.  ",
+    });
+
+    const [stored] = await lead.query(api.sharedServers.list, {});
+    expect(stored.description).toBe("staging. Do not run migrations here.");
+  });
+
+  test("a paragraph is refused rather than silently cut", async () => {
+    // The CLI draws one line under the server's name and cuts the rest. A lead
+    // who typed three hundred characters should be told that.
+    const t = setup();
+    const lead = await asRole(t, "lead");
+
+    await expect(
+      lead.mutation(api.sharedServers.add, {
+        ...GPU,
+        description: "x".repeat(121),
+      }),
+    ).rejects.toThrow(/one line/i);
+  });
+
+  test("a description can be edited without moving the server", async () => {
+    const t = setup();
+    const lead = await asRole(t, "lead");
+    const id: Id<"sharedServers"> = await lead.mutation(api.sharedServers.add, {
+      ...GPU,
+      description: "the old one",
+    });
+
+    await lead.mutation(api.sharedServers.update, {
+      ...GPU,
+      id,
+      description: "staging, do not run migrations here",
+    });
+
+    const [stored] = await lead.query(api.sharedServers.list, {});
+    expect(stored).toMatchObject({
+      host: "gpu.internal",
+      port: 2222,
+      user: "ada",
+      description: "staging, do not run migrations here",
+    });
+  });
+});

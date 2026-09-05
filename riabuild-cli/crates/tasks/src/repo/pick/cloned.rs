@@ -60,6 +60,13 @@ pub async fn choose_cloned(ctx: &mut Ctx) -> Result<Option<Repo>> {
                 repo: repo.clone(),
                 pushed_at: 0,
                 cloned: true,
+                // This box is drawn from `config.json` alone — no listing, and
+                // so nothing that could describe a repository. `riabuild
+                // move-project` is a question about directories on this
+                // machine, and spending a GitHub round trip on prose for it
+                // would be the picker's cost paid by a command that does not
+                // need the answer.
+                description: String::new(),
             })
             .collect();
         ctx.ui.info("");

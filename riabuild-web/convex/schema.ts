@@ -225,6 +225,20 @@ export default defineSchema({
     host: v.string(),
     port: v.number(),
     user: v.string(),
+    /**
+     * What this server is for, in one line a lead types — "the 4×A100 box",
+     * "staging, do not run migrations here". Every developer reads it under the
+     * server's name in `riabuild remote`'s picker, which is the whole reason it
+     * exists: a list of hostnames is not a list a new developer can choose from.
+     *
+     * Optional, because every row that existed before this field has none and
+     * inventing one for them would put a lead's words in riabuild's mouth. It
+     * is also the first field on this table that is *prose*, so it is the first
+     * that reaches a terminal as something other than an address — the CLI puts
+     * it through `riabuild_ui::one_line` before printing, and that is where the
+     * rule lives rather than here.
+     */
+    description: v.optional(v.string()),
     createdBy: v.id("members"),
     createdAt: v.number(),
     updatedAt: v.number(),

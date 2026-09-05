@@ -129,6 +129,7 @@ pub fn reconcile(ui: &Ui, store: &mut Store, servers: &[SharedServer]) -> Vec<Re
                 repo: String::new(),
                 session_id: String::new(),
                 shared_id: server.id.clone(),
+                description: server.description.clone(),
                 fresh: true,
             });
             continue;
@@ -150,6 +151,10 @@ pub fn reconcile(ui: &Ui, store: &mut Store, servers: &[SharedServer]) -> Vec<Re
         record.host = server.host.clone();
         record.port = server.port;
         record.user = server.user.clone();
+        // Taken from this run's fetch like the address beside it, including
+        // when a lead has cleared it: what is on disk is a memory of what
+        // riabuild-web last said, never an answer of this laptop's own.
+        record.description = server.description.clone();
         record.hash = hash;
         record.fresh = true;
     }
@@ -227,6 +232,7 @@ mod tests {
             host: host.into(),
             port: 22,
             user: "ada".into(),
+            description: String::new(),
         }
     }
 
@@ -286,6 +292,43 @@ mod tests {
         assert_eq!(record.home, "/home/ada");
         assert_eq!(record.last_used_at, 1_000);
         assert_eq!(record.origin(), Origin::Shared);
+    }
+
+    #[test]
+    fn a_description_comes_from_this_runs_fetch_and_only_from_it() {
+        // Like the address beside it: what is on disk is a memory of what
+        // riabuild-web last said, so a lead's edit lands on the next run and a
+        // lead clearing one clears it here too.
+        let mut store = saved_shared("k1", "gpu", "gpu.internal");
+        let described = SharedServer {
+            description: "the 4×A100 box".into(),
+            ..server("k1", "gpu", "gpu.internal")
+        };
+
+        reconcile(&ui(), &mut store, &[described]);
+        assert_eq!(store.remotes[0].description, "the 4×A100 box");
+
+        reconcile(&ui(), &mut store, &[server("k1", "gpu", "gpu.internal")]);
+        assert_eq!(
+            store.remotes[0].description, "",
+            "a description a lead removed must not live on in remotes.json"
+        );
+    }
+
+    #[test]
+    fn a_server_this_laptop_has_never_seen_arrives_with_its_description() {
+        let mut store = Store::default();
+        let described = SharedServer {
+            description: "staging, do not run migrations here".into(),
+            ..server("k1", "gpu", "gpu.internal")
+        };
+
+        reconcile(&ui(), &mut store, &[described]);
+
+        assert_eq!(
+            store.remotes[0].description,
+            "staging, do not run migrations here"
+        );
     }
 
     #[test]

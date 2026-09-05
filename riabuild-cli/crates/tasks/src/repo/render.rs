@@ -9,10 +9,16 @@ use riabuild_theme::{Role, Theme};
 
 /// How many repositories the box draws.
 ///
-/// Ten is what a developer can read at a prompt without scrolling their first
-/// screen of a run. The rest are not hidden — the line under the box says how
-/// many there are and that a name can be typed — and the ordering puts the ones
-/// this machine actually works with above the cut.
+/// Ten. The rest are not hidden — the line under the box says how many there
+/// are and that a name can be typed — and the ordering puts the ones this
+/// machine actually works with above the cut.
+///
+/// It stayed at ten when rows grew a description line under them, which can
+/// make the box twice as tall as it was. That is the cheaper of the two costs:
+/// a developer who has to scroll one screen has still been shown every
+/// repository they work with, where a box cut to five has quietly stopped
+/// naming one of them. The rows are also only *as* tall as GitHub made them —
+/// a repository that describes itself as nothing takes one line, as before.
 pub const SHOWN: usize = 10;
 
 /// One row of the box.
@@ -28,6 +34,11 @@ pub struct Row {
     /// The org default, which is what Enter means on a machine that has never
     /// chosen.
     pub default: bool,
+    /// What the repository says it is, in GitHub's own words, already put
+    /// through `riabuild_ui::one_line` by `list::parse`. Empty for a repository
+    /// that has no description, and for every row that came from this machine's
+    /// own list of checkouts rather than from the listing.
+    pub description: String,
 }
 
 /// `heading` rather than the org name, because the same box answers two
@@ -46,6 +57,11 @@ pub fn repos_box(heading: &str, rows: &[Row], hidden: usize, now: u64, theme: Th
     let name_width = width(rows.iter().map(|row| row.repo.name().to_string()));
     let number_width = rows.len().to_string().chars().count();
 
+    // Where a name starts, and so where its description starts under it: two
+    // spaces, the number, two more. Computed from the same widths the row
+    // above it is built from, so the two cannot drift apart.
+    let indent = " ".repeat(2 + number_width + 2);
+
     for (index, row) in rows.iter().enumerate() {
         let notes = notes(row, now);
         lines.push(format!(
@@ -54,6 +70,17 @@ pub fn repos_box(heading: &str, rows: &[Row], hidden: usize, now: u64, theme: Th
             row.repo.name(),
             theme.paint(Role::Muted, &notes),
         ));
+        // A repository that describes itself gets a second line for it, under
+        // its own name and dimmed. One that does not gets no line at all,
+        // rather than a blank one holding a space for a sentence nobody wrote:
+        // the same rule the `pushed` note follows, where inventing a value for
+        // a column riabuild does not know is a lie in a box.
+        if !row.description.is_empty() {
+            lines.push(format!(
+                "{indent}{}",
+                theme.paint(Role::Muted, &row.description)
+            ));
+        }
     }
 
     if hidden > 0 {
@@ -118,6 +145,7 @@ fn width(values: impl Iterator<Item = String>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use riabuild_theme::Depth;
 
     const NOW: u64 = 1_755_000_000;
     const HOUR: u64 = 3_600;
@@ -128,6 +156,14 @@ mod tests {
             pushed_at,
             cloned,
             default,
+            description: String::new(),
+        }
+    }
+
+    fn described(name: &str, description: &str) -> Row {
+        Row {
+            description: description.to_string(),
+            ..row(name, false, false, NOW)
         }
     }
 
@@ -148,6 +184,66 @@ mod tests {
         assert!(drawn.contains("pushed 2d ago"), "{drawn}");
         // Nothing was left out, so nothing claims anything was.
         assert!(!drawn.contains("more"), "{drawn}");
+    }
+
+    #[test]
+    fn a_repository_gets_a_second_line_for_what_it_says_it_is() {
+        let rows = [
+            described("ai-builders-hub", "Where every builder starts"),
+            described("payments", "Billing and payment flows"),
+        ];
+        let drawn = repos_box("Clubria repositories", &rows, 0, NOW, Theme::plain());
+
+        // Under its own name rather than beside it: the notes column is
+        // already there, and a sentence in it would push every row's width
+        // around whatever the longest description happened to be.
+        assert!(
+            drawn.contains(
+                "\n  1  ai-builders-hub   pushed just now\n     Where every builder starts\n"
+            ),
+            "{drawn}"
+        );
+        assert!(
+            drawn.contains("\n     Billing and payment flows"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_repository_that_describes_itself_as_nothing_takes_one_line() {
+        // A blank line holding space for a sentence nobody wrote is the same
+        // mistake as inventing an age for a row GitHub never mentioned.
+        let drawn = repos_box(
+            "Clubria repositories",
+            &[
+                row("payments", false, false, NOW),
+                described("hub", "The hub"),
+            ],
+            0,
+            NOW,
+            Theme::plain(),
+        );
+        assert!(
+            drawn.contains("1  payments   pushed just now\n  2  hub"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_description_is_dimmed_rather_than_printed_as_ordinary_text() {
+        let rows = [described("payments", "Billing and payment flows")];
+        let drawn = repos_box(
+            "Clubria repositories",
+            &rows,
+            0,
+            NOW,
+            Theme::with_depth(Depth::TrueColor),
+        );
+        let line = drawn
+            .lines()
+            .find(|line| line.contains("Billing"))
+            .expect("the description line");
+        assert!(line.contains('\x1b'), "{line:?}");
     }
 
     #[test]
