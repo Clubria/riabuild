@@ -332,16 +332,27 @@ check_contains "the status line names which account the window is" \
         "$RIA_HOME/claude-statusline" 2>&1)" \
   "claude-1"
 
-# The render above spooled a usage sample, which is the whole of collection being
-# automatic: no account was marked and nothing was turned on. What only this can
-# say is that the path riabuild derives from `CLAUDE_CONFIG_DIR` is the one
-# `Paths` really uses; the sample's contents are unit-tested.
+# Collection is automatic: no account was marked and nothing was turned on, so a
+# render that names a session spools a sample. What only this can say is that the
+# path riabuild derives from `CLAUDE_CONFIG_DIR` is the one `Paths` really uses;
+# a sample's contents are unit-tested.
 #
+# The payload names a session, unlike every render above it, and that is the
+# point rather than a detail. A sample that cannot say which session it measured
+# is not a measurement, so `{}` correctly spools nothing — an assertion built on
+# one of those renders is asserting a bug rather than the feature, which is
+# exactly how this one first failed.
+check_contains "a render naming a session still draws the marker" \
+  "$(cd "$PROJECT_DIR" && printf '{"session_id":"e2e-session"}' \
+      | CLAUDE_CONFIG_DIR="$RIA_HOME/claude/$CLAUDE_ACCOUNT" \
+        "$RIA_HOME/claude-statusline" 2>&1)" \
+  "(riabuild"
+
 # The *directory*, not the spool file. That render also started a flush — the
 # marker is absent on a fresh machine, so one is due — and a flush that reaches
 # this deployment removes the spool it just sent. Asserting the file would be
 # asserting that the dashboard was unreachable.
-check "the render spooled a usage sample" test -d "$RIA_HOME/usage"
+check "and spooled a usage sample nobody switched on" test -d "$RIA_HOME/usage"
 
 # The whole reason riabuild exists: a developer ends up with working secrets.
 ENV_DEV="$PROJECT_DIR/.env.dev"
