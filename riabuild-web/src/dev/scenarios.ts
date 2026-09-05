@@ -520,6 +520,7 @@ const REPO_SECRET_PATHS: RepoSecretPath[] = [
 function base(viewer: Member | null): Data {
   return {
     auth: viewer === null ? "signed-out" : "signed-in",
+    signInFailed: false,
     viewer: { state: "ready", value: viewer },
     membership: {
       org: "Clubria",
@@ -582,6 +583,20 @@ export const SCENARIOS: Record<string, () => Data> = {
   }),
 
   "signed-out": () => base(null),
+
+  /**
+   * Back from GitHub, still signed out.
+   *
+   * The screen this scenario exists for is the one nobody could see: for most of
+   * this project's life a failed OAuth round trip rendered the plain sign-in
+   * page above, identical in every pixel to a first visit, and three separate
+   * debugging sessions started from that blank. This is what the same failure
+   * looks like now that `functions/_proxy.ts` marks it.
+   */
+  "signin-round-trip-failed": () => ({
+    ...base(null),
+    signInFailed: true,
+  }),
 
   candidate: () => base(CANDIDATE),
   developer: () => base(DEVELOPER),

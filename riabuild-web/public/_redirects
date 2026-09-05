@@ -1,3 +1,9 @@
 # SPA fallback. The CLI opens /cli/authorize directly, and the dashboard routes
 # on window.location.pathname — without this that URL 404s on a cold load.
+#
+# It must not swallow /api/auth/*, which `functions/api/auth/[[path]].ts` serves.
+# `_routes.json` is what guarantees it does not: Pages invokes a Function only
+# for the paths listed there, and everything else reaches the static handler —
+# and this rule — untouched. Widening `_routes.json` and widening this rule are
+# the same mistake seen from two directions.
 /*    /index.html   200

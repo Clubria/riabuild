@@ -272,3 +272,32 @@ is permanently inert.
 package as beta and points new projects at third-party providers; if its instability
 starts costing time, `@convex-dev/better-auth` is the migration target. Requires the
 `read:org` scope so membership checks work.
+
+**Sign-in is served from this origin, and that is load-bearing rather than tidy.**
+`functions/api/auth/[[path]].ts` is a Cloudflare Pages Function proxying `/api/auth/*` to
+the Convex deployment, and `CUSTOM_AUTH_SITE_URL` is what makes the library name
+`riabuild.clubria.com` in both legs of the round trip. The reason is in
+`functions/_proxy.ts` and the runbook is in `../docs/deploying.md` §2; the short version is
+that the OAuth `state` and PKCE cookies used to belong to `convex.site`, a third-party
+domain nobody renders, which is what browser tracking prevention is built to strip — and
+Safari's decision to strip it lives per browser profile, outside cookies and outside local
+storage, so it cannot be cleared and a second profile disagrees forever.
+
+Three things here are one mistake seen from different sides, and each looks harmless:
+
+- **Widening `public/_routes.json`** past `/api/auth/*`, or widening the `_redirects`
+  catch-all. They partition the same space: Pages invokes a Function only for the paths
+  `_routes.json` lists, and the SPA fallback gets the rest.
+- **Proxying `/api/v1` too.** The CLI calls it directly, holds no cookies and is not a
+  browser. None of this applies to it, and a second hop under every provisioning run buys
+  nothing.
+- **Unsetting `CUSTOM_AUTH_SITE_URL`** — which reintroduces the original bug exactly.
+  The proxy refuses that with a 500 naming the variable rather than letting it bounce
+  developers silently, and `functions/_proxy.test.ts` is what keeps the refusal working.
+
+**This whole area fails silently by default, which is why it has been diagnosed from
+scratch three times.** A failed OAuth callback answers a bare redirect to `SITE_URL` with
+no `code` — byte-identical to somebody typing the address in. `functions/_proxy.ts` marks
+that redirect, `src/lib/authFailure.ts` reads the mark, and `SignIn` renders it; the
+`signin-round-trip-failed` scenario is what it looks like. If you find yourself changing
+any of those, keep the property rather than the code: a sign-in that fails must say so.

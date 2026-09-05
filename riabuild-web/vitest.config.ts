@@ -12,8 +12,16 @@ export default defineConfig({
     // its copied/idle announcement, for instance. The Playwright suite still
     // owns everything a screenshot *can* show; these are the exceptions, not a
     // second rendering strategy.
+    // `functions/` is the fourth set: the Cloudflare Pages Function that serves
+    // `/api/auth/*` from the dashboard's own origin. It runs in no browser and
+    // renders nothing, so a screenshot can say nothing about it, and the parts
+    // that break — folded `Set-Cookie` values, a relayed `content-encoding`, a
+    // callback bounced with no `code` — are all header handling. `edge-runtime`
+    // is the environment that has the same `Request`/`Response`/`Headers` it
+    // will meet in production.
     include: [
       "convex/**/*.test.ts",
+      "functions/**/*.test.ts",
       "src/**/*.test.ts",
       "src/**/*.test.tsx",
     ],

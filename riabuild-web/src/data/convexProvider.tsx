@@ -10,6 +10,7 @@ import type { FunctionReference, FunctionReturnType } from "convex/server";
 import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { readError } from "../lib/errors";
+import { signInRoundTripFailed } from "../lib/authFailure";
 import { useNow } from "../lib/time";
 import { DataContext } from "./context";
 import { Data, Loadable, Membership, OrgUpdate } from "./types";
@@ -224,6 +225,11 @@ export function ConvexDataProvider({ children }: { children: ReactNode }) {
         : isAuthenticated
           ? "signed-in"
           : "signed-out",
+      // Not state that moves: a snapshot of the URL this page was opened with,
+      // taken before React mounted. It is in `data` rather than read where it is
+      // rendered so the failure has a scenario, which is the only way anybody
+      // ever looks at it.
+      signInFailed: signInRoundTripFailed(),
       viewer,
       membership,
       sessions,

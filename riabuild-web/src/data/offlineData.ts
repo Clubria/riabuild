@@ -17,6 +17,8 @@ export function offlineData(message: string): Data {
 
   return {
     auth: "signed-out",
+    // No backend was reached, so no round trip was attempted.
+    signInFailed: false,
     viewer: failed,
     membership: { org: "Clubria", status: "unavailable", detail: message },
     sessions: failed,

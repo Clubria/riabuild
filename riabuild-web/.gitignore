@@ -25,3 +25,7 @@ dist-ssr
 
 e2e/__screens__/
 e2e/__results__/
+
+# Wrangler's local state — build output and the miniflare cache it writes when
+# `wrangler pages dev` or `pages functions build` runs against `functions/`.
+.wrangler/
