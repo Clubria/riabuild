@@ -1,10 +1,12 @@
 import GitHub from "@auth/core/providers/github";
+import { customFetch } from "@auth/core";
 import { convexAuth } from "@convex-dev/auth/server";
 import { Anonymous } from "@convex-dev/auth/providers/Anonymous";
 import { MutationCtx } from "./_generated/server";
 import { Id } from "./_generated/dataModel";
 import { claimOrCreateMember } from "./members";
 import { fetchUpstream } from "./lib/http";
+import { loggingOAuthFetch } from "./lib/oauthDiagnostics";
 
 /**
  * The issuer identifier GitHub puts in the `iss` authorization-response
@@ -51,6 +53,11 @@ export const GitHubProvider = GitHub({
   authorization: {
     params: { scope: "read:user user:email read:org" },
   },
+  // Say what GitHub answered when the token exchange fails, instead of letting
+  // `oauth4webapi` reword every cause into the same sentence. See
+  // `lib/oauthDiagnostics.ts` for what is and is not written down — a
+  // successful exchange, the one that carries a token, is not logged at all.
+  [customFetch]: loggingOAuthFetch(),
   async profile(githubProfile, tokens) {
     const login = String(githubProfile.login);
     const email = await resolveEmail(githubProfile.email, tokens.access_token);

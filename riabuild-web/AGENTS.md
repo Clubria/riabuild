@@ -304,3 +304,17 @@ no `code` — byte-identical to somebody typing the address in. `functions/_prox
 that redirect, `src/lib/authFailure.ts` reads the mark, and `SignIn` renders it; the
 `signin-round-trip-failed` scenario is what it looks like. If you find yourself changing
 any of those, keep the property rather than the code: a sign-in that fails must say so.
+
+**The browser learning that it failed is only half of it — the server has to say *why*.**
+`oauth4webapi` rewords every token-exchange failure into one of two sentences, neither of
+which carries the `error` GitHub actually sent, so a stale authorization code, a rejected
+client secret and a mismatched redirect URI are indistinguishable in the deployment log
+and each is a different repair. `convex/lib/oauthDiagnostics.ts` is a `customFetch` on the
+GitHub provider that logs the real one.
+
+It exists because the alternative was proved not to work. GitHub answers **HTTP 200** for
+every token-endpoint error reachable without a real authorization code — a wrong secret, a
+missing one, an unregistered redirect URI, a bogus code — so the failures that matter
+cannot be provoked from outside at all, only watched in flight. Do not replace this with a
+reproduction script; there is nothing to reproduce against. What it must never start doing
+is logging the successful exchange, which is the one that carries an access token.
