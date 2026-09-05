@@ -141,6 +141,15 @@ pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
     )
     .await;
 
+    // `confirm`, so **Enter is yes**, and that is worth defending against the
+    // line at the top of this file: a developer who presses Enter has still
+    // decided nothing. It still holds. Enter through both questions takes the
+    // repository riabuild would have chosen alone, and all this second one adds
+    // is that riabuild stops asking about a choice whose answer was already
+    // "whatever you were going to do" — which is the product, not an exception
+    // to it. What it must never become is a question that is *hard* to answer
+    // the other way, which is why `n` is one key, the pin is named on every run
+    // afterwards, and the flag that undoes it is printed beside it.
     if let Some(answer) = ctx.ui.confirm(&format!("Always use {chosen}?")) {
         pin = match answer {
             true => Pin::Set,
