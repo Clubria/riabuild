@@ -100,15 +100,25 @@ async fn write_image(dir: &Path, extension: &str, bytes: &[u8]) -> Result<PathBu
     Ok(path)
 }
 
-/// Clipboard text as one line.
+/// Clipboard text, with its lines intact.
 ///
-/// The box is a single-line editor, so a newline has no spelling in it — and
-/// the alternative to collapsing them is a `String` holding characters the
-/// caret arithmetic in `compose` cannot land on. Runs of whitespace collapse
-/// with them, because a pasted stack trace is mostly indentation and a line of
-/// it padded out to the terminal's width is unreadable.
+/// It used to be collapsed to one line, because the box was a single-line editor
+/// and a newline had no spelling in it. The box wraps now, so the collapse would
+/// be destroying the one thing the commonest paste into this window depends on:
+/// a stack trace, a diff or a block of logs is *made of* its line breaks, and an
+/// agent reads a flattened one considerably worse than a person does.
+///
+/// Two normalisations survive, and neither loses anything. `\r\n` becomes `\n`,
+/// because a carriage return is not a character the caret can land on and a
+/// clipboard filled from a Windows tool or a `curl` of a web page carries them.
+/// And the whole is trimmed, because a paste that ends in the newline the
+/// developer selected past the end of the last line would otherwise put the
+/// caret on a blank row under their own text.
 fn flatten(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -266,8 +276,13 @@ mod tests {
     /// — Ctrl-Shift-V and Cmd-V are the terminal's own bindings — so text has
     /// to be handled here or the key does nothing on the commonest clipboard
     /// there is.
+    ///
+    /// And it keeps its lines. A stack trace is the commonest thing anybody
+    /// pastes into this window and it is *made of* its line breaks; the box
+    /// wraps now, so collapsing them would be destroying the paste to fit an
+    /// editor that no longer needs it to.
     #[tokio::test]
-    async fn text_is_pasted_as_one_line() {
+    async fn text_is_pasted_with_its_lines_intact() {
         let dir = temp();
         let runner = arc(FakeRunner::new()
             .with(
@@ -285,7 +300,11 @@ mod tests {
         let clipboard = CliClipboard::x11(runner);
         assert_eq!(
             read(&clipboard, dir.path()).await.unwrap(),
-            Pasted::Text("thread 'main' panicked at src/lib.rs:12".into())
+            // The indent survives too: it is what tells a frame from a message.
+            // Only the trailing newline the developer selected past the end of
+            // the last line is taken, which would otherwise leave the caret on a
+            // blank row under their own text.
+            Pasted::Text("thread 'main' panicked at\n    src/lib.rs:12".into())
         );
         // and nothing was written: text is not an attachment
         let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
@@ -368,8 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn flattening_collapses_every_run_of_whitespace() {
-        assert_eq!(flatten("  a\n\n\tb  c "), "a b c");
+    fn only_the_carriage_returns_and_the_outer_whitespace_are_taken() {
+        // A clipboard filled from a Windows tool or a `curl` of a web page
+        // carries `\r\n`, and a carriage return is not a character the caret
+        // can land on.
+        assert_eq!(flatten("one\r\ntwo\rthree"), "one\ntwo\nthree");
+        // Everything a person would call the content survives — the blank line
+        // between two paragraphs, and the indent of a stack frame.
+        assert_eq!(flatten("  a\n\n\tb  c "), "a\n\n\tb  c");
         assert_eq!(flatten("\n\n"), "");
     }
 }

@@ -1492,6 +1492,39 @@ riabuild has not established. The emails live in a side table on `App` rather th
 `Account`, because an `Account` is compared by identity all over that crate and an email
 arriving late must not make the same sign-in unequal to itself.
 
+**Three states, and the third is what keeps the window usable.** `app::Signin` is `In` or
+`Out`, and *absent* is "nobody has answered yet" — `Identity::Unknown` is deliberately sent
+as no message at all. That distinction is load-bearing in both directions: a signed-out
+sign-in is said out loud on the rail, in the chooser and on the splash, and a prompt typed
+at one is **refused** rather than creating a directory and a turn that fails; but silence
+must never become either, or every account is accused of being logged out for the second
+the probes take to come back and the window refuses the prompt that would have said why.
+
+The refusal lives in the **keymap**, not in `drive::send`, and that placement is the whole
+of why it is not annoying: `Action::Send` is handed the text only after `Compose::take` has
+emptied the box, so refusing there would throw away the paragraph the developer had just
+typed. `App::blocked_offer` is asked before the take, the text stays, and pressing Enter
+again once they have signed in sends it. `drive::send` refuses too, for the one caller with
+no keymap in front of it — `riabuild agents "do the thing"`, which asks every offer at once.
+
+Only an **offer** is refused. A session that already exists has a conversation in it, and
+the harness's own answer to the next prompt is a better report than a guess made here.
+
+**A harness that says it is signed out is answered in riabuild's own words, under its
+own.** `Failed to authenticate: OAuth session expired and could not be refreshed` reaches a
+pane through `errors.log` as one more line of red text among however many the turn
+produced — indistinguishable from a compile error, which is how a developer loses an
+afternoon to it. `app::reads_as_signed_out` recognises the shape and pushes one more line
+naming the account and the command: ``claude-2 is not signed in — run `claude-2 auth
+login` ``. The vendor's sentence stays, because it is the evidence.
+
+Matched on **phrases** rather than whole sentences, because the sentences are vendors' and
+move without notice. `401` and `unauthorized` are deliberately not among them: an agent
+that ran a `curl` against a staging API prints both, and answering a tool result by telling
+the developer to sign in again is worse than saying nothing. It is said once however many
+times the harness repeats it, and cleared by the next prompt — signing in again is not
+something riabuild can watch happen, so asking for something is what re-tests it.
+
 **The window says which repository it is scoped to.** The scoping itself was never new —
 `Store::sessions` filters by the checkout a session records — but nothing said so, and a
 window that lists a subset without naming it looks like one that lists everything.
@@ -1507,6 +1540,41 @@ it leave for the rail (`compose.at_start()` is what that branches on). Enter sen
 *stays*, since a conversation is a sequence of prompts. `PageUp`/`PageDown` still work and
 nothing depends on them — they are `Fn` and an arrow on every laptop keyboard in the room,
 which is why the plain arrows scroll.
+
+**And the box has the gestures every other text field has**, because a prompt is prose and
+nobody edits prose one character at a time: Ctrl-arrow jumps a word, Cmd-arrow goes to the
+end of the line, Ctrl-Backspace takes a word and Cmd-Backspace takes the line. `editing_key`
+is tried before the plain arms, because the same `KeyCode` means two things and the
+modifier is the whole of the difference.
+
+Each is accepted in **every spelling a terminal sends**, which is not a nicety — a terminal
+is not a text field and no two agree. Ctrl-arrow is xterm's `1;5D`; a Mac terminal with
+natural text editing on sends Option-arrow as an ESC-prefixed key that crossterm reports as
+`ALT`, and `ESC b` / `ESC f` when it is not sending an arrow at all; `SUPER` reaches a
+program only under the kitty keyboard protocol. Ctrl-Backspace is the worst of them: it has
+**no encoding of its own**, and terminals send `^H` for it — so the `Ctrl-h` arm is not a
+guess about what somebody meant by Ctrl-h, it is the only thing Ctrl-Backspace can arrive
+as. Every modified key that is not one of these inserts *nothing*: a modifier looked at for
+the arrows and dropped for the letters is a bare `b` in somebody's prompt every time they
+reach for Option-left.
+
+**The box is multi-line and wrapped**, which is what all of the above is for. It was one
+line that ran off the right edge of the pane and took the caret with it, so the half of a
+paragraph a developer had just written was somewhere they could not see. `Compose::wrap`
+decides where the breaks fall rather than the renderer, because the caret has to land on
+the same row its character does and only the editor knows both — and every row it emits is
+a **contiguous slice** of the text, breaking *after* the space rather than swallowing it,
+which is what makes the caret's row and column arithmetic instead of a search.
+
+Enter still sends, so a line break is Alt-Enter, Shift-Enter or Ctrl-J — three spellings
+again, and for the same reason: outside the kitty protocol a terminal cannot tell
+Shift-Enter from Enter. The box grows to `BOX_LINES` and the transcript gives up the rows;
+past that it scrolls from the bottom, because the caret is where the typing is happening.
+
+**Text pasted into it keeps its lines.** It used to be collapsed to one, and that was
+correct while the box was a single-line editor; it is destructive now. A stack trace, a
+diff or a block of logs is *made of* its line breaks. Only `\r\n` is normalised (a carriage
+return is not a character the caret can land on) and the outer whitespace trimmed.
 
 **Ctrl-V pastes, and a pasted image becomes a file whose path goes in the prompt.** An
 agent reads *files*; a clipboard holds bytes with no name; and a turn is a detached child
@@ -1530,8 +1598,7 @@ bytes to carry back from the laptop.
 **Text pastes too, deliberately.** Ctrl-V reaching this window at all means the terminal
 did not handle it — Cmd-V and Ctrl-Shift-V are the terminal's own bindings — so binding it
 to images alone would make the key dead for the commonest clipboard there is. It arrives
-flattened to one line, because `Compose` is a single-line editor with a character-indexed
-caret and a newline has no spelling in it.
+with its lines intact — see the box above, which is what changed to allow that.
 
 **And it works on a server because nothing in it knows it is on one.** `agents::paste`
 names no platform and no tool: it asks a `Clipboard` what it holds and reads one type.
@@ -1560,6 +1627,26 @@ spending `Black` or `White` on one would repaint the developer's window rather t
 pane of it — so `has_surfaces()` is false there and `frame.rs` puts a muted rule in the
 gutter instead. That is the one thing a widget may branch on rather than asking for a role.
 
+**Two columns separate the rail from the pane, and they are two constants rather than
+one.** `GUTTER` is a single column and `rail_lines` keeps one spare at the rail's own right
+edge; what a developer counts is the sum. Three read as a seam rather than a join, and
+taking the width off the *gutter* rather than off the rail's spare column is deliberate —
+the spare column is what stops a long title touching the raised background.
+
+**A session is two lines of the rail, always.** One line of a forty-column rail is eighteen
+characters of prompt, and the rail is the only place two conversations are told apart, so
+the title carries on underneath itself — aligned to the same column, broken at a word,
+ellipsised where it still does not fit. The second line is blank when the title is short,
+and that is what gives a list of sessions any air; a row whose height depended on its title
+would reflow the whole rail every time an agent was asked something new. `(subagent)` moved
+onto the second line with it, so the title gets the whole of the first either way.
+
+The cost is that ten sessions no longer fit where they used to, which is why the rail
+scrolls now. `draw::rail_cursor_line` is arithmetic over the shape `rail_lines` builds, and
+the two would drift apart in silence — a rail that scrolled to the wrong line looks like a
+cursor that vanished — so a test walks every cursor position and asserts the line it names
+is the row it is on.
+
 **A pane with no session behind it says what typing would start.** Centred in the middle of
 the pane: *create a **Claude** session* over *login: claude-1 · ada@clubria.com*, with only
 the vendor's name accented. "waiting for the first reply…" was said there before, over
@@ -1580,6 +1667,22 @@ stayed on screen and the next shell prompt printed on top of it. The clear costs
 where the switch works and is the whole of the fix where it does not.
 `restore_terminal_on_panic` chains onto the existing hook for the same reason, and chains
 rather than replaces so the backtrace is still printed.
+
+**Mouse capture is never enabled, and that is what makes the window's text selectable.** A
+program that captures the mouse receives the drag itself, and the terminal's own selection —
+with every copy-on-select and middle-click paste built on it — stops working. riabuild would
+then have to reimplement selection, badly, in a window whose whole content is text somebody
+wants to paste into a bug report. Nothing in this crate reads a mouse event, so capturing
+one bought exactly nothing and cost that. Do not add `EnableMouseCapture` back for a
+scroll-wheel binding without reading this paragraph first.
+
+**The window names itself and the repository on the terminal's title bar**, because a
+developer with four terminals open has four riabuilds in them and the tab strip is the only
+place that can tell them apart. It is pushed and popped with XTWINOPS (`22;2t` / `23;2t`)
+rather than simply set: there is no escape sequence that *asks* a terminal what its title
+is, so the only way to give one back is to have never taken it. Terminals that do not
+implement it ignore both. `release()` pops before leaving the alternate screen, and the
+panic hook pops too.
 
 **The harnesses are driven headless, not embedded.** Each runs in its own structured
 output mode and riabuild draws the result; nothing renders a vendor's own full-screen

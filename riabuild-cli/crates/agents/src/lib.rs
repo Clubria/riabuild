@@ -54,6 +54,7 @@
 // found and the reasoning is written out in full.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,11 +62,10 @@ use anyhow::{Context, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{event, execute};
 use riabuild_harness::Kind;
@@ -84,6 +84,7 @@ pub mod store;
 pub mod turn;
 
 pub use account::{Account, Accounts};
+pub use app::Signin;
 use app::{App, Focus};
 use store::Store;
 
@@ -136,17 +137,22 @@ pub struct Request {
     pub unicode: bool,
 }
 
-/// Who a sign-in belongs to, as riabuild finds out.
+/// What riabuild found out about a sign-in.
 ///
 /// Streamed rather than resolved before the window opens: asking a harness who
 /// is signed in is a subprocess per account, and twenty-seven of them is a
 /// second and a half of a blank terminal before the first frame. An answer that
 /// has not arrived is rendered as nothing, never as "signed out".
+///
+/// Which is why an account that is *actually* signed out has to be sent as a
+/// message rather than left as silence — the two used to be the same thing here,
+/// so a developer whose OAuth session had expired found out by watching a turn
+/// fail rather than by looking at the rail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Login {
     pub kind: Kind,
     pub number: usize,
-    pub email: String,
+    pub signin: Signin,
 }
 
 /// What a keypress asks for.
@@ -241,6 +247,9 @@ fn list_key(app: &mut App, code: KeyCode) -> Action {
 /// changes nothing, and here dropping it is the difference between Ctrl-V and
 /// a literal `v` typed into the developer's prompt.
 fn session_key(app: &mut App, event: KeyEvent) -> Action {
+    if let Some(action) = editing_key(app, event) {
+        return action;
+    }
     if event.modifiers.contains(KeyModifiers::CONTROL) {
         return match event.code {
             KeyCode::Char('v') => Action::Paste,
@@ -316,6 +325,22 @@ fn session_key(app: &mut App, event: KeyEvent) -> Action {
         // Sending does not leave. A conversation is a sequence of prompts, and
         // being put back in a list after each one is a keypress per turn.
         KeyCode::Enter => {
+            // Shift-Enter is a line break, where the terminal can tell riabuild
+            // that Shift was held — which is the kitty keyboard protocol and
+            // nowhere else. Alt-Enter and Ctrl-J are the spellings that work
+            // everywhere; see `editing_key`.
+            if event.modifiers.contains(KeyModifiers::SHIFT) {
+                app.compose.insert('\n');
+                return Action::Nothing;
+            }
+            // Refused *before* the box is emptied, which is the whole reason
+            // this is asked here rather than in `drive::send`: a developer who
+            // has just typed a paragraph at a signed-out account keeps it, and
+            // gets it sent by pressing Enter again once they have signed in.
+            if let Some(hint) = app.blocked_offer() {
+                app.notice = Some(hint);
+                return Action::Nothing;
+            }
             let text = app.compose.take().trim().to_string();
             if text.is_empty() {
                 Action::Nothing
@@ -329,6 +354,69 @@ fn session_key(app: &mut App, event: KeyEvent) -> Action {
         }
         _ => Action::Nothing,
     }
+}
+
+/// The editing gestures every other text field a developer uses already has:
+/// jump a word, jump a line, and delete by either.
+///
+/// `Some` where the key was one of them, so [`session_key`] can go on treating
+/// everything else exactly as it did. Tried **before** the plain arms rather
+/// than inside them, because the same [`KeyCode`] means two things depending on
+/// what is held down and the modifier is the whole of the difference: `←` moves
+/// one character, Ctrl-`←` moves one word, Cmd-`←` goes to the start of the line.
+///
+/// # Three modifiers, because three of them arrive
+///
+/// A terminal is not a text field and does not agree with another terminal about
+/// how to spell these. Ctrl-arrow arrives as `CONTROL` with the arrow under
+/// xterm's `1;5D` encoding; macOS terminals with "natural text editing" turned
+/// on send Option-arrow as an `ESC`-prefixed key, which crossterm reports as
+/// `ALT`; and Cmd-arrow reaches a program at all only where the terminal has
+/// been told to send something for it, which is usually `SUPER` under the kitty
+/// keyboard protocol. So all three are accepted for what they are, and a word
+/// jump is spelled every way a keyboard in this office spells it.
+///
+/// The same is true of backspace, in a worse way: Ctrl-Backspace has no encoding
+/// of its own in the original terminal protocol, and terminals send `^H` for it —
+/// which is `Ctrl-h`. That arm is not a guess about what a developer meant by
+/// Ctrl-h; it is the only thing Ctrl-Backspace can arrive as outside kitty.
+fn editing_key(app: &mut App, event: KeyEvent) -> Option<Action> {
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = event.modifiers.contains(KeyModifiers::ALT);
+    // `SUPER` is Cmd on a Mac and the Windows key elsewhere. Both mean "the
+    // whole line" in every text field on those platforms.
+    let cmd = event.modifiers.contains(KeyModifiers::SUPER);
+    if !(ctrl || alt || cmd) {
+        return None;
+    }
+    match event.code {
+        KeyCode::Left if cmd => app.compose.line_start(),
+        KeyCode::Right if cmd => app.compose.line_end(),
+        KeyCode::Left => app.compose.word_left(),
+        KeyCode::Right => app.compose.word_right(),
+        // The readline spelling, which is what a macOS terminal sends for
+        // Option-arrow when it is not sending an arrow at all.
+        KeyCode::Char('b') if alt => app.compose.word_left(),
+        KeyCode::Char('f') if alt => app.compose.word_right(),
+        KeyCode::Backspace if cmd => app.compose.delete_to_line_start(),
+        KeyCode::Backspace => app.compose.delete_word_left(),
+        // `^H`, which is what a terminal sends for Ctrl-Backspace.
+        KeyCode::Char('h') if ctrl => app.compose.delete_word_left(),
+        // A line break rather than a send. Enter is the send, so this is the
+        // only way to put two paragraphs in one prompt — and it is why the
+        // box wraps at all.
+        KeyCode::Enter if alt || cmd => app.compose.insert('\n'),
+        // `^J`, the other spelling of the same gesture: a terminal with no
+        // kitty protocol cannot distinguish Alt-Enter from Enter, and this is
+        // what its users reach for instead.
+        KeyCode::Char('j') if ctrl => app.compose.insert('\n'),
+        _ => return None,
+    }
+    // Every gesture above moves or edits the box, so the transcript goes back to
+    // following the newest output — a developer who is typing has stopped
+    // reading history.
+    app.scrollback = 0;
+    Some(Action::Nothing)
 }
 
 /// Choosing which sign-in to put on the rail.
@@ -418,7 +506,8 @@ pub async fn run(
     }
 
     restore_terminal_on_panic();
-    let mut terminal = claim().context("could not take the terminal")?;
+    let mut terminal = claim(&title_for(request.repo.as_deref(), request.unicode))
+        .context("could not take the terminal")?;
     // Whatever happens below, the terminal is handed back. A provisioner that
     // left a developer in raw mode on the alternate screen would be worse than
     // one that simply failed.
@@ -441,10 +530,45 @@ pub async fn run(
 
 type Screen = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-fn claim() -> Result<Screen> {
+/// What the terminal is asked to call itself while this window is open.
+///
+/// The repository, because a developer with four terminals open has four
+/// riabuilds in them and the tab strip is the only place that can tell them
+/// apart. `None` is a checkout with no GitHub remote, which is left unnamed
+/// rather than guessed at.
+fn title_for(repo: Option<&str>, unicode: bool) -> String {
+    let dash = if unicode { "—" } else { "-" };
+    match repo {
+        Some(repo) => format!("riabuild agents {dash} {repo}"),
+        None => "riabuild agents".to_string(),
+    }
+}
+
+/// Saves the terminal's current title, and restores it.
+///
+/// XTWINOPS, which every terminal riabuild is used in understands and every
+/// terminal that does not ignores: `22;2t` pushes the window title onto the
+/// terminal's own stack, `23;2t` pops it. Without the pair, a window that named
+/// itself would leave that name on the developer's tab for the rest of the
+/// shell's life — there is no escape sequence that *asks* a terminal what its
+/// title is, so the only way to give one back is to have never taken it.
+const PUSH_TITLE: &str = "\x1b[22;2t";
+const POP_TITLE: &str = "\x1b[23;2t";
+
+fn claim(title: &str) -> Result<Screen> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(out, EnterAlternateScreen)?;
+    // Mouse capture is deliberately **not** enabled, and that is the whole of
+    // why a developer can select text in this window and their terminal copies
+    // it. A program that captures the mouse receives the drag itself, and the
+    // terminal's own selection — and every copy-on-select and middle-click paste
+    // built on it — stops working; riabuild would then have to reimplement
+    // selection, badly, in a window whose entire content is text somebody wants
+    // to paste into a bug report. Nothing here reads a mouse event, so capturing
+    // one bought nothing and cost that.
+    write!(out, "{PUSH_TITLE}")?;
+    execute!(out, SetTitle(title))?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     // The alternate screen is not a blank one, and ratatui only writes the cells
     // that differ from the frame before. On the very first draw the frame before
@@ -483,11 +607,8 @@ fn release(terminal: &mut Screen) {
     let _ = terminal.clear();
     let _ = terminal.flush();
     let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
+    let _ = write!(terminal.backend_mut(), "{POP_TITLE}");
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 }
 
@@ -502,7 +623,8 @@ fn restore_terminal_on_panic() {
     let existing = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = std::io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = write!(out, "{POP_TITLE}");
+        let _ = execute!(out, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         existing(info);
     }));
@@ -515,6 +637,175 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A key with modifiers held down, for the gestures a text field has.
+    fn with(modifiers: KeyModifiers, code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// A window with one session, focused on its box, holding `text`.
+    fn writing(text: &str) -> App {
+        let mut app = App::new(every_account());
+        app.add(Pane::new("s1".into(), Kind::Claude, "a session".into()));
+        app.cursor = 0;
+        app.focus = Focus::Session;
+        for ch in text.chars() {
+            app.compose.insert(ch);
+        }
+        app
+    }
+
+    #[test]
+    fn a_word_jump_arrives_however_the_terminal_spells_it() {
+        // Three spellings of one gesture, because three of them reach a program.
+        // Ctrl-arrow is xterm's `1;5D`; a macOS terminal with natural text
+        // editing on sends Option-arrow as an ESC-prefixed key, which crossterm
+        // reports as Alt; and the readline `ESC b` / `ESC f` is what the same
+        // terminals send when they are not sending an arrow at all.
+        for event in [
+            with(KeyModifiers::CONTROL, KeyCode::Left),
+            with(KeyModifiers::ALT, KeyCode::Left),
+            with(KeyModifiers::ALT, KeyCode::Char('b')),
+        ] {
+            let mut app = writing("why is the job slow");
+            assert_eq!(key(&mut app, event), Action::Nothing);
+            assert_eq!(app.compose.caret(), 15, "{event:?}");
+        }
+        for event in [
+            with(KeyModifiers::CONTROL, KeyCode::Right),
+            with(KeyModifiers::ALT, KeyCode::Right),
+            with(KeyModifiers::ALT, KeyCode::Char('f')),
+        ] {
+            let mut app = writing("why is the job slow");
+            app.compose.start();
+            key(&mut app, event);
+            assert_eq!(app.compose.caret(), 3, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_and_the_arrows_go_to_the_ends_of_the_line() {
+        let mut app = writing("first line\nsecond line");
+        key(&mut app, with(KeyModifiers::SUPER, KeyCode::Left));
+        assert_eq!(app.compose.caret(), 11);
+        key(&mut app, with(KeyModifiers::SUPER, KeyCode::Right));
+        assert_eq!(app.compose.caret(), 22);
+    }
+
+    #[test]
+    fn the_two_backspaces_take_a_word_and_a_line() {
+        let mut app = writing("cargo test --workspace");
+        key(&mut app, with(KeyModifiers::CONTROL, KeyCode::Backspace));
+        assert_eq!(app.compose.text(), "cargo test ");
+        // `^H`, which is the only thing Ctrl-Backspace can arrive as outside
+        // the kitty keyboard protocol.
+        key(&mut app, with(KeyModifiers::CONTROL, KeyCode::Char('h')));
+        assert_eq!(app.compose.text(), "cargo ");
+        // Alt-Backspace is the macOS spelling of the same thing.
+        key(&mut app, with(KeyModifiers::ALT, KeyCode::Backspace));
+        assert_eq!(app.compose.text(), "");
+
+        let mut app = writing("keep this\nthrow this away");
+        key(&mut app, with(KeyModifiers::SUPER, KeyCode::Backspace));
+        assert_eq!(app.compose.text(), "keep this\n");
+    }
+
+    #[test]
+    fn a_modified_key_is_never_typed_into_the_prompt() {
+        // The bug the whole `editing_key` arm sits in front of: a modifier that
+        // is looked at for the arrows and dropped for the letters puts a bare
+        // `b` in somebody's prompt every time they reach for Option-left.
+        let mut app = writing("");
+        for event in [
+            with(KeyModifiers::ALT, KeyCode::Char('b')),
+            with(KeyModifiers::ALT, KeyCode::Char('f')),
+            with(KeyModifiers::CONTROL, KeyCode::Char('h')),
+            with(KeyModifiers::CONTROL, KeyCode::Char('x')),
+        ] {
+            key(&mut app, event);
+            assert_eq!(app.compose.text(), "", "{event:?}");
+        }
+    }
+
+    #[test]
+    fn enter_sends_and_the_modified_enters_break_the_line() {
+        for event in [
+            with(KeyModifiers::ALT, KeyCode::Enter),
+            with(KeyModifiers::SHIFT, KeyCode::Enter),
+            with(KeyModifiers::CONTROL, KeyCode::Char('j')),
+        ] {
+            let mut app = writing("cargo test");
+            assert_eq!(key(&mut app, event), Action::Nothing, "{event:?}");
+            assert_eq!(app.compose.text(), "cargo test\n", "{event:?}");
+        }
+        // and the bare one still sends, and still empties the box
+        let mut app = writing("cargo test");
+        assert_eq!(
+            key(&mut app, press(KeyCode::Enter)),
+            Action::Send("cargo test".into())
+        );
+        assert!(app.compose.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_typed_at_a_signed_out_sign_in_is_refused_and_kept() {
+        // Both halves matter. Refusing is the point — a session created under a
+        // sign-in with nowhere to go is a directory on disk and a turn that
+        // fails — and *keeping the text* is why the refusal is here rather than
+        // in `drive::send`, which is handed the prompt only after the box has
+        // been emptied.
+        let mut app = App::new(every_account());
+        app.focus = Focus::Session;
+        let offered = app.offered().cloned().expect("the rail opens on an offer");
+        app.set_login(offered.kind, offered.number, Signin::Out);
+        for ch in "why is the nightly job slow".chars() {
+            app.compose.insert(ch);
+        }
+
+        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(app.compose.text(), "why is the nightly job slow");
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("claude-1 auth login"), "{notice}");
+
+        // and the same key sends the moment the account answers for itself
+        app.set_login(offered.kind, offered.number, Signin::In("ada@c.com".into()));
+        assert!(matches!(
+            key(&mut app, press(KeyCode::Enter)),
+            Action::Send(_)
+        ));
+    }
+
+    #[test]
+    fn a_sign_in_nobody_has_answered_for_is_not_refused() {
+        // The three-state distinction, from the side that would break things.
+        // Twenty-seven probes take a second and a half to come back; a window
+        // that read silence as "signed out" would refuse every prompt typed
+        // into it before they did.
+        let mut app = App::new(every_account());
+        app.focus = Focus::Session;
+        for ch in "hello".chars() {
+            app.compose.insert(ch);
+        }
+        assert!(app.blocked_offer().is_none());
+        assert!(matches!(
+            key(&mut app, press(KeyCode::Enter)),
+            Action::Send(_)
+        ));
+    }
+
+    #[test]
+    fn the_terminal_is_told_what_this_window_is_and_which_repository() {
+        assert_eq!(
+            title_for(Some("Clubria/riabuild"), true),
+            "riabuild agents — Clubria/riabuild"
+        );
+        assert_eq!(
+            title_for(Some("Clubria/riabuild"), false),
+            "riabuild agents - Clubria/riabuild"
+        );
+        // A checkout with no GitHub remote is left unnamed rather than guessed.
+        assert_eq!(title_for(None, true), "riabuild agents");
     }
 
     /// Every sign-in riabuild keeps, which is what the window is handed.

@@ -258,7 +258,7 @@ pub async fn drive(
             // Answers arrive over the life of the window rather than before it
             // opens: asking who is signed in is a subprocess per account.
             Some(login) = logins.recv() => {
-                app.set_login(login.kind, login.number, login.email);
+                app.set_login(login.kind, login.number, login.signin);
                 Action::Nothing
             }
             _ = ticker.tick() => {
@@ -376,6 +376,15 @@ pub async fn send(
             let Some(account) = app.offers.get(index).cloned() else {
                 return;
             };
+            // The keymap already refused this before emptying the box; this is
+            // the same refusal for the caller that has no keymap in front of it
+            // — `riabuild agents "do the thing"`, which asks every offer at once
+            // and would otherwise create a session under a sign-in that has
+            // nowhere to go, and leave it on the rail failing.
+            if app.is_signed_out(account.kind, account.number) {
+                app.notice = Some(crate::app::signed_out_hint(&account.name()));
+                return;
+            }
             match store.create(&account, &request.cwd).await {
                 Ok(record) => {
                     readers.insert(record.id.clone(), Reader::new(account.kind));

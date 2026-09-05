@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use riabuild_theme::{Role, Style, Theme};
 
 use crate::account::Account;
-use crate::app::{App, Entry, Focus, Pane, Row, State};
+use crate::app::{App, Entry, Focus, Pane, Row, State, signed_out_hint};
 
 /// What every line-builder needs and none of them should look up twice.
 ///
@@ -101,10 +101,46 @@ fn child_mark(unicode: bool) -> &'static str {
 /// The floor is a title, not the tag: a row reading `↳ codex-1  (subagent)` with
 /// the prompt clipped away says which kind of thing it is and nothing about
 /// which one, and the indent already said the first part.
+/// It rides on a row's **second** line rather than its first, which is what the
+/// second line bought: the tag used to eat the tail of the one line a title had,
+/// so the rows that most needed identifying were the ones with least room to do
+/// it. The title now gets the whole of the first line either way.
 fn tag_for(inner: usize, indent: usize) -> Option<String> {
     const TITLE_FLOOR: usize = 8;
     let room = inner.saturating_sub(2 + ACCOUNT_WIDTH + indent);
     (room >= SUBAGENT.chars().count() + 1 + TITLE_FLOOR).then(|| format!(" {SUBAGENT}"))
+}
+
+/// How many lines of the rail one session takes.
+///
+/// Two, always — the second one blank where the title fits on the first. A row
+/// whose height depended on its title would make the rail reflow every time an
+/// agent was asked something new, and the blank line is what gives a list of
+/// sessions any air at all.
+pub const ROW_LINES: usize = 2;
+
+/// A title laid across two lines of `first` and `second` columns.
+///
+/// Broken at a space where there is one inside the first line, so a title reads
+/// as prose rather than as a string cut at a column. The tail is clipped with an
+/// ellipsis by [`clip`], which is the mark that says a title goes on — without
+/// it two different sessions truncate to the same row and look like one.
+fn across_two(text: &str, first: usize, second: usize) -> (String, String) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= first {
+        return (text.to_string(), String::new());
+    }
+    // The last space at or before the break, so the first line ends on a word.
+    // A first word longer than the line — a path, a stack frame — has none, and
+    // is cut at the edge rather than pushed whole onto the second line, which
+    // would leave the first blank.
+    let cut = chars[..=first.min(chars.len() - 1)]
+        .iter()
+        .rposition(|ch| *ch == ' ')
+        .unwrap_or(first);
+    let head: String = chars[..cut].iter().collect();
+    let tail: String = chars[cut..].iter().collect();
+    (head.trim_end().to_string(), clip(tail.trim_start(), second))
 }
 
 /// A group heading in the rail.
@@ -167,11 +203,18 @@ pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static
         // clipped to nothing identifies neither. The indent survives as the
         // signal, which is what it is there for.
         let tag = child.then(|| tag_for(inner, indent_width)).flatten();
-        let title_width = inner
-            .saturating_sub(2 + ACCOUNT_WIDTH + indent_width)
-            .saturating_sub(tag.as_ref().map(|tag| tag.chars().count()).unwrap_or(0));
-        let title = clip(&pane.label(), title_width);
-        let mut spans = vec![
+        // The title column, and it is the same on both of a row's lines: the
+        // second is a continuation, so a developer reads one paragraph down one
+        // column rather than a title that jumps left when it wraps.
+        let title_width = inner.saturating_sub(2 + ACCOUNT_WIDTH + indent_width);
+        let tag_width = tag.as_ref().map(|tag| tag.chars().count()).unwrap_or(0);
+        let (head, tail) = across_two(
+            &pane.label(),
+            title_width,
+            title_width.saturating_sub(tag_width),
+        );
+        let title_style = theme.style(if selected { Role::Strong } else { Role::Muted });
+        lines.push(Line::from(vec![
             Span::styled(
                 cursor_mark(selected, chrome.unicode),
                 theme.style(Role::Brand),
@@ -195,23 +238,33 @@ pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static
                 format!("{:<ACCOUNT_WIDTH$}", pane.account_name()),
                 theme.style(Role::Muted),
             ),
+            Span::styled(head, title_style),
+        ]));
+
+        // The second line: the rest of the title under the first, and the
+        // cursor's bar carried down it so a selected row reads as one block
+        // rather than as a marked line with an unmarked one under it.
+        let mut second = vec![
             Span::styled(
-                title.clone(),
-                theme.style(if selected { Role::Strong } else { Role::Muted }),
+                cursor_mark(selected, chrome.unicode),
+                theme.style(Role::Brand),
             ),
+            Span::raw(" ".repeat(2 + indent_width + ACCOUNT_WIDTH)),
+            Span::styled(tail.clone(), title_style),
         ];
         if let Some(tag) = tag {
             // Padded out to the right edge here rather than by a second
             // `Line`-level alignment, because a `Line` carries one alignment for
             // all of its spans and this row is left-aligned everywhere else.
-            let used = title.chars().count();
-            let gap = title_width.saturating_sub(used);
-            spans.push(Span::styled(
+            let gap = title_width
+                .saturating_sub(tag_width)
+                .saturating_sub(tail.chars().count());
+            second.push(Span::styled(
                 format!("{}{tag}", " ".repeat(gap)),
                 theme.style(Role::Muted),
             ));
         }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(second));
     }
 
     lines.push(Line::from(String::new()));
@@ -236,16 +289,54 @@ pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static
         // Dropped rather than truncated where it does not fit. Half an email
         // address identifies nobody, and a rail that is narrow today is wide
         // again the moment the developer resizes the window.
-        if let Some(email) = app.login_of(account.kind, account.number) {
+        //
+        // "signed out" is the one tail that is *not* dropped when it is tight:
+        // it is the reason typing here would do nothing, and a row that hid it
+        // to save four columns would be hiding the only thing worth reading.
+        let signed_out = app.is_signed_out(account.kind, account.number);
+        let tail = match signed_out {
+            true => Some("signed out".to_string()),
+            false => app
+                .login_of(account.kind, account.number)
+                .map(str::to_string),
+        };
+        if let Some(tail) = tail {
             let room = inner.saturating_sub(2 + name.chars().count());
-            if email.chars().count() + 3 <= room {
+            if signed_out || tail.chars().count() + 3 <= room {
                 spans.push(Span::styled(" · ", theme.style(Role::Muted)));
-                spans.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
+                spans.push(Span::styled(
+                    tail,
+                    theme.style(if signed_out { Role::Warn } else { Role::Muted }),
+                ));
             }
         }
         lines.push(Line::from(spans));
     }
     lines
+}
+
+/// Which line of [`rail_lines`] the cursor is on.
+///
+/// Arithmetic rather than a second pass over the rows, and it has to exist
+/// because a session is two lines now: ten sessions no longer fit in a body that
+/// held them when each was one, so `frame.rs` scrolls the rail to keep the
+/// cursor in view. Every constant here is the shape `rail_lines` builds, and the
+/// two are pinned together by a test rather than by a comment.
+pub fn rail_cursor_line(app: &App) -> usize {
+    // The `SESSIONS` heading.
+    let sessions_at = 1;
+    // An empty list still draws a line saying so.
+    let sessions_height = if app.panes.is_empty() {
+        1
+    } else {
+        app.panes.len() * ROW_LINES
+    };
+    match app.row() {
+        Some(Row::Session(index)) => sessions_at + index * ROW_LINES,
+        // …the blank row, then the `NEW SESSION` heading.
+        Some(Row::Offer(index)) => sessions_at + sessions_height + 2 + index,
+        None => 0,
+    }
 }
 
 /// The selected session's transcript.
@@ -335,7 +426,17 @@ pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec
 /// A sentence rather than a status, because nothing is happening yet: the only
 /// thing worth saying is what typing would start, and under whose sign-in. Only
 /// the vendor's name is accented — the rest is prose.
-pub fn splash_lines(account: &Account, email: Option<&str>, theme: Theme) -> Vec<Line<'static>> {
+///
+/// A sign-in riabuild has been *told* is signed out says so here instead, with
+/// the command that fixes it: this is the screen a developer is looking at while
+/// they type the prompt that would be refused, so it is the one place the
+/// sentence arrives before the refusal rather than after it.
+pub fn splash_lines(
+    account: &Account,
+    email: Option<&str>,
+    signed_out: bool,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let mut login = vec![
         Span::styled("login: ", theme.style(Role::Muted)),
         Span::styled(account.name(), theme.style(Role::Strong)),
@@ -344,14 +445,22 @@ pub fn splash_lines(account: &Account, email: Option<&str>, theme: Theme) -> Vec
         login.push(Span::styled(" · ", theme.style(Role::Muted)));
         login.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
     }
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("create a ", Style::default()),
             Span::styled(account.kind.short(), theme.style(Role::Brand)),
             Span::styled(" session", Style::default()),
         ]),
         Line::from(login),
-    ]
+    ];
+    if signed_out {
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(Span::styled(
+            signed_out_hint(&account.name()),
+            theme.style(Role::Warn),
+        )));
+    }
+    lines
 }
 
 /// The sign-ins a new session can be started under.
@@ -368,9 +477,15 @@ pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>
         .enumerate()
         .map(|(index, account)| {
             let selected = index == app.picking;
-            let tail = match app.login_of(account.kind, account.number) {
-                Some(email) => email.to_string(),
-                None => account.kind.label().to_string(),
+            // Said here as well as on the rail, because this is the list a
+            // developer picks *from*: a chooser that lets somebody select a
+            // sign-in and refuses it a keypress later is asking a question it
+            // already knows the answer to.
+            let signed_out = app.is_signed_out(account.kind, account.number);
+            let tail = match (signed_out, app.login_of(account.kind, account.number)) {
+                (true, _) => "signed out".to_string(),
+                (false, Some(email)) => email.to_string(),
+                (false, None) => account.kind.label().to_string(),
             };
             Line::from(vec![
                 Span::styled(cursor_mark(selected, unicode), theme.style(Role::Brand)),
@@ -378,7 +493,10 @@ pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>
                     format!("{:<10}", account.name()),
                     theme.style(if selected { Role::Strong } else { Role::Muted }),
                 ),
-                Span::styled(tail, theme.style(Role::Muted)),
+                Span::styled(
+                    tail,
+                    theme.style(if signed_out { Role::Warn } else { Role::Muted }),
+                ),
             ])
         })
         .collect()
@@ -468,7 +586,14 @@ fn whose(app: &App) -> Option<(String, riabuild_harness::Kind, usize)> {
 }
 
 /// The key hints, which change with what the keyboard is talking to.
-pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
+///
+/// A hint that does not fit is **dropped whole** rather than cut at the edge.
+/// The list grew when the box learned to break a line, and on a split terminal
+/// ratatui simply stopped drawing partway through the last one — which renders
+/// as `← se`, a key hint that is not a key and not a word. Dropping from the
+/// right keeps the ones a developer needs most, which is why the order they are
+/// written in is the order they matter in.
+pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
     // A notice takes the whole line while it lasts. It is the answer to the key
     // just pressed, and the hints it stands in front of are still true — showing
     // both would make the one thing worth reading the shorter half of the line.
@@ -484,20 +609,30 @@ pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
         ],
         // No letters advertised: every one of them is a character in the box.
         Focus::Session => &[
-            ("type", "to write"),
             ("enter", "send"),
             // Advertised because it is the one key here a developer would
             // otherwise assume their terminal had eaten: Ctrl-V reaching this
             // window at all is unusual, and an image is the thing they cannot
             // type.
             ("^v", "paste"),
+            // The line break, which is the gesture nobody guesses: Enter sends,
+            // so a developer who wants two paragraphs has no way to find this
+            // by trying things.
+            ("alt+enter", "newline"),
             ("↑↓", "scroll"),
             ("←", "sessions"),
         ],
         Focus::Picker => &[("↑↓", "account"), ("enter", "choose"), ("esc", "back")],
     };
     let mut spans = Vec::new();
+    let mut used = 0usize;
     for (index, (key, what)) in keys.iter().enumerate() {
+        let separator = if index > 0 { 3 } else { 0 };
+        let wants = separator + key.chars().count() + 1 + what.chars().count();
+        if used + wants > width as usize {
+            break;
+        }
+        used += wants;
         if index > 0 {
             spans.push(Span::styled(" · ", theme.style(Role::Muted)));
         }
@@ -507,30 +642,75 @@ pub fn footer_line(app: &App, theme: Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The mark the box opens with, and the width it costs every row.
+///
+/// The continuation rows are indented by the same amount rather than starting at
+/// the pane's edge, so the prompt is one block of text with one left margin
+/// instead of a first line that is inset and a second that is not.
+const COMPOSE_MARK: &str = "› ";
+pub const COMPOSE_INDENT: usize = 2;
+
 /// The prompt box, which lives inside the pane and never across the window.
-pub fn compose_line(app: &App, theme: Theme) -> Line<'static> {
-    let mut spans = vec![Span::styled("› ", theme.style(Role::Brand))];
-    let (before, after) = app.compose.split();
-    if app.focus == Focus::Session {
-        spans.push(Span::raw(before.to_string()));
-        // A block rather than the terminal's own cursor, which would have to be
-        // positioned and would blink wherever the last cell was written.
-        spans.push(Span::styled("▏", theme.style(Role::Brand)));
-        spans.push(Span::raw(after.to_string()));
-    } else if app.compose.is_empty() {
-        spans.push(Span::styled(
-            "press → to write".to_string(),
-            theme.style(Role::Muted),
-        ));
-    } else {
-        // A half-written prompt stays on screen from the rail. Hiding it would
-        // read as having lost it.
-        spans.push(Span::styled(
-            app.compose.text().to_string(),
-            theme.style(Role::Muted),
-        ));
+///
+/// Many lines rather than one. A prompt is prose and prose is longer than a
+/// pane is wide, so a single line ran off the right edge and took the caret with
+/// it — the half of a paragraph a developer had just written was somewhere they
+/// could not see. `Compose::wrap` decides where the breaks fall, because the
+/// caret has to land on the same row its character does and only the editor
+/// knows both.
+pub fn compose_lines(app: &App, theme: Theme, width: u16) -> Vec<Line<'static>> {
+    let room = (width as usize).saturating_sub(COMPOSE_INDENT);
+    if app.focus != Focus::Session {
+        let (text, role) = if app.compose.is_empty() {
+            ("press → to write".to_string(), Role::Muted)
+        } else {
+            // A half-written prompt stays on screen from the rail. Hiding it
+            // would read as having lost it.
+            (app.compose.text().to_string(), Role::Muted)
+        };
+        return vec![Line::from(vec![
+            Span::styled(COMPOSE_MARK, theme.style(Role::Brand)),
+            Span::styled(clip(&text.replace('\n', " "), room), theme.style(role)),
+        ])];
     }
-    Line::from(spans)
+
+    let wrapped = app.compose.wrap(room);
+    let (caret_row, caret_column) = wrapped.caret;
+    wrapped
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            // The mark on the first row only: it opens the prompt rather than
+            // labelling each of its lines.
+            let lead = if index == 0 {
+                Span::styled(COMPOSE_MARK, theme.style(Role::Brand))
+            } else {
+                Span::raw(" ".repeat(COMPOSE_INDENT))
+            };
+            // A newline is a break, not a glyph: it is what put this row's
+            // successor on its own line and drawing it would paint a stray cell.
+            let text: String = row.chars().filter(|ch| *ch != '\n').collect();
+            if index != caret_row {
+                return Line::from(vec![lead, Span::raw(text)]);
+            }
+            let at = text
+                .char_indices()
+                .nth(caret_column)
+                .map(|(byte, _)| byte)
+                .unwrap_or(text.len());
+            let (before, after) = text.split_at(at);
+            Line::from(vec![
+                lead,
+                Span::raw(before.to_string()),
+                // A block rather than the terminal's own cursor, which would
+                // have to be positioned and would blink wherever the last cell
+                // was written.
+                Span::styled("▏", theme.style(Role::Brand)),
+                Span::raw(after.to_string()),
+            ])
+        })
+        .collect()
 }
 
 fn plural(count: usize) -> &'static str {
@@ -554,7 +734,7 @@ pub fn thousands(value: u64) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::account::{Account, Accounts};
-    use crate::app::Pane as TestPane;
+    use crate::app::{Pane as TestPane, Signin};
     use riabuild_harness::{Kind, testing};
     use riabuild_theme::Depth;
 
@@ -620,7 +800,7 @@ pub(crate) mod tests {
         let theme = Theme::with_depth(Depth::Ansi16);
         let mut app = App::new(Accounts::default());
         app.focus = Focus::Session;
-        let hints: String = footer_line(&app, theme)
+        let hints: String = footer_line(&app, theme, 120)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -628,7 +808,7 @@ pub(crate) mod tests {
         assert!(hints.contains("^v paste"), "{hints}");
 
         app.notice = Some("Nothing on the clipboard to paste.".into());
-        let notice: String = footer_line(&app, theme)
+        let notice: String = footer_line(&app, theme, 120)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -637,12 +817,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_hint_that_does_not_fit_is_dropped_whole_rather_than_cut() {
+        // A split terminal. Ratatui draws a too-long line by stopping partway
+        // through it, which renders the last hint as `← se` — not a key and not
+        // a word. The ones that matter most are written first, so what goes is
+        // what is worth least.
+        let mut app = App::new(Accounts::default());
+        app.focus = Focus::Session;
+        let theme = Theme::plain();
+        let whole = text_of(&footer_line(&app, theme, 120));
+        assert!(whole.contains("← sessions"), "{whole}");
+
+        let narrow = text_of(&footer_line(&app, theme, 30));
+        assert!(narrow.chars().count() <= 30, "{narrow:?}");
+        assert!(narrow.starts_with("enter send"), "{narrow:?}");
+        // Whole hints only: nothing ends mid-word or on a separator.
+        assert!(!narrow.ends_with(' '), "{narrow:?}");
+        assert!(!narrow.contains("← se\u{0}"), "{narrow:?}");
+        for hint in ["^v paste", "alt+enter newline", "↑↓ scroll", "← sessions"] {
+            let present = narrow.contains(hint);
+            let partial = hint
+                .char_indices()
+                .any(|(at, _)| at > 0 && narrow.ends_with(&hint[..at]));
+            assert!(present || !partial, "{hint:?} was cut\n{narrow:?}");
+        }
+    }
+
+    #[test]
     fn every_colour_on_screen_comes_from_the_palette() {
         // The rule the rest of riabuild follows, and the one ratatui makes easy
         // to break: a literal `Color::Rgb` here would reach a sixteen-colour
         // terminal as an escape it cannot read.
         let mut app = played(Kind::Claude, testing::CLAUDE);
-        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
+        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
         let sixteen = Theme::with_depth(Depth::Ansi16);
         let chrome = Chrome {
             theme: sixteen,
@@ -667,18 +874,28 @@ pub(crate) mod tests {
         lines.push(header_line(chrome));
         lines.push(counts_line(&app, sixteen));
         lines.push(status_line(&app, sixteen, 60));
-        lines.push(footer_line(&app, sixteen));
+        lines.push(footer_line(&app, sixteen, 120));
         // The footer has two shapes and the notice is the one that only appears
         // after a key was pressed — exactly the sort of line a palette check
         // over one frame never reaches.
         let mut noticed = App::new(Accounts::default());
         noticed.notice = Some("Nothing on the clipboard to paste.".into());
-        lines.push(footer_line(&noticed, sixteen));
-        lines.push(compose_line(&app, sixteen));
+        lines.push(footer_line(&noticed, sixteen, 120));
+        lines.extend(compose_lines(&app, sixteen, 40));
         lines.extend(picker_lines(&app, sixteen, true));
         lines.extend(splash_lines(
             &Account::new(Kind::Claude, 1, None),
             Some("ada@clubria.com"),
+            false,
+            sixteen,
+        ));
+        // The signed-out shape too, which only appears once a probe has come
+        // back and is exactly the sort of line a palette check over one frame
+        // never reaches.
+        lines.extend(splash_lines(
+            &Account::new(Kind::Claude, 2, None),
+            None,
+            true,
             sixteen,
         ));
 
@@ -789,25 +1006,113 @@ pub(crate) mod tests {
 
     #[test]
     fn a_subagent_is_indented_and_tagged_and_its_parent_is_neither() {
+        // Two lines per session, so the shape is: heading, the parent's pair,
+        // then the child's. The indent is on the line with the title on it and
+        // the tag is on the one under it — the title has the whole first line
+        // either way, which is what the second line was for.
         let rows = rows_of(&with_a_subagent(), 40);
-        let parent = rows
-            .iter()
-            .find(|row| row.contains("port the parser"))
-            .cloned()
-            .unwrap_or_default();
-        let child = rows
-            .iter()
-            .find(|row| row.contains("write tests"))
-            .cloned()
-            .unwrap_or_default();
+        let parent = &rows[1..3];
+        let child = &rows[3..5];
 
-        assert!(child.contains('↳'), "{child}");
-        assert!(child.contains("(subagent)"), "{child}");
-        assert!(!parent.contains('↳'), "{parent}");
-        assert!(!parent.contains("(subagent)"), "{parent}");
-        // Right-aligned: the tag ends the row, and the row fills the rail.
-        assert!(child.ends_with("(subagent)"), "{child}");
-        assert_eq!(child.chars().count(), 39, "{child}");
+        assert!(child[0].contains("write tests"), "{child:#?}");
+        assert!(child[0].contains('↳'), "{child:#?}");
+        assert!(child[1].contains("(subagent)"), "{child:#?}");
+        assert!(parent[0].contains("port the parser"), "{parent:#?}");
+        assert!(!parent.iter().any(|row| row.contains('↳')), "{parent:#?}");
+        assert!(
+            !parent.iter().any(|row| row.contains("(subagent)")),
+            "{parent:#?}"
+        );
+        // Right-aligned: the tag ends the line, and the line fills the rail.
+        assert!(child[1].ends_with("(subagent)"), "{child:#?}");
+        assert_eq!(child[1].chars().count(), 39, "{child:#?}");
+    }
+
+    #[test]
+    fn a_long_title_carries_on_under_itself_rather_than_being_cut_at_the_first_line() {
+        // The whole of why a session is two lines. The rail is the only place a
+        // developer tells two conversations apart, and one line of a forty-
+        // column rail is eighteen characters of prompt.
+        let mut app = App::new(every_account());
+        app.add(TestPane::new(
+            "s1".into(),
+            Kind::Claude,
+            "fix the total count of connections in the pool report".into(),
+        ));
+        app.cursor = 0;
+        let rows = rows_of(&app, 40);
+
+        assert!(rows[1].contains("claude-1"), "{rows:#?}");
+        assert!(rows[1].contains("fix the total count"), "{rows:#?}");
+        // The break falls between words rather than mid-word, and the second
+        // line carries on under the first — aligned to the same column, so it
+        // reads as one paragraph rather than two rows.
+        // Past the cursor's bar, which is carried down the second line too.
+        assert!(
+            rows[2]
+                .trim_start_matches(['▌', ' '])
+                .starts_with("connections"),
+            "{rows:#?}"
+        );
+        // In *characters*: the mark on the first line is one column and three
+        // bytes, so a byte offset would say these two are misaligned when they
+        // are drawn in the same column.
+        assert_eq!(
+            column_of(&rows[2], 'c'),
+            column_of(&rows[1], 'f'),
+            "the continuation is not under the title\n{rows:#?}"
+        );
+        // and what still does not fit says so, rather than stopping silently
+        assert!(rows[2].ends_with('…'), "{rows:#?}");
+    }
+
+    /// Where a character falls on screen, which is its character index and
+    /// never its byte one.
+    fn column_of(row: &str, ch: char) -> Option<usize> {
+        row.chars().position(|found| found == ch)
+    }
+
+    #[test]
+    fn a_title_that_fits_on_one_line_leaves_the_second_blank() {
+        let mut app = App::new(every_account());
+        app.add(TestPane::new("s1".into(), Kind::Claude, "why".into()));
+        app.cursor = 0;
+        let rows = rows_of(&app, 40);
+        assert!(rows[1].contains("why"), "{rows:#?}");
+        // The cursor's bar is the one thing on it: a selected row is one block
+        // down the rail's left edge rather than a marked line with an unmarked
+        // one under it.
+        assert_eq!(rows[2].trim_end(), "▌", "{rows:#?}");
+    }
+
+    #[test]
+    fn the_rail_scrolls_to_wherever_the_cursor_is() {
+        // `rail_cursor_line` is arithmetic over the shape `rail_lines` builds,
+        // and the two would drift apart in silence — a rail that scrolled to the
+        // wrong line looks like a cursor that vanished. This is what pins them.
+        let mut app = App::new(every_account());
+        for index in 0..4 {
+            app.add(TestPane::new(
+                format!("s{index}"),
+                Kind::Claude,
+                format!("session number {index}"),
+            ));
+        }
+        for cursor in 0..app.rows() {
+            app.cursor = cursor;
+            let rows = rows_of(&app, 40);
+            let at = rail_cursor_line(&app);
+            let expected = match app.row() {
+                Some(Row::Session(index)) => format!("session number {index}"),
+                Some(Row::Offer(index)) => app.offers[index].name(),
+                None => unreachable!(),
+            };
+            assert!(
+                rows[at].contains(&expected),
+                "line {at} is {:?}, not the row for cursor {cursor}\n{rows:#?}",
+                rows[at]
+            );
+        }
     }
 
     #[test]
@@ -834,17 +1139,18 @@ pub(crate) mod tests {
         };
         let mut app = with_a_subagent();
 
-        // Row 0 is the SESSIONS heading, 1 the parent, 2 the child. Span 1 of a
-        // row is the state mark.
+        // Line 0 is the SESSIONS heading and a session is two lines, so the
+        // parent's first is 1 and the child's is 3. Span 1 of a first line is
+        // the state mark.
         let quiet = rail_lines(&app, chrome, 40);
-        assert_eq!(quiet[2].spans[1].style, theme.style(Role::Muted));
+        assert_eq!(quiet[3].spans[1].style, theme.style(Role::Muted));
         // The parent beside it is untouched: only a *child* recedes.
         assert_eq!(quiet[1].spans[1].style, theme.style(Role::Ok));
 
         // A subagent that failed is not something to push into the background.
         app.panes[1].troubled = true;
         let failed = rail_lines(&app, chrome, 40);
-        assert_eq!(failed[2].spans[1].style, theme.style(Role::Danger));
+        assert_eq!(failed[3].spans[1].style, theme.style(Role::Danger));
     }
 
     #[test]
@@ -871,7 +1177,7 @@ pub(crate) mod tests {
         // What a developer with nine Claude accounts actually needs: `claude-1`
         // says which login it is only to riabuild.
         let mut app = App::new(every_account());
-        app.set_login(Kind::Claude, 1, "ada@clubria.com".into());
+        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
         let wide: String = rail_lines(&app, plain_chrome(), 40)
             .iter()
             .map(text_of)
@@ -890,7 +1196,7 @@ pub(crate) mod tests {
     #[test]
     fn a_session_says_which_sign_in_and_which_login_it_is_running_under() {
         let mut app = App::new(every_account());
-        app.set_login(Kind::Claude, 2, "ada@clubria.com".into());
+        app.set_login(Kind::Claude, 2, Signin::In("ada@clubria.com".into()));
         app.begin("s1".into(), &Account::new(Kind::Claude, 2, None));
         let status = text_of(&status_line(&app, Theme::plain(), 60));
         assert!(status.starts_with("claude-2 · ada@clubria.com"), "{status}");
@@ -912,10 +1218,11 @@ pub(crate) mod tests {
         // "waiting for the first reply…" was said over a pane that had no
         // session behind it at all, so there was nothing to wait for.
         let account = Account::new(Kind::Claude, 1, None);
-        let lines: Vec<String> = splash_lines(&account, Some("ada@clubria.com"), Theme::plain())
-            .iter()
-            .map(text_of)
-            .collect();
+        let lines: Vec<String> =
+            splash_lines(&account, Some("ada@clubria.com"), false, Theme::plain())
+                .iter()
+                .map(text_of)
+                .collect();
         assert_eq!(
             lines,
             vec![
@@ -925,7 +1232,7 @@ pub(crate) mod tests {
         );
         // and only the vendor's name is accented — the rest is prose
         let brand = Theme::with_depth(Depth::TrueColor);
-        let first = splash_lines(&account, None, brand).remove(0);
+        let first = splash_lines(&account, None, false, brand).remove(0);
         assert_eq!(first.spans[1].content.as_ref(), "Claude");
         assert_eq!(first.spans[1].style, brand.style(Role::Brand));
         assert_eq!(first.spans[0].style, Style::default());
@@ -970,12 +1277,12 @@ pub(crate) mod tests {
         app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
         app.cursor = 0;
         app.focus = Focus::List;
-        let listing = text_of(&footer_line(&app, Theme::plain()));
+        let listing = text_of(&footer_line(&app, Theme::plain(), 120));
         assert!(listing.contains("move"), "{listing}");
         assert!(listing.contains("quit"), "{listing}");
 
         app.focus = Focus::Session;
-        let writing = text_of(&footer_line(&app, Theme::plain()));
+        let writing = text_of(&footer_line(&app, Theme::plain(), 120));
         assert!(writing.contains("send"), "{writing}");
         assert!(writing.contains("scroll"), "{writing}");
         // No letter is advertised while typing: each one is a character then.
@@ -990,13 +1297,13 @@ pub(crate) mod tests {
         for ch in "hello".chars() {
             app.compose.insert(ch);
         }
-        assert!(text_of(&compose_line(&app, Theme::plain())).contains("hello"));
+        assert!(text_of(&compose_lines(&app, Theme::plain(), 40)[0]).contains("hello"));
         app.focus = Focus::List;
-        let from_rail = text_of(&compose_line(&app, Theme::plain()));
+        let from_rail = text_of(&compose_lines(&app, Theme::plain(), 40)[0]);
         assert!(from_rail.contains("hello"), "{from_rail}");
         // and an empty box says how to reach it rather than nothing at all
         app.compose.take();
-        assert!(text_of(&compose_line(&app, Theme::plain())).contains("press →"));
+        assert!(text_of(&compose_lines(&app, Theme::plain(), 40)[0]).contains("press →"));
     }
 
     #[test]
