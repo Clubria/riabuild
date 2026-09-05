@@ -73,6 +73,14 @@ mod report;
 mod words;
 pub use words::{duration_words, plural};
 
+/// Text riabuild did not write, on its way to a terminal — a repository's
+/// description from GitHub, a shared server's from riabuild-web. Its own file
+/// because it is a boundary rather than a formatter: what it removes is the
+/// escape sequences that would let somebody else's sentence redraw the box it
+/// is printed in.
+mod foreign;
+pub use foreign::one_line;
+
 pub struct Ui {
     /// The Clubria palette, bound to what this terminal can render. Every
     /// colour riabuild prints comes from here, so there is one place to change

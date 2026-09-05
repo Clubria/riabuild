@@ -138,6 +138,16 @@ export type SharedServer = {
   host: string;
   port: number;
   user: string;
+  /**
+   * What this server is for, in a lead's own words — read under the server's
+   * name in every developer's `riabuild remote` picker, which is what it is
+   * for: a list of hostnames is not a list a new developer can choose from.
+   *
+   * Empty for a server nobody has described, including every row saved before
+   * the field existed. Empty and absent are the same thing to everything that
+   * reads it, and `sharedServers.list` is where that stops being two cases.
+   */
+  description: string;
   updatedAt: number;
 };
 
@@ -146,6 +156,7 @@ export type SharedServerAddress = {
   host: string;
   port: number;
   user: string;
+  description: string;
 };
 
 /**

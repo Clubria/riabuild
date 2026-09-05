@@ -403,7 +403,10 @@ pub fn remote_request(
         quiet: cli.quiet,
         no_shell: cli.no_shell,
         project: cli.project.clone(),
-        repo: cli.repo.clone(),
+        // The named half of the flag only. A bare `--repo` is a request to be
+        // asked, and `remote::repo::choose_for` asks on the laptop already — it
+        // is what the empty value would otherwise talk it out of.
+        repo: cli.named_repo().map(str::to_string),
         jobs: cli.jobs,
     }
 }

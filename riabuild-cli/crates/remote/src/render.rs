@@ -77,6 +77,14 @@ pub fn servers_box(records: &[Record], shown: Shown, theme: Theme) -> String {
     let login_width = width(records.iter().map(login));
     let number_width = add_option(records.len()).to_string().chars().count();
 
+    // Where a name starts, and so where the line under it starts: the picker
+    // spends two spaces and a number that the listing does not. Computed from
+    // the widths the rows themselves are built from, so the two cannot drift.
+    let indent = match shown {
+        Shown::Choosing => " ".repeat(2 + number_width + 2),
+        Shown::Listing => "  ".to_string(),
+    };
+
     for (index, record) in records.iter().enumerate() {
         let row = format!(
             "{:<name_width$}   {:<login_width$}   {}",
@@ -89,6 +97,17 @@ pub fn servers_box(records: &[Record], shown: Shown, theme: Theme) -> String {
                 lines.push(format!("  {:>number_width$}  {row}", index + 1));
             }
             Shown::Listing => lines.push(format!("  {row}")),
+        }
+        // What one of the team's servers is *for*, in the lead's own words. A
+        // server nobody described — and every server this developer added
+        // themselves — gets no second line rather than a blank one: a row
+        // holding space for a sentence nobody wrote reads as one that failed
+        // to arrive.
+        if !record.description.is_empty() {
+            lines.push(format!(
+                "{indent}{}",
+                theme.paint(Role::Muted, &record.description)
+            ));
         }
     }
     if shown == Shown::Choosing {
@@ -401,6 +420,59 @@ mod tests {
         assert!(text.contains("ada@gpu.internal:2222"), "{text}");
         // The developer's own server keeps its own name, unprefixed.
         assert!(text.contains("1  build-01"), "{text}");
+    }
+
+    #[test]
+    fn one_of_the_teams_servers_says_what_it_is_for_under_its_name() {
+        let mut records = mine_and_the_teams();
+        records[1].description = "The 4×A100 box. Ask before a long run.".into();
+
+        let choosing = servers_box(&records, Shown::Choosing, Theme::plain());
+        // Under the name rather than beside it: the columns beside it are an
+        // address and an age, and a sentence in either would push every row's
+        // width around whatever the longest description happened to be.
+        assert!(choosing.contains("\n  2  shared-gpu"), "{choosing}");
+        assert!(
+            choosing.contains("\n     The 4×A100 box. Ask before a long run."),
+            "{choosing}"
+        );
+
+        // `remote list` numbers nothing, so its second line is indented to
+        // where its own rows start rather than to where the picker's do.
+        let listing = servers_box(&records, Shown::Listing, Theme::plain());
+        assert!(
+            listing.contains("\n  The 4×A100 box. Ask before a long run."),
+            "{listing}"
+        );
+    }
+
+    #[test]
+    fn a_server_nobody_described_takes_one_line() {
+        // Every server this developer added themselves — there is nobody to
+        // describe those — and every one of the team's that no lead has got
+        // round to. A blank line in their place reads as a description that
+        // failed to arrive.
+        let text = servers_box(&mine_and_the_teams(), Shown::Choosing, Theme::plain());
+        assert!(text.contains("1  build-01"), "{text}");
+        assert!(text.contains("2  shared-gpu"), "{text}");
+        // …and the option after the last server is still the row after it.
+        assert!(text.contains("3  Add a server"), "{text}");
+    }
+
+    #[test]
+    fn a_description_is_dimmed_rather_than_printed_as_ordinary_text() {
+        let mut records = mine_and_the_teams();
+        records[1].description = "the 4×A100 box".into();
+        let drawn = servers_box(
+            &records,
+            Shown::Listing,
+            Theme::with_depth(Depth::TrueColor),
+        );
+        let line = drawn
+            .lines()
+            .find(|line| line.contains("A100"))
+            .expect("the description line");
+        assert!(line.contains('\x1b'), "{line:?}");
     }
 
     #[test]

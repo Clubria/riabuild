@@ -28,12 +28,28 @@ const PAGE: usize = 30;
 /// point is not asking developers anything.
 const PATIENCE: Duration = Duration::from_secs(8);
 
-/// A repository, and when it was last pushed to.
+/// How much of a description the box will show.
+///
+/// Wide enough for the sentence most repositories actually carry, and narrow
+/// enough that the row it sits under stays one row on an 80-column terminal
+/// once the two-space indent is spent. Applied here rather than in `render` so
+/// that a description is cut once, on the way in: what riabuild holds is what
+/// riabuild would print.
+pub const DESCRIPTION: usize = 72;
+
+/// A repository, what it says it is, and when it was last pushed to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub repo: Repo,
     /// Seconds since the epoch, or 0 when GitHub did not say.
     pub pushed_at: u64,
+    /// GitHub's own one-line description, already put through
+    /// [`riabuild_ui::one_line`] — empty for a repository that has none.
+    ///
+    /// Sanitised at the boundary rather than at the point of printing, because
+    /// there is more than one point of printing and only one boundary: this is
+    /// a sentence any member of the org can set, and it reaches a terminal.
+    pub description: String,
 }
 
 /// What asking GitHub produced.
@@ -53,13 +69,21 @@ pub enum Listing {
     Unavailable(String),
 }
 
-/// The jq that turns GitHub's reply into one `slug<TAB>epoch` line per
-/// repository.
+/// The jq that turns GitHub's reply into one `slug<TAB>epoch<TAB>description`
+/// line per repository.
 ///
 /// `pushed_at` is null for a repository with no commits, and
 /// `fromdateiso8601` on null fails the whole filter rather than that one row —
 /// so the fallbacks are load-bearing, not defensive.
-const JQ: &str = r#".[] | "\(.full_name)\t\((.pushed_at // .created_at // "1970-01-01T00:00:00Z") | fromdateiso8601)""#;
+///
+/// The description is folded onto one line **here**, before it becomes output,
+/// rather than left to [`riabuild_ui::one_line`] on the way back in. That
+/// function cannot help with this one: a newline inside a description would
+/// have already ended the *row*, and `parse` would read the rest of the
+/// sentence as a repository slug of its own. Splitting on the two characters
+/// this format is built out of is enough, and it is enough without a regular
+/// expression — everything else a description can carry is `one_line`'s.
+const JQ: &str = r#".[] | "\(.full_name)\t\((.pushed_at // .created_at // "1970-01-01T00:00:00Z") | fromdateiso8601)\t\((.description // "") | split("\n") | join(" ") | split("\t") | join(" "))""#;
 
 pub async fn fetch(ctx: &Ctx, owner: &str) -> Listing {
     let gh = ctx.gh();
@@ -121,11 +145,15 @@ fn unanswered(error: &anyhow::Error) -> String {
     said
 }
 
-/// One `slug<TAB>epoch` line per repository.
+/// One `slug<TAB>epoch<TAB>description` line per repository.
 ///
 /// A row riabuild would refuse to clone is dropped rather than shown: GitHub
 /// allows names `Repo::parse` does not, and offering one at a prompt that then
 /// objects to it wastes the developer's attempt on riabuild's own rules.
+///
+/// The third field is optional, and stays optional: a `gh` that answered before
+/// this field was asked for, or a jq that could not produce it, must still give
+/// a usable list of repositories rather than none.
 pub fn parse(stdout: &str) -> Vec<Entry> {
     stdout
         .lines()
@@ -133,13 +161,80 @@ pub fn parse(stdout: &str) -> Vec<Entry> {
             // Split before trimming: a row GitHub gave no timestamp for is
             // `slug\t`, and trimming the line first eats the tab that makes it
             // one row rather than none.
-            let (slug, pushed) = line.split_once('\t')?;
+            let (slug, rest) = line.split_once('\t')?;
+            let (pushed, description) = match rest.split_once('\t') {
+                Some(halves) => halves,
+                None => (rest, ""),
+            };
             Some(Entry {
                 repo: Repo::parse(slug).ok()?,
                 pushed_at: pushed.trim().parse().unwrap_or(0),
+                description: riabuild_ui::one_line(description, DESCRIPTION),
             })
         })
         .collect()
+}
+
+/// Whether this developer can still see one particular repository.
+///
+/// Asked of exactly one repository, and only for the one a developer told
+/// riabuild to *always* use: the picker's own listing cannot answer it, because
+/// that is one page of the org sorted by push date and a repository can be
+/// missing from it for reasons that have nothing to do with access.
+///
+/// The three answers are the three [`Listing`] draws, for the reason it gives:
+/// "we could not tell" must never render as "you no longer have access". Only
+/// GitHub saying **404** unpins a repository, and everything else — a `gh` that
+/// is not installed yet, an expired token, a 500, a 403 from an org that has
+/// just turned on SAML — leaves the pin exactly where it was. The cost of
+/// guessing wrong in that direction is one run that asks a question; in the
+/// other it is a developer silently moved off the repository they work in.
+///
+/// Reading a 404 as "gone" rests on one fact about the token this asks with.
+/// GitHub answers 404 rather than 403 for a private repository a token cannot
+/// see, so a narrowed token would report a repository that is perfectly
+/// present — but `gh auth login` grants `repo` by default, which is what
+/// `github_cli` already relies on and why it only ever has to *add* `read:org`.
+/// A token without it is also one whose picker listing is missing every private
+/// repository in the org, so the pin is not where that developer finds out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// GitHub answered for it.
+    Yes,
+    /// GitHub said there is no such repository for this account.
+    Gone,
+    /// We asked and could not tell, in these words.
+    Unknown(String),
+}
+
+pub async fn access(ctx: &Ctx, repo: &Repo) -> Access {
+    let gh = ctx.gh();
+    if !tokio::fs::try_exists(&gh).await.unwrap_or(false) {
+        return Access::Unknown("GitHub sign-in is not installed here yet".to_string());
+    }
+
+    let endpoint = format!("repos/{}", repo.slug());
+    let args = ["api", endpoint.as_str(), "--jq", ".full_name"];
+    let options = RunOptions {
+        timeout: Some(PATIENCE),
+        ..Default::default()
+    };
+
+    match ctx.runner.run(&gh, &args, &options).await {
+        Err(error) => Access::Unknown(unanswered(&error)),
+        Ok(output) if output.ok() => Access::Yes,
+        Ok(output) => {
+            let detail = output.stderr.trim();
+            let detail = detail.lines().next().unwrap_or("gh api failed");
+            // `gh`'s own words for it, which is `gh: Not Found (HTTP 404)`.
+            // Matched on the status rather than on the sentence, because the
+            // sentence is localised and the number is not.
+            match detail.contains("404") {
+                true => Access::Gone,
+                false => Access::Unknown(detail.to_string()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +243,8 @@ mod tests {
     use crate::testing::{Bounds, ctx_and_runner, ctx_with, install_owned_tools};
     use riabuild_runner::{CommandRunner, FakeRunner};
 
-    const TWO_ROWS: &str = "Clubria/ai-builders-hub\t1755000000\nClubria/payments\t1754900000\n";
+    const TWO_ROWS: &str = "Clubria/ai-builders-hub\t1755000000\tWhere every builder starts\n\
+                            Clubria/payments\t1754900000\tBilling and payment flows\n";
 
     #[test]
     fn a_reply_becomes_one_entry_a_line() {
@@ -156,7 +252,40 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].repo.slug(), "Clubria/ai-builders-hub");
         assert_eq!(entries[0].pushed_at, 1755000000);
+        assert_eq!(entries[0].description, "Where every builder starts");
         assert_eq!(entries[1].repo.slug(), "Clubria/payments");
+    }
+
+    #[test]
+    fn a_repository_that_describes_itself_as_nothing_says_nothing() {
+        // GitHub serves `null` for a repository with no description, which the
+        // jq turns into an empty field. An empty string is what the box reads
+        // as "there is no second line for this row".
+        let entries = parse("Clubria/payments\t1754900000\t\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].description, "");
+    }
+
+    #[test]
+    fn a_gh_that_answered_before_descriptions_were_asked_for_still_lists() {
+        // Two fields rather than three. The picker must keep working against
+        // it: a listing is a great deal more use than a description.
+        let entries = parse("Clubria/payments\t1754900000\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pushed_at, 1754900000);
+        assert_eq!(entries[0].description, "");
+    }
+
+    #[test]
+    fn a_description_that_would_redraw_the_box_is_defused_on_the_way_in() {
+        // Any member of the org can set one of these, and it is printed
+        // straight onto a developer's terminal.
+        let entries = parse("Clubria/payments\t1\tpay\x1b[2Jments\n");
+        assert_eq!(entries[0].description, "pay[2Jments");
+
+        // And an essay is cut to the room the box has, once, here.
+        let entries = parse(&format!("Clubria/payments\t1\t{}\n", "a".repeat(500)));
+        assert_eq!(entries[0].description.chars().count(), DESCRIPTION);
     }
 
     #[test]
@@ -285,5 +414,59 @@ mod tests {
         let (ctx, _home, _fake) = ctx_and_runner(runner).await;
         install_owned_tools(&ctx).await;
         assert_eq!(fetch(&ctx, "Clubria").await, Listing::Repos(vec![]));
+    }
+
+    async fn asked_about(runner: FakeRunner) -> Access {
+        let (ctx, _home, _fake) = ctx_and_runner(runner).await;
+        install_owned_tools(&ctx).await;
+        access(&ctx, &Repo::parse("Clubria/payments").expect("parses")).await
+    }
+
+    #[tokio::test]
+    async fn a_repository_github_answers_for_is_still_this_developers() {
+        let runner = FakeRunner::new().containing("api repos/Clubria/payments", 0, "", "");
+        assert_eq!(asked_about(runner).await, Access::Yes);
+    }
+
+    #[tokio::test]
+    async fn a_repository_github_has_never_heard_of_is_gone() {
+        // The whole point of the check: a repository that was archived,
+        // renamed, or that this developer has been taken off. Only this answer
+        // unpins one.
+        let runner = FakeRunner::new().containing(
+            "api repos/Clubria/payments",
+            1,
+            "",
+            "gh: Not Found (HTTP 404)",
+        );
+        assert_eq!(asked_about(runner).await, Access::Gone);
+    }
+
+    #[tokio::test]
+    async fn every_other_failure_leaves_the_answer_unknown() {
+        // A token that expired overnight, an org that turned SAML on this
+        // morning, a GitHub having a bad day. None of them is "you no longer
+        // work on this repository", and reading them that way moves a developer
+        // off the repository they are in the middle of.
+        for said in [
+            "gh: You are not logged into any GitHub hosts",
+            "gh: Resource protected by organization SAML enforcement (HTTP 403)",
+            "gh: Server Error (HTTP 500)",
+        ] {
+            let runner = FakeRunner::new().containing("api repos/Clubria/payments", 1, "", said);
+            match asked_about(runner).await {
+                Access::Unknown(detail) => assert!(detail.contains("gh:"), "{detail}"),
+                other => panic!("{said:?} must not read as gone: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_gh_yet_cannot_tell_either() {
+        // Every machine's first run. `Access::Gone` here would unpin a
+        // repository on the one run that has no way of knowing anything.
+        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+        let repo = Repo::parse("Clubria/payments").expect("parses");
+        assert!(matches!(access(&ctx, &repo).await, Access::Unknown(_)));
     }
 }

@@ -32,6 +32,20 @@ pub struct UserConfig {
     /// `adopt_legacy_checkout` tests before it migrates anything.
     #[serde(default)]
     pub active_repo: Option<String>,
+    /// The repository this machine answered "always" for, as `owner/repo`.
+    ///
+    /// `active_repo` is what the picker's Enter *offers*; this is a developer
+    /// saying they do not want to be offered anything. A run that finds it set
+    /// puts no question at all — which is why the one thing that clears it is
+    /// GitHub saying the repository is not there any more. A pin nobody can
+    /// reach is a machine that provisions the wrong checkout in silence, and
+    /// silence is the whole feature the rest of the time.
+    ///
+    /// Recorded here rather than beside the checkout in `repos` because it is a
+    /// fact about this *machine* — which of several repositories it works on
+    /// without being asked — and not about any one of them.
+    #[serde(default)]
+    pub always_repo: Option<String>,
     /// The single checkout riabuild recorded before it asked which repository.
     ///
     /// Migrated into `repos` by `adopt_legacy_checkout`, which the picker calls —

@@ -71,7 +71,18 @@ pub(super) fn describe_repo(ctx: &Ctx) {
         Some(dir) => riabuild_paths::contract_tilde(&dir, &home),
         None => "not cloned yet".to_string(),
     };
-    ctx.ui.note(&format!("working on {repo} · {checkout}"));
+    // The whole of what a developer is told about a pin, and it is told on the
+    // run they answer `Always use …?` and on every run after — because a run
+    // that honours one draws no box, and this line stands where the box was.
+    // Said here rather than in the picker so there is one line about which
+    // repository this run is about, not two: `repo::pick::choose` deliberately
+    // says nothing.
+    let always = match ctx.config.always_repo.as_deref() == Some(repo.slug()) {
+        true => " · always — `riabuild --repo` asks again",
+        false => "",
+    };
+    ctx.ui
+        .note(&format!("working on {repo} · {checkout}{always}"));
 }
 
 /// One line per run in `~/.riabuild/logs/riabuild.log`.
@@ -162,5 +173,58 @@ mod tests {
             ..Default::default()
         });
         assert!(summary.contains("could not check"), "{summary}");
+    }
+
+    /// The line that stands where the box used to be.
+    ///
+    /// A run that honours a pin asks nothing and draws nothing, so this is the
+    /// only place the developer is told they have stopped being asked — and
+    /// the only place the way back is named.
+    #[tokio::test]
+    async fn a_pinned_machine_is_told_how_to_be_asked_again() {
+        let (mut ctx, _home) =
+            riabuild_tasks::testing::ctx_with(riabuild_runner::FakeRunner::new()).await;
+        ctx.ui = riabuild_ui::Ui::new(false);
+        ctx.repo = Some(riabuild_api::Repo::parse("Clubria/payments").expect("parses"));
+
+        describe_repo(&ctx);
+        assert!(
+            ctx.ui.noted().iter().all(|note| !note.contains("always")),
+            "a machine that has not pinned is told nothing about pins: {:?}",
+            ctx.ui.noted()
+        );
+
+        ctx.update_config(|config| config.always_repo = Some("Clubria/payments".into()))
+            .await
+            .expect("write");
+        describe_repo(&ctx);
+
+        let said = ctx.ui.noted().last().cloned().unwrap_or_default();
+        assert!(said.contains("working on Clubria/payments"), "{said}");
+        assert!(said.contains("always"), "{said}");
+        assert!(said.contains("riabuild --repo"), "{said}");
+    }
+
+    /// …and never about the repository this run is *not* about.
+    #[tokio::test]
+    async fn a_pin_naming_another_repository_says_nothing_here() {
+        // `riabuild --repo payments` on a machine pinned elsewhere is a run
+        // about `payments`, and `adopt_named` repoints the pin — but a `--check`
+        // writes nothing, so the two really can disagree while this line is
+        // printed. Claiming "always" about a repository the pin does not name
+        // would be the one sentence on screen that is false.
+        let (mut ctx, _home) =
+            riabuild_tasks::testing::ctx_with(riabuild_runner::FakeRunner::new()).await;
+        ctx.ui = riabuild_ui::Ui::new(false);
+        ctx.repo = Some(riabuild_api::Repo::parse("Clubria/payments").expect("parses"));
+        ctx.update_config(|config| config.always_repo = Some("Clubria/ai-builders-hub".into()))
+            .await
+            .expect("write");
+
+        describe_repo(&ctx);
+
+        let said = ctx.ui.noted().last().cloned().unwrap_or_default();
+        assert!(said.contains("working on Clubria/payments"), "{said}");
+        assert!(!said.contains("always"), "{said}");
     }
 }

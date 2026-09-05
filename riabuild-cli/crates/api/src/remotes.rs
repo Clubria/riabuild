@@ -22,6 +22,17 @@ pub struct SharedServer {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// What the server is for, in the lead's own words — drawn under its name
+    /// in the picker, already put through [`riabuild_ui::one_line`].
+    ///
+    /// The first field on this struct that is *prose* rather than an address,
+    /// and so the first that is checked for something other than shape. An
+    /// address is refused when it is wrong, because a wrong one reaches an
+    /// `ssh` argv; a description cannot be wrong, so it is *defused* instead —
+    /// a sentence riabuild-web served must not be able to redraw the terminal
+    /// it is printed on, and a server that arrived with an escape sequence in
+    /// its description is still a server the developer needs to connect to.
+    pub description: String,
 }
 
 /// What one fetch produced: the servers this laptop may use, and one sentence
@@ -57,6 +68,11 @@ struct WireServer {
     port: i64,
     #[serde(default)]
     user: String,
+    /// Absent from a riabuild-web deployed before descriptions existed, which
+    /// `#[serde(default)]` reads as no description — the same answer that
+    /// deployment's leads would give.
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,8 +135,23 @@ fn usable(wire: &WireServer) -> Result<SharedServer, String> {
         // Checked immediately above, so this cannot truncate.
         port: wire.port as u16,
         user: user.to_string(),
+        // Defused rather than refused, unlike everything above it. A wrong
+        // address is a machine riabuild must not connect to; a wrong
+        // description is a sentence riabuild must not print *as it arrived* —
+        // and refusing the server over it would take away the machine the
+        // developer needs because of the prose beside it.
+        description: riabuild_ui::one_line(&wire.description, DESCRIPTION),
     })
 }
+
+/// How much of a description the picker will draw.
+///
+/// riabuild-web refuses a longer one — `convex/sharedServers.ts` — so this is
+/// the second of two checks rather than the only one, and it is the one that
+/// holds for a deployment that forgets its own. Wide enough for the sentence a
+/// lead actually types, narrow enough that the line under a server's name stays
+/// one line on an eighty-column terminal.
+const DESCRIPTION: usize = 120;
 
 /// What a name or a username may hold. `pub` because `Remote::parse` holds a
 /// *typed* server to the same rule this holds a served one to — one definition
@@ -166,6 +197,7 @@ mod tests {
             host: host.into(),
             port: 2222,
             user: "ada".into(),
+            description: String::new(),
         }
     }
 
@@ -187,8 +219,58 @@ mod tests {
                 host: "gpu.internal".into(),
                 port: 2222,
                 user: "ada".into(),
+                description: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_description_arrives_beside_the_address() {
+        let server = usable(&WireServer {
+            description: "The 4×A100 box".into(),
+            ..wire("gpu.internal")
+        })
+        .expect("usable");
+        assert_eq!(server.description, "The 4×A100 box");
+    }
+
+    #[test]
+    fn a_description_that_would_redraw_the_terminal_costs_nobody_the_server() {
+        // The distinction this file is built on, applied to the first field on
+        // it that is prose: an address that would run a command is refused,
+        // because riabuild must not connect there. A description that would
+        // repaint the picker is *defused*, because the machine is still one the
+        // developer needs — and a server that vanished from the box over the
+        // sentence beside it is the support ticket `Fetched::refused` exists to
+        // prevent.
+        let server = usable(&WireServer {
+            description: "gpu\x1b[2J\x1b[1;1Hriabuild: not signed in".into(),
+            ..wire("gpu.internal")
+        })
+        .expect("still a server");
+        assert!(!server.description.contains('\x1b'), "{server:?}");
+        assert_eq!(server.host, "gpu.internal");
+
+        // And an essay is cut to the room the box has, rather than wrapping the
+        // rows under it into unreadability.
+        let server = usable(&WireServer {
+            description: "d".repeat(400),
+            ..wire("gpu.internal")
+        })
+        .expect("still a server");
+        assert_eq!(server.description.chars().count(), DESCRIPTION);
+    }
+
+    #[test]
+    fn a_deployment_that_predates_descriptions_serves_servers_with_none() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"servers":[{"id":"k1","name":"gpu","host":"gpu.internal",
+                "port":2222,"user":"ada"}]}"#,
+        )
+        .expect("decodes");
+        let fetched = sort_out(reply.servers);
+        assert_eq!(fetched.servers.len(), 1);
+        assert_eq!(fetched.servers[0].description, "");
     }
 
     #[test]

@@ -24,6 +24,7 @@ export const sharedServerView = v.object({
   host: v.string(),
   port: v.number(),
   user: v.string(),
+  description: v.string(),
   updatedAt: v.number(),
 });
 
@@ -32,7 +33,28 @@ export type Address = {
   host: string;
   port: number;
   user: string;
+  description: string;
 };
+
+/**
+ * The same, as it arrives: a client that predates the description sends none,
+ * and `validateAddress` reads that as "no description" rather than refusing the
+ * whole server over a field it did not know to send.
+ */
+export type SubmittedAddress = Omit<Address, "description"> & {
+  description?: string;
+};
+
+/**
+ * How long a description may be.
+ *
+ * One line under a server's name in a terminal picker, not a paragraph: the CLI
+ * draws it under `user@host:port` on an eighty-column terminal and cuts
+ * anything longer. Refused here rather than quietly truncated, because a lead
+ * who typed three hundred characters should be told that only some of them will
+ * ever be read.
+ */
+const DESCRIPTION_MAX = 120;
 
 /**
  * The address a lead typed, before it is stored anywhere.
@@ -51,10 +73,17 @@ export type Address = {
  * `api::org::version_only` does: the client survives a server that forgets its
  * own check.
  */
-export function validateAddress(input: Address): Address {
+export function validateAddress(input: SubmittedAddress): Address {
   const name = input.name.trim();
   const host = input.host.trim();
   const user = input.user.trim();
+  // Collapsed rather than refused: a description pasted out of a document
+  // arrives with that document's line breaks, and "your sentence contains a
+  // newline" is a poor thing to say about a sentence that is otherwise fine.
+  // What the CLI does about the rest — escape sequences, and the invisible
+  // characters that reverse the line they land in — is `riabuild_ui::one_line`,
+  // at the end that owns the terminal and cannot trust this one anyway.
+  const description = (input.description ?? "").replace(/\s+/g, " ").trim();
 
   if (!NAME.test(name)) {
     throw new Error(
@@ -86,11 +115,23 @@ export function validateAddress(input: Address): Address {
       "A username can hold letters, digits, dots, dashes and underscores, up to 32 of them.",
     );
   }
-  return { name, host, port: input.port, user };
+  if (description.length > DESCRIPTION_MAX) {
+    throw new Error(
+      `A description is one line, up to ${DESCRIPTION_MAX} characters — this one is ` +
+        `${description.length}. It goes under the server's name in every developer's picker.`,
+    );
+  }
+  return { name, host, port: input.port, user, description };
 }
 
-/** `user@host:port`, for the audit log and for the dashboard's own summary line. */
-function addressOf(server: Address): string {
+/**
+ * `user@host:port`, for the audit log and for the dashboard's own summary line.
+ *
+ * Takes the three fields it reads rather than an `Address`, so that a stored row
+ * — whose `description` is optional — is as good an argument as a validated one.
+ * Nothing about an address depends on what the server is *for*.
+ */
+function addressOf(server: Omit<Address, "name" | "description">): string {
   return `${server.user}@${server.host}:${server.port}`;
 }
 
@@ -99,6 +140,10 @@ const addressArgs = {
   host: v.string(),
   port: v.number(),
   user: v.string(),
+  // Optional on the wire, so a dashboard build older than this field can still
+  // save a server — and absent means *no description*, never a sentence
+  // riabuild-web wrote on a lead's behalf.
+  description: v.optional(v.string()),
 };
 
 /**
@@ -119,6 +164,10 @@ export const list = query({
         host: server.host,
         port: server.port,
         user: server.user,
+        // A row saved before this field existed has none. Absent and empty are
+        // the same thing to everything that reads it, so the difference stops
+        // here rather than being carried to two more places.
+        description: server.description ?? "",
         updatedAt: server.updatedAt,
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -241,6 +290,7 @@ export const forApi = internalQuery({
       host: v.string(),
       port: v.number(),
       user: v.string(),
+      description: v.string(),
     }),
   ),
   handler: async (ctx) => {
@@ -252,6 +302,7 @@ export const forApi = internalQuery({
         host: server.host,
         port: server.port,
         user: server.user,
+        description: server.description ?? "",
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
   },

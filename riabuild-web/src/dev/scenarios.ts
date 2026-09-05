@@ -326,6 +326,7 @@ const SHARED_SERVERS: SharedServer[] = [
     host: "build-01.fly.dev",
     port: 22,
     user: "clubria",
+    description: "Shared CI box. Long builds welcome, long-lived sessions not.",
     updatedAt: NOW - 30 * DAY,
   },
   {
@@ -334,6 +335,9 @@ const SHARED_SERVERS: SharedServer[] = [
     host: "gpu.internal",
     port: 2222,
     user: "ada",
+    // A server nobody has described, which is every row saved before the field
+    // existed — the column has to read as "nothing to say" rather than blank.
+    description: "",
     updatedAt: NOW - 2 * DAY,
   },
   {
@@ -342,6 +346,9 @@ const SHARED_SERVERS: SharedServer[] = [
     host: `${"long-hostname-segment.".repeat(4)}example.test`,
     port: 65535,
     user: "s".repeat(32),
+    // At the limit, beside a name and a hostname that are also at theirs:
+    // this is the row where the table runs out of room at 380px.
+    description: "d".repeat(120),
     updatedAt: NOW - 5 * MINUTE,
   },
 ];

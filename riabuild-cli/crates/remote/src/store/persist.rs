@@ -84,6 +84,10 @@ pub fn add(store: &mut Store, remote: &Remote) {
         repo: String::new(),
         session_id: String::new(),
         shared_id: String::new(),
+        // A server this developer typed in has nobody to describe it, and
+        // riabuild is not going to: they are looking at the only description
+        // there is.
+        description: String::new(),
         fresh: false,
     });
 }

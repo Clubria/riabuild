@@ -137,6 +137,7 @@ export type SharedServers = {
     host: string;
     port: number;
     user: string;
+    description: string;
   }[];
 };
 

@@ -78,6 +78,22 @@ pub struct Record {
     /// see [`Record::origin`].
     #[serde(default)]
     pub shared_id: String,
+    /// What one of the team's servers is *for*, as riabuild-web last described
+    /// it — the line the picker draws under its name.
+    ///
+    /// Empty for a server this laptop added, which has nobody to describe it:
+    /// a developer typing `riabuild remote ada@gpu.internal` is already looking
+    /// at the only description there is. Empty too for one of the team's that
+    /// no lead has described, and for a `remotes.json` written before this
+    /// field existed (`#[serde(default)]`, as above).
+    ///
+    /// Kept beside the address copy and refreshed by the same fetch, for the
+    /// same reason and with the same limit: it is a *memory* of what
+    /// riabuild-web last said, so a stale record still has something to show in
+    /// `remote list` — where it also still says "no longer shared", which is
+    /// the line that matters on that row.
+    #[serde(default)]
+    pub description: String,
     /// Whether this run's fetch of `/api/v1/remotes/shared` refreshed this
     /// record. In memory only, and **false by default on purpose** — a record
     /// read off the disk has not been refreshed by anything, so a shared server
@@ -269,6 +285,7 @@ pub fn record_for(remote: &super::Remote) -> Record {
         repo: String::new(),
         session_id: String::new(),
         shared_id: String::new(),
+        description: String::new(),
         fresh: false,
     }
 }
@@ -971,6 +988,7 @@ mod tests {
             repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
+            description: String::new(),
             fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = store)
@@ -1003,6 +1021,7 @@ mod tests {
             repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
+            description: String::new(),
             fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = store)
@@ -1024,6 +1043,7 @@ mod tests {
             repo: String::new(),
             session_id: String::new(),
             shared_id: String::new(),
+            description: String::new(),
             fresh: false,
         });
         Store::update(&paths, |on_disk| *on_disk = reloaded)

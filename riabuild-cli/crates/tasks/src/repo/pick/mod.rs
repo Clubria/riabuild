@@ -23,7 +23,7 @@ pub use answer::{Answer, rows_for, settle};
 use answer::ATTEMPTS;
 pub use cloned::choose_cloned;
 
-use super::list::{self, Listing};
+use super::list::{self, Access, Listing};
 use super::render::{self, Row};
 use crate::Ctx;
 use anyhow::Result;
@@ -32,17 +32,44 @@ use riabuild_paths::config::UserConfig;
 use riabuild_ui::Ui;
 use std::collections::BTreeMap;
 
-/// Which repository this run is about, asked if there is anybody to ask.
+/// Whether this run may take the repository a developer pinned without putting
+/// the question at all.
+///
+/// A named type rather than a `bool` because both call sites read as an
+/// English sentence and neither reads as `true`: the ordinary run honours a
+/// pin, and `riabuild --repo` with nothing after it is a developer asking for
+/// the box back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// The ordinary run. A pinned repository is taken in silence.
+    IfNotPinned,
+    /// Put the question even where there is a pin, and let this run's answer
+    /// replace it.
+    Always,
+}
+
+/// What this run's answer does to `config.always_repo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pin {
+    /// The pin, if there is one, is none of this run's business.
+    Leave,
+    Set,
+    Clear,
+}
+
+/// Which repository this run is about, asked if there is anybody to ask and if
+/// the developer has not already said they never want to be.
 ///
 /// Writes the answer before returning, so every repository-scoped task in the
 /// run that follows reads it from one place.
-pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
+pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
     // What Enter takes: the repository this machine last worked on, and the org
     // default on a machine that has never chosen. Fallible only for a dashboard
     // slug nobody could clone, which is the one case worth stopping a
     // provisioning run for — see `OrgConfig::default_repo`.
-    let default = ctx.repo()?;
+    let mut default = ctx.repo()?;
     let org_default = ctx.org()?.default_repo()?;
+    let pinned = pinned(&ctx.config);
 
     // Checked before the listing is fetched rather than after, so an unattended
     // run does not spend a GitHub round trip on a box nobody will see. Taking
@@ -50,8 +77,57 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
     // question: picking a repository is the decision riabuild would otherwise
     // have made alone. `remote::pick` refuses instead, because connecting
     // provisions a server — this does not.
+    //
+    // A pin is taken here without checking that GitHub still has it, and
+    // deliberately: the check exists to decide whether to *ask*, and there is
+    // nobody to ask. An unattended run on a repository that has gone fails at
+    // the clone with GitHub's own words, which is a better answer than one this
+    // could invent.
     if !ctx.ui.interactive() {
-        return adopt(ctx, default, &org_default).await;
+        return adopt(ctx, pinned.unwrap_or(default), &org_default, Pin::Leave).await;
+    }
+
+    // A pin nobody can parse is cleared by whatever this run settles on: it
+    // names no repository, so it cannot be honoured, and leaving it would mean
+    // asking this same question again on every run for ever.
+    let mut pin = match ctx.config.always_repo.is_some() && pinned.is_none() {
+        true => Pin::Clear,
+        false => Pin::Leave,
+    };
+
+    if let (Ask::IfNotPinned, Some(pinned)) = (ask, pinned) {
+        match list::access(ctx, &pinned).await {
+            // Nothing is said here. The run's next line already names the
+            // repository it is working on — `provision::describe_repo` — and it
+            // is that line, on every run, that carries the way back to the box.
+            // Two lines about one repository is how a developer stops reading
+            // either of them.
+            Access::Yes => return adopt(ctx, pinned, &org_default, Pin::Leave).await,
+            // "We could not tell" is not "you have lost access". A token that
+            // expired overnight must not move a developer off the repository
+            // they are in the middle of, so the pin stands and the reason is
+            // named rather than swallowed.
+            Access::Unknown(detail) => {
+                ctx.ui.note(&format!(
+                    "GitHub could not confirm {pinned} just now ({detail}), so riabuild is \
+                     carrying on with it"
+                ));
+                return adopt(ctx, pinned, &org_default, Pin::Leave).await;
+            }
+            Access::Gone => {
+                ctx.ui.warn(&format!(
+                    "GitHub does not have {pinned} for you any more, so riabuild is asking \
+                     which repository to work on."
+                ));
+                pin = Pin::Clear;
+                // And it cannot be what Enter takes either: `active_repo` is
+                // almost always the same slug, and offering a repository
+                // nobody can clone is offering to fail.
+                if default == pinned {
+                    default = org_default.clone();
+                }
+            }
+        }
     }
 
     let chosen = offer(
@@ -64,7 +140,40 @@ pub async fn choose(ctx: &mut Ctx) -> Result<Repo> {
         },
     )
     .await;
-    adopt(ctx, chosen, &org_default).await
+
+    // `confirm`, so **Enter is yes**, and that is worth defending against the
+    // line at the top of this file: a developer who presses Enter has still
+    // decided nothing. It still holds. Enter through both questions takes the
+    // repository riabuild would have chosen alone, and all this second one adds
+    // is that riabuild stops asking about a choice whose answer was already
+    // "whatever you were going to do" — which is the product, not an exception
+    // to it. What it must never become is a question that is *hard* to answer
+    // the other way, which is why `n` is one key, the pin is named on every run
+    // afterwards, and the flag that undoes it is printed beside it.
+    if let Some(answer) = ctx.ui.confirm(&format!("Always use {chosen}?")) {
+        pin = match answer {
+            true => Pin::Set,
+            // An explicit no clears a pin as well as declining one, which is
+            // what makes `riabuild --repo` a way back to being asked every run
+            // rather than only a way to be asked once.
+            false => Pin::Clear,
+        };
+    }
+    // Nothing is said about a yes either, for the same reason: the line
+    // `describe_repo` prints a moment later says `always — riabuild --repo asks
+    // again`, on this run and on every run after it, which is where a developer
+    // will be looking for it on the morning they want the box back.
+    adopt(ctx, chosen, &org_default, pin).await
+}
+
+/// The repository this machine said "always" to, if it named one riabuild could
+/// use.
+///
+/// `Repo::parse` rather than the raw string, for the reason the crate rule
+/// gives: this value reaches `gh repo clone` argv and a directory name, and it
+/// has been sitting in a file a person can edit since the run that wrote it.
+fn pinned(config: &UserConfig) -> Option<Repo> {
+    Repo::parse(config.always_repo.as_deref()?).ok()
 }
 
 /// Who the question is being put for, and what it may say about their machine.
@@ -182,8 +291,8 @@ fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str, on: Option<&s
     default.clone()
 }
 
-/// Records the repository this run is about, and migrates the checkout an older
-/// riabuild left behind.
+/// Records the repository this run is about, what that does to the pin, and
+/// migrates the checkout an older riabuild left behind.
 ///
 /// The migration happens here because this is the first place both facts are
 /// known: the path in `config.json`, and the repository it must be a checkout of
@@ -191,14 +300,23 @@ fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str, on: Option<&s
 /// cloned before it asked. Both go in one write, so a run that is interrupted
 /// between them cannot leave a machine that has adopted nothing and forgotten
 /// where its checkout was.
-pub async fn adopt(ctx: &mut Ctx, chosen: Repo, org_default: &Repo) -> Result<Repo> {
+async fn adopt(ctx: &mut Ctx, chosen: Repo, org_default: &Repo, pin: Pin) -> Result<Repo> {
     let (slug, default_slug) = (chosen.slug().to_string(), org_default.slug().to_string());
     // Under `--check` nothing is written: a dry run must leave the machine as it
     // found it, and `config.json` is part of "as it found it".
     if !ctx.dry_run {
         ctx.update_config(|config: &mut UserConfig| {
             config.adopt_legacy_checkout(&default_slug);
-            config.active_repo = Some(slug);
+            config.active_repo = Some(slug.clone());
+            // In the same write as the choice it is about. A run interrupted
+            // between the two would leave a machine pinned to one repository
+            // and working on another, which is the one state nothing on it
+            // could explain.
+            match pin {
+                Pin::Leave => {}
+                Pin::Set => config.always_repo = Some(slug),
+                Pin::Clear => config.always_repo = None,
+            }
         })
         .await?;
     }
@@ -211,16 +329,33 @@ pub async fn adopt(ctx: &mut Ctx, chosen: Repo, org_default: &Repo) -> Result<Re
 /// Separate from [`adopt`] only in where the org default comes from: `--repo` is
 /// honoured on a machine with no session, where there is no default to migrate a
 /// pre-picker checkout under, so there the choice is recorded on its own.
+///
+/// **A named repository replaces a pin and never creates one.** On a machine
+/// that has answered "always", the next bare `riabuild` puts no question — so a
+/// `--repo` that left the pin alone would move this run onto one repository and
+/// the next one silently back, which is the switch nobody could see happening.
+/// On a machine that has not, `--repo payments` is one run about `payments` and
+/// says nothing about the rest, which is what it has always meant and what
+/// every script and CI job passing it relies on.
 pub async fn adopt_named(ctx: &mut Ctx, repo: Repo) -> Result<()> {
+    let pin = match ctx.config.always_repo.is_some() {
+        true => Pin::Set,
+        false => Pin::Leave,
+    };
     match ctx.org.as_ref().and_then(|org| org.default_repo().ok()) {
         Some(default) => {
-            adopt(ctx, repo, &default).await?;
+            adopt(ctx, repo, &default, pin).await?;
         }
         None => {
             if !ctx.dry_run {
                 let slug = repo.slug().to_string();
-                ctx.update_config(|config: &mut UserConfig| config.active_repo = Some(slug))
-                    .await?;
+                ctx.update_config(|config: &mut UserConfig| {
+                    config.active_repo = Some(slug.clone());
+                    if pin == Pin::Set {
+                        config.always_repo = Some(slug);
+                    }
+                })
+                .await?;
             }
             ctx.repo = Some(repo);
         }
@@ -254,6 +389,7 @@ mod tests {
         Entry {
             repo: repo(slug),
             pushed_at,
+            description: String::new(),
         }
     }
 
@@ -408,7 +544,7 @@ mod tests {
     async fn enter_takes_the_org_default_on_a_machine_that_has_never_chosen() {
         let (mut ctx, _home, _fake) = asked(&[""], listing_runner()).await;
 
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
         assert_eq!(
@@ -425,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn a_number_picks_the_repository_on_that_row() {
         let (mut ctx, _home, _fake) = asked(&["2"], listing_runner()).await;
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
         assert_eq!(chosen.slug(), "Clubria/payments");
         assert_eq!(ctx.config.active_repo.as_deref(), Some("Clubria/payments"));
     }
@@ -433,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn a_typed_name_picks_a_repository_the_box_never_showed() {
         let (mut ctx, _home, _fake) = asked(&["internal-tooling"], listing_runner()).await;
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
         assert_eq!(chosen.slug(), "Clubria/internal-tooling");
     }
 
@@ -442,14 +578,20 @@ mod tests {
         let (mut ctx, _home, _fake) =
             asked(&["nope/../x", "-x", "99", "2"], listing_runner()).await;
 
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(
             chosen.slug(),
             "Clubria/ai-builders-hub",
-            "the fourth answer is never read: the bound is three"
+            "the fourth answer never picks a repository: the bound is three"
         );
-        assert_eq!(ctx.ui.asked().len(), 3, "asked three times, then stopped");
+        let asked_which = ctx
+            .ui
+            .asked()
+            .into_iter()
+            .filter(|question| question.starts_with("Which repository"))
+            .count();
+        assert_eq!(asked_which, 3, "asked three times, then stopped");
     }
 
     #[tokio::test]
@@ -460,7 +602,7 @@ mod tests {
         install_owned_tools(&ctx).await;
         ctx.org = Some(org_config());
 
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
         assert!(
@@ -480,7 +622,7 @@ mod tests {
             .await
             .expect("write");
 
-        choose(&mut ctx).await.expect("chooses");
+        choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(
             ctx.config
@@ -500,7 +642,7 @@ mod tests {
             .await
             .expect("write");
 
-        choose(&mut ctx).await.expect("chooses");
+        choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(ctx.config.active_repo.as_deref(), Some("Clubria/payments"));
         assert_eq!(
@@ -518,7 +660,7 @@ mod tests {
         let (mut ctx, _home, _fake) = asked(&["payments"], listing_runner()).await;
         ctx.dry_run = true;
 
-        let chosen = choose(&mut ctx).await.expect("chooses");
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
 
         assert_eq!(chosen.slug(), "Clubria/payments");
         assert_eq!(
@@ -537,7 +679,7 @@ mod tests {
         );
         let (mut ctx, _home, _fake) = asked(&[""], runner).await;
 
-        let chosen = choose(&mut ctx)
+        let chosen = choose(&mut ctx, Ask::IfNotPinned)
             .await
             .expect("a failed listing is not fatal");
 
@@ -551,10 +693,230 @@ mod tests {
         org.repo_slug = "not a repository".into();
         ctx.org = Some(org);
 
-        let error = choose(&mut ctx).await.expect_err("cannot proceed");
+        let error = choose(&mut ctx, Ask::IfNotPinned)
+            .await
+            .expect_err("cannot proceed");
         assert!(
             format!("{error:#}").contains("riabuild dashboard"),
             "the developer has to be sent to the lead who typed it: {error:#}"
         );
+    }
+
+    /// A listing runner that also answers for one repository by name, which is
+    /// what `list::access` asks about a pinned one.
+    fn runner_that_still_has(slug: &str) -> FakeRunner {
+        listing_runner().containing(&format!("api repos/{slug}"), 0, slug, "")
+    }
+
+    /// The same, for a repository GitHub no longer has for this account.
+    fn runner_that_lost(slug: &str) -> FakeRunner {
+        listing_runner().containing(
+            &format!("api repos/{slug}"),
+            1,
+            "",
+            "gh: Not Found (HTTP 404)",
+        )
+    }
+
+    async fn pinned_to(
+        slug: &str,
+        answers: &[&str],
+        runner: FakeRunner,
+    ) -> (Ctx, tempfile::TempDir) {
+        let (mut ctx, home, _fake) = asked(answers, runner).await;
+        let slug = slug.to_string();
+        ctx.update_config(|config| config.always_repo = Some(slug))
+            .await
+            .expect("write");
+        (ctx, home)
+    }
+
+    #[tokio::test]
+    async fn saying_yes_to_always_records_it_and_the_next_run_asks_nothing() {
+        // The whole feature, in the order a developer meets it.
+        let (mut ctx, _home, _fake) = asked(&["payments", "y"], listing_runner()).await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/payments");
+        assert_eq!(
+            ctx.config.always_repo.as_deref(),
+            Some("Clubria/payments"),
+            "the answer to `Always use …?` is what has to survive the run"
+        );
+        assert!(
+            ctx.ui.asked().iter().any(|q| q.contains("Always use")),
+            "{:?}",
+            ctx.ui.asked()
+        );
+        // And nothing is said about it here. The way back is on the line
+        // `provision::describe_repo` prints a moment later, on this run and on
+        // every run after — which is `report::a_pinned_machine_is_told_how_to_
+        // be_asked_again`, and is why two lines about one repository would be
+        // one line too many.
+        assert!(
+            ctx.ui.noted().iter().all(|note| !note.contains("--repo")),
+            "{:?}",
+            ctx.ui.noted()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_repository_is_taken_without_a_question_or_a_box() {
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/payments",
+            &[],
+            runner_that_still_has("Clubria/payments"),
+        )
+        .await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/payments");
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+        assert_eq!(ctx.config.active_repo.as_deref(), Some("Clubria/payments"));
+        assert_eq!(ctx.config.always_repo.as_deref(), Some("Clubria/payments"));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_repository_that_github_no_longer_has_asks_again() {
+        // The one thing that undoes a pin on its own. Without it the machine
+        // provisions a checkout nobody can clone, in the silence the pin was
+        // chosen for.
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/payments",
+            &["", "n"],
+            runner_that_lost("Clubria/payments"),
+        )
+        .await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert!(
+            ctx.ui.warned().iter().any(|said| said.contains("payments")),
+            "the developer has to be told why they are being asked: {:?}",
+            ctx.ui.warned()
+        );
+        assert_eq!(
+            chosen.slug(),
+            "Clubria/ai-builders-hub",
+            "Enter cannot still offer the repository that has just gone"
+        );
+        assert_eq!(ctx.config.always_repo, None, "and the pin goes with it");
+    }
+
+    #[tokio::test]
+    async fn a_pin_github_could_not_confirm_is_left_exactly_where_it_was() {
+        // A token that expired overnight, a 500, an org that turned SAML on
+        // this morning. "We could not tell" is not "you have lost access", and
+        // reading it that way moves a developer off the repository they are in
+        // the middle of.
+        let runner = listing_runner().containing(
+            "api repos/Clubria/payments",
+            1,
+            "",
+            "gh: Server Error (HTTP 500)",
+        );
+        let (mut ctx, _home) = pinned_to("Clubria/payments", &[], runner).await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/payments");
+        assert_eq!(ctx.config.always_repo.as_deref(), Some("Clubria/payments"));
+        assert!(ctx.ui.asked().is_empty(), "{:?}", ctx.ui.asked());
+    }
+
+    #[tokio::test]
+    async fn asking_on_purpose_puts_the_box_back_and_no_answer_clears_the_pin() {
+        // `riabuild --repo` with nothing after it.
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/payments",
+            &["1", "n"],
+            runner_that_still_has("Clubria/payments"),
+        )
+        .await;
+
+        let chosen = choose(&mut ctx, Ask::Always).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
+        assert_eq!(
+            ctx.config.always_repo, None,
+            "declining is how a developer goes back to being asked every run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_machine_with_nobody_there_takes_the_pin_and_asks_github_nothing() {
+        // Every CI job and every `ssh … riabuild --no-shell`. The access check
+        // exists to decide whether to *ask*, and there is nobody to ask.
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/payments",
+            &[],
+            runner_that_still_has("Clubria/payments"),
+        )
+        .await;
+        ctx.ui = Ui::new(false);
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/payments");
+    }
+
+    #[tokio::test]
+    async fn a_pin_nobody_could_parse_does_not_survive_the_run_that_finds_it() {
+        // A hand-edited `config.json`, or one written by a riabuild that meant
+        // something else by the field. It names no repository, so it cannot be
+        // honoured — and leaving it would put this same question every run.
+        let (mut ctx, _home) = pinned_to("not a repository", &["", "n"], listing_runner()).await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
+        assert_eq!(ctx.config.always_repo, None);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_neither_pins_nor_unpins() {
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/payments",
+            &[],
+            runner_that_lost("Clubria/payments"),
+        )
+        .await;
+        ctx.dry_run = true;
+
+        choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(
+            ctx.config.always_repo.as_deref(),
+            Some("Clubria/payments"),
+            "a run that promised to change nothing must not unpin a repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_repository_replaces_a_pin_and_never_creates_one() {
+        // `riabuild --repo payments` on a pinned machine is a switch, because
+        // the next bare run would otherwise go silently back.
+        let (mut ctx, _home) = pinned_to(
+            "Clubria/ai-builders-hub",
+            &[],
+            runner_that_still_has("Clubria/ai-builders-hub"),
+        )
+        .await;
+
+        adopt_named(&mut ctx, repo("Clubria/payments"))
+            .await
+            .expect("adopts");
+
+        assert_eq!(ctx.config.always_repo.as_deref(), Some("Clubria/payments"));
+
+        // …and on a machine that never pinned, it says nothing about the rest,
+        // which is what every script passing `--repo` relies on.
+        let (mut ctx, _home, _fake) = asked(&[], listing_runner()).await;
+        adopt_named(&mut ctx, repo("Clubria/payments"))
+            .await
+            .expect("adopts");
+        assert_eq!(ctx.config.always_repo, None);
     }
 }

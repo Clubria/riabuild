@@ -34,6 +34,7 @@ describe("the team's shared servers", () => {
       host: string;
       port: number;
       user: string;
+      description: string;
     }> = {},
   ) {
     await t.run(async (ctx) => {
@@ -43,6 +44,7 @@ describe("the team's shared servers", () => {
         host: overrides.host ?? "gpu.internal",
         port: overrides.port ?? 2222,
         user: overrides.user ?? "ada",
+        description: overrides.description,
         createdBy: lead,
         createdAt: now,
         updatedAt: now,
@@ -81,6 +83,31 @@ describe("the team's shared servers", () => {
     // has to survive a rename and an address edit, which is what a row id does.
     expect(typeof body.servers[1].id).toBe("string");
     expect(body.servers[1].id.length).toBeGreaterThan(0);
+  });
+
+  test("a server's description travels with its address", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    await seedServer(t, rowId, { description: "the 4×A100 box" });
+    // …and one saved before the field existed carries an empty one rather than
+    // an absent key, which is what stops the CLI having to tell them apart.
+    await seedServer(t, rowId, { name: "build", host: "build.internal" });
+    const { token } = await issueSession(t, rowId);
+    stubMembership(204);
+
+    const response = await t.fetch("/api/v1/remotes/shared", {
+      headers: bearer(token),
+    });
+
+    const body = await json<SharedServers>(response);
+    expect(body.servers[0]).toMatchObject({
+      name: "build",
+      description: "",
+    });
+    expect(body.servers[1]).toMatchObject({
+      name: "gpu",
+      description: "the 4×A100 box",
+    });
   });
 
   test("a lead gets them too", async () => {

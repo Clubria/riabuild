@@ -15,9 +15,16 @@ import {
 } from "../ui";
 
 /** An empty form, and what "cancel" goes back to. */
-const BLANK = { name: "", host: "", port: "22", user: "" };
+const BLANK = { name: "", host: "", port: "22", user: "", description: "" };
 
 type Draft = typeof BLANK;
+
+/**
+ * The longest description riabuild-web will store, and so the longest one worth
+ * typing. `convex/sharedServers.ts` is the authority; this copy is what lets the
+ * form say so before a lead loses a paragraph to a refusal.
+ */
+const DESCRIPTION_MAX = 120;
 
 function draftOf(server: SharedServer): Draft {
   return {
@@ -25,6 +32,7 @@ function draftOf(server: SharedServer): Draft {
     host: server.host,
     port: String(server.port),
     user: server.user,
+    description: server.description,
   };
 }
 
@@ -59,6 +67,12 @@ export function SharedServers() {
 
   const servers = data.sharedServers.value;
   const port = Number(draft.port);
+  // How long the description is, when that is too long — `null` otherwise, so
+  // the two places that read it (the field's error and the disabled submit)
+  // cannot disagree about where the limit is. riabuild-web refuses it anyway;
+  // this is so a lead finds out while they are still typing.
+  const typed = draft.description.trim().length;
+  const overlong = typed > DESCRIPTION_MAX ? typed : null;
   // The address a lead is about to save re-identifies the server for everyone
   // if any part of the login target moves. A rename does not — the name is a
   // label, and `Remote::hash` never covers it.
@@ -83,6 +97,7 @@ export function SharedServers() {
       host: draft.host.trim(),
       port: Number(draft.port),
       user: draft.user.trim(),
+      description: draft.description.trim(),
     };
     const done =
       editing === null
@@ -141,6 +156,16 @@ export function SharedServers() {
         columns={columns}
         rows={servers}
         rowKey={(server) => server._id}
+        // Two lines, the way the CLI's own picker draws them: the address, and
+        // under it what the server is for. A server nobody has described gets
+        // one line rather than a blank second one — the same rule the CLI
+        // follows, where a row holding space for a sentence nobody wrote reads
+        // as a sentence that failed to load.
+        renderSubRow={(server) =>
+          server.description === "" ? null : (
+            <span className="text-fg-faint">{server.description}</span>
+          )
+        }
         renderActions={(server) => (
           <>
             <Button
@@ -242,6 +267,25 @@ export function SharedServers() {
           />
         </div>
 
+        {/* Its own row rather than a third cell in the grid: it is the only
+            box here that holds a sentence, and half a column is not where a
+            sentence goes. Not `required` either — a server with no description
+            is a server nobody has got round to, not a mistake. */}
+        <div className="mt-4">
+          <Field
+            label="what it is for"
+            hint="One line, shown under the server's name in every developer's picker."
+            error={
+              overlong === null
+                ? null
+                : `One line, up to ${DESCRIPTION_MAX} characters — this one is ${overlong}.`
+            }
+            value={draft.description}
+            placeholder="The 4×A100 box. Ask before starting a long training run."
+            onChange={(description) => setDraft({ ...draft, description })}
+          />
+        </div>
+
         {readdressing && (
           <div className="mt-4">
             <Alert tone="warn" title="This is a different machine to riabuild">
@@ -263,7 +307,7 @@ export function SharedServers() {
             variant="primary"
             pending={saving}
             pendingLabel="saving"
-            disabled={busy !== null}
+            disabled={busy !== null || overlong !== null}
           >
             {editing === null ? "add server" : "save changes"}
           </Button>
