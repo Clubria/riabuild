@@ -1398,14 +1398,14 @@ test -z "$(in_container 'find /tmp /run -name hosts.yml 2>/dev/null')"
 # valid file that would satisfy `test -f` and carry no policy at all.
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_A/org-settings.json"
 in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settings.json"
-# status line: one script, at the path the settings above actually name
+# status line: one file, at the path the settings above actually name
 #
 # The counterpart to those two assertions, and the case where the namespace is
-# the *wrong* answer. Those settings name `node ~/.riabuild/claude-statusline.js`;
+# the *wrong* answer. Those settings name `~/.riabuild/claude-statusline`;
 # Claude Code runs it through a shell, so `~` is this box's shared account. The
 # task built that path on `RIABUILD_ROOT` until 2026-08-17 and therefore wrote
-# into each namespace instead — `node` was handed a path that does not exist, and
-# a status line whose command fails renders as no status line at all. Nothing
+# into each namespace instead — Claude Code was handed a path that does not
+# exist, and a status line whose command fails renders as nothing at all. Nothing
 # errored, nothing was logged, and the task reported satisfied on both runs.
 #
 # Written here, and — like every assertion in this block — NOT RUNNING YET, for
@@ -1414,9 +1414,14 @@ in_container "grep -q CLUBRIA_REMOTE_E2E ~/.riabuild-remote/$MEMBER_B/org-settin
 # shape via `testing::ctx_on_a_server` instead of the laptop every test here had
 # been built on. This line is what starts covering it from outside the binary the
 # moment the run gets past the install step.
-in_container "test -s ~/.riabuild/claude-statusline.js"
-# and nowhere else — a copy in a namespace is byte-identical to the live script,
-# so it answers "is the script installed?" with a yes that means nothing.
+in_container "test -x ~/.riabuild/claude-statusline"
+# and nowhere else — a copy in a namespace is byte-identical to the live file, so
+# it answers "is the status line installed?" with a yes that means nothing. The
+# `.js` names are the JavaScript riabuild installed before 2026-09-05, which the
+# task removes wherever it finds one.
+in_container "! test -e ~/.riabuild-remote/$MEMBER_A/claude-statusline"
+in_container "! test -e ~/.riabuild-remote/$MEMBER_B/claude-statusline"
+in_container "! test -e ~/.riabuild/claude-statusline.js"
 in_container "! test -e ~/.riabuild-remote/$MEMBER_A/claude-statusline.js"
 in_container "! test -e ~/.riabuild-remote/$MEMBER_B/claude-statusline.js"
 

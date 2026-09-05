@@ -27,19 +27,19 @@ use riabuild_paths::contract_tilde;
 pub struct OrgSettings;
 
 /// The status line command the `claude_statusline` task installs on *this*
-/// machine, which is the only one `vetting` will let through.
+/// machine, which is the one `vetting` writes into the file.
 ///
 /// Derived from `Paths` rather than written out, because the two are not the
 /// same string everywhere: `claude_statusline_file()` hangs off `tools_root()`,
 /// so on a server it is the shared account's `~/.riabuild` and not this
-/// developer's namespace. A constant here would be a fourth place that has to
-/// agree with `riabuild-web`'s `DEFAULT_STATUS_LINE` and would be wrong on
-/// exactly the machines nobody tests by hand.
+/// developer's namespace. A constant here would be wrong on exactly the machines
+/// nobody tests by hand.
+///
+/// `~`, not the absolute path, and that is not cosmetic: Claude Code runs this
+/// through a shell, and the tilde is what makes one string right for a laptop
+/// and for every developer on a server at once.
 fn installed_status_line(ctx: &Ctx) -> String {
-    format!(
-        "node {}",
-        contract_tilde(&ctx.paths.claude_statusline_file(), &ctx.paths.home())
-    )
+    contract_tilde(&ctx.paths.claude_statusline_file(), &ctx.paths.home())
 }
 
 #[async_trait]
@@ -88,9 +88,10 @@ impl Task for OrgSettings {
         // Reporting it here is what makes an upgrade re-write it — or, when it
         // carries a program, fail loudly on the next run instead of the next
         // dashboard edit.
-        if let Err(refusal) = vetting::vet(&cached, &installed_status_line(ctx)) {
-            return Ok(Status::needs(refusal.reason().to_string()));
-        }
+        let vetted = match vetting::vet(&cached, &installed_status_line(ctx)) {
+            Ok(vetted) => vetted,
+            Err(refusal) => return Ok(Status::needs(refusal.reason().to_string())),
+        };
 
         // Nothing to compare against until this machine is signed in, and the
         // question has to be *asked* before it can be answered — an
@@ -104,6 +105,24 @@ impl Task for OrgSettings {
         // `project` and `env_local` already use.
         if ctx.member.is_none() {
             return Ok(Status::needs("waiting for sign-in"));
+        }
+
+        // Vetting is idempotent — it is run over its own output here — so a
+        // cached file that differs from what riabuild would write now is a file
+        // riabuild did not write. That is what repairs a `statusLine` naming a
+        // status line that is no longer installed, which is every machine
+        // provisioned before 2026-09-05: `updated_at` cannot see it, because
+        // nothing on the server changed. It also makes a hand-edited settings
+        // file drift rather than policy.
+        //
+        // **After** the sign-in guard, not with the local checks above it,
+        // because `apply` needs the network: reporting this on a signed-out
+        // machine would send the run into a fetch that 401s, which is the exact
+        // regression `a_signed_out_machine_is_reported_not_thrown` exists for.
+        if vetted.settings != cached {
+            return Ok(Status::needs(
+                "the cached team settings are not what riabuild would write now",
+            ));
         }
 
         // The authoritative comparison: what the server says it published.
@@ -260,31 +279,49 @@ mod tests {
         assert!(format!("{status:?}").contains("hooks"), "{status:?}");
     }
 
-    /// The other half of the same guard: a status line the server rewrote is a
-    /// program too, and it is the one key allowed to name one at all.
+    /// A cached file naming a status line riabuild did not install is drift,
+    /// and it is the shape every machine provisioned before 2026-09-05 is in:
+    /// the settings name the JavaScript, that file is gone, and a status line
+    /// whose command fails renders as nothing at all.
+    ///
+    /// `updated_at` cannot see it — nothing on the server changed — so the
+    /// comparison against what riabuild would write now is the only thing that
+    /// repairs it.
     #[tokio::test]
-    async fn a_cached_file_naming_another_status_line_is_reported() {
-        let (ctx, _home) = ctx_with(FakeRunner::new()).await;
+    async fn a_cached_file_naming_a_status_line_riabuild_did_not_install_is_reported() {
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        // Signed in, because this drift is reported after the sign-in guard —
+        // a machine with no session has a more useful thing to be told.
+        ctx.member = Some(riabuild_api::Member {
+            github_login: "ada".into(),
+            member_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            email: "ada@clubria.dev".into(),
+            role: "developer".into(),
+            status: "active".into(),
+        });
         write_file(
             &ctx.paths.org_settings_file(),
-            r#"{"statusLine":{"type":"command","command":"node /tmp/theirs.js"}}"#,
+            r#"{"statusLine":{"type":"command","command":"node ~/.riabuild/x.js"}}"#,
         )
         .await;
 
         let status = OrgSettings.check(&ctx).await.unwrap();
-        assert!(format!("{status:?}").contains("statusLine"), "{status:?}");
+        assert!(
+            format!("{status:?}").contains("what riabuild would write"),
+            "{status:?}"
+        );
     }
 
-    /// What `vetting` is measured against, resolved from this machine's own
-    /// `Paths` — the assertion `claude_statusline`'s suite makes about the file
-    /// it installs, seen from the side that has to match it.
+    /// The command riabuild writes into the settings is the file
+    /// `claude_statusline` installs, expressed through the `~` Claude Code's
+    /// shell expands. Both come from one `Paths` method; this is the side that
+    /// has to spell it.
     #[tokio::test]
-    async fn the_status_line_vetting_allows_is_the_one_that_gets_installed() {
+    async fn the_status_line_written_is_the_one_that_gets_installed() {
         let (ctx, _home) = ctx_with(FakeRunner::new()).await;
-        assert_eq!(
-            installed_status_line(&ctx),
-            "node ~/.riabuild/claude-statusline.js"
-        );
+        assert_eq!(installed_status_line(&ctx), "~/.riabuild/claude-statusline");
     }
 
     #[tokio::test]

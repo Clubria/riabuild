@@ -142,7 +142,10 @@ pub(crate) async fn launch(
         settings,
         checkouts,
         default_checkout,
-        usage_spool,
+        // Written by launchers older than 2026-09-05 and deliberately unread:
+        // the status line derives its own spool now. See the flag's own
+        // documentation in `cli.rs` for why it is still parsed at all.
+        usage_spool: _,
         args,
     } = action
     else {
@@ -153,7 +156,6 @@ pub(crate) async fn launch(
         settings: settings.as_deref().map(PathBuf::from),
         checkouts: checkouts.iter().map(PathBuf::from).collect(),
         default_checkout: default_checkout.as_deref().map(PathBuf::from),
-        usage_spool: usage_spool.as_deref().map(PathBuf::from),
         args: args.clone(),
         ..Plan::new(
             (*harness).into(),
@@ -163,6 +165,63 @@ pub(crate) async fn launch(
         )
     };
     riabuild_tasks::shims::launch::run(runner, &plan).await
+}
+
+/// `riabuild internal statusline` — the line Claude Code draws, on every render.
+///
+/// The payload arrives on stdin and the line goes to stdout. Everything it is
+/// computed from is in `riabuild_tasks::statusline`; this is the wiring, and the
+/// order of the three steps is the only decision it makes.
+///
+/// **The line is printed before anything touches a file.** Claude Code debounces
+/// renders at 300ms and cancels the in-flight one when a newer supersedes it, so
+/// the developer's bar must never be behind a spool write, a `mkdir`, or a
+/// process spawn. Collection then happens with the answer already delivered.
+///
+/// **The flush is detached, and it is riabuild.** `spawn_detached` `setsid`s and
+/// nulls the child's stdio, which is what keeps a flush from dying mid-POST when
+/// Claude Code kills this render — the same treatment `internal agent-turn`
+/// gets. `current_exe` rather than a path passed in: the status line is riabuild
+/// now, so it knows where it lives, and `~/.riabuild/bin` is the one directory
+/// riabuild does not put itself in.
+///
+/// Takes no `Ctx`, like `launch` and more sharply — this runs several times a
+/// minute for as long as a session is open.
+pub(crate) async fn statusline(runner: &dyn riabuild_runner::CommandRunner) -> Result<i32> {
+    use riabuild_tasks::statusline::{Session, collect, render};
+    use tokio::io::AsyncReadExt;
+
+    // `tokio::io`, not `std::io`: a blocking read on the current-thread runtime
+    // stalls every other future on it, which is the invariant in
+    // riabuild-cli/CLAUDE.md.
+    let mut payload = String::new();
+    // A read that fails is an empty payload, not a failure: the marker and the
+    // account are still worth drawing, and a status line that exits non-zero
+    // draws nothing at all.
+    let _ = tokio::io::stdin().read_to_string(&mut payload).await;
+
+    let session = Session::from_env();
+    print!("{}", render(&payload, &session));
+    // Explicitly, before the collection below: `print!` is line-buffered and
+    // nothing here writes a newline, so the line would otherwise sit in this
+    // process's buffer until exit — behind exactly the work this ordering exists
+    // to put it in front of.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    if collect(&payload, &session).await
+        && let Ok(riabuild) = std::env::current_exe()
+    {
+        // Silently. Nothing reads this process's stderr, and a flush that could
+        // not be started is one the next render starts instead.
+        let _ = runner
+            .spawn_detached(
+                &riabuild.to_string_lossy(),
+                &["internal", "usage-flush"],
+                &RunOptions::default(),
+            )
+            .await;
+    }
+    Ok(0)
 }
 
 /// `riabuild internal ngrok` — ngrok, with the team's authtoken in its

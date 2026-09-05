@@ -252,11 +252,12 @@ export function Usage() {
         rowKey={(row) => row.memberId}
         empty={
           <Empty glyph="◔" title="Nothing reported yet.">
-            Collection is opt-in per Claude account. A developer runs{" "}
-            <span className="text-fg-dim">riabuild claude track &lt;n&gt;</span>{" "}
-            to mark one of their accounts as work; an unmarked account reports
-            nothing at all, which is what keeps a personal subscription
-            personal.
+            Every Claude Code account riabuild manages reports its own usage,
+            about once a minute, while somebody is working. A panel this empty
+            means no session has run since the team upgraded to a riabuild that
+            collects &mdash; or that nobody has run{" "}
+            <span className="text-fg-dim">riabuild</span> since, which is what
+            installs the status line that does the reporting.
           </Empty>
         }
       />

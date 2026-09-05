@@ -23,10 +23,9 @@ pub fn accounts_box(accounts: &[Account], theme: Theme) -> String {
         let label = label(account);
         let padding = " ".repeat(width - label.chars().count());
         lines.push(format!(
-            "  {}. {label}{padding}   {}{}",
+            "  {}. {label}{padding}   {}",
             account.number,
-            identity(&account.identity, theme),
-            tracked(account, theme)
+            identity(&account.identity, theme)
         ));
     }
 
@@ -85,18 +84,6 @@ fn identity(identity: &Identity, theme: Theme) -> String {
 ///
 /// A hint that refuses when typed is worse than no hint: it reads as riabuild
 /// being broken rather than as the developer asking for something impossible.
-/// The tag on an account whose usage reaches the dashboard.
-///
-/// Only on the accounts that carry it. An "(not tracked)" on every other line
-/// would be four words of noise on the common case — nothing is tracked until
-/// somebody asks — and would make the box harder to read to say less.
-fn tracked(account: &Account, theme: Theme) -> String {
-    match account.tracked {
-        true => format!("  {}", theme.paint(Role::Muted, "· usage tracked")),
-        false => String::new(),
-    }
-}
-
 fn hints(accounts: &[Account]) -> Vec<(String, String)> {
     let mut hints = Vec::new();
     if accounts.len() < MAX {
@@ -133,21 +120,6 @@ fn hints(accounts: &[Account]) -> Vec<(String, String)> {
             format!("claude-{} auth login", account.number),
         ));
     }
-    // Each shown only where it would do something, like every hint above it.
-    // A developer with nothing tracked is never offered `untrack`, and one with
-    // everything tracked is never offered `track`.
-    if let Some(account) = accounts.iter().find(|account| !account.tracked) {
-        hints.push((
-            "Report its usage:".to_string(),
-            format!("riabuild claude track {}", account.number),
-        ));
-    }
-    if let Some(account) = accounts.iter().find(|account| account.tracked) {
-        hints.push((
-            "Stop reporting:".to_string(),
-            format!("riabuild claude untrack {}", account.number),
-        ));
-    }
     hints
 }
 
@@ -161,86 +133,21 @@ mod tests {
             number,
             id: format!("id-{number}"),
             identity,
-            tracked: false,
         }
     }
 
-    fn tracked_account(number: usize, identity: Identity) -> Account {
-        Account {
-            tracked: true,
-            ..account(number, identity)
-        }
-    }
-
-    /// The default is invisible, and that is the point: nothing is tracked
-    /// until somebody asks, so the common box says nothing about it.
+    /// Nothing in the box says anything about usage collection, because there
+    /// is no longer anything to say: every account riabuild manages reports,
+    /// and a tag on all of them would be noise on every line.
     #[test]
-    fn an_untracked_account_carries_no_tag() {
+    fn no_account_carries_a_usage_tag() {
         let drawn = accounts_box(
             &[account(1, Identity::LoggedIn("ada@example.com".into()))],
             Theme::plain(),
         );
 
-        assert!(!drawn.contains("usage tracked"), "{drawn}");
-    }
-
-    /// A developer can see, in the place they already look, which of their
-    /// accounts reports usage to their employer.
-    #[test]
-    fn a_tracked_account_says_so_beside_its_email() {
-        let drawn = accounts_box(
-            &[
-                tracked_account(1, Identity::LoggedIn("ada@clubria.com".into())),
-                account(2, Identity::LoggedIn("ada@personal.example".into())),
-            ],
-            Theme::plain(),
-        );
-
-        let tracked_line = drawn
-            .lines()
-            .find(|line| line.contains("ada@clubria.com"))
-            .expect("the tracked account is listed");
-        assert!(tracked_line.contains("usage tracked"), "{drawn}");
-
-        let personal_line = drawn
-            .lines()
-            .find(|line| line.contains("ada@personal.example"))
-            .expect("the personal account is listed");
-        assert!(
-            !personal_line.contains("usage tracked"),
-            "a personal account must not be tagged: {drawn}"
-        );
-    }
-
-    /// Every hint in this box is a command that works right now. A developer
-    /// with nothing tracked has nothing to untrack.
-    #[test]
-    fn untrack_is_not_offered_when_nothing_is_tracked() {
-        let drawn = accounts_box(
-            &[account(1, Identity::LoggedIn("ada@example.com".into()))],
-            Theme::plain(),
-        );
-
-        assert!(drawn.contains("riabuild claude track 1"), "{drawn}");
-        assert!(!drawn.contains("untrack"), "{drawn}");
-    }
-
-    /// And the reverse.
-    #[test]
-    fn track_is_not_offered_when_everything_is_tracked() {
-        let drawn = accounts_box(
-            &[tracked_account(
-                1,
-                Identity::LoggedIn("ada@example.com".into()),
-            )],
-            Theme::plain(),
-        );
-
-        assert!(drawn.contains("riabuild claude untrack 1"), "{drawn}");
-        assert!(
-            !drawn.contains("claude track "),
-            "nothing left to track: {drawn}"
-        );
+        assert!(!drawn.contains("usage"), "{drawn}");
+        assert!(!drawn.contains("track"), "{drawn}");
     }
 
     fn three() -> Vec<Account> {

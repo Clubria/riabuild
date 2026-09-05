@@ -1,8 +1,13 @@
 # Usage tracking
 
 **Date:** 2026-08-29
-**Status:** implemented
-**Code:** `riabuild-cli/crates/tasks/assets/claude-statusline.js`,
+**Status:** implemented, with two decisions since overturned — see
+[`2026-09-05-statusline-in-rust-design.md`](2026-09-05-statusline-in-rust-design.md).
+Collection is **automatic** for every account riabuild manages rather than opt-in per
+account, and the collector is `riabuild internal statusline` rather than a JavaScript file
+run on `node`. Everything else below still holds — why the status line is the collection
+point at all, what a sample carries, and how the server merges them.
+**Code:** `riabuild-cli/crates/tasks/src/statusline/`,
 `riabuild-cli/crates/cli/src/internal/usage.rs`, `riabuild-web/convex/usage.ts`
 
 Clubria's developers run Claude Code on **personal Pro and Max subscriptions**. That one
@@ -111,9 +116,10 @@ This is self-clocking, and that is the point. It fires while somebody is using C
 There is no daemon, no launchd job and no systemd timer, and therefore no background
 service riabuild has to install, supervise or remove.
 
-`RIABUILD_BIN` is set by the Claude launcher's `handoff`, absolute, alongside the
-environment it already sets there. It is a path and not a credential. The script never
-looks riabuild up on `PATH`, for the reason
+Which riabuild it starts was `RIABUILD_SELF`, set by the Claude launcher's `handoff`
+alongside the environment it already sets there — a path and not a credential. Since
+2026-09-05 the status line *is* riabuild, so it asks `current_exe()` and the launcher sets
+nothing. Either way it never looks riabuild up on `PATH`, for the reason
 `no_shim_looks_riabuild_up_on_the_path` exists.
 
 ## `riabuild internal usage-flush`
@@ -205,6 +211,14 @@ Left unlabelled it ends up in a budget.
 
 ## Personal accounts
 
+> **Overturned on 2026-09-05.** Collection is automatic for every account riabuild
+> manages, and the gate that remains is a fact rather than a setting: only an account
+> under `<root>/claude/<uuid>` is spooled, so a `claude` riabuild did not create writes
+> nothing. What the argument below missed is that the developer who never reads the
+> release note also never runs the command — the fleet reported nothing at all, including
+> from the work accounts nobody would have objected to. See
+> [`2026-09-05-statusline-in-rust-design.md`](2026-09-05-statusline-in-rust-design.md).
+
 `riabuild claude` manages up to nine accounts per developer and
 [`2026-08-06-claude-accounts-design.md`](2026-08-06-claude-accounts-design.md) says plainly
 what they are for: "a personal subscription and one or more work accounts". Instrumenting
@@ -231,9 +245,10 @@ The decisions worth pinning are pure and are tested that way:
 - `spool_target` — that `<root>/claude/<uuid>` yields the right root and account on both a
   laptop path and a `~/.riabuild-remote/<member>` one, and that an absent
   `CLAUDE_CONFIG_DIR` yields nothing.
-- The script's own behaviour, through `node`, over the recorded payload: that it still
-  prints the label and bar, that it appends exactly one line, and that it writes nothing for
-  an untracked account.
+- The renderer's own behaviour over the recorded payload: that it still prints the label
+  and bar, that it appends exactly one line, and that a `CLAUDE_CONFIG_DIR` riabuild did
+  not create spools nothing. Through `node` and the shipped script until 2026-09-05; a
+  plain unit test over a `Session` value since.
 
 Convex-side, `usage.test.ts` covers the upsert taking the maximum, the rejection of a
 sample naming another member, and a candidate's read returning their own rows only.

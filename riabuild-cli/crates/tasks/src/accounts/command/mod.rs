@@ -71,44 +71,6 @@ pub(crate) async fn update_accounts<T>(
     outcome.context("update_config did not run its closure")?
 }
 
-/// `riabuild claude track <n>` and `riabuild claude untrack <n>`.
-///
-/// Whether this account's usage reaches the team dashboard. Off for every
-/// account until it is asked for, because a developer's accounts include their
-/// personal subscriptions — see `2026-08-06-claude-accounts-design.md`, which
-/// describes the list as "a personal subscription and one or more work
-/// accounts". Defaulting to on and offering a way out would collect from
-/// exactly the developer who never read the release note.
-///
-/// The mark is stored against the account's **uuid** rather than its number, so
-/// deleting account 2 does not silently start tracking whichever account moves
-/// up into its place.
-///
-/// Rewriting the launchers is the second half and not a detail: the spool path
-/// lives on the launcher's exec line, so until they are rewritten `claude`
-/// still carries the old answer. Doing it here means the developer's next
-/// `claude` obeys them without a `riabuild` run in between.
-pub async fn track(ctx: &mut Ctx, number: usize, on: bool) -> Result<i32> {
-    let id = accounts::id_of(&ctx.config, number)?;
-    if ctx.dry_run {
-        let verb = if on { "start" } else { "stop" };
-        ctx.ui
-            .info(&format!("would {verb} reporting account {number}'s usage"));
-        return Ok(0);
-    }
-
-    update_accounts(ctx, |config| {
-        config.tracked_accounts.retain(|held| held != &id);
-        if on {
-            config.tracked_accounts.push(id.clone());
-        }
-        Ok(())
-    })
-    .await?;
-    shims::write_all(ctx).await?;
-    list(ctx).await
-}
-
 pub async fn list(ctx: &Ctx) -> Result<i32> {
     let found = status::read_all(ctx).await;
     ctx.ui.info("");

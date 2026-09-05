@@ -338,7 +338,7 @@ tasks added after this document was written never took one.
 | 12 | `claude_onboarding` | `claude_accounts` | *every* account's `.claude.json` records `hasCompletedOnboarding == true`. Deliberately not on `project`: unlike trust, nothing here needs a checkout. |
 | 14 | `claude_agents_view` | `claude_accounts` | *every* account's `.claude.json` carries the `defaultToAgentsView` key. Presence, not truth — a developer who turned the view off has answered the question, and re-asking it every run is how riabuild would keep overruling them. |
 | 9 | `env_local` | `login`, `infisical_cli`, `project` | one `.env.<environment>` per environment in `orgConfig.secretEnvironments` exists, parses, is newer than `orgConfig.secretsUpdatedAt`, and is gitignored. A developer or lead gets `.env.dev` and `.env.staging`; a candidate gets `.env.dev`. The task id is historical — it wrote a single `.env.local` before environments were plural. |
-| 11 | `claude_statusline` | — | the status line script is byte-identical to the copy compiled into this binary. Comparing contents rather than existence is what makes a script that changes in a release repair itself, so `version()` never has to move. The path is `Paths::claude_statusline_file`, and it is `~/.riabuild/claude-statusline.js` on a server as well as on a laptop: the shared tools root, not the per-developer namespace, because the org settings name it through a `~` the shell expands to the account's home. A copy in the namespace is a status line whose command silently fails, which is what remote mode had until 2026-08-17 with the task reporting satisfied throughout. |
+| 11 | `claude_statusline` | — | the installed status line is byte-identical to what riabuild would write now: one `exec` into `riabuild internal statusline`, naming this binary by absolute path. Comparing contents rather than existence is what makes an upgrade repair itself, so `version()` never has to move. It was `node ~/.riabuild/claude-statusline.js` until 2026-09-05, and the task still removes that file wherever an older riabuild left one. The path is `Paths::claude_statusline_file`, and it is `~/.riabuild/claude-statusline` on a server as well as on a laptop: the shared tools root, not the per-developer namespace, because the org settings name it through a `~` the shell expands to the account's home. A copy in the namespace is a status line whose command silently fails, which is what remote mode had until 2026-08-17 with the task reporting satisfied throughout. |
 | 13 | `claude_plugins` | `claude_accounts`, `project` | every marketplace and plugin the *checkout's own* `.claude/settings.json` declares is installed, once per account. Satisfied with zero subprocesses when the checkout declares none. **Nothing here decides what to install**: an org setting naming a marketplace would be the server-driven task manifest under another name. |
 
 > **Superseded for Claude Code.** This document's single-profile model — one
@@ -407,14 +407,17 @@ against it. It writes the key under both the literal and the resolved checkout p
 since a symlinked checkout makes those different strings and trust under one is invisible
 under the other.
 
-**11 — `claude_statusline`.** The org settings ship a `statusLine` naming
-`node ~/.riabuild/claude-statusline.js`, a context-window bar. The two halves are
-deliberately split across the trust boundary: the server sends the *pointer*, and the
-*script* is compiled into the binary with `include_str!` and installed by this task.
-Serving the script body instead would be a one-key remote code execution channel — the
-task manifest this design already rejected, wearing a different name. `node` resolves
-because `path_with_riabuild` puts riabuild's Node and `~/.riabuild/bin` on `PATH`
-together, so the interpreter is present wherever the account launchers are.
+**11 — `claude_statusline`.** The marker, the repository, the signed-in account and a
+context-window bar, drawn on every render. The org settings used to ship a `statusLine`
+naming it, split across the trust boundary — the server sending the *pointer* and the
+*script* compiled into the binary — because serving the script body would have been a
+one-key remote code execution channel, the task manifest this design already rejected
+wearing a different name. Since 2026-09-05 the pointer does not come from the server
+either: this task installs `~/.riabuild/claude-statusline`, one `exec` into `riabuild
+internal statusline`, and `org_settings` writes that command into the settings file it
+caches. One fewer key the server names a program with, and one fewer string two
+repositories had to spell identically. See
+`2026-09-05-statusline-in-rust-design.md`.
 
 **12 — `claude_onboarding`.** The second piece of Claude Code state that is not settings
 data. Signing an account in does not complete Claude Code's first-run setup: `claude auth

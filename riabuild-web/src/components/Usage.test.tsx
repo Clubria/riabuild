@@ -123,11 +123,13 @@ describe("Usage", () => {
     expect(screen.getAllByText("partial").length).toBeGreaterThan(0);
   });
 
-  test("nothing reported yet explains how collection is turned on", () => {
+  test("nothing reported yet explains why, rather than reading as broken", () => {
     renderUsage(SCENARIOS["usage-empty"]());
 
     expect(screen.getByText(/Nothing reported yet/i)).toBeInTheDocument();
-    expect(screen.getByText(/riabuild claude track/)).toBeInTheDocument();
+    // There is nothing for a lead to switch on any more, so the empty state has
+    // to name what it is waiting for instead.
+    expect(screen.getByText(/about once a minute/i)).toBeInTheDocument();
     // The empty state is the table's stand-in, so there is no table to read.
     expect(screen.queryByRole("table")).toBeNull();
   });

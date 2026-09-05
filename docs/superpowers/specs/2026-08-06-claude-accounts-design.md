@@ -270,9 +270,11 @@ the trust key into each account's config file. The existing read-modify-write, t
 symlink-aware `trust_keys`, and the move-aside of an unreadable config are unchanged and
 simply run once per account.
 
-`claude_statusline` needs no such change: it installs one script at
-`~/.riabuild/claude-statusline.js` that the org settings name by path, and every account
-gets those settings through `--settings`.
+`claude_statusline` needs no such change: it installs one file at
+`~/.riabuild/claude-statusline` that the settings name by path, and every account gets
+those settings through `--settings`. Which account a render is *for* comes from that
+session's own `CLAUDE_CONFIG_DIR`, which is why one shared file can name the launcher and
+the email of whichever account is running.
 
 ## Commands — `accounts/command.rs`
 

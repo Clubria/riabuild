@@ -290,21 +290,24 @@ check_contains "org-settings.json is what this deployment served" \
 
 check "the first account's config directory exists" test -d "$RIA_HOME/claude/$CLAUDE_ACCOUNT"
 
-# The org settings *name* this script; the binary carries it. That split is what
-# keeps a dashboard field from being a way to run code on a laptop, so the file
-# has to actually arrive from the binary for the settings to mean anything.
-check "the status line script was installed from the binary" \
-  test -s "$RIA_HOME/claude-statusline.js"
+# The settings name this file and riabuild writes both. Nothing on the server
+# chooses any part of it — the file is one `exec` into the binary that installed
+# it — so it has to actually arrive for the settings to mean anything.
+check "the status line was installed" \
+  test -x "$RIA_HOME/claude-statusline"
+check_contains "the status line runs riabuild rather than an interpreter" \
+  "$(cat "$RIA_HOME/claude-statusline" 2>/dev/null)" "internal statusline"
+check_contains "the team settings name the status line riabuild installed" \
+  "$(cat "$RIA_HOME/org-settings.json" 2>/dev/null)" "~/.riabuild/claude-statusline"
 
 # And that it answers with the repository the developer is standing in. The unit
-# tests run this script against `.git` directories written by hand, which is the
+# tests run the renderer against `.git` directories written by hand, which is the
 # right shape for the branches but proves nothing about the chain: this is the
-# one place where riabuild's own Node runs the script the binary carried, inside
-# a checkout `gh repo clone` really made, against an `origin` nobody wrote down
-# for the occasion.
+# one place the installed file is executed the way Claude Code executes it,
+# inside a checkout `gh repo clone` really made, against an `origin` nobody
+# wrote down for the occasion.
 check_contains "the status line names the repository the developer is in" \
-  "$(cd "$PROJECT_DIR" && printf '{}' \
-      | "$RIA_HOME/node/$NODE_VERSION/bin/node" "$RIA_HOME/claude-statusline.js" 2>&1)" \
+  "$(cd "$PROJECT_DIR" && printf '{}' | "$RIA_HOME/claude-statusline" 2>&1)" \
   "(riabuild · $E2E_REPO_SLUG)"
 
 # And which account the window is, which is the same argument one step over. The
@@ -314,10 +317,10 @@ check_contains "the status line names the repository the developer is in" \
 # the ordered list the number is counted from would be caught here and nowhere
 # else.
 #
-# `CLAUDE_CONFIG_DIR` is set explicitly rather than relied on, because this
-# script is not a launcher: on a laptop running the suite from inside Claude
-# Code the variable is already in the environment, naming a different account
-# entirely, and the assertion would be about the developer rather than the run.
+# `CLAUDE_CONFIG_DIR` is set explicitly rather than relied on, because this is
+# not a launcher: on a laptop running the suite from inside Claude Code the
+# variable is already in the environment, naming a different account entirely,
+# and the assertion would be about the developer rather than the run.
 #
 # Only the number is asserted. The e2e account is never signed in to a real
 # Claude subscription, so there is no email to expect — and a check that
@@ -326,8 +329,30 @@ check_contains "the status line names the repository the developer is in" \
 check_contains "the status line names which account the window is" \
   "$(cd "$PROJECT_DIR" && printf '{}' \
       | CLAUDE_CONFIG_DIR="$RIA_HOME/claude/$CLAUDE_ACCOUNT" \
-        "$RIA_HOME/node/$NODE_VERSION/bin/node" "$RIA_HOME/claude-statusline.js" 2>&1)" \
+        "$RIA_HOME/claude-statusline" 2>&1)" \
   "claude-1"
+
+# Collection is automatic: no account was marked and nothing was turned on, so a
+# render that names a session spools a sample. What only this can say is that the
+# path riabuild derives from `CLAUDE_CONFIG_DIR` is the one `Paths` really uses;
+# a sample's contents are unit-tested.
+#
+# The payload names a session, unlike every render above it, and that is the
+# point rather than a detail. A sample that cannot say which session it measured
+# is not a measurement, so `{}` correctly spools nothing — an assertion built on
+# one of those renders is asserting a bug rather than the feature, which is
+# exactly how this one first failed.
+check_contains "a render naming a session still draws the marker" \
+  "$(cd "$PROJECT_DIR" && printf '{"session_id":"e2e-session"}' \
+      | CLAUDE_CONFIG_DIR="$RIA_HOME/claude/$CLAUDE_ACCOUNT" \
+        "$RIA_HOME/claude-statusline" 2>&1)" \
+  "(riabuild"
+
+# The *directory*, not the spool file. That render also started a flush — the
+# marker is absent on a fresh machine, so one is due — and a flush that reaches
+# this deployment removes the spool it just sent. Asserting the file would be
+# asserting that the dashboard was unreachable.
+check "and spooled a usage sample nobody switched on" test -d "$RIA_HOME/usage"
 
 # The whole reason riabuild exists: a developer ends up with working secrets.
 ENV_DEV="$PROJECT_DIR/.env.dev"

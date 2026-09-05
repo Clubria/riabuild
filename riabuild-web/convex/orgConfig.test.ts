@@ -182,7 +182,7 @@ describe("org config and claude settings", () => {
     expect(settings.skipDangerousModePermissionPrompt).toBe(true);
   });
 
-  test("the default settings carry the context-window status line", async () => {
+  test("the default settings name no status line", async () => {
     const t = setup();
     const { rowId } = await seedMember(t);
     const { token } = await issueSession(t, rowId);
@@ -190,141 +190,14 @@ describe("org config and claude settings", () => {
     const response = await t.fetch("/api/v1/org/claude-settings", {
       headers: bearer(token),
     });
-    // The path is load-bearing across two repositories: riabuild-cli's
-    // `claude_statusline` task writes exactly this file.
+
+    // A status line is a command Claude Code runs on every render, so it is
+    // not a thing this server sends: the CLI writes the one its own
+    // `claude_statusline` task installed on that machine. A key here would be
+    // dropped on every laptop.
     expect(
       (await json<{ settings: ClaudeSettings }>(response)).settings.statusLine,
-    ).toEqual({
-      type: "command",
-      command: "node ~/.riabuild/claude-statusline.js",
-    });
-  });
-
-  test("the backfill adds a status line to settings a lead saved earlier", async () => {
-    const t = setup();
-    await t.run(async (ctx) => {
-      await ctx.db.insert("orgConfig", {
-        claudeSettings: JSON.stringify({ env: { CLUBRIA_ORG: "1" } }),
-        claudeSettingsUpdatedAt: 1234,
-        repoSlug: "Clubria/ai-builders-hub",
-        minCliVersion: "0.1.0",
-        latestCliVersion: "0.1.0",
-        secretsUpdatedAt: 0,
-      });
-    });
-
-    const result = await t.mutation(internal.org.backfillStatusLine, {});
-    expect(result.updated).toBe(true);
-
-    const row = await t.run(
-      async (ctx) => await ctx.db.query("orgConfig").first(),
-    );
-    const settings = parseSettings(row!.claudeSettings);
-    expect(settings.statusLine.command).toBe(
-      "node ~/.riabuild/claude-statusline.js",
-    );
-    // Settings a lead already chose survive the migration.
-    expect(settings.env).toEqual({ CLUBRIA_ORG: "1" });
-    // The CLI re-fetches by comparing this. A backfill that left it at 1234
-    // would change the database and nobody's laptop.
-    expect(row!.claudeSettingsUpdatedAt).toBeGreaterThan(1234);
-  });
-
-  /**
-   * A stored status line the backfill will not touch — including one no lead
-   * can save any more.
-   *
-   * `org.update` now refuses anything but the command `claude_statusline`
-   * installs, so a row like this one only exists from before that gate, or
-   * from a hand edit. The backfill still leaves it exactly as it is: it fills
-   * a key that is *absent* and overwrites nothing, and a migration that
-   * rewrote settings a lead cannot see is worse than one that does nothing.
-   *
-   * What that costs is stated rather than hidden: the CLI hard-refuses this
-   * row, naming `statusLine.command`, on every developer's next run. Recovery
-   * is a lead opening the settings screen and pressing save — the dashboard
-   * takes the stored status line out of the box it renders and writes
-   * riabuild's own back, so no CLI release and no hand-edited row is needed.
-   * See `OrgSettings` in `src/components/LeadPanel.tsx`.
-   */
-  test("the backfill leaves a status line a lead chose alone", async () => {
-    const t = setup();
-    const chosen = { type: "command", command: "my-own-statusline" };
-    await t.run(async (ctx) => {
-      await ctx.db.insert("orgConfig", {
-        claudeSettings: JSON.stringify({ statusLine: chosen }),
-        claudeSettingsUpdatedAt: 1234,
-        repoSlug: "Clubria/ai-builders-hub",
-        minCliVersion: "0.1.0",
-        latestCliVersion: "0.1.0",
-        secretsUpdatedAt: 0,
-      });
-    });
-
-    const result = await t.mutation(internal.org.backfillStatusLine, {});
-    expect(result.updated).toBe(false);
-
-    const row = await t.run(
-      async (ctx) => await ctx.db.query("orgConfig").first(),
-    );
-    expect(parseSettings(row!.claudeSettings).statusLine).toEqual(chosen);
-    expect(row!.claudeSettingsUpdatedAt).toBe(1234);
-  });
-
-  test("running the backfill twice is a no-op the second time", async () => {
-    const t = setup();
-    await t.run(async (ctx) => {
-      await ctx.db.insert("orgConfig", {
-        claudeSettings: "{}",
-        claudeSettingsUpdatedAt: 0,
-        repoSlug: "Clubria/ai-builders-hub",
-        minCliVersion: "0.1.0",
-        latestCliVersion: "0.1.0",
-        secretsUpdatedAt: 0,
-      });
-    });
-
-    expect(
-      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
-    ).toBe(true);
-    expect(
-      (await t.mutation(internal.org.backfillStatusLine, {})).updated,
-    ).toBe(false);
-
-    const entries = await t.run(async (ctx) =>
-      ctx.db
-        .query("auditLog")
-        .collect()
-        .then((rows) =>
-          rows.filter((row) => row.meta.via === "backfillStatusLine"),
-        ),
-    );
-    expect(entries).toHaveLength(1);
-  });
-
-  test("the backfill refuses to guess at settings it cannot parse", async () => {
-    const t = setup();
-    await t.run(async (ctx) => {
-      await ctx.db.insert("orgConfig", {
-        claudeSettings: "{ not json",
-        claudeSettingsUpdatedAt: 1234,
-        repoSlug: "Clubria/ai-builders-hub",
-        minCliVersion: "0.1.0",
-        latestCliVersion: "0.1.0",
-        secretsUpdatedAt: 0,
-      });
-    });
-
-    const result = await t.mutation(internal.org.backfillStatusLine, {});
-    expect(result.updated).toBe(false);
-    expect(result.reason).toMatch(/dashboard/i);
-
-    const row = await t.run(
-      async (ctx) => await ctx.db.query("orgConfig").first(),
-    );
-    // Replacing unreadable settings with generated ones would lose whatever the
-    // lead meant to write.
-    expect(row!.claudeSettings).toBe("{ not json");
+    ).toBeUndefined();
   });
 
   /** Exactly what an org that saved before the permission keys existed holds. */
@@ -371,9 +244,9 @@ describe("org config and claude settings", () => {
     // added one and not the other would look repaired and behave otherwise.
     expect(settings.skipDangerousModePermissionPrompt).toBe(true);
     expect(settings.theme).toBe("auto");
-    expect(settings.statusLine.command).toBe(
-      "node ~/.riabuild/claude-statusline.js",
-    );
+    // And nothing puts a status line back: it left the defaults when riabuild
+    // started writing its own on each machine.
+    expect(settings.statusLine).toBeUndefined();
     expect(result.added).toContain("permissions.defaultMode");
 
     // The CLI re-fetches by comparing this. A backfill that left it at 1234

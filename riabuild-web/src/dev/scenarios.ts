@@ -290,10 +290,10 @@ const AUDIT: AuditEntry[] = [
 
 const ORG: OrgConfig = {
   repoSlug: "Clubria/ai-builders-hub",
-  // `statusLine` is here because every real stored blob carries it, and the
-  // settings screen has to be looked at with one present: it is taken out of
-  // the box a lead types in and shown read-only underneath. A fixture without
-  // it would render the one state that never happens.
+  // `statusLine` is here because every row saved before 2026-09-05 still
+  // carries one, and the settings screen has to be looked at in that state: it
+  // is taken out of the box a lead types in and never put back. A fixture
+  // without it would never exercise the removal.
   claudeSettings: JSON.stringify(
     {
       permissions: { allow: ["Bash(pnpm *)"] },
@@ -761,9 +761,9 @@ export const SCENARIOS: Record<string, () => Data> = {
   }),
 
   /**
-   * Nobody has opted an account in yet, which is the state every deployment
-   * starts in and stays in until developers run `riabuild claude track`. The
-   * empty state has to say that, or a lead reads it as broken.
+   * No session has run since the team upgraded to a riabuild that collects,
+   * which is the state every deployment starts in and the one a lead is most
+   * likely to read as broken. The empty state has to explain it.
    */
   "usage-empty": () => ({
     ...base(LEAD),

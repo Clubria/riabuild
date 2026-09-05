@@ -39,15 +39,6 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
     // landing mid-write, which leaves a truncated `claude-2` that fails with a
     // shell syntax error. `write_script` is what guarantees that.
     for (index, id) in ids.iter().enumerate() {
-        // Only an account the developer marked gets a spool path, and an
-        // account that loses the mark gets a launcher without one on the next
-        // run — which is drift `check()` already sees, because the value is on
-        // the exec line like every other. See `UserConfig::tracked_accounts`.
-        let spool = ctx
-            .config
-            .tracked_accounts
-            .contains(id)
-            .then(|| ctx.paths.usage_spool_file(id));
         let script = launcher_script(
             &riabuild,
             &ctx.paths.claude_profile_dir(id),
@@ -58,7 +49,6 @@ pub async fn write_all(ctx: &Ctx) -> Result<()> {
                 all: &checkouts,
                 default: default.as_deref(),
             },
-            spool.as_deref(),
         );
         write_script(&bin, &format!("claude-{}", index + 1), &script).await?;
         if index == 0 {
