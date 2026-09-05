@@ -234,6 +234,32 @@ export function Gallery() {
           rowKey={(r) => r.id}
           empty={<Empty title="unused" />}
         />
+        {/* Prose under a row, spanning every column — and the row beside it
+            with none, because a table where every row has a second line and one
+            where only some do are two different pictures. The unbroken
+            120-character name is what makes this state worth a slot: it is what
+            squeezes a `grow` column to its floor, which is the reason a
+            description cannot live in one. */}
+        <DataTable
+          caption="Gallery table, rows with a line under them"
+          columns={TABLE_COLUMNS}
+          rows={TABLE_ROWS}
+          rowKey={(r) => r.id}
+          renderSubRow={(r) =>
+            r.detail === "" ? null : (
+              <span className="text-fg-faint">
+                {r.detail}, said at length under the row it is about rather than
+                inside a column that has no room for a sentence.
+              </span>
+            )
+          }
+          renderActions={(r) => (
+            <Button variant="quiet" aria-label={`edit ${r.name}`}>
+              edit
+            </Button>
+          )}
+          empty={<Empty title="unused" />}
+        />
         <DataTable
           caption="Gallery table, empty"
           columns={TABLE_COLUMNS}
@@ -279,7 +305,9 @@ const TABLE_COLUMNS: Column<GalleryRow>[] = [
   {
     key: "state",
     header: "state",
-    render: (r) => <Badge tone={r.state === "active" ? "ok" : "muted"}>{r.state}</Badge>,
+    render: (r) => (
+      <Badge tone={r.state === "active" ? "ok" : "muted"}>{r.state}</Badge>
+    ),
   },
   {
     key: "detail",
@@ -362,7 +390,13 @@ function GalleryForm() {
   );
 }
 
-function Section({ name, children }: { name: string; children: React.ReactNode }) {
+function Section({
+  name,
+  children,
+}: {
+  name: string;
+  children: React.ReactNode;
+}) {
   return (
     <section>
       <h2 className="mb-3 border-b border-rule pb-1 text-xs tracking-widest text-accent uppercase">
@@ -373,7 +407,13 @@ function Section({ name, children }: { name: string; children: React.ReactNode }
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-wrap items-center gap-3">
       <span className="w-28 shrink-0 text-xs text-fg-faint">{label}</span>

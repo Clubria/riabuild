@@ -126,22 +126,8 @@ export function SharedServers() {
       key: "address",
       header: "address",
       grow: true,
-      // Two lines, the way the CLI's own picker draws them: the address, and
-      // under it what the server is for. A server nobody has described gets one
-      // line rather than a blank second one — the same rule the CLI follows,
-      // where a row holding space for a sentence nobody wrote reads as a
-      // sentence that failed to load.
       render: (server) => (
-        <div className="min-w-0">
-          <span className="block text-fg-dim wrap-value">
-            {address(server)}
-          </span>
-          {server.description !== "" && (
-            <span className="block text-fg-faint wrap-value">
-              {server.description}
-            </span>
-          )}
-        </div>
+        <span className="text-fg-dim wrap-value">{address(server)}</span>
       ),
     },
     {
@@ -170,6 +156,16 @@ export function SharedServers() {
         columns={columns}
         rows={servers}
         rowKey={(server) => server._id}
+        // Two lines, the way the CLI's own picker draws them: the address, and
+        // under it what the server is for. A server nobody has described gets
+        // one line rather than a blank second one — the same rule the CLI
+        // follows, where a row holding space for a sentence nobody wrote reads
+        // as a sentence that failed to load.
+        renderSubRow={(server) =>
+          server.description === "" ? null : (
+            <span className="text-fg-faint">{server.description}</span>
+          )
+        }
         renderActions={(server) => (
           <>
             <Button
