@@ -134,7 +134,7 @@ function relay(incoming: URL, upstream: Response): Response {
   // several `Set-Cookie` values into one comma-joined header is how a browser
   // ends up with one cookie named after two. The sign-in leg sets three.
   for (const cookie of setCookiesOf(upstream.headers)) {
-    headers.append("set-cookie", cookie);
+    headers.append("set-cookie", firstPartyCookie(cookie));
   }
   headers.set("cache-control", NEVER_CACHE);
 
@@ -156,6 +156,49 @@ function relay(incoming: URL, upstream: Response): Response {
     statusText: upstream.statusText,
     headers,
   });
+}
+
+/**
+ * Re-attributes an auth cookie for the origin it now belongs to.
+ *
+ * `@convex-dev/auth` hardcodes `SameSite=None; Partitioned` on every cookie it
+ * sets, and both are right for the deployment it assumes: auth routes on
+ * `convex.site`, third-party to the app, where the cookie must survive a
+ * cross-site request and Chrome's third-party cookie rules require CHIPS to
+ * keep it at all. Serving `/api/auth/*` from this origin made both wrong, and
+ * `Partitioned` then breaks the sign-in outright.
+ *
+ * A partitioned cookie is double-keyed on (host, top-level site), and it is the
+ * *second* key that fails here. The cookie is set while the developer is on
+ * this origin, so it is stored under partition `https://clubria.com` — but the
+ * hop that has to carry it back is the one arriving **from `github.com`**, and
+ * a browser keys that request by where it came from rather than where it is
+ * going. The partitions do not match, so the cookie is withheld. Measured in
+ * Chromium against production, with three cookies on this origin differing only
+ * in this attribute: partitioned was withheld on the callback hop, unpartitioned
+ * was sent, with `SameSite` making no difference either way.
+ *
+ * What that costs is a whole day of looking in the wrong place, because nothing
+ * reports it. `@convex-dev/auth` answers a missing PKCE cookie by sending the
+ * literal string `"decoy"` as the `code_verifier` rather than by raising, so
+ * GitHub rejects a five-character verifier under RFC 7636 and the developer is
+ * bounced to the sign-in screen. The cookie is stored, visible in devtools, and
+ * simply never sent.
+ *
+ * `SameSite=Lax` rather than merely dropping `Partitioned`: the callback is a
+ * top-level GET navigation, which is exactly what Lax permits, and `None` on a
+ * first-party cookie asks every tracking-prevention feature to take an interest
+ * in a cookie that has no cross-site use. Both were confirmed to arrive.
+ *
+ * Rewritten here rather than configured, because the library exposes no hook —
+ * `SHARED_COOKIE_OPTIONS` is a module-level constant. This function must keep
+ * its hands off the cookie's name and value: `Secure` and `HttpOnly` stay, and
+ * the `__Host-` prefix keeps meaning what it says.
+ */
+export function firstPartyCookie(setCookie: string): string {
+  return setCookie
+    .replace(/;\s*Partitioned\b/gi, "")
+    .replace(/;\s*SameSite\s*=\s*None\b/gi, "; SameSite=Lax");
 }
 
 /**

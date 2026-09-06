@@ -318,3 +318,24 @@ missing one, an unregistered redirect URI, a bogus code — so the failures that
 cannot be provoked from outside at all, only watched in flight. Do not replace this with a
 reproduction script; there is nothing to reproduce against. What it must never start doing
 is logging the successful exchange, which is the one that carries an access token.
+
+**The cookies that carry a sign-in are re-attributed by the proxy, and that is the
+other half of serving auth from this origin.** `@convex-dev/auth` hardcodes
+`SameSite=None; Partitioned` on every cookie it sets — correct for the deployment it
+assumes, where `/api/auth/*` lives on `convex.site` and is third-party to the app.
+Serving it here made both wrong, and `Partitioned` then broke sign-in outright: the
+cookie is stored under the partition of *this* site, but the hop that has to carry it
+back arrives from `github.com`, and a browser keys that request by where it came from.
+The partitions never match, so the cookie is stored, visible in devtools, and never
+sent. `firstPartyCookie` in `functions/_proxy.ts` drops `Partitioned` and makes
+`SameSite` `Lax`, which is what a top-level callback navigation carries.
+
+Measure before changing it, because every part of this is invisible. The symptom is not
+a cookie error: `@convex-dev/auth` answers a missing PKCE cookie by sending the literal
+string `"decoy"` as the `code_verifier`, so GitHub returns `invalid_grant` complaining
+that a verifier must be 43–128 characters, and the developer just lands back on the
+sign-in screen. Three cookies on this origin differing only in the partition, and a
+top-level navigation from `github.com`, is what settled it — the partitioned one was
+withheld and both unpartitioned ones arrived, with `SameSite` making no difference. Do
+not restore `Partitioned` on the grounds that it is the modern attribute; it is the
+right attribute for a third-party cookie, and these are not third-party any more.

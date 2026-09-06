@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CALLBACK_PATH_PREFIX,
   DEFAULT_UPSTREAM,
+  firstPartyCookie,
   proxyAuthRequest,
   upstreamOriginFrom,
 } from "./_proxy";
@@ -303,5 +304,90 @@ describe("the misconfiguration guard", () => {
     );
 
     expect(response.status).toBe(302);
+  });
+});
+
+/**
+ * The cookie attributes, and the outage they caused.
+ *
+ * Production served `__Host-githubOAuthpkce=…; Path=/; Expires=…; HttpOnly;
+ * Secure; Partitioned; SameSite=None`. The browser stored it and then withheld
+ * it on the one hop that needed it — the top-level navigation back from
+ * `github.com` — because a partitioned cookie is keyed by top-level site and
+ * that request is keyed by the site it came from. `@convex-dev/auth` then sent
+ * the literal `"decoy"` as the `code_verifier`, and GitHub answered
+ * `invalid_grant`: a five-character verifier fails RFC 7636's length rule.
+ *
+ * Asserted on the exact production string rather than a tidied-up one, because
+ * the attribute order and spelling are what the regexes have to survive.
+ */
+describe("the auth cookies, re-attributed for this origin", () => {
+  const PRODUCTION_PKCE =
+    "__Host-githubOAuthpkce=sHE9IlctYLj8FqbM_xDypehfD9csJWqvDyNtDCrY3cY; " +
+    "Path=/; Expires=Sun, 06 Sep 2026 14:27:49 GMT; HttpOnly; Secure; " +
+    "Partitioned; SameSite=None";
+
+  it("drops Partitioned, which is what withheld the cookie", () => {
+    expect(firstPartyCookie(PRODUCTION_PKCE)).not.toMatch(/Partitioned/i);
+  });
+
+  it("makes SameSite Lax, which a top-level callback navigation carries", () => {
+    expect(firstPartyCookie(PRODUCTION_PKCE)).toMatch(/;\s*SameSite=Lax\b/);
+    expect(firstPartyCookie(PRODUCTION_PKCE)).not.toMatch(/SameSite=None/i);
+  });
+
+  it("keeps the name, the value and every attribute that carries a guarantee", () => {
+    const rewritten = firstPartyCookie(PRODUCTION_PKCE);
+    // The verifier itself: 43 base64url characters, and the reason GitHub
+    // rejected `"decoy"` is that it was not this.
+    expect(rewritten).toContain(
+      "__Host-githubOAuthpkce=sHE9IlctYLj8FqbM_xDypehfD9csJWqvDyNtDCrY3cY",
+    );
+    expect(rewritten).toMatch(/;\s*Secure\b/);
+    expect(rewritten).toMatch(/;\s*HttpOnly\b/);
+    expect(rewritten).toMatch(/;\s*Path=\//);
+    expect(rewritten).toContain("Expires=Sun, 06 Sep 2026 14:27:49 GMT");
+  });
+
+  it("leaves a cookie that carries neither attribute alone", () => {
+    const plain = "__Host-githubRedirectTo=/cli; Path=/; Secure";
+    expect(firstPartyCookie(plain)).toBe(plain);
+  });
+
+  it("re-attributes every cookie, not just the first", async () => {
+    // The sign-in leg sets three, and one left partitioned is one sign-in that
+    // fails for a reason nothing reports.
+    const upstream = new Response(null, {
+      status: 302,
+      headers: [
+        ["location", "https://github.com/login/oauth/authorize"],
+        [
+          "set-cookie",
+          "__Host-githubOAuthpkce=one; Secure; Partitioned; SameSite=None",
+        ],
+        [
+          "set-cookie",
+          "__Host-githubOAuthstate=two; Secure; Partitioned; SameSite=None",
+        ],
+        [
+          "set-cookie",
+          "__Host-githubRedirectTo=/cli; Secure; Partitioned; SameSite=None",
+        ],
+      ],
+    });
+    const { fetchImpl } = upstreamReturning(upstream);
+
+    const response = await proxyAuthRequest(
+      signInRequest(),
+      UPSTREAM,
+      fetchImpl,
+    );
+
+    const cookies = response.headers.getSetCookie();
+    expect(cookies).toHaveLength(3);
+    for (const cookie of cookies) {
+      expect(cookie).not.toMatch(/Partitioned/i);
+      expect(cookie).toMatch(/;\s*SameSite=Lax\b/);
+    }
   });
 });
