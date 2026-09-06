@@ -192,6 +192,14 @@ fn merge(held: &mut Sample, incoming: Sample) {
     if incoming.model.is_some() {
         held.model = incoming.model;
     }
+    // The newest reading that had one, like the model beside it. A render that
+    // caught `.claude.json` mid-write reports no email, and that is not the
+    // account having become anonymous — it is one render that could not read a
+    // file. Letting it clear a name already spooled would move the session into
+    // the unnamed row for the rest of the window.
+    if incoming.account_email.is_some() {
+        held.account_email = incoming.account_email;
+    }
     if incoming.five_hour_pct.is_some() {
         held.five_hour_pct = incoming.five_hour_pct;
         held.five_hour_resets_at = incoming.five_hour_resets_at;
@@ -285,6 +293,26 @@ mod tests {
         .join("\n");
 
         assert_eq!(compact(&spool).len(), 2);
+    }
+
+    /// One unreadable render must not un-name the account for the whole window.
+    ///
+    /// `.claude.json` is rewritten by Claude Code while it runs, so a render
+    /// landing mid-write spools a sample with no email — and the compaction that
+    /// takes the newest of everything would take that absence as the answer.
+    /// The rule is the model's: the newest reading that *had* one.
+    #[test]
+    fn a_render_that_could_not_read_the_email_does_not_erase_it() {
+        let spool = [
+            r#"{"harness":"claude","accountId":"a","accountEmail":"ada@clubria.com","sessionId":"s"}"#,
+            r#"{"harness":"claude","accountId":"a","sessionId":"s"}"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            compact(&spool)[0].account_email.as_deref(),
+            Some("ada@clubria.com")
+        );
     }
 
     /// A line naming no session is not a session.

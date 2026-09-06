@@ -401,11 +401,24 @@ export default defineSchema({
   usageSessions: defineTable({
     memberId: v.id("members"),
     /**
-     * The uuid riabuild names a Claude config directory with — not an email,
-     * and not the account *number* a developer sees in `riabuild claude`, which
-     * renumbers when one is deleted.
+     * The uuid riabuild names a Claude config directory with — not the account
+     * *number* a developer sees in `riabuild claude`, which renumbers when one
+     * is deleted. Still the upsert key, because it is the one name that is
+     * always there and never changes under a re-login.
      */
     accountId: v.string(),
+    /**
+     * The address that account is signed in as, read off `.claude.json` by the
+     * status line — which is what the lead rollup groups by, because a
+     * rate-limit window belongs to an Anthropic account and not to a person.
+     *
+     * Optional, and the absence is ordinary: a signed-out account, a config
+     * caught mid-write, a sample from a riabuild older than 2026-09-06. Such
+     * rows still count — the rollup shows them as an account it cannot name,
+     * and folds them in as soon as any session on that `accountId` arrives
+     * carrying one.
+     */
+    accountEmail: v.optional(v.string()),
     sessionId: v.string(),
     /** "claude" today. Grok publishes a status line of the same shape; Codex will arrive over a different producer. */
     harness: v.string(),

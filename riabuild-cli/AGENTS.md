@@ -1343,10 +1343,26 @@ take the *newest* value, because a five-hour window legitimately falls when it r
 tokens *currently in the window* — `0` before the first response, smaller again after every
 `/compact`. Merged by maximum it reports peak context size under a heading saying "tokens".
 `cost.total_cost_usd` is the only cumulative measure of volume the status line offers, and
-it is rendered as **list-price equivalent** everywhere, because on a subscription it is not
-money anyone spent. `no_token_count_is_ever_spooled` and
-`nothing_about_the_work_itself_is_spooled` are the gates — the second because the script
-has the repository in hand for the marker and must not send it.
+it is still spooled — under no heading, since 2026-09-06. It was shown as **list-price
+equivalent**, which is what it is on a subscription: not money anyone spent, and a number
+that needed a paragraph under every rendering of it saying so. It is kept because removing
+a column is not a reason to stop measuring. `no_token_count_is_ever_spooled` and
+`nothing_about_the_work_itself_is_spooled` are the gates — the second because the status
+line has the repository in hand for the marker and must not send it.
+
+**The one identity a sample carries is the account's own email address.** A rate-limit
+window belongs to an Anthropic account rather than to a person — one developer with two
+sign-ins has two windows, and one account open on a laptop and a server is one window seen
+twice — so that is what a lead's panel groups by, and nothing else on the machine can name
+it. It comes from `.claude.json`'s `oauthAccount.emailAddress` through
+`statusline::account::email_in`, the same read that draws `claude-2 · ada@clubria.com` on
+the bar, so it costs no subprocess on the render path; `claude auth status --json` is what
+`accounts::status` uses and is 450 ms per call, which is a provisioning cost and not a
+rendering one. An account it cannot read is spooled **unnamed** rather than not spooled,
+and the newest reading that had a name wins at both merges — a render that caught the file
+mid-write must not un-name a session for the rest of the window. What this buys is stated
+with what it costs in the design spec: riabuild-web now holds a durable ninety-day map of
+which Anthropic accounts each developer signs in with.
 
 **Everything about the flush is silent and non-blocking.** It takes
 `FileLock::try_acquire` and gives up rather than queueing, because three Claude Code

@@ -34,6 +34,7 @@ import { requireLead } from "./members";
 export const usageSample = v.object({
   harness: v.string(),
   accountId: v.string(),
+  accountEmail: v.optional(v.string()),
   sessionId: v.string(),
   model: v.optional(v.string()),
   costUsd: v.optional(v.number()),
@@ -88,6 +89,13 @@ function largest(
  * Upserts one flush's worth of samples, keyed by `(memberId, accountId,
  * sessionId)`.
  *
+ * Still keyed by the member even though a lead reads this grouped by Claude
+ * account: `memberId` is what the bearer token proved and the index the rollup
+ * reads by, and an email is a *label* a laptop supplied. Keying a stored row on
+ * something the client says would let a mistyped address merge two people's
+ * sessions into one; grouping the answer by it merges nothing that cannot be
+ * ungrouped by reading again.
+ *
  * Deliberately writes **no `auditLog` row**. That table is the record of
  * changes to access — a role promotion, a suspension, a revoked session, a
  * credential handed out — and it is read by a human scrolling a list. A row per
@@ -125,6 +133,7 @@ export const record = internalMutation({
           memberId: args.memberId,
           accountId: sample.accountId,
           sessionId: sample.sessionId,
+          accountEmail: sample.accountEmail,
           harness: sample.harness,
           model: sample.model,
           observedAt: args.observedAt,
@@ -149,6 +158,12 @@ export const record = internalMutation({
         // The newest non-null. A sample that does not name a model is not a
         // sample saying the model was forgotten.
         model: sample.model ?? existing.model,
+        // Same rule, and the same reason said about a name: `.claude.json` is
+        // rewritten while Claude Code runs, so a render that caught it mid-write
+        // reports no email. That is one unreadable file, never an account that
+        // has become anonymous, and letting it clear a name already stored would
+        // move a live session into the unnamed row.
+        accountEmail: sample.accountEmail ?? existing.accountEmail,
 
         costUsd: largest(existing.costUsd, sample.costUsd),
         durationMs: largest(existing.durationMs, sample.durationMs),
@@ -172,35 +187,43 @@ export const record = internalMutation({
   },
 });
 
-/** One member's line in the rollup. */
+/**
+ * One **Claude account's** line in the rollup, which is what a lead reads.
+ *
+ * Not one member's, and the difference is the whole of why this is keyed the
+ * way it is: a five-hour window belongs to an Anthropic account. One developer
+ * signed in to two of them has two windows and a row each; the same account
+ * open on a laptop and on a server is one window seen twice, and folding those
+ * two config directories into a person would report a window nobody has.
+ */
 const usageRow = v.object({
-  memberId: v.id("members"),
-  githubLogin: v.string(),
+  /**
+   * Unique per row, and nothing else reads it: `email:<address>` for an account
+   * that named itself, `account:<uuid>` for one that could not. It exists
+   * because a table needs a key and neither field alone is one — an email is
+   * absent on some rows, and an account uuid is one of several behind others.
+   */
+  accountKey: v.string(),
+  /** `null` where riabuild has never read an email for this account. */
+  accountEmail: v.union(v.string(), v.null()),
+  /**
+   * The config-directory uuid, and only on a row no email could be found for —
+   * the one case where it is single-valued, and the only thing left to tell two
+   * unnamed rows apart. A named row can stand for several directories on
+   * several machines, so it carries none.
+   */
+  accountId: v.union(v.string(), v.null()),
   /** Sessions with at least one sample inside the window. */
   sessions: v.number(),
-  /**
-   * Summed across sessions — which is the one place summing is right, because
-   * each session's own number is already the whole of that session.
-   *
-   * Labelled "list-price equivalent" wherever it is shown and never "spend":
-   * these are personal Pro and Max subscriptions, so this is what the work
-   * would have cost against the public API price sheet and not money anybody
-   * paid. Left unlabelled it ends up in a budget.
-   */
-  costUsd: v.number(),
-  linesAdded: v.number(),
-  linesRemoved: v.number(),
-  /** From this member's newest sample. `null` where the harness reported none. */
+  /** From this account's newest sample. `null` where the harness reported none. */
   fiveHourPct: v.union(v.number(), v.null()),
-  fiveHourResetsAt: v.union(v.number(), v.null()),
   sevenDayPct: v.union(v.number(), v.null()),
-  sevenDayResetsAt: v.union(v.number(), v.null()),
-  /** Unix seconds. When riabuild last heard anything from this member. */
+  /** Unix seconds. When riabuild last heard anything from this account. */
   lastObservedAt: v.number(),
   /**
-   * This member had more sessions in the window than one read may return, so
-   * the totals beside it are a floor rather than the answer. Said out loud
-   * rather than silently truncated — a `take()` nobody reports is a number
+   * A member feeding this row had more sessions in the window than one read may
+   * return, so the count beside it is a floor rather than the answer. Said out
+   * loud rather than silently truncated — a `take()` nobody reports is a number
    * that is quietly wrong.
    */
   truncated: v.boolean(),
@@ -223,6 +246,138 @@ const SESSIONS_PER_MEMBER = 500;
 /** The bound on the member list, matching `members.list`. */
 const MEMBER_LIMIT = 200;
 
+/**
+ * A value and the instant it was observed, so that "newest wins" survives being
+ * folded out of order.
+ *
+ * The rollup used to read the first defined value off a newest-first list,
+ * which was sound while one member's sessions arrived in one ordered read. An
+ * account can be fed by several members' reads now — two developers signed in
+ * to one address is exactly what this grouping exists to show — so the order
+ * rows arrive in says nothing, and each field carries the instant it belongs
+ * to instead.
+ */
+type Newest<T> = { value: T; at: number };
+
+function newer<T>(
+  held: Newest<T> | null,
+  value: T | undefined,
+  at: number,
+): Newest<T> | null {
+  if (value === undefined) return held;
+  if (held !== null && held.at >= at) return held;
+  return { value, at };
+}
+
+function newerOf<T>(
+  held: Newest<T> | null,
+  incoming: Newest<T> | null,
+): Newest<T> | null {
+  if (incoming === null) return held;
+  return newer(held, incoming.value, incoming.at);
+}
+
+function valueOf<T>(held: Newest<T> | null): T | null {
+  return held === null ? null : held.value;
+}
+
+/** What one Claude account, or one row of them, adds up to while it is folded. */
+type Tally = {
+  accountId: string;
+  email: Newest<string> | null;
+  sessions: number;
+  fiveHour: Newest<number> | null;
+  sevenDay: Newest<number> | null;
+  lastObservedAt: number;
+  truncated: boolean;
+};
+
+function emptyTally(accountId: string): Tally {
+  return {
+    accountId,
+    email: null,
+    sessions: 0,
+    fiveHour: null,
+    sevenDay: null,
+    lastObservedAt: 0,
+    truncated: false,
+  };
+}
+
+/**
+ * Folds one session into the account that produced it.
+ *
+ * By `accountId` rather than by email, which is what makes the changeover free:
+ * a session stored before riabuild sent an email at all, or one whose render
+ * caught `.claude.json` mid-write, is still that account's session and takes
+ * the account's name from whichever of its sessions did report one. Grouping on
+ * the email itself would have split one account into a named row and an unnamed
+ * one for the length of the window.
+ */
+function foldSession(
+  into: Map<string, Tally>,
+  session: Doc<"usageSessions">,
+  truncated: boolean,
+) {
+  const tally = into.get(session.accountId) ?? emptyTally(session.accountId);
+  const at = session.observedAt;
+  tally.sessions += 1;
+  tally.email = newer(tally.email, session.accountEmail, at);
+  tally.fiveHour = newer(tally.fiveHour, session.fiveHourPct, at);
+  tally.sevenDay = newer(tally.sevenDay, session.sevenDayPct, at);
+  tally.lastObservedAt = Math.max(tally.lastObservedAt, at);
+  tally.truncated = tally.truncated || truncated;
+  into.set(session.accountId, tally);
+}
+
+/** `email:<address>`, or `account:<uuid>` for an account riabuild cannot name. */
+function keyFor(tally: Tally): string {
+  const email = valueOf(tally.email);
+  return email === null ? `account:${tally.accountId}` : `email:${email}`;
+}
+
+/**
+ * One row per address, folding together the config directories that share one.
+ *
+ * A developer with the same Claude account on their laptop and on two servers
+ * has three `accountId`s and one rate-limit window, so the percentages take the
+ * newest reading of the three rather than any kind of average. Sessions really
+ * are three separate things being counted, so those are summed. Nothing merges
+ * the email: every account in a group has the same one, because that is what
+ * the key is made of.
+ */
+function rowsFrom(accounts: Map<string, Tally>) {
+  const grouped = new Map<string, Tally>();
+  for (const account of accounts.values()) {
+    const key = keyFor(account);
+    const held = grouped.get(key);
+    if (held === undefined) {
+      grouped.set(key, account);
+      continue;
+    }
+    held.sessions += account.sessions;
+    held.fiveHour = newerOf(held.fiveHour, account.fiveHour);
+    held.sevenDay = newerOf(held.sevenDay, account.sevenDay);
+    held.lastObservedAt = Math.max(held.lastObservedAt, account.lastObservedAt);
+    held.truncated = held.truncated || account.truncated;
+  }
+
+  return [...grouped.entries()].map(([accountKey, tally]) => {
+    const email = valueOf(tally.email);
+    return {
+      accountKey,
+      accountEmail: email,
+      // Only where the row *is* one unnamed account. See `usageRow`.
+      accountId: email === null ? tally.accountId : null,
+      sessions: tally.sessions,
+      fiveHourPct: valueOf(tally.fiveHour),
+      sevenDayPct: valueOf(tally.sevenDay),
+      lastObservedAt: tally.lastObservedAt,
+      truncated: tally.truncated,
+    };
+  });
+}
+
 export const rollup = query({
   args: { windowDays: v.optional(v.number()) },
   returns: v.object({
@@ -242,8 +397,13 @@ export const rollup = query({
     const since = nowSeconds - windowDays * 24 * 60 * 60;
 
     const members = await ctx.db.query("members").take(MEMBER_LIMIT);
-    const rows = [];
 
+    // Still read per member: `by_member_observed` is the index that exists, and
+    // it is a bounded read each rather than one unbounded scan of the table.
+    // Who a session belonged to simply stops being what the answer is grouped
+    // by — the accounts are folded across every member's read, and the rows
+    // come out of that.
+    const accounts = new Map<string, Tally>();
     for (const member of members) {
       const sessions = await ctx.db
         .query("usageSessions")
@@ -260,12 +420,14 @@ export const rollup = query({
       const kept = truncated
         ? sessions.slice(0, SESSIONS_PER_MEMBER)
         : sessions;
-      rows.push(rowFor(member, kept, truncated));
+      for (const session of kept) foldSession(accounts, session, truncated);
     }
 
+    const rows = rowsFrom(accounts);
+
     // Fullest window first: a lead opening this is looking for who is close to
-    // running out, and that person should not be somewhere down a list sorted
-    // by when somebody joined.
+    // running out, and that account should not be somewhere down a list sorted
+    // by whichever member happened to be read first.
     rows.sort((a, b) => headroomRank(b) - headroomRank(a));
 
     return { windowDays, since, rows };
@@ -285,56 +447,7 @@ function clampWindow(days: number): number {
   return Math.min(Math.max(Math.floor(days), 1), RETENTION_DAYS);
 }
 
-function rowFor(
-  member: Doc<"members">,
-  sessions: Doc<"usageSessions">[],
-  truncated: boolean,
-) {
-  let costUsd = 0;
-  let linesAdded = 0;
-  let linesRemoved = 0;
-  for (const session of sessions) {
-    costUsd += session.costUsd ?? 0;
-    linesAdded += session.linesAdded ?? 0;
-    linesRemoved += session.linesRemoved ?? 0;
-  }
-
-  return {
-    memberId: member._id,
-    githubLogin: member.githubLogin,
-    sessions: sessions.length,
-    // Cents, so a sum of floats does not surface as 12.300000000000001. The
-    // number is notional to two decimal places and rounding it here is what
-    // stops every consumer having to.
-    costUsd: Math.round(costUsd * 100) / 100,
-    linesAdded,
-    linesRemoved,
-    // `sessions` is newest-first, so the first row reporting a window is the
-    // most recent reading of it. A member whose newest session predates their
-    // last rate-limited one still gets an answer rather than a blank.
-    fiveHourPct: newest(sessions, "fiveHourPct"),
-    fiveHourResetsAt: newest(sessions, "fiveHourResetsAt"),
-    sevenDayPct: newest(sessions, "sevenDayPct"),
-    sevenDayResetsAt: newest(sessions, "sevenDayResetsAt"),
-    lastObservedAt: sessions[0].observedAt,
-    truncated,
-  };
-}
-
-/** The first defined value for a field, over rows already ordered newest-first. */
-function newest(
-  sessions: Doc<"usageSessions">[],
-  field:
-    "fiveHourPct" | "fiveHourResetsAt" | "sevenDayPct" | "sevenDayResetsAt",
-): number | null {
-  for (const session of sessions) {
-    const value = session[field];
-    if (value !== undefined) return value;
-  }
-  return null;
-}
-
-/** How close to the ceiling this member is, over either window. */
+/** How close to the ceiling this account is, over either window. */
 function headroomRank(row: {
   fiveHourPct: number | null;
   sevenDayPct: number | null;

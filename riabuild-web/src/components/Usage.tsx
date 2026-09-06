@@ -13,14 +13,15 @@ import {
 } from "../ui";
 
 /**
- * What Claude Code cost the team, led by the only number that runs out.
+ * How much of each Claude account's allowance is gone, led by the only number
+ * that runs out.
  *
- * These are personal Pro and Max subscriptions, so nobody pays per token and
- * the five-hour and seven-day rate-limit windows are the real budget. Cost is
- * here as a measure of relative effort and is labelled **list-price
- * equivalent** in the header, in the footnote and in the column's accessible
- * name — never "spend". A developer's own subscription is not the team's money,
- * and an unlabelled dollar figure ends up in a budget.
+ * **A row is an account, not a person.** These are personal Pro and Max
+ * subscriptions and the five-hour and seven-day rate-limit windows are the real
+ * budget — and a window belongs to the Anthropic account it was spent from. One
+ * developer signed in to two accounts has two windows and a row each; the same
+ * account open on a laptop and on a server is one window seen twice. A table
+ * keyed by developer could say neither.
  *
  * Deliberately absent: which repository, which model, and anything about what
  * the work *was*. The status line payload carries `workspace.repo` and this
@@ -86,10 +87,9 @@ function Meter({ pct, label }: { pct: number | null; label: string }) {
 /**
  * A gap, in the shortest form that is still true: `4m`, `3h`, `6d`.
  *
- * Compact because both columns that use it sit to the right of six others, and
- * the full `25 Jul 2026, 19:20` in each of them pushed the table into a
- * sideways scroll at 1440px — a lead reading a rate-limit window wants "in two
- * hours", not a date. The exact instant is still there, in the `title`.
+ * Compact because the column that uses it sits to the right of three others,
+ * and the full `25 Jul 2026, 19:20` in it pushed the table into a sideways
+ * scroll at 1440px. The exact instant is still there, in the `title`.
  */
 function shortGap(ms: number): string {
   const minutes = Math.round(ms / 60_000);
@@ -98,13 +98,6 @@ function shortGap(ms: number): string {
   const hours = Math.round(minutes / 60);
   if (hours < 48) return `${hours}h`;
   return `${Math.round(hours / 24)}d`;
-}
-
-/** When a window rolls over, counted forwards. */
-function resetsIn(seconds: number | null, now: number): string {
-  if (seconds === null) return "—";
-  const ms = seconds * 1000 - now;
-  return ms <= 0 ? "any moment" : `in ${shortGap(ms)}`;
 }
 
 /** When riabuild last heard anything, counted backwards. */
@@ -119,15 +112,37 @@ function fromSeconds(seconds: number | null): string {
 }
 
 /**
- * Two decimal places, always, and a leading `$`.
- *
- * `toFixed` rather than a locale formatter: the value is notional and the point
- * of the column is comparing one row against another, which a thousands
- * separator that moves with the reader's locale makes harder rather than
- * easier.
+ * How much of an account uuid is worth showing, on the rows that have nothing
+ * else. Enough to tell two of them apart, and never presented as something to
+ * type: it names a directory on somebody's laptop.
  */
-function listPrice(usd: number): string {
-  return `$${usd.toFixed(2)}`;
+const ID_SHOWN = 8;
+
+/**
+ * Who the row is, which is an email address wherever riabuild has read one.
+ *
+ * An account with no email is still an account somebody is spending a window
+ * from, so it is a row rather than a gap — and it says it is unnamed rather
+ * than borrowing a developer's login, which would be riabuild asserting a
+ * link it did not observe. It happens for an account signed out at the moment
+ * of the read, a `.claude.json` caught mid-write, and every sample sent by a
+ * riabuild older than the one that started reporting the address.
+ */
+function Who({ row }: { row: UsageRow }) {
+  if (row.accountEmail !== null) {
+    return <span className="wrap-value text-fg">{row.accountEmail}</span>;
+  }
+  return (
+    <span
+      className="text-fg-dim"
+      title="riabuild has not read an email for this Claude account — it was signed out, or the laptop is on a riabuild that predates reporting one."
+    >
+      unnamed account{" "}
+      <span className="text-fg-faint">
+        {(row.accountId ?? "").slice(0, ID_SHOWN)}
+      </span>
+    </span>
+  );
 }
 
 export function Usage() {
@@ -145,19 +160,19 @@ export function Usage() {
   }
 
   const { windowDays, rows } = data.usage.value;
-  // The ticking clock, so "resets in 2h" counts down while the page is open
-  // rather than freezing at whatever it said when the tab was opened.
+  // The ticking clock, so "2h ago" keeps up while the page is open rather than
+  // freezing at whatever it said when the tab was opened.
   const now = data.now;
 
   const columns: Column<UsageRow>[] = [
     {
       key: "who",
-      header: "github",
+      header: "claude account",
       grow: true,
       render: (row) => (
         <span className="inline-flex flex-wrap items-baseline gap-1.5">
-          <span className="text-fg">@{row.githubLogin}</span>
-          {/* Said out loud rather than swallowed: everything to the right of
+          <Who row={row} />
+          {/* Said out loud rather than swallowed: the count to the right of
               this badge is a floor, not a total. */}
           {row.truncated && <Badge tone="warn">partial</Badge>}
         </span>
@@ -179,48 +194,9 @@ export function Usage() {
     },
     {
       key: "sessions",
-      header: "sessions",
+      header: "total sessions",
       align: "end",
       render: (row) => <span className="text-fg-dim">{row.sessions}</span>,
-    },
-    {
-      key: "cost",
-      header: "list-price equiv",
-      align: "end",
-      render: (row) => (
-        <span
-          className="text-fg-dim"
-          title="List-price equivalent — not money anyone spent."
-        >
-          {listPrice(row.costUsd)}
-        </span>
-      ),
-    },
-    {
-      key: "lines",
-      header: "lines",
-      align: "end",
-      priority: "wide",
-      render: (row) => (
-        <span className="whitespace-nowrap text-fg-faint">
-          <span className="text-ok">+{row.linesAdded}</span>{" "}
-          <span className="text-danger">&minus;{row.linesRemoved}</span>
-        </span>
-      ),
-    },
-    {
-      key: "resets",
-      header: "5h resets",
-      align: "end",
-      priority: "wide",
-      render: (row) => (
-        <span
-          className="whitespace-nowrap text-fg-faint"
-          title={fromSeconds(row.fiveHourResetsAt)}
-        >
-          {resetsIn(row.fiveHourResetsAt, now)}
-        </span>
-      ),
     },
     {
       key: "seen",
@@ -241,15 +217,16 @@ export function Usage() {
   return (
     <>
       <p className="mb-3 max-w-prose text-fg-dim">
-        The last {windowDays} days, from each developer&rsquo;s own status line.
-        Rate-limit headroom first: on a subscription nobody pays per token, so
-        the window is the only thing that actually runs out.
+        The last {windowDays} days, per Claude account, from each
+        developer&rsquo;s own status line. Rate-limit headroom first: on a
+        subscription nobody pays per token, so the window is the only thing that
+        actually runs out.
       </p>
       <DataTable
-        caption={`Claude Code usage per member over the last ${windowDays} days`}
+        caption={`Claude Code usage per account over the last ${windowDays} days`}
         columns={columns}
         rows={rows}
-        rowKey={(row) => row.memberId}
+        rowKey={(row) => row.accountKey}
         empty={
           <Empty glyph="◔" title="Nothing reported yet.">
             Every Claude Code account riabuild manages reports its own usage,
@@ -261,19 +238,16 @@ export function Usage() {
           </Empty>
         }
       />
-      {/* Only beside a table. It explains three columns and a badge, none of
-          which exist on an empty panel — a legend for a table that is not there
-          reads as a description of data being withheld. */}
+      {/* Only beside a table. It explains a badge and a row shape, neither of
+          which exists on an empty panel — a legend for a table that is not
+          there reads as a description of data being withheld. */}
       {rows.length > 0 && (
         <p className="mt-3 max-w-prose text-xs text-fg-faint">
-          <span className="text-fg-dim">list-price equivalent</span> is what the
-          work would have cost against the public API price sheet. These are
-          personal Pro and Max subscriptions, so it is a measure of relative
-          effort and not money anyone spent &mdash; it is not a spend report and
-          does not belong in a budget. A row marked{" "}
-          <span className="text-warn">partial</span> had more sessions than one
-          read returns, so its totals are a floor. Nothing here records which
-          repository, which file or which prompt.
+          One row is one Claude account, so a developer signed in to two of them
+          is two rows and one account used from two machines is a single row. A
+          row marked <span className="text-warn">partial</span> had more
+          sessions than one read returns, so its count is a floor. Nothing here
+          records which repository, which file or which prompt.
         </p>
       )}
     </>

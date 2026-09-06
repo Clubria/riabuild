@@ -162,22 +162,58 @@ another in flight cannot walk a total backwards.
 This is also what makes the write volume trivial: one document per session per flush rather
 than one per render.
 
-### Keyed by member, not by email
+### Keyed by member, reported by account
 
-The obvious join key is the Claude account's email address, and it is the wrong one three
-times over. It is **not in the payload** — the status line JSON has `session_id`, `model`,
-`workspace`, `cost`, `context_window` and `rate_limits`, and no account identity at all. It
-is **weaker than what the request already proves**: the flush authenticates as the member,
-so the server knows who this is from the bearer token, and a client-supplied email is a
-client-supplied claim. And it is **personal-subscription identity** — these are accounts
-like `someone@gmail.com` — so keying on it means Convex holds a durable map of which
-private Anthropic accounts each developer owns, which is a thing to decide out loud rather
-than to acquire as a side effect of picking a primary key.
+Stored rows are keyed `(memberId, accountId, sessionId)`, where `accountId` is the
+config-directory uuid riabuild already assigns. It survives `riabuild claude delete`
+renumbering, which an account *number* would not, and it distinguishes one developer's two
+accounts.
 
-`(memberId, accountId)` it is, where `accountId` is the config-directory uuid riabuild
-already assigns. It survives `riabuild claude delete` renumbering, which an account
-*number* would not, and it distinguishes one developer's two accounts without naming
-either.
+What a **lead reads** is grouped by the account's email address instead, and the rest of
+this section is the argument for that, because the first version of this document said it
+was wrong three times over and shipped a per-member panel. Two of those three objections
+were about a key and are answered; the third was about a cost and is now paid on purpose.
+
+**Why it changed.** A rate-limit window belongs to an *Anthropic account*, not to a person,
+and a per-member row could not describe either shape that actually occurs. One developer
+signed in to a work account and a personal one has two windows, and a single row folded
+them into one number that neither of them has. One account signed in on a laptop and on
+two servers is three config directories and *one* window, reported three times over — or,
+where two colleagues share an account, split across two rows each showing headroom the
+account does not have. The panel exists to answer "who is about to run out", and it was
+answering about the wrong noun.
+
+**"It is not in the payload"** — still true, and it never comes from there. The status line
+JSON has `session_id`, `model`, `workspace`, `cost`, `context_window` and `rate_limits`,
+and no account identity at all. The email is read from `.claude.json`'s
+`oauthAccount.emailAddress`, in the same directory `CLAUDE_CONFIG_DIR` already names, by
+the same function that draws `claude-2 · ada@clubria.com` on the status line itself. It is
+one more field off a file that was already open on that render, and it costs no subprocess
+and no request. Where it cannot be read the sample is sent unnamed rather than dropped, and
+the panel shows an account it cannot name — the honest answer, and the one every row stored
+before this existed gets.
+
+**"It is weaker than what the request already proves"** — that objection stands, and is why
+the *stored* key did not move. The flush still authenticates as the member, the wire still
+carries no `memberId`, and the email is a **label on a measurement** rather than a key or a
+claim: it grants nothing, and a laptop that sent somebody else's address would still file
+its rows under the member the bearer token proved. Grouping the answer by a label can be
+undone by reading again; keying a stored row on one cannot.
+
+**"It is personal-subscription identity"** — this one was right, and it is the price. Say it
+plainly: **Convex now holds a durable map of which Anthropic accounts each developer signs
+in with, and a lead can read the list.** Three things bound it, and none of them is that
+nobody thought about it. Only an account riabuild created under `<root>/claude/<uuid>` is
+ever spooled, so a developer's own `~/.claude` install is not in the map at all — see
+`statusline::usage::spool_target`. The ninety-day reaper deletes these rows with everything
+else, so the map is a window rather than a record. And the panel is lead-only, which was
+already the gate on the usage it reports.
+
+The fold is by `accountId` first and by address second, which is what makes the changeover
+cost nothing: a session stored before any of this — or one whose render caught
+`.claude.json` mid-write — takes its account's name from whichever of that account's
+sessions did report one, rather than sitting in an unnamed row beside a named one for the
+length of the window.
 
 ### No token counts, which is not an omission
 
@@ -198,11 +234,23 @@ populate would be worse than the gap it papers over.
 
 ### What a lead sees, and what they do not
 
-Notional cost, sessions, lines changed and rate-limit headroom per member. **Not** which
+Five columns, one row per Claude account: the account, the five-hour and seven-day windows
+as bars, the total number of sessions, and when riabuild last heard from it. **Not** which
 repository, not a prompt, not a file path — the status line payload carries
 `workspace.repo` and this deliberately drops it. A usage tracker that also reports what
 each developer was working on is a different product with a different conversation attached
 to it.
+
+Three columns that were there first are deliberately gone, and the reasons differ. The
+**list-price equivalent** — `cost.total_cost_usd` summed over the window — was the one
+number on the panel that reads as money and is not: these are subscriptions, nobody paid
+it, and every rendering of it needed a paragraph underneath saying so. A figure that has to
+be explained every time it is shown, on a panel whose whole subject is the *window* rather
+than the spend, is a column that costs more than it says. **Lines added and removed** was a
+measure of typing rather than of allowance. And **5h resets** was the countdown beside a
+bar that already says how much is left. All three are still collected and still stored —
+removing a column is not a reason to stop measuring, and `durationMs` was already an
+example of a field the table keeps and the panel does not show.
 
 `total_cost_usd` is rendered as *list-price equivalent* and labelled as such wherever it
 appears. On a subscription it is what the session would have cost against the public API

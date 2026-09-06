@@ -6,10 +6,11 @@ import { SCENARIOS } from "../dev/scenarios";
 import { Usage } from "./Usage";
 
 /**
- * The three things about this panel a screenshot cannot assert: that the cost
- * column is labelled, that a missing rate-limit window is not drawn as zero,
- * and that the bar is decoration a screen reader skips rather than eight
- * announced block characters.
+ * The things about this panel a screenshot cannot assert: that a row is a
+ * Claude account rather than a developer, that an account riabuild cannot name
+ * is still a row, that a missing rate-limit window is not drawn as zero, and
+ * that the bar is decoration a screen reader skips rather than eight announced
+ * block characters.
  */
 
 function renderUsage(data: ReturnType<typeof SCENARIOS.lead>) {
@@ -22,42 +23,81 @@ function renderUsage(data: ReturnType<typeof SCENARIOS.lead>) {
 
 describe("Usage", () => {
   /**
-   * The labelling rule from the design, as a test. These are personal Pro and
-   * Max subscriptions: the dollar figure is what the work would have cost
-   * against the public price sheet, and an unlabelled one ends up in a budget.
+   * The keying rule from the design, as a test. A rate-limit window belongs to
+   * the Anthropic account it was spent from, so the row names that account —
+   * and a developer's GitHub login, which names a person and not a window, is
+   * nowhere in the table.
    */
-  test("cost is labelled list-price equivalent, and never called spend", () => {
-    renderUsage(SCENARIOS.lead());
+  test("a row is a Claude account, not a developer", () => {
+    const data = SCENARIOS.lead();
+    if (data.usage.state !== "ready") throw new Error("fixture invariant");
+
+    renderUsage(data);
 
     expect(
-      screen.getByRole("columnheader", { name: /list-price equiv/i }),
+      screen.getByRole("columnheader", { name: /claude account/i }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/list-price equivalent/i)).toBeInTheDocument();
-    expect(screen.getByText(/not money anyone spent/i)).toBeInTheDocument();
+    expect(screen.getByText("ada@clubria.com")).toBeInTheDocument();
 
-    // No heading calls it spend, or cost, or anything else that reads as money
-    // somebody paid. The word appears once in the footnote, in the sentence
-    // saying it is not one — which is the labelling, not a leak of it.
     for (const header of screen.getAllByRole("columnheader")) {
-      expect(header.textContent ?? "").not.toMatch(/spend|^cost$|\$/i);
+      expect(header.textContent ?? "").not.toMatch(/github|member|developer/i);
     }
+    // One person's two sign-ins are two rows: merging them would report a
+    // window neither account has.
+    expect(screen.getByText("ada@personal.example")).toBeInTheDocument();
   });
 
-  test("rate-limit headroom comes before sessions and cost", () => {
+  /**
+   * The fields removed on 2026-09-06, kept out by name. Cost is list price
+   * against subscriptions nobody pays per token with — a number that reads as
+   * money and is not — and the line counts and the reset countdown were three
+   * columns nobody used pushing the four that matter off a narrow screen.
+   */
+  test("no cost, lines or reset column comes back", () => {
+    renderUsage(SCENARIOS.lead());
+
+    for (const header of screen.getAllByRole("columnheader")) {
+      expect(header.textContent ?? "").not.toMatch(
+        /list-price|spend|cost|\$|lines|resets/i,
+      );
+    }
+    expect(screen.queryByText(/list-price equivalent/i)).toBeNull();
+  });
+
+  test("rate-limit headroom comes before the session count", () => {
     renderUsage(SCENARIOS.lead());
 
     const headers = screen
       .getAllByRole("columnheader")
       .map((cell) => cell.textContent?.trim() ?? "");
     expect(headers.indexOf("5h used")).toBeLessThan(
-      headers.indexOf("sessions"),
+      headers.indexOf("total sessions"),
     );
     expect(headers.indexOf("7d used")).toBeLessThan(
-      headers.indexOf("sessions"),
+      headers.indexOf("total sessions"),
     );
-    expect(headers.indexOf("sessions")).toBeLessThan(
-      headers.indexOf("list-price equiv"),
+  });
+
+  /**
+   * An account riabuild has no email for is still an account somebody is
+   * spending a window from. Dropping the row would lose the usage; borrowing a
+   * developer's login for it would assert a link riabuild never observed.
+   */
+  test("an account with no email is a row that says so", () => {
+    const data = SCENARIOS.lead();
+    if (data.usage.state !== "ready") throw new Error("fixture invariant");
+    const unnamed = data.usage.value.rows.filter(
+      (row) => row.accountEmail === null,
     );
+    expect(unnamed.length).toBeGreaterThan(0);
+
+    renderUsage(data);
+
+    expect(screen.getAllByText(/unnamed account/i).length).toBe(unnamed.length);
+    // Enough of the config-directory uuid to tell two of them apart.
+    expect(
+      screen.getByText((unnamed[0].accountId ?? "").slice(0, 8)),
+    ).toBeInTheDocument();
   });
 
   /**
@@ -77,11 +117,11 @@ describe("Usage", () => {
 
     for (const row of rowsWithout) {
       const cells = screen
-        .getByText(`@${row.githubLogin}`)
+        .getByText(row.accountEmail ?? /unnamed account/i)
         .closest("tr")
         ?.querySelectorAll("td");
       if (cells === undefined) throw new Error("the row renders as a row");
-      // Columns are github, 5h, 7d, … — the two meters sit at 1 and 2.
+      // Columns are account, 5h, 7d, … — the two meters sit at 1 and 2.
       expect(cells[1].textContent).toBe("—");
       expect(cells[2].textContent).toBe("—");
       expect(cells[1].textContent).not.toContain("0%");
