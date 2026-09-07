@@ -204,40 +204,39 @@ export type IssuedKey = {
 };
 
 /**
- * One member's line in the usage rollup, over the window the query was asked
- * for.
+ * One **Claude account's** line in the usage rollup, over the window the query
+ * was asked for.
  *
- * `costUsd` is **list-price equivalent** and is labelled that way everywhere it
- * is rendered. These are personal Pro and Max subscriptions: the number is what
- * the work would have cost against the public API price sheet, it is a
- * reasonable measure of relative effort, and it is not money anybody spent.
- * Left unlabelled it ends up in a budget.
+ * Not one member's: a rate-limit window belongs to the Anthropic account it was
+ * spent from, so a developer with two accounts is two rows and one account used
+ * from a laptop and a server is one. See `convex/usage.ts`.
  *
- * There is deliberately no token count. The status line reports what is
- * currently in the context window rather than what a session consumed, so a
- * "tokens" column here could only be filled with the largest context a session
- * ever held — see `convex/schema.ts`.
+ * There is deliberately no token count and no cost. The status line reports
+ * what is currently in the context window rather than what a session consumed,
+ * so a "tokens" column could only be filled with the largest context a session
+ * ever held — see `convex/schema.ts` — and `cost.total_cost_usd` is list price
+ * against a subscription nobody pays per token with, which is a number that
+ * reads as money and is not.
  *
  * A `null` percentage is a harness that reported no rate-limit window at all
  * (an API-key or Console login), which is not the same as a window at zero.
  */
 export type UsageRow = {
-  memberId: MemberId;
-  githubLogin: string;
+  /** `email:<address>` or `account:<uuid>`. Unique per row; nothing reads it. */
+  accountKey: string;
+  /** `null` where riabuild has never read an email for this account. */
+  accountEmail: string | null;
+  /** The config-directory uuid, and only on a row with no email to show. */
+  accountId: string | null;
   sessions: number;
-  costUsd: number;
-  linesAdded: number;
-  linesRemoved: number;
   fiveHourPct: number | null;
-  /** Unix **seconds**, like everything else on this row. */
-  fiveHourResetsAt: number | null;
   sevenDayPct: number | null;
-  sevenDayResetsAt: number | null;
+  /** Unix **seconds**, like everything else on this row. */
   lastObservedAt: number;
   /**
-   * This member had more sessions in the window than one read returns, so the
-   * totals beside them are a floor. Rendered rather than swallowed: a
-   * truncation nobody mentions is a number that is quietly wrong.
+   * A member feeding this row had more sessions in the window than one read
+   * returns, so the count beside it is a floor. Rendered rather than swallowed:
+   * a truncation nobody mentions is a number that is quietly wrong.
    */
   truncated: boolean;
 };

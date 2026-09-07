@@ -1058,6 +1058,7 @@ function parseSamples(body: unknown) {
     return {
       harness,
       accountId,
+      accountEmail: usageString(sample.accountEmail, false),
       sessionId,
       model: usageString(sample.model, false),
       costUsd: usageNumber(sample.costUsd),

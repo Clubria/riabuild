@@ -400,9 +400,15 @@ const ISSUED_KEYS: IssuedKey[] = [
 /**
  * The usage rollup, in the four shapes that read differently.
  *
+ * A row is a **Claude account** rather than a developer, which is what the
+ * third and fourth entries are here to show: one person's second sign-in is a
+ * row of its own, and an account riabuild could not read an email for is a row
+ * that says so instead of borrowing somebody's login.
+ *
  * `NOW` is milliseconds and every field on a usage row is unix **seconds**, so
  * each timestamp here is divided rather than written twice — a fixture that got
- * that wrong would render a reset time in 1970 and look like a formatting bug.
+ * that wrong would render a last-seen time in 1970 and look like a formatting
+ * bug.
  */
 const SECONDS = Math.floor(NOW / 1000);
 const HOUR_S = 60 * 60;
@@ -412,63 +418,55 @@ const USAGE_ROWS: UsageRow[] = [
   // Nearly out of headroom on the five-hour window, which is the row a lead
   // opens this panel to find.
   {
-    memberId: DEVELOPER._id,
-    githubLogin: DEVELOPER.githubLogin,
+    accountKey: "email:ada@clubria.com",
+    accountEmail: "ada@clubria.com",
+    accountId: null,
     sessions: 14,
-    costUsd: 46.82,
-    linesAdded: 2140,
-    linesRemoved: 830,
     fiveHourPct: 94,
-    fiveHourResetsAt: SECONDS + 2 * HOUR_S,
     sevenDayPct: 61,
-    sevenDayResetsAt: SECONDS + 3 * DAY_S,
     lastObservedAt: SECONDS - 4 * 60,
     truncated: false,
   },
   {
-    memberId: LEAD._id,
-    githubLogin: LEAD.githubLogin,
+    accountKey: "email:grace@clubria.com",
+    accountEmail: "grace@clubria.com",
+    accountId: null,
     sessions: 6,
-    costUsd: 12.4,
-    linesAdded: 310,
-    linesRemoved: 96,
     fiveHourPct: 78,
-    fiveHourResetsAt: SECONDS + 40 * 60,
     sevenDayPct: 33,
-    sevenDayResetsAt: SECONDS + 5 * DAY_S,
     lastObservedAt: SECONDS - 90 * 60,
     truncated: false,
   },
+  // The same developer as the first row, on their own subscription. Two
+  // accounts are two windows, and merging them into a person would report one
+  // that does not exist.
   {
-    memberId: CANDIDATE._id,
-    githubLogin: CANDIDATE.githubLogin,
+    accountKey: "email:ada@personal.example",
+    accountEmail: "ada@personal.example",
+    accountId: null,
     sessions: 1,
-    costUsd: 0.34,
-    linesAdded: 12,
-    linesRemoved: 0,
     fiveHourPct: 3,
-    fiveHourResetsAt: SECONDS + 4 * HOUR_S,
     sevenDayPct: 1,
-    sevenDayResetsAt: SECONDS + 6 * DAY_S,
     lastObservedAt: SECONDS - 2 * DAY_S,
     truncated: false,
   },
   /**
-   * An account that reports no rate-limit block at all — an API-key or Console
-   * login, which the status line documents and which is not the same as a
-   * window sitting at zero. The panel has to say "—" rather than "0%".
+   * Two absences at once, and neither is a zero.
+   *
+   * No rate-limit block at all — an API-key or Console login, which the status
+   * line documents and which is not the same as a window sitting at zero, so
+   * the panel has to say "—" rather than "0%". And no email: an account signed
+   * out at the moment of the read, or a laptop on a riabuild older than the one
+   * that started reporting the address. It is still an account somebody spent a
+   * window from, so it is still a row.
    */
   {
-    memberId: SUSPENDED._id,
-    githubLogin: SUSPENDED.githubLogin,
+    accountKey: "account:0f9c1e5b-7d2a-4864-9c1e-5b8d3a7f2c94",
+    accountEmail: null,
+    accountId: "0f9c1e5b-7d2a-4864-9c1e-5b8d3a7f2c94",
     sessions: 3,
-    costUsd: 5,
-    linesAdded: 44,
-    linesRemoved: 44,
     fiveHourPct: null,
-    fiveHourResetsAt: null,
     sevenDayPct: null,
-    sevenDayResetsAt: null,
     lastObservedAt: SECONDS - 6 * DAY_S,
     truncated: false,
   },
@@ -789,15 +787,18 @@ export const SCENARIOS: Record<string, () => Data> = {
       state: "ready" as const,
       value: {
         ...USAGE,
-        rows: Array.from({ length: 20 }, (_, i) => ({
-          ...USAGE_ROWS[i % USAGE_ROWS.length],
-          memberId: id<"members">(`m_usage_${i}`),
-          githubLogin: `dev-${String(i).padStart(2, "0")}`,
-          fiveHourPct: i * 5,
-          sevenDayPct: 100 - i * 5,
-          sessions: i,
-          costUsd: i * 3.5,
-        })),
+        rows: Array.from({ length: 20 }, (_, i) => {
+          const email = `dev-${String(i).padStart(2, "0")}@clubria.com`;
+          return {
+            ...USAGE_ROWS[i % USAGE_ROWS.length],
+            accountKey: `email:${email}`,
+            accountEmail: email,
+            accountId: null,
+            fiveHourPct: i * 5,
+            sevenDayPct: 100 - i * 5,
+            sessions: i,
+          };
+        }),
       },
     },
   }),
@@ -1075,26 +1076,21 @@ export const SCENARIOS: Record<string, () => Data> = {
         rows: [
           {
             ...USAGE_ROWS[0],
-            memberId: id<"members">("m_usage_hostile"),
-            // The 60-character unbroken login the rest of the overflow
-            // scenario uses, beside a `partial` badge — which is where this
-            // table runs out of room first.
-            githubLogin: "a".repeat(60),
+            // A 60-character unbroken address beside a `partial` badge, which
+            // is where this table runs out of room first.
+            accountKey: `email:${"a".repeat(60)}@clubria.com`,
+            accountEmail: `${"a".repeat(60)}@clubria.com`,
+            accountId: null,
             sessions: 999_999,
-            // Wider than the column, and a reminder that this is notional: a
-            // number this size is exactly the one somebody would put in a
-            // budget if it were not labelled.
-            costUsd: 1_234_567.89,
-            linesAdded: 9_876_543,
-            linesRemoved: 8_765_432,
             fiveHourPct: 100,
             sevenDayPct: 100,
             truncated: true,
           },
           {
-            ...USAGE_ROWS[3],
-            memberId: id<"members">("m_usage_unicode"),
-            githubLogin: UNICODE.githubLogin,
+            ...USAGE_ROWS[2],
+            accountKey: `email:${UNICODE.githubLogin}@clubria.com`,
+            accountEmail: `${UNICODE.githubLogin}@clubria.com`,
+            accountId: null,
           },
         ],
       },

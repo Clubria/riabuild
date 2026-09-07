@@ -18,6 +18,13 @@
 //! model's prompt and the transcript path within reach when it writes a sample,
 //! and sends none of them.
 //!
+//! The one identity it does send is the **account's own email address**, because
+//! a rate-limit window belongs to an Anthropic account rather than to a person:
+//! one developer with two accounts has two windows, and the same account open on
+//! a laptop and a server is one window seen twice. Nothing but the laptop knows
+//! which is which, and it costs nothing to say — [`super::account`] has already
+//! read it out of `.claude.json` to draw this very line.
+//!
 //! Design: `docs/superpowers/specs/2026-08-29-usage-tracking-design.md`.
 
 use riabuild_api::usage::Sample;
@@ -78,8 +85,14 @@ pub fn spool_target(config_dir: &Path) -> Option<(PathBuf, String)> {
 /// volume the status line offers, so it is the one taken.
 ///
 /// `None` for a payload naming no session: a sample that cannot say what it
-/// measured is not a measurement.
-pub fn sample_from_payload(payload: &Value, account_id: &str) -> Option<Sample> {
+/// measured is not a measurement. An `account_email` of `None` is not that — an
+/// account nothing can name is still an account somebody is using, and the panel
+/// says so rather than dropping the row.
+pub fn sample_from_payload(
+    payload: &Value,
+    account_id: &str,
+    account_email: Option<String>,
+) -> Option<Sample> {
     let session_id = payload.get("session_id").and_then(Value::as_str)?;
     if session_id.is_empty() {
         return None;
@@ -94,6 +107,7 @@ pub fn sample_from_payload(payload: &Value, account_id: &str) -> Option<Sample> 
     Some(Sample {
         harness: "claude".to_string(),
         account_id: account_id.to_string(),
+        account_email,
         session_id: session_id.to_string(),
         model: payload
             .get("model")
@@ -119,10 +133,16 @@ pub fn sample_from_payload(payload: &Value, account_id: &str) -> Option<Sample> 
 /// a developer's status line because a dashboard is unreachable has turned a
 /// usage tracker into an outage.
 pub(super) async fn collect(payload: &Value, config_dir: Option<&Path>) -> bool {
-    let Some((spool, account)) = config_dir.and_then(spool_target) else {
+    let Some(dir) = config_dir else {
         return false;
     };
-    let Some(sample) = sample_from_payload(payload, &account) else {
+    let Some((spool, account)) = spool_target(dir) else {
+        return false;
+    };
+    // The same read the bar above this already did, and the same failure: an
+    // account this cannot name is spooled unnamed rather than not spooled.
+    let email = super::account::email_in(dir);
+    let Some(sample) = sample_from_payload(payload, &account, email) else {
         return false;
     };
     let Ok(line) = serde_json::to_string(&sample) else {
@@ -231,7 +251,10 @@ mod tests {
     #[tokio::test]
     async fn an_account_spools_one_line_per_render() {
         let home = tempfile::TempDir::new().unwrap();
-        let dirs = namespace(&home.path().join("ns"), &[("acc-uuid", None)]);
+        let dirs = namespace(
+            &home.path().join("ns"),
+            &[("acc-uuid", Some("ada@clubria.com"))],
+        );
 
         collect(&payload(), Some(&dirs[0])).await;
         collect(&payload(), Some(&dirs[0])).await;
@@ -246,6 +269,9 @@ mod tests {
         assert_eq!(sample["sessionId"], "sess-1");
         // The file name *is* the account, so nothing has to be passed twice.
         assert_eq!(sample["accountId"], "acc-uuid");
+        // And the address it is signed in as, which is what the lead panel
+        // groups by — read from the same `.claude.json` the bar reads.
+        assert_eq!(sample["accountEmail"], "ada@clubria.com");
         assert_eq!(sample["costUsd"], 0.5);
         assert_eq!(sample["fiveHourPct"], 23.5);
         assert_eq!(sample["sevenDayPct"], 41.2);
@@ -258,9 +284,33 @@ mod tests {
     /// after every `/compact` — so merged by maximum it would report peak
     /// context size under a heading that said "tokens". This is what stops it
     /// being added back because the payload obviously has it.
+    /// An account whose email cannot be read is still an account being used.
+    ///
+    /// A signed-out account, a `.claude.json` caught mid-write, a Claude Code
+    /// that has stopped recording `oauthAccount`: all of them still spend a
+    /// rate-limit window, so all of them still spool. The panel shows the row as
+    /// an account it cannot name — which is why this must not become a
+    /// precondition for collecting at all.
+    #[tokio::test]
+    async fn an_account_with_no_readable_email_still_spools() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dirs = namespace(&home.path().join("ns"), &[("acc-uuid", None)]);
+
+        collect(&payload(), Some(&dirs[0])).await;
+
+        let written =
+            std::fs::read_to_string(home.path().join("ns/usage/acc-uuid.ndjson")).unwrap();
+        let sample: Value = serde_json::from_str(written.lines().next().unwrap()).unwrap();
+        assert_eq!(sample["accountId"], "acc-uuid");
+        assert!(
+            sample.get("accountEmail").is_none(),
+            "an unreadable email is an absent key, never an invented address: {sample}"
+        );
+    }
+
     #[test]
     fn no_token_count_is_ever_spooled() {
-        let sample = sample_from_payload(&payload(), "acc").unwrap();
+        let sample = sample_from_payload(&payload(), "acc", None).unwrap();
         let json = serde_json::to_string(&sample).unwrap();
 
         for forbidden in ["Token", "token", "15500", "1200"] {
@@ -273,7 +323,7 @@ mod tests {
     /// how much was used.
     #[test]
     fn nothing_about_the_work_itself_is_spooled() {
-        let sample = sample_from_payload(&payload(), "acc").unwrap();
+        let sample = sample_from_payload(&payload(), "acc", None).unwrap();
         let json = serde_json::to_string(&sample).unwrap();
 
         for forbidden in ["workspace", "current_dir", "/tmp", "project_dir"] {
@@ -287,7 +337,7 @@ mod tests {
     /// would be a measurement riabuild invented.
     #[test]
     fn an_unmeasured_field_is_absent_rather_than_zero() {
-        let sample = sample_from_payload(&json!({ "session_id": "s1" }), "acc").unwrap();
+        let sample = sample_from_payload(&json!({ "session_id": "s1" }), "acc", None).unwrap();
         let json = serde_json::to_string(&sample).unwrap();
 
         assert!(!json.contains("costUsd"), "{json}");
@@ -297,8 +347,8 @@ mod tests {
 
     #[test]
     fn a_payload_with_no_session_is_not_a_sample() {
-        assert!(sample_from_payload(&json!({}), "acc").is_none());
-        assert!(sample_from_payload(&json!({ "session_id": "" }), "acc").is_none());
+        assert!(sample_from_payload(&json!({}), "acc", None).is_none());
+        assert!(sample_from_payload(&json!({ "session_id": "" }), "acc", None).is_none());
     }
 
     /// A `claude` the launchers did not start has no account directory, so it

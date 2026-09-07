@@ -4,12 +4,18 @@
 //! crate whose request body says anything about what a developer did. Read the
 //! two limits on that plainly, because both are load-bearing:
 //!
-//! **The member is never on the wire.** The request carries an account uuid and
-//! a session id and no identity at all — who this is comes from the bearer token
-//! the server already authenticated. A `memberId` field would be a claim the
-//! client makes about itself, which is strictly weaker than the one the session
-//! already proves, and it would put a *personal* Claude account's identity in a
-//! payload that did not need it.
+//! **The member is never on the wire.** The request carries an account uuid, a
+//! session id and the address that account is signed in as, and no *riabuild*
+//! identity at all — who this is comes from the bearer token the server already
+//! authenticated. A `memberId` field would be a claim the client makes about
+//! itself, which is strictly weaker than the one the session already proves.
+//!
+//! **The email is a label, never a credential.** Usage is counted and read per
+//! Claude account, so the account has to name itself: no session token implies
+//! `ada@example.com`, and the config-directory uuid beside it means nothing to
+//! the lead reading the panel. It authorises nothing — a sample naming somebody
+//! else's address still lands under the member the bearer token proved, and
+//! still buys that sample no access to anything.
 //!
 //! **What is measured is volume, never content.** A sample is a cost, some
 //! durations, a line count and two rate-limit percentages. The status line has
@@ -51,8 +57,18 @@ pub struct Sample {
     /// Grok Build are a new producer rather than a migration.
     pub harness: String,
     /// The Claude config directory's uuid — riabuild's own name for the
-    /// account, and deliberately not the account's email address.
+    /// account. Still the upsert key: it is stable across a re-login and it is
+    /// there even on the renders where the email cannot be read.
     pub account_id: String,
+    /// Who that account is signed in as, which is what a lead's panel groups by.
+    ///
+    /// `None` is an ordinary answer rather than a failure — a signed-out
+    /// account, a `.claude.json` caught mid-write, a Claude Code that has
+    /// stopped recording `oauthAccount`. Such samples are still sent and still
+    /// counted; the panel shows them as an account it cannot name, which is
+    /// honest where inventing an address would not be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -119,6 +135,7 @@ mod tests {
         let sample = Sample {
             harness: "claude".to_string(),
             account_id: "acc".to_string(),
+            account_email: Some("ada@example.com".to_string()),
             session_id: "s1".to_string(),
             model: Some("claude-opus-5".to_string()),
             cost_usd: Some(1.0),
@@ -148,6 +165,7 @@ mod tests {
         let mut expected = [
             "harness",
             "accountId",
+            "accountEmail",
             "sessionId",
             "model",
             "costUsd",
@@ -197,6 +215,10 @@ mod tests {
 
         assert!(json.contains(r#""accountId":"bbbbbbbb-2222-4333-8444-555555555555""#));
         assert!(json.contains(r#""costUsd":0.25"#));
+        assert!(
+            !json.contains("accountEmail"),
+            "an account whose email could not be read sends no key at all: {json}"
+        );
         assert!(
             !json.contains("fiveHourPct"),
             "an unmeasured rate limit must not appear at all: {json}"

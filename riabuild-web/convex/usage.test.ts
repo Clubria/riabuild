@@ -25,6 +25,7 @@ type Accepted = { accepted: number };
 type Sample = {
   harness?: string;
   accountId?: string;
+  accountEmail?: string;
   sessionId?: string;
   model?: string;
   costUsd?: number;
@@ -73,6 +74,7 @@ async function storedRows(t: TestConvex, memberId: Id<"members">) {
       .collect();
     return rows.map((row) => ({
       accountId: row.accountId,
+      accountEmail: row.accountEmail,
       sessionId: row.sessionId,
       harness: row.harness,
       model: row.model,
@@ -106,6 +108,7 @@ describe("POST /api/v1/usage", () => {
     expect(await storedRows(t, rowId)).toEqual([
       {
         accountId: ACCOUNT,
+        accountEmail: undefined,
         sessionId: "sess-1",
         harness: "claude",
         model: "claude-opus-5",
@@ -205,6 +208,26 @@ describe("POST /api/v1/usage", () => {
     ]);
 
     expect(await storedRows(t, rowId)).toHaveLength(4);
+  });
+
+  /**
+   * The email is a label on a measurement, so a render that could not read one
+   * must not take the name off a session that already has it. `.claude.json` is
+   * rewritten while Claude Code runs, so an unreadable render is ordinary — and
+   * a cleared name would move a live session into the unnamed row.
+   */
+  test("a sample with no email does not clear an email already stored", async () => {
+    const t = setup();
+    const { rowId } = await seedMember(t, { role: "developer" });
+    const { token } = await issueSession(t, rowId);
+    stubMembership(204);
+
+    await post(t, token, [sample({ accountEmail: "ada@clubria.com" })]);
+    await post(t, token, [sample({ costUsd: 2 })]);
+
+    const rows = await storedRows(t, rowId);
+    expect(rows[0].accountEmail).toBe("ada@clubria.com");
+    expect(rows[0].costUsd).toBe(2);
   });
 
   /**
@@ -372,7 +395,36 @@ describe("the lead rollup", () => {
     return t.withIdentity({ subject: `${userId}|session` });
   }
 
-  test("a lead sees one row per member, summed across their sessions", async () => {
+  /**
+   * Samples filed at an instant the test chooses.
+   *
+   * `POST /api/v1/usage` stamps `observedAt` from the server's clock, which is
+   * right — a laptop does not get to choose which window its rows land in — and
+   * leaves two posts in one test sharing a second. Where the assertion is about
+   * which reading is the *newest*, the mutation underneath takes the instant as
+   * an argument and is the honest way to write it down.
+   */
+  async function recordAt(
+    t: TestConvex,
+    memberId: Id<"members">,
+    observedAt: number,
+    samples: Sample[],
+  ) {
+    await t.mutation(internal.usage.record, {
+      memberId,
+      observedAt,
+      samples: samples.map((entry) => ({
+        harness: entry.harness ?? "claude",
+        accountId: entry.accountId ?? ACCOUNT,
+        sessionId: entry.sessionId ?? "sess-1",
+        accountEmail: entry.accountEmail,
+        fiveHourPct: entry.fiveHourPct,
+        sevenDayPct: entry.sevenDayPct,
+      })),
+    });
+  }
+
+  test("a lead sees one row per Claude account, counted across its sessions", async () => {
     const t = setup();
     const lead = await seedMember(t, { login: "grace", role: "lead" });
     const dev = await seedMember(t, {
@@ -384,14 +436,11 @@ describe("the lead rollup", () => {
     stubMembership(204);
 
     await post(t, token, [
-      sample({ sessionId: "a", costUsd: 1.5, linesAdded: 10, linesRemoved: 2 }),
+      sample({ sessionId: "a", accountEmail: "ada@clubria.com" }),
       sample({
         sessionId: "b",
-        costUsd: 2.25,
-        linesAdded: 5,
-        linesRemoved: 1,
+        accountEmail: "ada@clubria.com",
         fiveHourPct: 42,
-        fiveHourResetsAt: 1_800_000_000,
         sevenDayPct: 12,
       }),
     ]);
@@ -402,16 +451,195 @@ describe("the lead rollup", () => {
     expect(result.windowDays).toBe(7);
     expect(result.rows).toHaveLength(1);
     expect(result.rows[0]).toMatchObject({
-      githubLogin: "ada",
+      accountKey: "email:ada@clubria.com",
+      accountEmail: "ada@clubria.com",
+      // Named, so there is no single directory to name. See `usageRow`.
+      accountId: null,
       sessions: 2,
-      // Summed *across* sessions, which is the one place summing is right.
-      costUsd: 3.75,
-      linesAdded: 15,
-      linesRemoved: 3,
       fiveHourPct: 42,
-      fiveHourResetsAt: 1_800_000_000,
       sevenDayPct: 12,
       truncated: false,
+    });
+    // The developer is not on the row at all: what is being reported is an
+    // account's window, and naming a person beside it invites reading one as
+    // the other.
+    expect(result.rows[0]).not.toHaveProperty("githubLogin");
+    expect(result.rows[0]).not.toHaveProperty("memberId");
+  });
+
+  /**
+   * The whole reason this is keyed by account. Two developers signed in to one
+   * Anthropic account share one five-hour window, and two rows would report a
+   * headroom neither of them has.
+   */
+  test("two members on one account email are one row", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "grace", role: "lead" });
+    const one = await seedMember(t, {
+      login: "ada",
+      githubId: "5678",
+      role: "developer",
+    });
+    const two = await seedMember(t, {
+      login: "bo",
+      githubId: "9012",
+      role: "developer",
+    });
+
+    // Recorded rather than posted, because which reading is the newest is the
+    // whole assertion and the endpoint stamps both with the same second.
+    const at = Math.floor(Date.now() / 1000);
+    await recordAt(t, one.rowId, at - 60, [
+      sample({ accountEmail: "team@clubria.com", fiveHourPct: 10 }),
+    ]);
+    await recordAt(t, two.rowId, at, [
+      // A different laptop, so a different config directory and a session id of
+      // its own — one account all the same.
+      sample({
+        accountId: "other-directory",
+        accountEmail: "team@clubria.com",
+        sessionId: "sess-2",
+        fiveHourPct: 55,
+      }),
+    ]);
+
+    const asLead = await signedIn(t, lead.userId);
+    const result = await asLead.query(api.usage.rollup, {});
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].sessions).toBe(2);
+    // The newest reading of one window, never a sum and never an average.
+    expect(result.rows[0].fiveHourPct).toBe(55);
+  });
+
+  /**
+   * And the newest wins downwards too, across members: a window that has reset
+   * on the laptop that reported last is a window with headroom, however busy
+   * the other machine's older reading was.
+   */
+  test("a newer reading of one window replaces an older, even downwards", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "grace", role: "lead" });
+    const one = await seedMember(t, {
+      login: "ada",
+      githubId: "5678",
+      role: "developer",
+    });
+    const two = await seedMember(t, {
+      login: "bo",
+      githubId: "9012",
+      role: "developer",
+    });
+
+    const at = Math.floor(Date.now() / 1000);
+    await recordAt(t, one.rowId, at - 60, [
+      sample({ accountEmail: "team@clubria.com", fiveHourPct: 96 }),
+    ]);
+    await recordAt(t, two.rowId, at, [
+      sample({
+        accountId: "other-directory",
+        accountEmail: "team@clubria.com",
+        sessionId: "sess-2",
+        fiveHourPct: 4,
+      }),
+    ]);
+
+    const asLead = await signedIn(t, lead.userId);
+    const result = await asLead.query(api.usage.rollup, {});
+
+    expect(result.rows[0].fiveHourPct).toBe(4);
+  });
+
+  /** And the other way round: one developer's two sign-ins are two windows. */
+  test("one member's two accounts are two rows", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "grace", role: "lead" });
+    const dev = await seedMember(t, {
+      login: "ada",
+      githubId: "5678",
+      role: "developer",
+    });
+    const { token } = await issueSession(t, dev.rowId);
+    stubMembership(204);
+
+    await post(t, token, [
+      sample({ accountEmail: "ada@clubria.com", fiveHourPct: 90 }),
+      sample({
+        accountId: "second-directory",
+        accountEmail: "ada@personal.example",
+        fiveHourPct: 5,
+      }),
+    ]);
+
+    const asLead = await signedIn(t, lead.userId);
+    const result = await asLead.query(api.usage.rollup, {});
+
+    expect(result.rows.map((row) => row.accountEmail)).toEqual([
+      // Fullest window first.
+      "ada@clubria.com",
+      "ada@personal.example",
+    ]);
+  });
+
+  /**
+   * The changeover, which is why sessions are folded by `accountId` before they
+   * are grouped by address. Every row already in the table was written before
+   * riabuild sent an email, and one flush from an upgraded laptop names all of
+   * them rather than leaving a named row and an unnamed one side by side.
+   */
+  test("sessions stored before the email arrived join their account's row", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "grace", role: "lead" });
+    const dev = await seedMember(t, {
+      login: "ada",
+      githubId: "5678",
+      role: "developer",
+    });
+    const { token } = await issueSession(t, dev.rowId);
+    stubMembership(204);
+
+    await post(t, token, [
+      // What an older riabuild sent: an account uuid and no name for it.
+      sample({ sessionId: "before" }),
+      sample({ sessionId: "after", accountEmail: "ada@clubria.com" }),
+    ]);
+
+    const asLead = await signedIn(t, lead.userId);
+    const result = await asLead.query(api.usage.rollup, {});
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].accountEmail).toBe("ada@clubria.com");
+    expect(result.rows[0].sessions).toBe(2);
+  });
+
+  /**
+   * An account nothing has ever named is still an account somebody spent a
+   * window from. Dropping it would lose the usage; borrowing the member's login
+   * would assert a link riabuild never observed.
+   */
+  test("an account with no email is a row keyed by its directory", async () => {
+    const t = setup();
+    const lead = await seedMember(t, { login: "grace", role: "lead" });
+    const dev = await seedMember(t, {
+      login: "ada",
+      githubId: "5678",
+      role: "developer",
+    });
+    const { token } = await issueSession(t, dev.rowId);
+    stubMembership(204);
+
+    await post(t, token, [sample({ fiveHourPct: 7 })]);
+
+    const asLead = await signedIn(t, lead.userId);
+    const result = await asLead.query(api.usage.rollup, {});
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      accountKey: `account:${ACCOUNT}`,
+      accountEmail: null,
+      accountId: ACCOUNT,
+      sessions: 1,
+      fiveHourPct: 7,
     });
   });
 

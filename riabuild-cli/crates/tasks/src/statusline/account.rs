@@ -72,6 +72,10 @@ fn number_of(dir: &Path) -> Option<usize> {
 
 /// The email Claude Code recorded for the account signed in there.
 ///
+/// Shared with [`super::usage`], which stamps it on every sample so that a lead
+/// reads usage per Claude account rather than per developer. Same read, same
+/// render, and no second source of truth about who this window is.
+///
 /// Read as a file, for the reason `repo` reads `.git/config` as one:
 /// `claude auth status --json` is the supported way to ask this and
 /// `accounts::status` uses it, where it costs one Claude Code startup — about
@@ -87,7 +91,7 @@ fn number_of(dir: &Path) -> Option<usize> {
 /// Nothing breaks and nothing is misreported — whereas a signed-out account and
 /// a renamed key must never be told apart by guessing, so neither is: both draw
 /// nothing.
-fn email_in(dir: &Path) -> Option<String> {
+pub(super) fn email_in(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join(".claude.json")).ok()?;
     // Claude Code rewrites this file while it runs. A read that lands mid-write
     // is a parse error and not a signed-out account, so it draws nothing rather
