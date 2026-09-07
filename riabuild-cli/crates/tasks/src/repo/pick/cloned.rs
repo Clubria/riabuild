@@ -5,7 +5,7 @@
 //! with no checkout has nothing to move.
 
 use super::super::render::{self, Row};
-use super::answer::{ATTEMPTS, Answer, settle};
+use super::answer::{ATTEMPTS, Answer, offered_name, settle};
 use super::now;
 use crate::Ctx;
 use anyhow::Result;
@@ -51,8 +51,8 @@ pub async fn choose_cloned(ctx: &mut Ctx) -> Result<Option<Repo>> {
         return Ok(Some(only));
     }
 
+    let org_default = ctx.org.as_ref().and_then(|org| org.default_repo().ok());
     let chosen = if ctx.ui.interactive() {
-        let org_default = ctx.org.as_ref().and_then(|org| org.default_repo().ok());
         let rows: Vec<Row> = cloned
             .iter()
             .map(|repo| Row {
@@ -77,7 +77,11 @@ pub async fn choose_cloned(ctx: &mut Ctx) -> Result<Option<Repo>> {
             now(),
             ctx.ui.theme(),
         ));
-        ask_cloned(&ctx.ui, &cloned, &default)
+        // The owner the question may leave unsaid is the org's, not this
+        // repository's: on a machine with no session there is none, and
+        // `someone-else/hub` has to keep its owner rather than borrow the
+        // silence meant for `Clubria/hub`.
+        ask_cloned(&ctx.ui, &cloned, &default, org_default.as_ref())
     } else {
         // The crate rule: a prompt offers a choice, so nobody there takes the
         // default. `move-project` with no path then fails at its own question,
@@ -94,8 +98,15 @@ pub async fn choose_cloned(ctx: &mut Ctx) -> Result<Option<Repo>> {
 /// A typed name has to be one of them: a repository this machine has not cloned
 /// has no directory to move, and "which repository" is a better place to say so
 /// than a failed `rename`.
-fn ask_cloned(ui: &Ui, cloned: &[Repo], default: &Repo) -> Repo {
-    let question = format!("Which repository's checkout? (press enter for {default})");
+fn ask_cloned(ui: &Ui, cloned: &[Repo], default: &Repo, org_default: Option<&Repo>) -> Repo {
+    // The same sentence the provisioning picker puts, for the same two reasons:
+    // the org is the word every row above already carries, and the numbers are
+    // the fastest answer on screen with nothing else to say so. No clock here
+    // though — `riabuild move-project` is a command a developer typed, not a
+    // question riabuild put to them on its way past.
+    let offered = offered_name(default, org_default.map_or("", Repo::owner));
+    let question =
+        format!("Which repository's checkout? (press enter for {offered}, or type a number)");
     for _ in 0..ATTEMPTS {
         let Some(answer) = ui.ask(&question) else {
             break;

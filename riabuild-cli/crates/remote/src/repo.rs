@@ -105,7 +105,7 @@ pub async fn choose_for(
         },
     )
     .await;
-    Some(chosen.slug().to_string())
+    Some(chosen.repo.slug().to_string())
 }
 
 #[cfg(test)]
@@ -171,8 +171,11 @@ mod tests {
         .await;
 
         assert_eq!(chosen.as_deref(), Some("Clubria/payments"));
+        // Named without its owner, which is the word every row of the box
+        // above already carries — and the numbers offered beside it, because
+        // the box is what `--quiet` drops.
         assert!(
-            ctx.ui.asked()[0].contains("Clubria/payments"),
+            ctx.ui.asked()[0].contains("press enter for payments, or type a number"),
             "{:?}",
             ctx.ui.asked()
         );

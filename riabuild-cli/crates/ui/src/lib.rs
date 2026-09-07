@@ -48,6 +48,17 @@ pub mod tty;
 /// exist yet.
 mod prompt;
 
+/// A question that takes its default when nobody answers it — `Ui::ask` with
+/// the wait made finite, and the third answer that only a bounded wait can
+/// tell apart: nobody was reading. Its own file because the terminal handling
+/// is a different discipline from `prompt`'s single blocking read, and because
+/// the wording and the plural of the countdown are pure and worth asserting on
+/// their own.
+mod countdown;
+#[cfg(any(test, feature = "testing"))]
+pub use countdown::NOBODY_ANSWERED;
+pub use countdown::{Waited, seconds_left, selected, selecting};
+
 /// Reading one secret with the terminal's echo off, over `/dev/tty` rather
 /// than stdin and stdout. Its own file because it shares neither of those
 /// with `prompt` above: the caller's stdout is a pipe `ssh` reads a password
