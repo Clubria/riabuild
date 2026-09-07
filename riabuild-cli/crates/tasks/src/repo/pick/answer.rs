@@ -7,12 +7,40 @@ use super::super::list::Entry;
 use super::super::render::{Row, SHOWN};
 use riabuild_api::Repo;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// How many unusable answers are asked about again before riabuild takes the
 /// default. The bound `project::choose_dir` and `remote::pick` already use, for
 /// the reason they already give: a developer who cannot give a usable answer is
 /// better served by riabuild choosing than by being asked forever.
 pub(super) const ATTEMPTS: usize = 3;
+
+/// How long the question waits before taking the repository it offered.
+///
+/// The one prompt riabuild puts on a run where *nothing has gone wrong*, so it
+/// is also the one prompt that must not be able to stop a run: a laptop left
+/// provisioning while the developer makes coffee used to sit on this question
+/// until they came back. Five seconds is long enough to read the box and reach
+/// for a number, and short enough that nobody sits and watches it.
+///
+/// It bounds the wait, not the answer. The first keystroke cancels the clock
+/// for good, so a developer typing a repository name has as long as they like.
+pub(super) const PATIENCE: Duration = Duration::from_secs(5);
+
+/// How the repository Enter takes is named in the question.
+///
+/// The bare name where it belongs to the org whose box is on screen: every row
+/// above the question carries that same owner, so repeating it inside the
+/// question spends the longest word in the sentence on the one word that
+/// distinguishes nothing. The full slug where it does not — `someone-else/hub`
+/// shortened to `hub` names a repository this org has too, and the developer
+/// would press Enter for the wrong one.
+pub fn offered_name<'a>(repo: &'a Repo, org_owner: &str) -> &'a str {
+    match repo.owner() == org_owner {
+        true => repo.name(),
+        false => repo.slug(),
+    }
+}
 
 /// What a typed answer meant.
 #[derive(Debug, Clone, PartialEq, Eq)]

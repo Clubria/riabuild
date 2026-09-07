@@ -33,9 +33,12 @@ Clubria repositories:
 Which repository? (press enter for payments)
 ```
 
-Enter takes the active repository — the one this machine used last, and the org default
-on a machine that has never chosen. A number picks from the box. A name picks anything
-at all this developer can see: `payments`, `Clubria/payments`, or another owner's
+~~Enter takes the active repository — the one this machine used last, and the org default
+on a machine that has never chosen.~~ **Superseded on 2026-09-07** — Enter takes the org
+default on every run, the question no longer names the owner or waits for ever, and the
+box above is now `(press enter for ai-builders-hub, or type a number)` with a countdown
+line under it. See the addendum at the foot. A number picks from the box. A name picks
+anything at all this developer can see: `payments`, `Clubria/payments`, or another owner's
 `owner/repo`.
 
 Ordering is the active repository, then the ones already cloned on this machine, then the
@@ -82,8 +85,10 @@ drops a checkout nothing has folded yet, and the next run clones a second copy o
 repository the developer already has.
 
 `Ctx::project_dir` reads the map, keyed by the repository *this run* is about rather than
-by `active_repo` — which repository a run is about is the run's to know, and `active_repo`
-is only how that is remembered for the next run's default.
+by `active_repo` — which repository a run is about is the run's to know, and ~~`active_repo`
+is only how that is remembered for the next run's default~~ **superseded on 2026-09-07**:
+`active_repo` records what this machine is set up for, which is what `status`, `env` and
+`shell` report, and the next run's default is the org's or a pin rather than this.
 
 It falls back to `project_path` under two conditions together: the repository asked about
 is the org default, and nothing has chosen yet. Both are about never handing back a path
@@ -401,3 +406,75 @@ first that goes through `riabuild_ui::one_line` before it is printed. A descript
 be *wrong* the way an address can, so it is defused rather than refused: an escape sequence
 in one must not repaint the picker, and a server must not vanish from the box over the
 sentence beside it.
+
+## Addendum: the question stops waiting, and stops remembering
+
+**Date:** 2026-09-07
+
+Two changes, and they are one change: the picker no longer keeps a memory of its own, and
+it no longer waits for ever.
+
+```
+Clubria repositories:
+  1. ai-builders-hub    default · cloned · pushed 2h ago
+     The Clubria builders' hub
+  2. payments           cloned · pushed yesterday
+     Ledger, payouts, and the reconciliation jobs
+  …
+
+Which repository? (press enter for ai-builders-hub, or type a number)
+selecting ai-builders-hub in 3 seconds...
+```
+
+**Enter takes the org default, on every machine and on every run.** The line above — *"Enter
+takes the active repository — the one this machine used last"* — is superseded. That memory
+was the picker's own and it was silent: one mistyped answer decided every run after it, and
+nothing on screen distinguished a developer who *wanted* to stay on a repository from one
+who had drifted onto it. The addendum of 2026-09-05 gave staying on a repository its own
+answer, asked out loud and named on every run afterwards, so the implicit half is now a
+second persistence for one idea. `active_repo` is still written and still decides what
+`status`, `env` and `shell` report — that is a record of what the machine *is* set up for,
+which is a different question from what the next run should offer. What Enter takes and what
+an unattended run takes stay one answer, or the same machine provisions two different
+repositories depending on whether anybody was watching.
+
+**And the question takes that default after five seconds.** It is the only prompt riabuild
+puts on a run where nothing has gone wrong, so it is the only one that can hold a
+provisioning run open while its developer makes coffee. The countdown line redraws once a
+second — `selecting ai-builders-hub in 3 seconds...`, with the name in the brand colour —
+and the **first keystroke cancels the clock for good**. Typing is answering; a timer that
+could still expire under a half-typed repository name would be riabuild racing somebody it
+can see is there.
+
+`riabuild-ui`'s `countdown` module is what that costs. It takes stdin out of canonical mode
+and turns echo off, because a `read_line` hands nothing over until Enter — so without it
+"they have started typing" is not observable at all — and because the countdown and the
+answer share one line, which the tty driver would interleave in whichever order the tick and
+the keystroke arrived. It reads **one byte at a time** so that nothing past the newline is
+consumed: a developer who types `2`, Enter, `y`, Enter through both of the picker's
+questions would otherwise lose the `y` to a read that took the whole burst. `ISIG` is left
+alone, so ^C kills riabuild here exactly as it does everywhere else, and the terminal is
+restored by a `Drop` guard on every path out.
+
+**`Waited` has three cases where `Ui::ask` has two, and the third is the point.**
+`Unanswered` says nobody was reading, which `ask`'s `None` cannot distinguish from Enter.
+The pin's `Always use <repo>?` is a `confirm` with no clock of its own, so putting it after
+a countdown that ran out would hold the run on an Enter that is not coming — the hang the
+countdown exists to remove, moved one question down. A developer who walked away therefore
+gets the org default and no pin, which is the state they were already in.
+
+**The question also stopped naming the org, and started naming the numbers.** `(press enter
+for Clubria/ai-builders-hub)` spent the longest word in the sentence on the one word that
+distinguishes nothing — every row of the box above carries the same owner. `offered_name`
+keeps the owner for the one case where it does distinguish something: `someone-else/hub`
+shortened to `hub` names a repository this org has too, and Enter would take the wrong one.
+And `or type a number` is there because the numbers are the fastest answer on screen and
+nothing said so — the box draws them, the box is what `--quiet` drops, and `remote::pick`
+has named them in its own question since it had one. `riabuild move-project`'s picker says
+the same sentence, without the clock: that is a command a developer typed, not a question
+riabuild put to them on its way past.
+
+What none of this touches: the per-server memory in `Record.repo`. That is what this laptop
+last set *that server* up for, it is a fact about a machine the laptop cannot otherwise ask,
+and `2026-08-26-remote-repository-first-design.md` records why it had to travel with the
+question when the question moved.

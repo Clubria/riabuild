@@ -69,7 +69,7 @@ impl Ui {
     }
 
     #[cfg(not(any(test, feature = "testing")))]
-    fn read_answer(&self, question: &str) -> Option<String> {
+    pub(crate) fn read_answer(&self, question: &str) -> Option<String> {
         println!();
         print!(
             "    {} ",
@@ -86,7 +86,7 @@ impl Ui {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    fn read_answer(&self, question: &str) -> Option<String> {
+    pub(crate) fn read_answer(&self, question: &str) -> Option<String> {
         crate::recorded(&self.asked).push(question.to_string());
         crate::recorded(&self.answers).pop_front()
     }

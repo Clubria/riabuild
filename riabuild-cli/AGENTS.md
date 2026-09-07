@@ -224,6 +224,19 @@ is `Ctx::repo`, set by the picker or by `--repo`; a task that reaches for the or
 instead will clone one repository and provision another, on a machine where every test
 still passes because the two are the same value until somebody picks.
 
+**The picker offers the org default on every run, and never the repository this machine
+last worked on.** `active_repo` is still written and still decides what `status`, `env` and
+`shell` report — that is a record of what the machine *is* set up for. It is not what the
+next run opens on, and reintroducing that is how the bug comes back: the memory was silent,
+so one mistyped answer decided every run after it, and the developer who wanted to stay on
+one repository could not tell that from the developer who had drifted onto it. `always_repo`
+does that job out loud, is asked for once, and is named on every run afterwards with the
+flag that undoes it printed beside. Two persistences for one idea is one too many —
+especially now the question no longer waits for ever, since a countdown whose default is
+"whatever happened last time" takes a decision nobody is present to see. What Enter takes
+and what nobody-there takes are one answer, both here and in the `!interactive` branch
+above it.
+
 **A pinned repository is undone by GitHub and by nothing else.** `Always use <repo>?` after
 the picker writes `UserConfig::always_repo`, and a run that finds one draws no box and asks
 nothing — which is the feature, and also why the one thing that clears it on its own has to
@@ -296,6 +309,24 @@ default that could be right. So it *refuses*, loudly and immediately, instead of
 inventing an answer or blocking on a read that will never return. If you find
 yourself reaching for the `_required` pair anywhere a sensible default exists, use
 `ask`/`confirm` instead.
+
+**And one prompt takes its default after five seconds, which is that rule with a clock on
+it rather than an exception to it.** `Ui::ask_within` is the repository picker's, and it is
+the only question riabuild puts on a run where *nothing has gone wrong* — so it is the only
+one that can stop a run somebody has walked away from. `riabuild-ui`'s `countdown` takes
+the terminal out of canonical mode to do it, because a `read_line` hands nothing over until
+Enter and riabuild would otherwise have no way to tell a developer half way through typing
+`payments` from an empty room. **The first keystroke cancels the clock for good**; typing
+is answering, and a timer that could still expire under a half-typed name would be riabuild
+racing somebody it can see.
+
+`Waited` has three cases where `ask`'s `Option` has two, and the third is why this is not
+just `ask` with a timeout: `Unanswered` says *nobody was reading*, which `ask` cannot
+distinguish from Enter. A caller with a **second** question to put has to know — the pin's
+`Always use <repo>?` is a `confirm` with no clock of its own, so putting it after a
+countdown that ran out would hold the run on an Enter that is not coming, which is the hang
+the countdown exists to remove, moved one question down. Do not reach for `ask_within`
+anywhere the answer is not already the thing riabuild would have done alone.
 
 **A dependency wave runs concurrently, and reports one task at a time.** `engine` runs the
 tasks of one wave together — the four tool downloads of the first wave have no edges

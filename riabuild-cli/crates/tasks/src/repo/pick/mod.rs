@@ -18,9 +18,9 @@
 mod answer;
 mod cloned;
 
-pub use answer::{Answer, rows_for, settle};
+pub use answer::{Answer, offered_name, rows_for, settle};
 
-use answer::ATTEMPTS;
+use answer::{ATTEMPTS, PATIENCE};
 pub use cloned::choose_cloned;
 
 use super::list::{self, Access, Listing};
@@ -29,7 +29,7 @@ use crate::Ctx;
 use anyhow::Result;
 use riabuild_api::Repo;
 use riabuild_paths::config::UserConfig;
-use riabuild_ui::Ui;
+use riabuild_ui::{Ui, Waited};
 use std::collections::BTreeMap;
 
 /// Whether this run may take the repository a developer pinned without putting
@@ -63,12 +63,30 @@ enum Pin {
 /// Writes the answer before returning, so every repository-scoped task in the
 /// run that follows reads it from one place.
 pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
-    // What Enter takes: the repository this machine last worked on, and the org
-    // default on a machine that has never chosen. Fallible only for a dashboard
-    // slug nobody could clone, which is the one case worth stopping a
-    // provisioning run for — see `OrgConfig::default_repo`.
-    let mut default = ctx.repo()?;
+    // What Enter takes: the org default, on every machine and on every run.
+    //
+    // **Not** the repository this machine last worked on. That memory was the
+    // picker's own, it was silent, and `always_repo` now does the same job out
+    // loud and better: a developer who wants to stay on one repository is
+    // asked once and told about it on every run afterwards, with the flag that
+    // undoes it printed beside. Two persistences for one idea meant a machine
+    // could drift onto a repository nobody chose and nothing named — one
+    // mistyped answer, and every run after it opened on the mistake. Worse
+    // once the question stopped waiting for ever: a countdown whose default is
+    // "whatever happened last time" takes a decision nobody is present to see.
+    //
+    // `active_repo` is still written, and still decides what `status`, `env`
+    // and `shell` report — that is a record of what this machine *is* set up
+    // for, which is a different question from what the next run should offer.
+    //
+    // Fallible only for a dashboard slug nobody could clone, which is the one
+    // case worth stopping a provisioning run for — see
+    // `OrgConfig::default_repo`.
     let org_default = ctx.org()?.default_repo()?;
+    // The same value, kept under its own name because the two are different
+    // questions and only coincide here: `Offer.default` is *what Enter takes*,
+    // and `riabuild remote` fills it with what that server was last set up for.
+    let default = org_default.clone();
     let pinned = pinned(&ctx.config);
 
     // Checked before the listing is fetched rather than after, so an unattended
@@ -120,17 +138,17 @@ pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
                      which repository to work on."
                 ));
                 pin = Pin::Clear;
-                // And it cannot be what Enter takes either: `active_repo` is
-                // almost always the same slug, and offering a repository
-                // nobody can clone is offering to fail.
-                if default == pinned {
-                    default = org_default.clone();
-                }
+                // Nothing to repair in what Enter takes: it is the org
+                // default, which is the one repository this run already knows
+                // GitHub could name. Before the picker stopped remembering,
+                // `active_repo` was almost always the pin's own slug, and the
+                // question would have offered the repository it had just said
+                // nobody could clone.
             }
         }
     }
 
-    let chosen = offer(
+    let picked = offer(
         ctx,
         Offer {
             default: &default,
@@ -140,6 +158,7 @@ pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
         },
     )
     .await;
+    let chosen = picked.repo;
 
     // `confirm`, so **Enter is yes**, and that is worth defending against the
     // line at the top of this file: a developer who presses Enter has still
@@ -150,7 +169,15 @@ pub async fn choose(ctx: &mut Ctx, ask: Ask) -> Result<Repo> {
     // to it. What it must never become is a question that is *hard* to answer
     // the other way, which is why `n` is one key, the pin is named on every run
     // afterwards, and the flag that undoes it is printed beside it.
-    if let Some(answer) = ctx.ui.confirm(&format!("Always use {chosen}?")) {
+    //
+    // It is put only to somebody who answered the first question. The picker's
+    // clock runs out because nobody is reading, and `confirm` has no clock of
+    // its own — asking there would hold the run on an Enter that is not coming,
+    // which is the hang the countdown exists to remove. A developer who walked
+    // away gets the org default and no pin, which is the state they were in.
+    if picked.answered
+        && let Some(answer) = ctx.ui.confirm(&format!("Always use {chosen}?"))
+    {
         pin = match answer {
             true => Pin::Set,
             // An explicit no clears a pin as well as declining one, which is
@@ -201,6 +228,27 @@ pub struct Offer<'a> {
     pub on: Option<&'a str>,
 }
 
+/// What the question settled on, and whether a developer settled it.
+///
+/// The second field is the one [`Ui::ask`] could never report. It is `false`
+/// only for the countdown running out with nobody reading — not for Enter,
+/// which is an answer — and it exists because a caller with a *second*
+/// question to put has to know there is nobody to put it to.
+pub struct Picked {
+    pub repo: Repo,
+    pub answered: bool,
+}
+
+impl Picked {
+    /// A repository a developer settled on, by typing or by pressing Enter.
+    fn by_hand(repo: Repo) -> Self {
+        Self {
+            repo,
+            answered: true,
+        }
+    }
+}
+
 /// The box, the question, and nothing written down.
 ///
 /// Split out of [`choose`] because `riabuild remote` puts the same question on
@@ -212,7 +260,7 @@ pub struct Offer<'a> {
 /// The caller decides whether there is anybody to ask. Both of them check
 /// before the listing is fetched rather than after, so an unattended run does
 /// not spend a GitHub round trip on a box nobody will see.
-pub async fn offer(ctx: &Ctx, offer: Offer<'_>) -> Repo {
+pub async fn offer(ctx: &Ctx, offer: Offer<'_>) -> Picked {
     let Offer {
         default,
         org_default,
@@ -260,35 +308,68 @@ pub async fn offer(ctx: &Ctx, offer: Offer<'_>) -> Repo {
 }
 
 /// The question, and the three attempts it is put in.
-fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str, on: Option<&str>) -> Repo {
+fn ask(ui: &Ui, rows: &[Row], default: &Repo, default_owner: &str, on: Option<&str>) -> Picked {
     // The default is named inside the question rather than only in the box
     // above it: `Ui::info` returns early under `--quiet` and `Ui::ask` does not,
     // so `riabuild --quiet` puts this question with the box silently dropped.
     // The same reason `remote::pick::settle` names the server in its prompt.
     //
-    // `on` is that same reason one step further out: `riabuild remote` asks this
-    // on the laptop about a server, and the two questions are otherwise
+    // Named, and not owned: the org is the same word on every row above and
+    // inside the question it distinguishes nothing — see `offered_name`, which
+    // keeps the owner for the one case where it does.
+    //
+    // The numbers are offered in the same breath, because they are the fastest
+    // answer on screen and nothing else says so. The box draws them, the box is
+    // what `--quiet` drops, and `remote::pick` has named them in its question
+    // since it had one.
+    //
+    // `on` is the `--quiet` reason one step further out: `riabuild remote` asks
+    // this on the laptop about a server, and the two questions are otherwise
     // indistinguishable at the one terminal they are both typed into.
+    let offered = offered_name(default, default_owner);
     let question = match on {
-        Some(server) => format!("Which repository on {server}? (press enter for {default})"),
-        None => format!("Which repository? (press enter for {default})"),
+        Some(server) => {
+            format!("Which repository on {server}? (press enter for {offered}, or type a number)")
+        }
+        None => format!("Which repository? (press enter for {offered}, or type a number)"),
     };
-    for _ in 0..ATTEMPTS {
-        // `None` is Enter, ^D, or nobody there, and all three mean "the one you
-        // offered" — so none of them costs the developer an attempt.
-        let Some(answer) = ui.ask(&question) else {
-            break;
+    for attempt in 0..ATTEMPTS {
+        // The clock is put on the first attempt and never again. A developer
+        // who has just been told their answer was unusable is plainly at the
+        // keyboard, and starting a countdown against them there would be
+        // riabuild racing somebody it has asked to try again.
+        let answer = match attempt {
+            0 => match ui.ask_within(&question, offered, PATIENCE) {
+                Waited::Typed(answer) => answer,
+                // Enter or ^D: an answer, and it is the one that was offered.
+                Waited::Offered => break,
+                // Nobody was reading. The repository is the same one Enter
+                // would have taken; what differs is that nothing here may put
+                // a second question.
+                Waited::Unanswered => {
+                    return Picked {
+                        repo: default.clone(),
+                        answered: false,
+                    };
+                }
+            },
+            // `None` is Enter, ^D, or nobody there, and all three mean "the one
+            // you offered" — so none of them costs the developer an attempt.
+            _ => match ui.ask(&question) {
+                Some(answer) => answer,
+                None => break,
+            },
         };
         match settle(&answer, rows.len(), default_owner) {
             Ok(Answer::Default) => break,
             // In range by construction: `settle` only ever reports a row it was
             // told about.
-            Ok(Answer::Listed(index)) => return rows[index].repo.clone(),
-            Ok(Answer::Named(repo)) => return repo,
+            Ok(Answer::Listed(index)) => return Picked::by_hand(rows[index].repo.clone()),
+            Ok(Answer::Named(repo)) => return Picked::by_hand(repo),
             Err(objection) => ui.warn(&objection),
         }
     }
-    default.clone()
+    Picked::by_hand(default.clone())
 }
 
 /// Records the repository this run is about, what that does to the pin, and
@@ -444,6 +525,24 @@ mod tests {
     }
 
     #[test]
+    fn the_question_leaves_out_the_owner_that_every_row_already_carries() {
+        assert_eq!(
+            offered_name(&repo("Clubria/ai-builders-hub"), "Clubria"),
+            "ai-builders-hub"
+        );
+    }
+
+    #[test]
+    fn a_repository_belonging_to_somebody_else_keeps_its_owner() {
+        // `someone-else/ai-builders-hub` shortened to `ai-builders-hub` names
+        // the org's own repository, and Enter would take the wrong one.
+        assert_eq!(
+            offered_name(&repo("someone-else/ai-builders-hub"), "Clubria"),
+            "someone-else/ai-builders-hub"
+        );
+    }
+
+    #[test]
     fn the_default_leads_then_the_trees_this_machine_has() {
         let listing = [
             entry("Clubria/design-system", NOW),
@@ -554,6 +653,83 @@ mod tests {
         );
         assert_eq!(
             ctx.repo.as_ref().map(Repo::slug),
+            Some("Clubria/ai-builders-hub")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_repository_this_machine_last_worked_on_is_not_what_enter_takes() {
+        // The picker used to open on `active_repo`, and that memory is gone:
+        // one mistyped answer would otherwise decide every run after it, and
+        // silently. `always_repo` is where staying on a repository lives now,
+        // and it is asked for out loud and named on every run.
+        let (mut ctx, _home, _fake) = asked(&[""], listing_runner()).await;
+        ctx.update_config(|config| config.active_repo = Some("Clubria/payments".into()))
+            .await
+            .expect("write");
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
+        assert!(
+            ctx.ui.asked()[0].contains("press enter for ai-builders-hub"),
+            "and the question has to offer what it will take: {:?}",
+            ctx.ui.asked()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_takes_the_org_default_rather_than_the_last_one_too() {
+        // What Enter takes and what nobody-there takes are one answer, or the
+        // same machine provisions two different repositories depending on
+        // whether a person happened to be watching.
+        let (mut ctx, _home, _fake) = ctx_and_runner(listing_runner()).await;
+        install_owned_tools(&ctx).await;
+        ctx.org = Some(org_config());
+        ctx.update_config(|config| config.active_repo = Some("Clubria/payments".into()))
+            .await
+            .expect("write");
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
+    }
+
+    #[tokio::test]
+    async fn nobody_answering_takes_the_default_and_is_not_asked_to_pin_it() {
+        // The countdown running out. `confirm` has no clock of its own, so a
+        // second question here would hold the run on an Enter that is not
+        // coming — the hang the countdown exists to remove, moved one question
+        // down.
+        let (mut ctx, _home, _fake) =
+            asked(&[riabuild_ui::NOBODY_ANSWERED, "y"], listing_runner()).await;
+
+        let chosen = choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(chosen.slug(), "Clubria/ai-builders-hub");
+        assert_eq!(
+            ctx.ui.asked().len(),
+            1,
+            "the `y` must never be read: nobody was there to type it — {:?}",
+            ctx.ui.asked()
+        );
+        assert_eq!(
+            ctx.config.always_repo, None,
+            "a pin nobody agreed to is a machine nothing on it could explain"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_is_an_answer_and_is_asked_about_the_pin() {
+        // The other side of the test above, and the line between them: Enter
+        // is a developer saying yes to what was offered, and the clock running
+        // out is nobody saying anything.
+        let (mut ctx, _home, _fake) = asked(&["", "y"], listing_runner()).await;
+
+        choose(&mut ctx, Ask::IfNotPinned).await.expect("chooses");
+
+        assert_eq!(
+            ctx.config.always_repo.as_deref(),
             Some("Clubria/ai-builders-hub")
         );
     }
