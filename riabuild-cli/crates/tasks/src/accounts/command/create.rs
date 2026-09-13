@@ -1,7 +1,8 @@
 //! `riabuild claude new` — adding an account and signing it in.
 //!
-//! The four things done to a freshly created account before it is ever
-//! launched — the team's settings, the agents view, onboarding, and trust —
+//! The five things done to a freshly created account before it is ever
+//! launched — the team's settings, the agents view, onboarding, bypass
+//! consent, and trust —
 //! and the roll-back that leaves nothing behind when the sign-in did not
 //! happen.
 
@@ -10,7 +11,9 @@ use crate::Ctx;
 use crate::accounts;
 use crate::accounts::status::{self, Identity};
 use crate::shims;
-use crate::{claude_agents_view, claude_onboarding, claude_trust, org_settings};
+use crate::{
+    claude_agents_view, claude_bypass_consent, claude_onboarding, claude_trust, org_settings,
+};
 use anyhow::Result;
 use riabuild_ui::Failure;
 use std::path::Path;
@@ -85,6 +88,7 @@ pub async fn new(ctx: &mut Ctx) -> Result<i32> {
 
     settle_org_settings(ctx, number).await;
     settle_onboarding(ctx, &id, number).await;
+    settle_bypass_consent(ctx, &id, number).await;
     prefer_agents_view(ctx, &id).await;
     trust(ctx, &id, number).await;
     list(ctx).await
@@ -154,6 +158,22 @@ async fn settle_onboarding(ctx: &mut Ctx, id: &str, number: usize) {
     if let Err(error) = claude_onboarding::complete_one(ctx, id).await {
         ctx.ui.note(&format!(
             "Account {number} will still ask you Claude Code's first-run questions ({error:#}) — run `riabuild` to finish it"
+        ));
+    }
+}
+
+/// Records the bypass-permissions disclaimer as accepted for one freshly
+/// created account.
+///
+/// Without it the very first session the agents view dispatches under
+/// `claude-<n>` starts in `default` mode and says the disclaimer has to be
+/// accepted interactively — in a background session nobody can accept it in.
+/// See `tasks::claude_bypass_consent`. A note on failure, for onboarding's
+/// reason: the account exists, and the next `riabuild` run repairs it.
+async fn settle_bypass_consent(ctx: &mut Ctx, id: &str, number: usize) {
+    if let Err(error) = claude_bypass_consent::consent_one(ctx, id).await {
+        ctx.ui.note(&format!(
+            "Account {number}'s agents-view sessions will still ask for permissions ({error:#}) — run `riabuild` to fix it"
         ));
     }
 }

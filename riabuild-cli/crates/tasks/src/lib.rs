@@ -20,6 +20,7 @@
 pub mod accounts;
 pub mod claude_accounts;
 pub mod claude_agents_view;
+pub mod claude_bypass_consent;
 pub mod claude_codex_mcp;
 pub mod claude_config;
 pub mod claude_onboarding;
@@ -85,6 +86,7 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(claude_trust::ClaudeTrust),
         Box::new(claude_onboarding::ClaudeOnboarding),
         Box::new(claude_agents_view::ClaudeAgentsView),
+        Box::new(claude_bypass_consent::ClaudeBypassConsent),
         Box::new(env_local::EnvLocal),
         Box::new(claude_statusline::ClaudeStatusline),
         Box::new(claude_plugins::ClaudePlugins),

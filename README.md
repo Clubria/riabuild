@@ -118,9 +118,10 @@ sorts by declared dependencies, so it is not necessarily the order they run in.
 | 13 | `claude_trust` | every account trusts the checkout, so no modal on first launch |
 | 14 | `claude_onboarding` | every account past Claude Code's first-run questions |
 | 15 | `claude_agents_view` | the agents view offered as each account's default, and never imposed on one that answered |
-| 16 | `env_local` | one `.env.<environment>` per environment you may see — `.env.dev`, plus `.env.staging` for developers and leads — freshly brokered, parseable, and git-ignored |
-| 17 | `claude_statusline` | the status line every Claude Code session draws — installed by riabuild, named by riabuild, and never by the dashboard |
-| 18 | `claude_plugins` | the marketplaces and plugins the checkout's own settings declare, installed before your first session rather than during it |
+| 16 | `claude_bypass_consent` | every account has accepted the bypass-permissions disclaimer, so sessions the agents view starts are not downgraded to asking for permissions |
+| 17 | `env_local` | one `.env.<environment>` per environment you may see — `.env.dev`, plus `.env.staging` for developers and leads — freshly brokered, parseable, and git-ignored |
+| 18 | `claude_statusline` | the status line every Claude Code session draws — installed by riabuild, named by riabuild, and never by the dashboard |
+| 19 | `claude_plugins` | the marketplaces and plugins the checkout's own settings declare, installed before your first session rather than during it |
 
 Then it drops you into your own shell with the environment applied, opening with a box
 listing your Claude Code accounts and who is signed into each.

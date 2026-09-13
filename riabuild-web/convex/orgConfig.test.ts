@@ -178,7 +178,10 @@ describe("org config and claude settings", () => {
     // These two are one setting wearing two names. Claude Code downgrades
     // bypassPermissions to default unless the disclaimer has been accepted, so
     // shipping the mode alone produces a developer who thinks permissions are
-    // off and gets prompted anyway.
+    // off and gets prompted anyway. This key only covers a foreground session:
+    // Claude Code does not read it from the `--settings` file for a session the
+    // agents view dispatches, so the CLI's `claude_bypass_consent` records it in
+    // each account's own settings.json as well.
     expect(settings.skipDangerousModePermissionPrompt).toBe(true);
   });
 

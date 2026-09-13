@@ -1082,6 +1082,21 @@ mod tests {
         );
     }
 
+    /// The per-account `settings.json` has two writers: `claude_bypass_consent`
+    /// read-modify-writes it, and `claude_plugins` runs a user-scope
+    /// `claude plugin install` that records `enabledPlugins` there.
+    #[test]
+    fn every_writer_of_the_account_settings_declares_it() {
+        let registry = registry();
+        let writers: Vec<TaskId> = registry
+            .iter()
+            .filter(|task| task.writes().contains(&"claude_settings"))
+            .map(|task| task.id())
+            .collect();
+
+        assert_eq!(writers, vec!["claude_bypass_consent", "claude_plugins"]);
+    }
+
     /// The four of them are independent, so they land in one wave — which is
     /// what makes the declaration above load-bearing rather than decorative.
     #[test]
