@@ -1166,6 +1166,21 @@ it on the command line, on every launch but the bare interactive one that takes 
 agents view instead. Before adding anything to the dashboard's settings JSON, check it
 is a settings key at all: one that is not gets served to every laptop and read by nobody.
 
+**And a settings key is not always read from every settings file.**
+`skipDangerousModePermissionPrompt` is in the dashboard's JSON and is still not enough:
+before starting a session the agents view dispatches (`CLAUDE_CODE_SESSION_KIND=bg`),
+Claude Code 2.1.270 honours it only from policy settings or the account's own
+`settings.json` — never from `flagSettings`, which is what `--settings` is. Every such
+session started in `default` with "Permission mode downgraded to default — bypass requires
+accepting the disclaimer interactively first", in a session nobody could accept it in. So
+`claude_bypass_consent` writes that one key into each account's `settings.json`, under
+`claude_config::edit_settings` and the `claude_settings` resource `claude_plugins` also
+names. It is consent, not policy: the mode is still the org's `defaultMode`. The
+`.claude.json` spelling, `bypassPermissionsModeAccepted`, is migrated out of that file at
+startup and does not prevent the downgrade — do not "simplify" the task onto it. When a key
+seems to arrive and not take effect, capture which *source* the check reads before
+concluding the key is wrong.
+
 **A settings value that names a path names it on every machine, so what it names goes in
 `tools_root()`.** The settings carry `~/.riabuild/claude-statusline` — written by riabuild
 itself since 2026-09-05, not sent by the server, and one `exec` into `riabuild internal

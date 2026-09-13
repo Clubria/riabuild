@@ -160,6 +160,22 @@ pub trait Paths: Send + Sync {
     fn claude_config_lock_file(&self, profile: &str) -> PathBuf {
         self.claude_profile_dir(profile).join(".claude.json.lock")
     }
+    /// That profile's own settings — Claude Code's `userSettings` source.
+    ///
+    /// Named by Claude Code for the same reason `.claude.json` is: it reads
+    /// `settings.json` from whatever `CLAUDE_CONFIG_DIR` is. Not the team's
+    /// settings, which `org_settings_file` holds and every launcher layers over
+    /// this one with `--settings`.
+    fn claude_settings_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join("settings.json")
+    }
+    /// Guards a read-modify-write of one account's `settings.json`, for
+    /// [`claude_config_lock_file`]'s reasons.
+    ///
+    /// [`claude_config_lock_file`]: Paths::claude_config_lock_file
+    fn claude_settings_lock_file(&self, profile: &str) -> PathBuf {
+        self.claude_profile_dir(profile).join("settings.json.lock")
+    }
     /// The nine Codex profiles, one directory each.
     ///
     /// A parent rather than a `CODEX_HOME` itself. Codex keeps its credentials

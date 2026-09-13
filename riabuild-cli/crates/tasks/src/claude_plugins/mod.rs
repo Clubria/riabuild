@@ -66,8 +66,12 @@ impl Task for ClaudePlugins {
     /// its three siblings — `claude plugin install` writes it, from inside a
     /// `claude` pointed at the profile directory by `CLAUDE_CONFIG_DIR`. The
     /// resource is the file, not the function that reaches it.
+    ///
+    /// And the per-account `settings.json`, for the same reason: a user-scope
+    /// install records `enabledPlugins` there, which is the file
+    /// `claude_bypass_consent` read-modify-writes.
     fn writes(&self) -> &[Resource] {
-        &["claude_config"]
+        &["claude_config", "claude_settings"]
     }
 
     async fn check(&self, ctx: &Ctx) -> Result<Status> {

@@ -67,9 +67,9 @@ check_outstanding() {
   fi
 }
 
-# The five tasks a machine with nobody at the keyboard cannot get past, in the
+# The six tasks a machine with nobody at the keyboard cannot get past, in the
 # engine's own order — see the comment on the `--check` below.
-BLOCKED_BY_SIGN_IN="claude_accounts,claude_trust,claude_onboarding,claude_agents_view,claude_codex_mcp"
+BLOCKED_BY_SIGN_IN="claude_accounts,claude_trust,claude_onboarding,claude_agents_view,claude_bypass_consent,claude_codex_mcp"
 
 if [ "$SIGN_IN" = done ]; then
   riabuild --no-shell >/dev/null 2>&1 || fail "the second run did not exit 0"
@@ -81,12 +81,13 @@ else
   # A real second run stops at the sign-in again and never reaches the code that
   # writes the run log, so there is no `applied=[]` to read. `--check` runs every
   # task's status and applies nothing, so it completes — and what it must report
-  # is the five tasks the sign-in blocks and *nothing else*. That is the same
+  # is the six tasks the sign-in blocks and *nothing else*. That is the same
   # claim `applied=[]` makes, minus the one item this environment cannot supply.
   #
-  # Five, not one: `claude_trust`, `claude_onboarding`, `claude_agents_view` and
-  # `claude_codex_mcp` each write per-account state into a `.claude.json` that
-  # only exists once an account does, so a missing sign-in blocks all four.
+  # Six, not one: `claude_trust`, `claude_onboarding`, `claude_agents_view`,
+  # `claude_bypass_consent` and `claude_codex_mcp` each write per-account state
+  # into a profile directory that only exists once an account does, so a missing
+  # sign-in blocks all five.
   # `claude_plugins` sits in the same wave and is *not* here, because it answers
   # Satisfied for a checkout that declares no plugins — which is the shape of
   # this one.

@@ -36,6 +36,13 @@ import { compareVersions } from "./lib/version";
  * disclaimer interactively first" — so shipping `defaultMode` without it would
  * look configured and behave otherwise.
  *
+ * It is not sufficient on its own, and it cannot be made so from here. For a
+ * *background* session — every session the agents view dispatches — Claude Code
+ * 2.1.270 honours the disclaimer only from policy settings or the account's own
+ * `settings.json`, never from the `--settings` file this constant becomes. The
+ * CLI's `claude_bypass_consent` task writes the key into each account's
+ * settings for that case; the copy here still covers a foreground session.
+ *
  * `model` and `env.CLAUDE_CODE_SUBAGENT_MODEL` are one decision written in two
  * places, because Claude Code spells them in two places: the session's own model
  * is a settings key and the model its subagents default to is an environment

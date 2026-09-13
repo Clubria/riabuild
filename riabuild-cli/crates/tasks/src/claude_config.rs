@@ -28,6 +28,11 @@
 //! see `claude_plugins`'s own note. Inside one riabuild `Task::writes` keeps it
 //! away from the other three; across two, it is Claude Code's file and riabuild
 //! is the guest.
+//!
+//! The per-account `settings.json` goes through here too, by [`edit_settings`]
+//! under a lock of its own, for exactly one key: `claude_bypass_consent`
+//! records the bypass-permissions disclaimer as accepted, which Claude Code
+//! honours from that file and no longer from the one `--settings` names.
 
 use super::Ctx;
 use anyhow::Result;
@@ -57,7 +62,20 @@ pub(crate) enum Stored {
 
 /// Reads one account's config for a `check()`.
 pub(crate) async fn read(ctx: &Ctx, id: &str) -> Stored {
-    let Ok(text) = tokio::fs::read_to_string(config_file(ctx, id)).await else {
+    read_file(&config_file(ctx, id)).await
+}
+
+/// Reads one account's own `settings.json` for a `check()`.
+///
+/// Claude Code's `userSettings` source, not the team's file the launchers
+/// layer over it. riabuild writes one key there and no policy — see
+/// `claude_bypass_consent` for why that key can live nowhere else.
+pub(crate) async fn read_settings(ctx: &Ctx, id: &str) -> Stored {
+    read_file(&ctx.paths.claude_settings_file(id)).await
+}
+
+async fn read_file(file: &Path) -> Stored {
+    let Ok(text) = tokio::fs::read_to_string(file).await else {
         return Stored::Missing;
     };
     match serde_json::from_str::<Value>(&text) {
@@ -78,6 +96,30 @@ where
     F: FnOnce(&mut Map<String, Value>),
 {
     let file = config_file(ctx, id);
+    let lock = ctx.paths.claude_config_lock_file(id);
+    edit_file(ctx, &file, &lock, change).await
+}
+
+/// Applies one change to an account's own `settings.json`, preserving every
+/// key it does not touch.
+///
+/// The same hazards as [`edit`], and one more reason to take them seriously:
+/// `/config`, `/model` and `claude plugin install` all write this file, so
+/// nearly everything in it is the developer's. Under its own lock rather than
+/// `.claude.json`'s — two files, two turns that never meet.
+pub(crate) async fn edit_settings<F>(ctx: &mut Ctx, id: &str, change: F) -> Result<()>
+where
+    F: FnOnce(&mut Map<String, Value>),
+{
+    let file = ctx.paths.claude_settings_file(id);
+    let lock = ctx.paths.claude_settings_lock_file(id);
+    edit_file(ctx, &file, &lock, change).await
+}
+
+async fn edit_file<F>(ctx: &mut Ctx, file: &Path, lock: &Path, change: F) -> Result<()>
+where
+    F: FnOnce(&mut Map<String, Value>),
+{
     if let Some(parent) = file.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -99,9 +141,9 @@ where
     // unspecified and may deadlock. Within one process `Task::writes` keeps
     // the four `.claude.json` writers off each other already, so this one is
     // only ever contended between processes.
-    let _lock = FileLock::acquire(&ctx.paths.claude_config_lock_file(id), || {}).await?;
+    let _lock = FileLock::acquire(lock, || {}).await?;
 
-    let mut root = load_or_reset(ctx, &file).await?;
+    let mut root = load_or_reset(ctx, file).await?;
     change(&mut root);
 
     let text = serde_json::to_string_pretty(&Value::Object(root))?;
@@ -116,7 +158,7 @@ where
     // two writers cannot meet even if the lock above could not be taken —
     // which is a real case, because `FileLock` fails open on a filesystem that
     // refuses to lock at all.
-    riabuild_paths::config::write_atomic(&file, text.as_bytes()).await?;
+    riabuild_paths::config::write_atomic(file, text.as_bytes()).await?;
     Ok(())
 }
 
@@ -134,8 +176,12 @@ async fn load_or_reset(ctx: &mut Ctx, file: &Path) -> Result<Map<String, Value>>
         _ => {
             let aside = file.with_extension("json.unreadable");
             tokio::fs::rename(file, &aside).await?;
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             ctx.note(format!(
-                "The Claude Code profile config was unreadable; the old file is at {}",
+                "The Claude Code profile's {name} was unreadable; the old file is at {}",
                 contract_tilde(&aside, &ctx.paths.home())
             ));
             Ok(Map::new())
