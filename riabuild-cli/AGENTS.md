@@ -1317,6 +1317,56 @@ the background pass lands *during* the first session and a plugin is loaded on t
 one — not because there is another prompt to suppress. Do not go looking for a
 plugin-trust key; there isn't one.
 
+**Installing Claude Code is the one npm install riabuild cannot let npm own, and both
+halves of that were found the same afternoon.** `@anthropic-ai/claude-code` ships a
+**500-byte placeholder** at `bin/claude.exe` and swaps the real native binary in from a
+platform `optionalDependency` during `postinstall`. An install interrupted between those
+two steps — a closed laptop, a lost network, `INSTALL_PATIENCE` expiring, a `^C` — leaves
+`bin/claude` pointing at a file whose mode is `0644`, and every `claude --version` after
+that fails `EACCES`. `RealRunner::run` answers a spawn failure with `Err`, so that error
+travelled out of `check()` and riabuild stopped with *"could not start …: Permission
+denied"* under *"send this to your team lead"*, on a machine that could not be repaired by
+running riabuild again.
+
+`claude_accounts::installed` answers `Installed::Broken` for it instead, so it is drift
+`apply()` repairs rather than a hard error. What draws the line is
+`riabuild_runner::cannot_execute`, which is about the **path** — `EACCES`, `ENOEXEC`, a
+shebang's missing interpreter — and never about the **machine**: an `EAGAIN` under a
+process limit on a shared box still propagates, because
+`toolchain::a_node_that_will_not_start_is_not_evidence_that_it_is_missing` is the record
+of what reinstalling on that evidence cost a co-tenant. Widening it to "any spawn failure"
+re-creates that bug.
+
+The second half is why `crate::npm` exists at all, and it is the more dangerous one
+because nothing about it is specific to Claude Code. **npm retires a package before
+replacing it, to a directory named by a sha1 of its absolute path** — so
+`…/node_modules/@anthropic-ai/claude-code` always retires to
+`…/node_modules/@anthropic-ai/.claude-code-eEXEHRqA`, every install, for ever. An
+interrupted install leaves that directory behind, and npm's own first act next time is the
+rename that collides with it:
+
+```text
+npm error ENOTEMPTY: directory not empty, rename
+  '…/@anthropic-ai/claude-code' -> '…/@anthropic-ai/.claude-code-eEXEHRqA'
+```
+
+Every `npm install -g` of that package into that prefix fails identically from then on.
+That is the shape `.agents/skills/writing-setup-tasks` names as worse than no check at all
+— an `apply()` that can never succeed, turned by the engine into "it did not take effect"
+on every run. `npm::clear_retired` sweeps it before **every** install, and all three npm
+sites call it (`claude_accounts`, `codex_cli`, `typescript_language_server`) because the
+wedge is a property of the shared prefix rather than of any one package. It is safe
+because a retired directory exists only *during* a reify and the provisioning lock means no
+second riabuild is inside npm; it matches `.{package}-{eight alphanumerics}` exactly rather
+than by prefix, or `typescript` would sweep `typescript-language-server`'s.
+
+`npm::remove_installed` is the other half and is taken **only** from `Installed::Broken`.
+npm reifies towards a tree it reads off the disk, so a package directory already at the
+version npm was going to install is one it re-extracts nothing for and runs no
+`postinstall` for — "reinstall it" is a no-op against exactly the machine that needs it.
+Do not reach for it on the ordinary install or upgrade path: it is a deletion of a tool,
+and the sentence two paragraphs up is what deleting one on a guess costs.
+
 Design: `../docs/superpowers/specs/2026-08-06-claude-accounts-design.md`.
 
 ## Usage tracking

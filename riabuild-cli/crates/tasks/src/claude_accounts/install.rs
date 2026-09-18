@@ -4,7 +4,7 @@
 //! about making `npm -g` mean riabuild's own tree rather than whichever Node
 //! the developer's `PATH` happens to lead to.
 
-use crate::Ctx;
+use crate::{Ctx, npm};
 use anyhow::Result;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
@@ -28,6 +28,26 @@ pub(super) fn npm_env(node_bin: &Path) -> Vec<(String, String)> {
         "PATH".to_string(),
         format!("{}:{ambient}", node_bin.display()),
     )]
+}
+
+/// The package npm knows Claude Code by.
+///
+/// Named once because `npm` needs the same string to find what a previous
+/// interrupted install left behind, and a second spelling of it would sweep the
+/// wrong directory in silence.
+pub(super) const PACKAGE: &str = "@anthropic-ai/claude-code";
+
+/// What `install_claude` does with the copy already on disk.
+pub(super) enum Existing {
+    /// Leave it for npm to replace — the ordinary install, and the upgrade.
+    Replaced,
+    /// Delete it first, because riabuild has established that it cannot be
+    /// started and npm would otherwise consider it done and re-extract nothing.
+    ///
+    /// Reached only from `Installed::Broken`. It is a deletion of a tool, and
+    /// `toolchain::a_node_that_will_not_start_is_not_evidence_that_it_is_missing`
+    /// is the standing account of what doing that on a guess costs.
+    Discarded,
 }
 
 /// How long `npm install` may take.
@@ -54,7 +74,7 @@ fn install_options(node_bin: &Path) -> RunOptions {
     }
 }
 
-pub(super) async fn install_claude(ctx: &mut Ctx) -> Result<()> {
+pub(super) async fn install_claude(ctx: &mut Ctx, existing: Existing) -> Result<()> {
     let node_version = match ctx.config.node_version.clone() {
         Some(pinned) => pinned,
         // Not `unwrap_or_else`: the fallback awaits, and a closure cannot.
@@ -74,6 +94,33 @@ pub(super) async fn install_claude(ctx: &mut Ctx) -> Result<()> {
     }
 
     ctx.ui.note("Installing Claude Code…");
+
+    if let Existing::Discarded = existing {
+        npm::remove_installed(&node_dir, PACKAGE)
+            .await
+            .map_err(|error| {
+                Failure::new(
+                    "installing Claude Code",
+                    "Remove it yourself and run `riabuild` again.",
+                )
+                .detail(format!(
+                    "{} could not be removed: {error}",
+                    node_dir
+                        .join("lib")
+                        .join("node_modules")
+                        .join(PACKAGE)
+                        .display()
+                ))
+            })?;
+    }
+    // Before npm, every time, and not only on the repair path. An install
+    // interrupted at the wrong moment leaves npm's retired directory on disk,
+    // and npm's own first act is the rename that collides with it — so from
+    // then on every install of this package into this prefix fails `ENOTEMPTY`
+    // and nothing riabuild does in `apply()` can ever take effect. See
+    // `crate::npm`.
+    npm::clear_retired(&node_dir, PACKAGE).await;
+
     // `--prefix` names the tree `Ctx::claude()` reads, and names it on the
     // command line so a `prefix` line in the developer's own `~/.npmrc` cannot
     // redirect the install. Without it, `check()` reports Claude Code as missing
@@ -84,13 +131,7 @@ pub(super) async fn install_claude(ctx: &mut Ctx) -> Result<()> {
         .runner
         .run(
             &npm.to_string_lossy(),
-            &[
-                "install",
-                "-g",
-                "--prefix",
-                &prefix,
-                "@anthropic-ai/claude-code",
-            ],
+            &["install", "-g", "--prefix", &prefix, PACKAGE],
             &install_options(&node_bin),
         )
         .await?;

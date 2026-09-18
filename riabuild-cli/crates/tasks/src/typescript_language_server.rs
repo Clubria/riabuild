@@ -99,6 +99,14 @@ impl Task for TypescriptLanguageServer {
         }
 
         ctx.ui.note("Installing the TypeScript language server…");
+
+        // Both of them, and for the reason `crate::npm` gives: a previous
+        // interrupted install leaves a retired directory that npm cannot get
+        // past, so every install after it fails `ENOTEMPTY` and this `apply()`
+        // can never take effect again.
+        crate::npm::clear_retired(&node_dir, SERVER_PACKAGE).await;
+        crate::npm::clear_retired(&node_dir, TYPESCRIPT_PACKAGE).await;
+
         let prefix = node_dir.to_string_lossy().into_owned();
         let server = format!("{SERVER_PACKAGE}@{SERVER_VERSION}");
         let typescript = format!("{TYPESCRIPT_PACKAGE}@{TYPESCRIPT_VERSION}");
