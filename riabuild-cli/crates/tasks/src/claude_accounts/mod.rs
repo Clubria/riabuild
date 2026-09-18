@@ -13,7 +13,7 @@
 mod install;
 mod sign_in;
 
-use install::install_claude;
+use install::{Existing, install_claude};
 use sign_in::sign_in;
 
 use super::{Ctx, Resource, Status, Task, TaskId};
@@ -36,7 +36,22 @@ const MIN_VERSION: &str = "2.1.223";
 
 pub struct ClaudeAccounts;
 
-/// Whether riabuild has to install Claude Code before it can be used.
+/// What asking the Claude Code on this machine its version found.
+///
+/// Three answers rather than a `bool`, because the third one needs a different
+/// `apply()` from the second — see `Existing` in `install`.
+enum Installed {
+    /// There, and new enough to use.
+    Ready,
+    /// Absent, or below `MIN_VERSION`. An `npm install -g` over the top is the
+    /// whole repair, and the reason is the sentence `check()` shows.
+    Wanted(String),
+    /// There, and impossible to start. Not a version riabuild can compare and
+    /// not a machine it can use, so it is neither `Ready` nor `Wanted`.
+    Broken(String),
+}
+
+/// Which Claude Code this machine has.
 ///
 /// The existence test comes first and is not optional. `RealRunner::run` returns
 /// `Err` when the program is not there — a spawn failure, not an exit code — so
@@ -45,18 +60,52 @@ pub struct ClaudeAccounts;
 /// Claude Code would abort before it could. `github_cli` and `toolchain` gate on
 /// `try_exists` for the same reason.
 ///
-/// An installed copy below the floor routes here too: `install_claude` is the
-/// upgrade path as well as the install path.
-async fn install_needed(ctx: &Ctx) -> Result<bool> {
+/// Existing and *unstartable* is the case that test does not cover, and it is
+/// reachable: `@anthropic-ai/claude-code` ships a 500-byte placeholder at
+/// `bin/claude.exe` and swaps the native binary in from a platform
+/// `optionalDependency` during `postinstall`, so an install interrupted between
+/// those two steps leaves `bin/claude` pointing at a file whose mode is 0644.
+/// Every `claude --version` after that fails `EACCES`, and until this returned
+/// `Broken` that error travelled all the way out of `check()` — riabuild
+/// stopping on "could not start …: Permission denied", with a next action of
+/// "send this to your team lead" and no run that could ever get past it.
+///
+/// `cannot_execute` is what keeps that from becoming the opposite bug. A spawn
+/// that failed because the *machine* could not spawn anything — `EAGAIN` under
+/// a process limit on a shared box — still propagates, because
+/// `toolchain::a_node_that_will_not_start_is_not_evidence_that_it_is_missing`
+/// is the record of what treating that as a broken install costs.
+async fn installed(ctx: &Ctx) -> Result<Installed> {
     let claude = ctx.claude();
     if !tokio::fs::try_exists(&claude).await.unwrap_or(false) {
-        return Ok(true);
+        return Ok(Installed::Wanted("Claude Code is not installed".into()));
     }
-    let reported = ctx
+    let reported = match ctx
         .runner
         .run(&claude, &["--version"], &RunOptions::default())
-        .await?;
-    Ok(!reported.ok() || !version::at_least(reported.trimmed(), MIN_VERSION))
+        .await
+    {
+        Ok(reported) => reported,
+        // `{error:#}` rather than `{error}`: the top of the chain is only
+        // "could not start `<path>`", and the errno under it is the whole
+        // diagnosis.
+        Err(error) if riabuild_runner::cannot_execute(&error) => {
+            return Ok(Installed::Broken(format!(
+                "Claude Code is installed and cannot be started ({error:#})"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    if !reported.ok() {
+        return Ok(Installed::Wanted("Claude Code is not installed".into()));
+    }
+    if !version::at_least(reported.trimmed(), MIN_VERSION) {
+        return Ok(Installed::Wanted(format!(
+            "Claude Code {} is older than {MIN_VERSION}",
+            reported.trimmed()
+        )));
+    }
+    Ok(Installed::Ready)
 }
 
 #[async_trait]
@@ -98,22 +147,16 @@ impl Task for ClaudeAccounts {
         // name it falls back to before a Node is pinned would *not* be safe
         // here — `try_exists("claude")` resolves against the current directory,
         // so a checkout containing a file called `claude` satisfies it.
-        let claude = ctx.claude();
-        if !tokio::fs::try_exists(&claude).await.unwrap_or(false) {
-            return Ok(Status::needs("Claude Code is not installed"));
-        }
-        let reported = ctx
-            .runner
-            .run(&claude, &["--version"], &RunOptions::default())
-            .await?;
-        if !reported.ok() {
-            return Ok(Status::needs("Claude Code is not installed"));
-        }
-        if !version::at_least(reported.trimmed(), MIN_VERSION) {
-            return Ok(Status::needs(format!(
-                "Claude Code {} is older than {MIN_VERSION}",
-                reported.trimmed()
-            )));
+        match installed(ctx).await? {
+            Installed::Ready => {}
+            // Both of the other two are drift `apply()` repairs, so both are a
+            // reason rather than an error. `Broken` arriving here as a
+            // `Status::needs` instead of an `Err` is the difference between a
+            // developer running `riabuild` again and a developer sending a
+            // screenshot to their team lead.
+            Installed::Wanted(reason) | Installed::Broken(reason) => {
+                return Ok(Status::needs(reason));
+            }
         }
 
         let ids = &ctx.config.claude_accounts;
@@ -154,8 +197,15 @@ impl Task for ClaudeAccounts {
     }
 
     async fn apply(&self, ctx: &mut Ctx) -> Result<()> {
-        if install_needed(ctx).await? {
-            install_claude(ctx).await?;
+        match installed(ctx).await? {
+            Installed::Ready => {}
+            Installed::Wanted(_) => install_claude(ctx, Existing::Replaced).await?,
+            // npm reifies towards a tree it reads off the disk, so a package
+            // directory already at the version it was going to install is one
+            // it re-extracts nothing for and runs no `postinstall` for. Against
+            // a half-installed copy that is a no-op, which would leave `check()`
+            // reporting the same thing for ever.
+            Installed::Broken(_) => install_claude(ctx, Existing::Discarded).await?,
         }
 
         let claude_dir = ctx.paths.claude_dir();
@@ -365,6 +415,292 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
+    /// A machine whose Claude Code will not start until npm reinstalls it.
+    ///
+    /// `FakeRunner` cannot express either half: every stub, and every unstubbed
+    /// call, returns `Ok` with an exit code, so the spawn failure has no
+    /// spelling in it — and a double that refused for ever would be a machine no
+    /// repair could fix, which is the opposite of what these tests are about.
+    /// The error carries a real `io::Error` under an `anyhow` context, because
+    /// that is the shape `RealRunner::start` produces and the shape
+    /// `cannot_execute` reads.
+    struct WontStartUntilReinstalled {
+        program: String,
+        /// `EACCES`, spelled as the errno so the message reads as it does on the
+        /// machine this was reported from.
+        errno: i32,
+        reinstalled: std::sync::atomic::AtomicBool,
+        rest: Arc<FakeRunner>,
+    }
+
+    impl WontStartUntilReinstalled {
+        fn new(program: String, rest: FakeRunner) -> Self {
+            Self {
+                program,
+                errno: 13,
+                reinstalled: std::sync::atomic::AtomicBool::new(false),
+                rest: Arc::new(rest),
+            }
+        }
+
+        fn refusal(&self, program: &str) -> anyhow::Error {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(self.errno))
+                .context(format!("could not start `{program}`"))
+        }
+
+        /// The npm that repairs it, and the binary that is broken until it runs.
+        fn note(&self, program: &str, args: &[&str]) {
+            if program.ends_with("npm") && args.first() == Some(&"install") {
+                self.reinstalled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn mine(&self, program: &str) -> bool {
+            program == self.program && !self.reinstalled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl riabuild_runner::CommandRunner for WontStartUntilReinstalled {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<riabuild_runner::CommandOutput> {
+            if self.mine(program) {
+                return Err(self.refusal(program));
+            }
+            self.note(program, args);
+            self.rest.run(program, args, options).await
+        }
+        async fn run_bytes(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<riabuild_runner::BytesOutput> {
+            if self.mine(program) {
+                return Err(self.refusal(program));
+            }
+            self.rest.run_bytes(program, args, options).await
+        }
+        async fn run_forking(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<i32> {
+            if self.mine(program) {
+                return Err(self.refusal(program));
+            }
+            self.rest.run_forking(program, args, options).await
+        }
+        async fn spawn(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<Box<dyn riabuild_runner::ChildHandle>> {
+            if self.mine(program) {
+                return Err(self.refusal(program));
+            }
+            self.rest.spawn(program, args, options).await
+        }
+        async fn run_interactive(
+            &self,
+            program: &str,
+            args: &[&str],
+            options: &RunOptions,
+        ) -> Result<i32> {
+            self.rest.run_interactive(program, args, options).await
+        }
+        fn which(&self, program: &str) -> Option<std::path::PathBuf> {
+            self.rest.which(program)
+        }
+    }
+
+    /// The double `toolchain` uses: a machine that cannot start *anything*,
+    /// named by no errno at all.
+    struct CannotSpawnAnything;
+
+    #[async_trait]
+    impl riabuild_runner::CommandRunner for CannotSpawnAnything {
+        async fn run(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<riabuild_runner::CommandOutput> {
+            Err(anyhow::anyhow!(
+                "could not start `{program}`: Resource temporarily unavailable (os error 11)"
+            ))
+        }
+        async fn run_bytes(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<riabuild_runner::BytesOutput> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+        async fn run_forking(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+        async fn spawn(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<Box<dyn riabuild_runner::ChildHandle>> {
+            Err(anyhow::anyhow!("could not start `{program}`"))
+        }
+        async fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _options: &RunOptions,
+        ) -> Result<i32> {
+            unreachable!("this task never runs anything interactively here")
+        }
+        fn which(&self, _program: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// Where npm would retire this package to in `node_dir` — the deterministic
+    /// name, spelled the way `crate::npm` matches it.
+    fn retired_in(node_dir: &Path) -> std::path::PathBuf {
+        node_dir
+            .join("lib")
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join(".claude-code-eEXEHRqA")
+    }
+
+    fn installed_in(node_dir: &Path) -> std::path::PathBuf {
+        node_dir
+            .join("lib")
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code")
+    }
+
+    /// A ctx with a Claude Code that is on disk and refuses to start.
+    async fn ctx_with_an_unstartable_claude() -> (Ctx, tempfile::TempDir) {
+        let (mut ctx, home) = ctx_with_claude(signed_in()).await;
+        let claude = ctx.claude();
+        ctx.runner = Arc::new(WontStartUntilReinstalled::new(
+            claude,
+            signed_in().with("npm install", 0, "", ""),
+        ));
+        (ctx, home)
+    }
+
+    #[tokio::test]
+    async fn a_claude_that_cannot_be_started_is_drift_rather_than_a_hard_error() {
+        // The bug this whole change is about. `@anthropic-ai/claude-code` ships
+        // a placeholder at `bin/claude.exe` and swaps the native binary in
+        // during `postinstall`, so an install interrupted between the two
+        // leaves `bin/claude` pointing at a 0644 file. `claude --version` then
+        // fails `EACCES` for ever, and this used to leave `check()` returning
+        // `Err` — riabuild stopping on "could not start …: Permission denied",
+        // under "send this to your team lead", with no run able to get past it.
+        let (ctx, _home) = ctx_with_an_unstartable_claude().await;
+
+        let status = ClaudeAccounts
+            .check(&ctx)
+            .await
+            .expect("drift, not an error");
+
+        assert!(
+            format!("{status:?}").contains("cannot be started"),
+            "{status:?}"
+        );
+        // The errno is the whole diagnosis, so it has to survive into the
+        // sentence the developer reads.
+        assert!(
+            format!("{status:?}").contains("Permission denied"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_that_cannot_spawn_anything_is_still_a_hard_error() {
+        // The inverse bug, and the more expensive one. `EAGAIN` under a process
+        // limit on a shared box says nothing about the file, and
+        // `toolchain::a_node_that_will_not_start_is_not_evidence_that_it_is_missing`
+        // is the record of what reinstalling on that evidence cost. Widening
+        // the branch above to "any spawn failure" would delete a colleague's
+        // Claude Code out from under a live session.
+        let (mut ctx, _home) = ctx_with_claude(signed_in()).await;
+        ctx.runner = Arc::new(CannotSpawnAnything);
+
+        let error = ClaudeAccounts
+            .check(&ctx)
+            .await
+            .expect_err("a machine that cannot spawn is not a diagnosis of the file");
+        assert!(error.to_string().contains("could not start"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unstartable_claude_is_reinstalled_from_nothing() {
+        // npm reifies towards a tree it reads off the disk, so a package
+        // directory already at the version npm was going to install is one it
+        // re-extracts nothing for — and, decisively, runs no `postinstall` for.
+        // Reinstalling over the top is therefore a no-op against exactly the
+        // machine that needs it, and `check()` would go on reporting the same
+        // thing after every run.
+        let (mut ctx, _home) = ctx_with_an_unstartable_claude().await;
+        let node_dir = ctx.paths.node_dir(NODE);
+        write_file(&node_dir.join("bin").join("npm"), "#!/bin/sh\n").await;
+        write_file(&installed_in(&node_dir).join("package.json"), "{}").await;
+
+        ClaudeAccounts
+            .apply(&mut ctx)
+            .await
+            .expect("the repair runs");
+
+        assert!(
+            !tokio::fs::try_exists(installed_in(&node_dir))
+                .await
+                .unwrap(),
+            "the half-installed tree is what npm would otherwise consider done"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_installs_leftover_is_cleared_before_npm_runs() {
+        // npm's retirement directory is named by a hash of the absolute path,
+        // so it is the same name every time: one interrupted install makes
+        // every later `npm install -g` of this package into this prefix fail
+        // `ENOTEMPTY`, for ever. An `apply()` that can never succeed is the one
+        // shape `.agents/skills/writing-setup-tasks` names as worse than no
+        // check at all.
+        let (mut ctx, _home) = ctx_with(FakeRunner::new()).await;
+        ctx.config.node_version = Some(NODE.into());
+        let node_dir = ctx.paths.node_dir(NODE);
+        write_file(&node_dir.join("bin").join("npm"), "#!/bin/sh\n").await;
+        let retired = retired_in(&node_dir);
+        write_file(&retired.join("bin").join("claude.exe"), "the good binary").await;
+        ctx.runner = Arc::new(FakeRunner::new().with("npm install", 0, "", ""));
+
+        install_claude(&mut ctx, Existing::Replaced)
+            .await
+            .expect("the install runs");
+
+        assert!(
+            !tokio::fs::try_exists(&retired).await.unwrap(),
+            "npm's own first act is the rename that collides with this"
+        );
+    }
+
     #[tokio::test]
     async fn applying_installs_claude_code_before_running_it() {
         // The other half of the same bug: the task whose job is installing
@@ -405,7 +741,9 @@ mod tests {
         let runner = Arc::new(FakeRunner::new().with("npm install", 0, "", ""));
         ctx.runner = runner.clone();
 
-        install_claude(&mut ctx).await.expect("the install runs");
+        install_claude(&mut ctx, Existing::Replaced)
+            .await
+            .expect("the install runs");
 
         let call = runner
             .calls()
@@ -435,7 +773,9 @@ mod tests {
         let bounds = Bounds::default();
         ctx.runner = bounds.watching(Arc::new(FakeRunner::new().with("npm install", 0, "", "")));
 
-        install_claude(&mut ctx).await.expect("the install runs");
+        install_claude(&mut ctx, Existing::Replaced)
+            .await
+            .expect("the install runs");
 
         assert_eq!(
             bounds.of("install -g"),

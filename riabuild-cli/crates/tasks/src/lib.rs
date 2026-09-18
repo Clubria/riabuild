@@ -39,6 +39,7 @@ pub mod grok_cli;
 pub mod infisical_cli;
 pub mod login;
 pub mod ngrok;
+pub(crate) mod npm;
 pub mod org_settings;
 pub(crate) mod owned_tool;
 pub mod project;

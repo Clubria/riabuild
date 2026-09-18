@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 mod child;
 mod delegate;
+mod diagnosis;
 #[cfg(any(test, feature = "testing"))]
 mod fake;
 mod options;
@@ -32,6 +33,7 @@ mod subdue;
 
 pub use child::{ChildHandle, ChildReader, ChildWriter, PipedChildHandle};
 pub use delegate::{Decoration, Delegating, EnvScope, ScopedRunner};
+pub use diagnosis::cannot_execute;
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{FakePipes, FakeRunner, Recorded};
 pub use options::{DEFAULT_TIMEOUT, RunOptions, directory_for_riabuild, should_subdue};

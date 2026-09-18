@@ -4,8 +4,8 @@
 //! `npm -g` mean riabuild's own tree rather than whichever Node the
 //! developer's `PATH` happens to lead to.
 
-use super::{package_spec, path_led_by};
-use crate::Ctx;
+use super::{PACKAGE, package_spec, path_led_by};
+use crate::{Ctx, npm};
 use anyhow::Result;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
@@ -31,6 +31,14 @@ pub(super) async fn install_codex(ctx: &mut Ctx) -> Result<()> {
     }
 
     ctx.ui.note("Installing the Codex CLI…");
+
+    // The wedge is a property of the prefix rather than of any one package: an
+    // install interrupted at the wrong moment leaves npm's retired directory
+    // behind, and npm's own first act next time is the rename that collides
+    // with it. See `crate::npm` — `claude_accounts` is where it was found, and
+    // the Codex CLI goes into the same `lib/node_modules`.
+    npm::clear_retired(&node_dir, PACKAGE).await;
+
     // `--prefix` names the tree `Ctx::codex()` reads, and names it on the
     // command line so a `prefix` line in the developer's own `~/.npmrc` cannot
     // redirect the install. Without it, `check()` reports Codex as missing on a
