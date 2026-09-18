@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 pub mod accounts;
+pub mod cf_cli;
 pub mod claude_accounts;
 pub mod claude_agents_view;
 pub mod claude_bypass_consent;
@@ -52,6 +53,7 @@ mod task;
 pub mod testing;
 pub mod toolchain;
 pub mod typescript_language_server;
+pub mod wrangler;
 
 pub use crate::ctx::{Ctx, SecretScope};
 pub use crate::task::{Reason, Resource, Status, Task, TaskId};
@@ -77,6 +79,8 @@ pub fn registry() -> Vec<Box<dyn Task>> {
         Box::new(ngrok::NGROK),
         Box::new(toolchain::Toolchain),
         Box::new(typescript_language_server::TypescriptLanguageServer),
+        Box::new(wrangler::Wrangler),
+        Box::new(cf_cli::CfCli),
         Box::new(project::Project),
         Box::new(repo_status::RepoStatus),
         Box::new(codex_cli::CodexCli),
