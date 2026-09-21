@@ -11,6 +11,7 @@ use directory::choose_dir;
 use super::{Ctx, Status, Task, TaskId};
 use anyhow::Result;
 use async_trait::async_trait;
+use riabuild_api::Repo;
 use riabuild_paths::contract_tilde;
 use riabuild_runner::RunOptions;
 use riabuild_ui::Failure;
@@ -50,18 +51,112 @@ fn clone_options() -> RunOptions {
     }
 }
 
-/// `git -C <dir> remote get-url origin`, or `None` if this is not a checkout.
-async fn origin_url(ctx: &Ctx, dir: &Path) -> Option<String> {
+/// Every remote URL a checkout has, or git's own words for why it could not
+/// say.
+///
+/// Every remote rather than `origin` alone. A developer who cloned their fork
+/// has this repository as `upstream`, and one who renamed a remote has it under
+/// whatever they chose; both are checkouts of the right repository, and a check
+/// that read only `origin` reported them as having no remote at all — which
+/// `apply()` did not repair, so riabuild stopped on "it did not take effect" on
+/// every run for ever.
+///
+/// And git failing is kept apart from git answering "none". `remote -v` exits 0
+/// with nothing on stdout for a checkout with no remotes; a non-zero exit is
+/// git refusing the repository — "detected dubious ownership" on a tree another
+/// account cloned is the usual one — and the only useful thing to say about
+/// that is what git said.
+async fn remote_urls(ctx: &Ctx, dir: &Path) -> std::result::Result<Vec<String>, String> {
     let output = ctx
         .runner
         .run(
             "git",
-            &["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"],
+            &["-C", &dir.to_string_lossy(), "remote", "-v"],
             &RunOptions::default(),
         )
         .await
-        .ok()?;
-    output.ok().then(|| output.trimmed().to_string())
+        .map_err(|error| error.to_string())?;
+    if !output.ok() {
+        let said = output.stderr.trim();
+        return Err(if said.is_empty() {
+            "`git remote -v` failed and said nothing".to_string()
+        } else {
+            said.to_string()
+        });
+    }
+    // `origin\thttps://github.com/Clubria/x.git (fetch)` — once for fetch and
+    // once for push, so the same URL twice is expected rather than a surprise.
+    let mut urls: Vec<String> = Vec::new();
+    for line in output.stdout.lines() {
+        if let Some(url) = line.split_whitespace().nth(1)
+            && !urls.iter().any(|seen| seen == url)
+        {
+            urls.push(url.to_string());
+        }
+    }
+    Ok(urls)
+}
+
+/// What a checkout's remotes say about whether it is the repository asked for.
+enum Verdict {
+    /// One of its remotes is this repository, under whatever name.
+    Matches,
+    /// It has no remotes at all — a `git init`, or a remote removed by hand.
+    NoRemote,
+    /// It has remotes, and none of them is this repository.
+    Elsewhere(String),
+    /// git could not read it; what git said.
+    Unreadable(String),
+}
+
+async fn verdict(ctx: &Ctx, dir: &Path, repo: &Repo) -> Verdict {
+    match remote_urls(ctx, dir).await {
+        Err(said) => Verdict::Unreadable(said),
+        Ok(urls) if urls.iter().any(|url| repo.matches_remote(url)) => Verdict::Matches,
+        Ok(urls) if urls.is_empty() => Verdict::NoRemote,
+        Ok(urls) => Verdict::Elsewhere(urls.join(", ")),
+    }
+}
+
+/// Points a checkout with no remote at all at the repository it was chosen for.
+///
+/// Repaired rather than refused because there is nothing to disagree with: a
+/// checkout that names no remote makes no claim to be anything else, and it is
+/// sitting where this repository's checkout was chosen to be. `git remote add`
+/// touches nothing but `.git/config`, so no work in the tree is at risk, and a
+/// developer who meant otherwise has `git remote remove origin`. One that names
+/// a *different* repository is still refused — that is a real disagreement, and
+/// not riabuild's to settle.
+///
+/// https, because that is what `git_credentials` makes `gh` answer for.
+async fn add_origin(ctx: &mut Ctx, dir: &Path, repo: &Repo) -> Result<()> {
+    let url = format!("https://github.com/{}.git", repo.slug());
+    ctx.ui.note(&format!("Pointing that checkout at {repo}…"));
+    let output = ctx
+        .runner
+        .run(
+            "git",
+            &[
+                "-C",
+                &dir.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                &url,
+            ],
+            &RunOptions::default(),
+        )
+        .await?;
+    if !output.ok() {
+        return Err(Failure::new(
+            format!("adding {repo} as the `origin` of {}", dir.display()),
+            "Fix what git reports below, then run `riabuild` again.",
+        )
+        .command(format!("git -C {} remote add origin {url}", dir.display()))
+        .detail(output.stderr)
+        .into());
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -116,14 +211,17 @@ impl Task for Project {
             return Ok(Status::needs("waiting for sign-in"));
         }
         let repo = ctx.repo()?;
-        match origin_url(ctx, &dir).await {
-            None => Ok(Status::needs("that checkout has no `origin` remote")),
-            Some(remote) if repo.matches_remote(&remote) => Ok(Status::Satisfied),
+        match verdict(ctx, &dir, &repo).await {
+            Verdict::Matches => Ok(Status::Satisfied),
+            Verdict::NoRemote => Ok(Status::needs("that checkout has no remote")),
+            Verdict::Unreadable(said) => Ok(Status::needs(format!(
+                "git could not read that checkout: {said}"
+            ))),
             // Reached by picking a repository whose checkout is not where this
             // one is, as well as by a developer moving a directory aside. Naming
             // the repository that was *asked for* is what makes the first case
             // read as an answer rather than a fault.
-            Some(remote) => Ok(Status::needs(format!(
+            Verdict::Elsewhere(remote) => Ok(Status::needs(format!(
                 "that checkout points at {remote}, not {repo}"
             ))),
         }
@@ -153,15 +251,31 @@ impl Task for Project {
             // Already a checkout: verify rather than clone over it. Cloning into
             // an existing directory would fail, and deleting it could destroy
             // uncommitted work.
-            if let Some(remote) = origin_url(ctx, &dir).await
-                && !repo.matches_remote(&remote)
-            {
-                return Err(Failure::new(
-                    format!("using {} for {repo}", dir.display()),
-                    "Move that directory aside, or set another path with `riabuild --project <path>`, then run `riabuild` again.",
-                )
-                .detail(format!("it is a checkout of {remote}"))
-                .into());
+            //
+            // Every arm either leaves a checkout `check()` accepts or stops with
+            // a reason. Returning `Ok` over one it would still refuse is what
+            // made riabuild report "it did not take effect" and ask for a re-run
+            // that could only do the same thing again.
+            match verdict(ctx, &dir, &repo).await {
+                Verdict::Matches => {}
+                Verdict::NoRemote => add_origin(ctx, &dir, &repo).await?,
+                Verdict::Elsewhere(remote) => {
+                    return Err(Failure::new(
+                        format!("using {} for {repo}", dir.display()),
+                        "Move that directory aside, or set another path with `riabuild --project <path>`, then run `riabuild` again.",
+                    )
+                    .detail(format!("it is a checkout of {remote}"))
+                    .into());
+                }
+                Verdict::Unreadable(said) => {
+                    return Err(Failure::new(
+                        format!("reading the checkout at {}", dir.display()),
+                        "Fix what git reports below, then run `riabuild` again.",
+                    )
+                    .command(format!("git -C {} remote -v", dir.display()))
+                    .detail(said)
+                    .into());
+                }
             }
         } else {
             if let Some(parent) = dir.parent() {
@@ -627,7 +741,7 @@ mod tests {
         let (mut ctx, home) = ctx_with(FakeRunner::new().with(
             "git -C",
             0,
-            "git@github.com:Clubria/ai-builders-hub.git",
+            "origin\tgit@github.com:Clubria/ai-builders-hub.git (fetch)\norigin\tgit@github.com:Clubria/ai-builders-hub.git (push)\n",
             "",
         ))
         .await;
@@ -758,7 +872,7 @@ mod tests {
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",
             0,
-            "git@github.com:Clubria/some-other-repo.git",
+            "origin\tgit@github.com:Clubria/some-other-repo.git (fetch)\norigin\tgit@github.com:Clubria/some-other-repo.git (push)\n",
             "",
         ));
         let status = Project.check(&ctx).await.unwrap();
@@ -777,9 +891,89 @@ mod tests {
         ctx.runner = Arc::new(FakeRunner::new().with(
             "git -C",
             0,
-            "git@github.com:Clubria/ai-builders-hub.git",
+            "origin\tgit@github.com:Clubria/ai-builders-hub.git (fetch)\norigin\tgit@github.com:Clubria/ai-builders-hub.git (push)\n",
             "",
         ));
         assert_eq!(Project.check(&ctx).await.unwrap(), Status::Satisfied);
+    }
+
+    /// A developer who cloned their fork has this repository as `upstream`.
+    /// That is a checkout of the right repository, and reading `origin` alone
+    /// called it one with no remote — which nothing could repair.
+    #[tokio::test]
+    async fn a_checkout_whose_repository_is_not_origin_is_satisfied() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let dir = home.path().join("code/hub");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        ctx.config.project_path = Some(dir.to_string_lossy().into());
+        ctx.runner = Arc::new(FakeRunner::new().with(
+            "git -C",
+            0,
+            "origin\tgit@github.com:ada/ai-builders-hub.git (fetch)\n\
+             origin\tgit@github.com:ada/ai-builders-hub.git (push)\n\
+             upstream\thttps://github.com/Clubria/ai-builders-hub.git (fetch)\n\
+             upstream\thttps://github.com/Clubria/ai-builders-hub.git (push)\n",
+            "",
+        ));
+        assert_eq!(Project.check(&ctx).await.unwrap(), Status::Satisfied);
+    }
+
+    #[tokio::test]
+    async fn a_checkout_with_no_remote_is_detected() {
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        let dir = home.path().join("code/hub");
+        write_file(&dir.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        ctx.config.project_path = Some(dir.to_string_lossy().into());
+        ctx.runner = Arc::new(FakeRunner::new().with("git -C", 0, "", ""));
+        let status = Project.check(&ctx).await.unwrap();
+        assert!(format!("{status:?}").contains("no remote"), "{status:?}");
+    }
+
+    /// The machine this was reported from: `apply()` accepted a checkout with
+    /// no remote, `check()` refused it, and every run stopped on "it did not
+    /// take effect". `apply()` now gives it the remote `check()` looks for.
+    #[tokio::test]
+    async fn a_checkout_with_no_remote_is_pointed_at_the_repository() {
+        let runner = Arc::new(FakeRunner::new().with("git -C", 0, "", ""));
+        let (mut ctx, home) = ctx_with(FakeRunner::new()).await;
+        ctx.runner = runner.clone();
+        let existing = home.path().join("work/hub");
+        write_file(&existing.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        ctx.ui = Ui::scripted([existing.to_string_lossy().as_ref()]);
+
+        Project.apply(&mut ctx).await.unwrap();
+
+        let calls = runner.calls();
+        assert!(
+            calls.iter().any(|call| call
+                .ends_with("remote add origin https://github.com/Clubria/ai-builders-hub.git")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.contains("repo clone")),
+            "{calls:?}"
+        );
+    }
+
+    /// git refusing the repository is not "no remote", and adding one would
+    /// fail the same way. What git said is the only useful thing to report.
+    #[tokio::test]
+    async fn a_checkout_git_cannot_read_stops_with_what_git_said() {
+        let said = "fatal: detected dubious ownership in repository at '/Users/ada/hub'";
+        let (mut ctx, home) = ctx_with(FakeRunner::new().with("git -C", 128, "", said)).await;
+        let existing = home.path().join("work/hub");
+        write_file(&existing.join(".git/HEAD"), "ref: refs/heads/main\n").await;
+        ctx.ui = Ui::scripted([existing.to_string_lossy().as_ref()]);
+
+        let error = Project.apply(&mut ctx).await.unwrap_err();
+        let failure = error.downcast_ref::<Failure>().expect("a Failure");
+        assert!(failure.detail.contains("dubious ownership"), "{failure:?}");
+
+        ctx.config.project_path = Some(existing.to_string_lossy().into());
+        let status = Project.check(&ctx).await.unwrap();
+        assert!(
+            format!("{status:?}").contains("dubious ownership"),
+            "{status:?}"
+        );
     }
 }
