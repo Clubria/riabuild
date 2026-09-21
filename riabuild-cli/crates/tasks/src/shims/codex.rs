@@ -133,10 +133,15 @@ pub(super) fn handoff(
     if !plan.args.iter().any(|arg| arg == TRUST_HOOKS) {
         args.push(TRUST_HOOKS.to_string());
     }
-    let bare_and_interactive = plan.args.is_empty() && world.stdin_is_tty && world.stdout_is_tty;
-    if bare_and_interactive {
-        args.push("agents".to_string());
-    }
+    // A bare `codex` opens the ordinary interactive session, not `codex
+    // agents`. The agents view refuses any launch that carries its own
+    // configuration — "`codex agents` cannot attach to shared sessions with
+    // invocation-specific configuration overrides", and `--yolo` and
+    // `--dangerously-bypass-hook-trust` are both that — and without them it
+    // wants the standalone install Codex's own installer lays down under
+    // `$CODEX_HOME/packages/standalone`, which is a second provisioner and not
+    // the npm package riabuild verifies. Verified against 0.149.0. A developer
+    // who wants it can still type `codex agents` and get Codex's own answer.
     args.extend(plan.args.iter().cloned());
     handoff.with_args(args)
 }
@@ -286,8 +291,11 @@ mod tests {
         );
     }
 
+    /// `codex agents` rejects `--yolo` and `--dangerously-bypass-hook-trust`
+    /// as invocation-specific overrides, so a bare launch that opened it
+    /// failed every time instead of starting a session.
     #[test]
-    fn a_bare_interactive_launch_opens_the_agents_view() {
+    fn a_bare_interactive_launch_opens_an_ordinary_session() {
         let interactive = World {
             stdin_is_tty: true,
             stdout_is_tty: true,
@@ -295,22 +303,12 @@ mod tests {
         };
         assert_eq!(
             launch_handoff(&fixture(), &interactive).args,
-            vec![YOLO, TRUST_HOOKS, "agents"]
+            vec![YOLO, TRUST_HOOKS]
         );
     }
 
     #[test]
-    fn a_noninteractive_or_explicit_launch_does_not_open_the_agents_view() {
-        let stdin_is_a_pipe = World {
-            stdin_is_tty: false,
-            stdout_is_tty: true,
-            ..laptop()
-        };
-        assert_eq!(
-            launch_handoff(&fixture(), &stdin_is_a_pipe).args,
-            vec![YOLO, TRUST_HOOKS]
-        );
-
+    fn an_explicit_subcommand_is_passed_through() {
         let interactive = World {
             stdin_is_tty: true,
             stdout_is_tty: true,
