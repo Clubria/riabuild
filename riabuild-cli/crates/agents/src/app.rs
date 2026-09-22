@@ -84,6 +84,77 @@ pub fn signed_out_hint(name: &str) -> String {
     format!("{name} is not signed in \u{2014} run `{name} auth login` in a terminal.")
 }
 
+/// Whether a harness said, in its own words, that an account is out of usage.
+///
+/// The complaint this exists for: Codex kept reporting itself as "working"
+/// through repeated retries after the developer's subscription ran out, with
+/// nothing distinguishing that from an ordinary turn in progress — the same
+/// blind spot `reads_as_signed_out` closes for an expired sign-in, one
+/// category over. Only Claude Code says this in a structured field
+/// (`rate_limit_event`, folded into `Event::Trouble` as `"rate limited:
+/// …"` by `claude::rate_limit`); Codex and Grok Build have no field for it at
+/// all, so all three are read the same way riabuild already reads a sign-in
+/// failure — by the vendor's own sentence, matched on phrases rather than
+/// whole wording because the wording is the vendor's and moves without
+/// notice, and case-insensitively for the same reason.
+///
+/// None of these phrases names a plain rate-limited HTTP call the way `401` or
+/// `unauthorized` would have named an ordinary tool failure for
+/// [`reads_as_signed_out`] — each is specific to a quota or a billing plan,
+/// which is what keeps a `curl` against someone else's rate-limited API from
+/// being read as the developer's own usage running out.
+pub fn reads_as_usage_limit(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "rate limit",
+        "rate-limit",
+        "usage limit",
+        "usage cap",
+        "quota",
+        "429",
+        "too many requests",
+        "resource_exhausted",
+        "resource exhausted",
+        "credit balance",
+        "out of usage",
+        "plan limit",
+        "subscription limit",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// What to tell a developer whose account has run out of usage.
+///
+/// One sentence, said once per trouble the same way [`signed_out_hint`] is,
+/// under the harness's own wording rather than instead of it.
+pub fn usage_limit_hint(name: &str, plan: &str) -> String {
+    format!("{name} looks to have hit a usage limit \u{2014} check your {plan} plan.")
+}
+
+/// What `turn::one_turn` writes to `errors.log` when a developer's Esc
+/// caught up with it.
+///
+/// Matched whole rather than by phrase, unlike [`reads_as_signed_out`] and
+/// [`reads_as_usage_limit`] just above — both of those are guessing at a
+/// vendor's sentence, which is free to move without notice. This one is
+/// riabuild's own, written by riabuild's own code in exactly this spelling,
+/// so nothing a harness says could ever produce it by coincidence and an
+/// exact match costs nothing a phrase match would have bought.
+pub const INTERRUPTED: &str = "Stopped \u{2014} you pressed Esc.";
+
+/// Whether a trouble line is riabuild saying a developer stopped the turn on
+/// purpose, rather than a harness saying something went wrong.
+///
+/// [`Pane::apply`] uses this to route the line to [`Entry::Note`] instead of
+/// [`Entry::Trouble`] and to leave [`Pane::troubled`] false — stopping a turn
+/// on purpose is not a failure, and a pane that read as failed after being
+/// stopped on purpose would be the bug `troubled`'s stickiness exists to
+/// prevent elsewhere, arriving from the opposite direction.
+pub fn reads_as_interrupted(text: &str) -> bool {
+    text == INTERRUPTED
+}
+
 /// Where a session has got to.
 ///
 /// Not stored — computed from two facts that are each answerable on their own:
@@ -179,6 +250,17 @@ pub struct Pane {
     /// prompt — because a developer who has signed in again finds out by asking
     /// for something, and nothing else riabuild can watch changes in between.
     pub signed_out: bool,
+    /// Whether the last trouble was the harness saying this account is out of
+    /// usage.
+    ///
+    /// Sticky like [`Pane::signed_out`] and cleared the same way, and unlike
+    /// [`Pane::troubled`] it *does* override [`Pane::state`] while `running` is
+    /// still true: this is the one trouble that outlives the turn that raised
+    /// it. Codex answers an exhausted subscription with retries rather than
+    /// with an ending, so the lock can stay held — and a spinner is a session
+    /// that is thinking, not one nobody can hear from until a person notices
+    /// the plan is empty.
+    pub usage_limited: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub entries: Vec<Entry>,
@@ -212,6 +294,7 @@ impl Pane {
             running: false,
             troubled: false,
             signed_out: false,
+            usage_limited: false,
             input_tokens: 0,
             output_tokens: 0,
             entries: Vec::new(),
@@ -222,7 +305,9 @@ impl Pane {
     }
 
     pub fn state(&self) -> State {
-        if self.running {
+        if self.usage_limited {
+            State::Trouble
+        } else if self.running {
             State::Busy
         } else if self.troubled {
             State::Trouble
@@ -325,6 +410,14 @@ impl Pane {
                 self.output_tokens = self.output_tokens.max(*output);
             }
             Event::Trouble(text) => {
+                // Said on purpose, not gone wrong — see `reads_as_interrupted`.
+                // Routed here rather than through the ordinary `Trouble` entry
+                // so a session a developer stopped on Esc does not read as one
+                // that failed.
+                if reads_as_interrupted(text) {
+                    self.push(Entry::Note(text.clone()), delegated);
+                    return;
+                }
                 self.push(Entry::Trouble(text.clone()), delegated);
                 self.troubled = true;
                 // Said once, in riabuild's own words, under the vendor's. The
@@ -339,6 +432,14 @@ impl Pane {
                             "{name} is not signed in \u{2014} run `{name} auth login` in a \
                              terminal, then send this again."
                         )),
+                        false,
+                    );
+                }
+                if reads_as_usage_limit(text) && !self.usage_limited {
+                    self.usage_limited = true;
+                    let name = self.account_name();
+                    self.push(
+                        Entry::Trouble(usage_limit_hint(&name, self.kind.short())),
                         false,
                     );
                 }
@@ -659,6 +760,7 @@ impl App {
             // could see, so asking again is what re-tests it.
             pane.troubled = false;
             pane.signed_out = false;
+            pane.usage_limited = false;
             if pane.title.is_empty() {
                 pane.title = crate::store::title_of(text);
             }
@@ -766,6 +868,117 @@ mod tests {
         app.cursor = 0;
         app.sent("try again");
         assert!(!app.selected().unwrap().signed_out);
+    }
+
+    #[test]
+    fn a_session_out_of_usage_says_so_even_while_it_still_holds_the_lock() {
+        // The complaint this exists for: Codex answers an exhausted
+        // subscription with retries rather than with an ending, so `running`
+        // can stay true for as long as the developer is looking at the
+        // screen. A trouble that only overrode the state while idle would
+        // never be seen — the pane would just spin.
+        let mut app = play(Kind::Codex, "");
+        app.set_running("s1", true);
+        assert_eq!(app.selected().unwrap().state(), State::Busy);
+
+        app.observe(
+            "s1",
+            &Event::Trouble("Rate limit reached for your account".into()),
+        );
+        let pane = app.selected().unwrap();
+        assert!(pane.usage_limited);
+        // Still busy underneath — the lock is untouched — but shown as
+        // trouble, which is the one thing a developer scanning for a stuck
+        // session is looking for.
+        assert!(pane.running);
+        assert_eq!(pane.state(), State::Trouble);
+
+        let said: Vec<&str> = pane
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Trouble(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(said.iter().any(|text| text.contains("Rate limit reached")));
+        assert!(
+            said.iter().any(|text| text.contains("codex-1")
+                && text.contains("usage limit")
+                && text.contains("Codex")),
+            "{said:#?}"
+        );
+
+        // Said once, however many times the harness repeats it — Codex's own
+        // comment records that these arrive in bursts.
+        app.observe(
+            "s1",
+            &Event::Trouble("Rate limit reached for your account".into()),
+        );
+        assert_eq!(
+            app.selected()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, Entry::Trouble(text) if text.contains("usage limit"))
+                )
+                .count(),
+            1
+        );
+
+        // and asking again is what clears it, same as a sign-in problem: a
+        // usage window resetting is not something riabuild can watch happen.
+        app.cursor = 0;
+        app.sent("try again");
+        assert!(!app.selected().unwrap().usage_limited);
+        assert_eq!(app.selected().unwrap().state(), State::Busy);
+    }
+
+    #[test]
+    fn every_provider_names_its_own_wording_of_out_of_usage() {
+        // None of the three have a structured field for this — Claude Code is
+        // the only one with anything close, and even that folds into the same
+        // `Event::Trouble` text every other harness's plain-text error does.
+        for (kind, text) in [
+            (Kind::Claude, "rate limited: rejected"),
+            (
+                Kind::Codex,
+                "You've exceeded your current quota, please check your plan",
+            ),
+            (Kind::Grok, "429 Too Many Requests: usage cap reached"),
+        ] {
+            let mut app = play(kind, "");
+            app.observe("s1", &Event::Trouble(text.into()));
+            assert!(app.selected().unwrap().usage_limited, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_a_developer_stopped_reads_as_a_note_rather_than_a_failure() {
+        // `turn::one_turn` writes `INTERRUPTED` to `errors.log` the same way it
+        // writes any other trouble, so this is exactly the line a harness's own
+        // failure would take — and the whole point is that it must not read
+        // like one.
+        let mut app = play(Kind::Codex, "");
+        app.observe("s1", &Event::Trouble(INTERRUPTED.into()));
+
+        let pane = app.selected().unwrap();
+        assert!(!pane.troubled);
+        assert_eq!(pane.state(), State::Idle);
+        assert!(
+            pane.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Note(text) if text == INTERRUPTED)),
+            "{:#?}",
+            pane.entries
+        );
+        assert!(
+            !pane
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Trouble(_)))
+        );
     }
 
     #[test]

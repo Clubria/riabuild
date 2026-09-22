@@ -25,7 +25,20 @@ use riabuild_paths::filelock::FileLock;
 use riabuild_runner::{CommandRunner, RunOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::app::INTERRUPTED;
 use crate::store::{Record, Store};
+
+/// How often a running turn checks whether a developer has pressed Esc.
+///
+/// Polled rather than watched, because the marker is a file a *different*
+/// process writes — see [`Store::request_cancel`] — and this read loop
+/// otherwise only wakes when the harness says something. A hung harness, or
+/// Codex retrying forever through an exhausted subscription, says nothing at
+/// all, and a cancel that could only be noticed between lines would never be
+/// noticed in either case. Frequent enough that Esc reads as immediate,
+/// infrequent enough to cost nothing next to however long an ordinary turn
+/// runs.
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Runs the turn whose prompt is waiting in `prompt_file`.
 ///
@@ -71,6 +84,12 @@ pub async fn run(
         .with_context(|| format!("no prompt at {}", prompt_file.display()))?;
 
     let outcome = one_turn(runner, store, &record, program, org_settings, &prompt).await;
+
+    // Cleared unconditionally, not only when it was acted on. A marker means
+    // "stop *this* turn" — one written just as this turn was finishing on its
+    // own, too late for the read loop below to notice, would otherwise
+    // outlive it and reach into the next turn this session runs.
+    store.clear_cancel(id).await;
 
     // Whatever happened, the prompt is not run twice. A wrapper that failed and
     // left the file behind would replay that turn on the next window's tick.
@@ -153,21 +172,53 @@ async fn one_turn(
     let mut reader = Reader::new(kind);
     let mut thread = record.thread.clone();
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        // Written before it is decoded, so a line this riabuild cannot read is
-        // still on disk for one that can. The spool is the harness's bytes, not
-        // riabuild's opinion of them.
-        spool.write_all(line.as_bytes()).await?;
-        spool.write_all(b"\n").await?;
-        spool.flush().await?;
 
-        for event in reader.read(&line) {
-            if let Event::Ready {
-                thread: Some(named),
-                ..
-            } = event
-            {
-                thread = Some(named);
+    let mut cancel_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    // The first tick of an `interval` fires immediately rather than after one
+    // full period; consumed here so the earliest a cancel can be noticed is
+    // one real `CANCEL_POLL_INTERVAL` in, not on the very first spin of the
+    // loop below.
+    cancel_poll.tick().await;
+
+    let mut interrupted = false;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        // Written before it is decoded, so a line this riabuild
+                        // cannot read is still on disk for one that can. The
+                        // spool is the harness's bytes, not riabuild's opinion
+                        // of them.
+                        spool.write_all(line.as_bytes()).await?;
+                        spool.write_all(b"\n").await?;
+                        spool.flush().await?;
+
+                        for event in reader.read(&line) {
+                            if let Event::Ready {
+                                thread: Some(named),
+                                ..
+                            } = event
+                            {
+                                thread = Some(named);
+                            }
+                        }
+                    }
+                    // EOF or a read error both end the turn the ordinary way —
+                    // the harness closed its stdout, one way or another.
+                    _ => break,
+                }
+            }
+            _ = cancel_poll.tick() => {
+                if store.cancel_requested(&record.id).await {
+                    interrupted = true;
+                    // Idempotent, and safe to call while the branch above is
+                    // also waiting on the same child's stdout — see
+                    // `ChildHandle::kill`'s own doc for why it takes `&self`
+                    // rather than consuming.
+                    let _ = child.kill().await;
+                    break;
+                }
             }
         }
     }
@@ -189,11 +240,17 @@ async fn one_turn(
         .unwrap_or(updated.updated);
     store.write(&updated).await?;
 
-    // A harness that exited non-zero without saying anything in its own stream
-    // would otherwise be invisible: the pane would show a turn that ended with
-    // no reply and no reason.
     let code = finished.code.unwrap_or(-1);
-    if code != 0 {
+    if interrupted {
+        // Said in riabuild's own words rather than as whatever a killed
+        // process reports of itself — a `kill(2)`'d child leaves no exit
+        // code at all, which would otherwise read exactly like the harness
+        // failing on its own for no stated reason.
+        note_trouble(store, &record.id, INTERRUPTED).await;
+    } else if code != 0 {
+        // A harness that exited non-zero without saying anything in its own
+        // stream would otherwise be invisible: the pane would show a turn
+        // that ended with no reply and no reason.
         let detail = finished.stderr.trim();
         let detail = if detail.is_empty() {
             format!("{} exited {code}", kind.label())
@@ -364,6 +421,51 @@ mod tests {
         assert!(trouble.contains("not signed in"), "{trouble}");
         // and the prompt is still consumed, so it is not retried for ever
         assert!(!tokio::fs::try_exists(&file).await.unwrap());
+    }
+
+    /// The whole feature, from the inside: a marker left before the turn
+    /// starts reading is exactly what a developer pressing Esc on an already
+    /// hung or endlessly-retrying harness produces, since there is no line
+    /// arriving to notice it between.
+    #[tokio::test]
+    async fn a_cancel_marker_kills_the_child_and_says_so_in_riabuilds_own_words() {
+        let (_dir, store) = store();
+        let record = store
+            .create(&Account::new(Kind::Codex, 1, None), Path::new("/work"))
+            .await
+            .unwrap();
+        let file = queued(&store, &record.id, "hello").await;
+        store.request_cancel(&record.id).await.unwrap();
+
+        // A child that never says anything and never exits on its own — the
+        // shape of a hung harness, and of Codex retrying through an exhausted
+        // subscription with nothing riabuild would read as a sign-in problem.
+        let runner = FakeRunner::new().spawning_until_killed("/opt/codex");
+
+        let code = run(&runner, &store, &record.id, "/opt/codex", None, &file)
+            .await
+            .unwrap();
+        assert_eq!(code, -1, "a killed child reports no exit code of its own");
+
+        assert!(
+            runner
+                .killed()
+                .iter()
+                .any(|invocation| invocation.starts_with("/opt/codex")),
+            "{:?}",
+            runner.killed()
+        );
+        // Released, so the window reads the session as idle rather than
+        // permanently busy the moment it next asks.
+        assert!(!store.running(&record.id).await);
+        // Cleared rather than left behind, so this marker cannot also cancel
+        // whichever turn reads this session's next queued prompt.
+        assert!(!store.cancel_requested(&record.id).await);
+
+        let trouble = tokio::fs::read_to_string(store.trouble_path(&record.id))
+            .await
+            .unwrap();
+        assert_eq!(trouble.trim(), crate::app::INTERRUPTED);
     }
 
     #[tokio::test]

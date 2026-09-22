@@ -276,6 +276,7 @@ pub async fn drive(
             Action::Quit => app.quit = true,
             Action::Send(text) => send(store, reach.runner, request, app, readers, &text).await,
             Action::Paste => paste_into_compose(store, app, reach.clipboard).await,
+            Action::Interrupt => interrupt(store, app).await,
         }
     }
 }
@@ -312,6 +313,18 @@ async fn paste_into_compose(store: &Store, app: &mut App, clipboard: Option<&dyn
         Ok(Pasted::Nothing) => app.notice = Some("Nothing on the clipboard to paste.".to_string()),
         Err(error) => app.notice = Some(format!("{error:#}")),
     }
+}
+
+/// Esc, on a session that is still working: asks its turn to stop.
+///
+/// Fire-and-forget, like [`paste_into_compose`]'s clipboard read — there is
+/// nothing to wait for here either, because the turn this asks is a detached
+/// process this window never held a handle to (see the crate's own doc
+/// comment on why). `follow`'s next tick is what tells the pane the turn is
+/// actually gone, the same way it always learns a turn ended.
+async fn interrupt(store: &Store, app: &App) {
+    let Some(pane) = app.selected() else { return };
+    let _ = store.request_cancel(&pane.id).await;
 }
 
 /// Reads whatever the running turns have appended since the last tick.
@@ -436,7 +449,7 @@ mod tests {
     use crate::account::{Account, Accounts};
     use riabuild_harness::Kind;
     use riabuild_runner::FakeRunner;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn request(root: &std::path::Path) -> Request {
@@ -606,5 +619,28 @@ mod tests {
             notice.contains("xclip") || notice.contains("wl-clipboard"),
             "{notice}"
         );
+    }
+
+    /// The window's half of the feature: asking is a marker on disk, not a
+    /// signal to a process this window never held a handle to.
+    #[tokio::test]
+    async fn escape_asks_the_selected_sessions_turn_to_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::rooted_at(temp.path());
+        let record = store
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
+            .await
+            .unwrap();
+        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        app.add(Pane::new(
+            record.id.clone(),
+            Kind::Claude,
+            "a session".into(),
+        ));
+        app.cursor = 0;
+
+        assert!(!store.cancel_requested(&record.id).await);
+        interrupt(&store, &app).await;
+        assert!(store.cancel_requested(&record.id).await);
     }
 }
