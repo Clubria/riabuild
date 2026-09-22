@@ -811,6 +811,13 @@ impl App {
         }
     }
 
+    /// This session's harness wrote a line that decoded to no event.
+    pub fn heard(&mut self, id: &str) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            pane.turn.heard(pane.entries.len());
+        }
+    }
+
     /// riabuild's wrapper wrote that this session's turn could not go on.
     pub fn stopped(&mut self, id: &str) {
         if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {

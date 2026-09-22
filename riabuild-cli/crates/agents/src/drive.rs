@@ -94,7 +94,11 @@ async fn hydrate(store: &Store, record: &store::Record) -> Option<(Pane, Reader)
     pane.account = record.account;
     pane.offset = spool.len() as u64;
     for line in spool.lines() {
-        for event in reader.read(line) {
+        let events = reader.read(line);
+        if events.is_empty() && !line.trim().is_empty() {
+            pane.turn.heard(pane.entries.len());
+        }
+        for event in events {
             pane.observe(&event);
         }
     }
@@ -350,9 +354,17 @@ async fn follow(store: &Store, app: &mut App, readers: &mut HashMap<String, Read
             && !fresh.is_empty()
         {
             if let Some(reader) = readers.get_mut(&id) {
-                let events: Vec<_> = fresh.lines().flat_map(|line| reader.read(line)).collect();
-                for event in events {
-                    app.observe(&id, &event);
+                for line in fresh.lines() {
+                    let events = reader.read(line);
+                    // A line that decodes to nothing — a hook starting, a
+                    // frame this riabuild does not know — is still the harness
+                    // speaking, so the turn is past launching.
+                    if events.is_empty() && !line.trim().is_empty() {
+                        app.heard(&id);
+                    }
+                    for event in events {
+                        app.observe(&id, &event);
+                    }
                 }
             }
             if let Some(pane) = app.pane_mut(&id) {

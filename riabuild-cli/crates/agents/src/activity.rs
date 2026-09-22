@@ -392,6 +392,22 @@ mod tests {
     }
 
     #[test]
+    fn a_line_no_decoder_understood_still_ends_launching() {
+        // Grok's documented frames and Claude's hook notices decode to nothing,
+        // and a turn that is writing them is not still starting.
+        let mut app = crate::app::App::new();
+        app.begin(
+            "s1".into(),
+            &crate::account::Account::new(Kind::Grok, 1, None),
+        );
+        app.sent("hello");
+        app.set_running("s1", true);
+        assert_eq!(app.panes[0].activity(), Some(Activity::Launching));
+        app.heard("s1");
+        assert_eq!(app.panes[0].activity(), Some(Activity::Thinking));
+    }
+
+    #[test]
     fn a_turn_another_window_started_is_seen_launching() {
         let mut pane = pane(Kind::Codex);
         pane.set_running(true);
