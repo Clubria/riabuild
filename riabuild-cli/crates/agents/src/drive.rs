@@ -10,13 +10,14 @@ use ratatui::crossterm::event::Event as TermEvent;
 use riabuild_channel::clipboard::Clipboard;
 use riabuild_harness::Reader;
 use riabuild_runner::CommandRunner;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 
+use crate::account::SignedIn;
 use crate::app::{App, Pane, Row};
 use crate::draw::Chrome;
 use crate::paste::{self, Pasted};
 use crate::store::{self, Store};
-use crate::{Action, Login, Request, Screen, frame, key, keys};
+use crate::{Action, Request, Screen, frame, key, keys};
 
 /// How many ticks apart the window looks for sessions it did not open.
 ///
@@ -188,9 +189,10 @@ fn regroup(app: &mut App, records: &[store::Record]) {
 
 /// `riabuild agents "do the thing"` — asked of every harness at once.
 ///
-/// One session per offer, created here rather than on the way in, because this
-/// is a prompt: it is the thing that turns an offer into a session everywhere
-/// else too.
+/// One session per harness that has anything signed in, under the first of its
+/// signed-in sign-ins, created here rather than on the way in, because this is
+/// a prompt: it is the thing that turns an offer into a session everywhere else
+/// too.
 pub async fn first_prompt(
     store: &Store,
     runner: &dyn CommandRunner,
@@ -199,10 +201,14 @@ pub async fn first_prompt(
     readers: &mut HashMap<String, Reader>,
     prompt: &str,
 ) {
-    for offer in 0..app.offers.len() {
-        // Counted afresh each time: every session this creates is another
-        // row above the offers, and a count taken once before the loop put the
-        // cursor back on the first offer from the second pass on.
+    let firsts: Vec<usize> = (0..app.offers.len())
+        .filter(|&at| {
+            let kind = app.offers[at].kind;
+            app.offers[..at].iter().all(|earlier| earlier.kind != kind)
+        })
+        .collect();
+    for offer in firsts {
+        // Offers come after sessions, and each send adds one.
         app.move_to(app.panes.len() + offer);
         send(store, runner, request, app, readers, prompt).await;
     }
@@ -230,7 +236,7 @@ pub async fn drive(
     request: &Request,
     app: &mut App,
     readers: &mut HashMap<String, Reader>,
-    mut logins: UnboundedReceiver<Login>,
+    mut signed_in: oneshot::Receiver<Vec<SignedIn>>,
 ) -> Result<()> {
     let mut keys = keys();
     // Fast enough for the spinner to read as motion and for output to feel live,
@@ -254,10 +260,11 @@ pub async fn drive(
                 TermEvent::Key(pressed) => key(app, pressed),
                 _ => Action::Nothing,
             },
-            // Answers arrive over the life of the window rather than before it
-            // opens: asking who is signed in is a subprocess per account.
-            Some(login) = logins.recv() => {
-                app.set_login(login.kind, login.number, login.signin);
+            // Arrives once, a moment after the window opens: asking Claude
+            // Code who is signed in is a subprocess per account. Not polled
+            // again once it has answered, which a oneshot does not allow.
+            found = &mut signed_in, if app.checking => {
+                app.signed_in(found.unwrap_or_default());
                 Action::Nothing
             }
             _ = ticker.tick() => {
@@ -391,15 +398,6 @@ pub async fn send(
             let Some(account) = app.offers.get(index).cloned() else {
                 return;
             };
-            // The keymap already refused this before emptying the box; this is
-            // the same refusal for the caller that has no keymap in front of it
-            // — `riabuild agents "do the thing"`, which asks every offer at once
-            // and would otherwise create a session under a sign-in that has
-            // nowhere to go, and leave it on the rail failing.
-            if app.is_signed_out(account.kind, account.number) {
-                app.notice = Some(crate::app::signed_out_hint(&account.name()));
-                return;
-            }
             match store.create(&account, &request.cwd).await {
                 Ok(record) => {
                     readers.insert(record.id.clone(), Reader::new(account.kind));
@@ -474,7 +472,8 @@ pub async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{Account, Accounts};
+    use crate::account::Account;
+    use crate::account::tests::first_of_each;
     use riabuild_harness::Kind;
     use riabuild_runner::FakeRunner;
     use std::path::{Path, PathBuf};
@@ -485,7 +484,6 @@ mod tests {
             riabuild: PathBuf::from("/opt/riabuild"),
             cwd: root.join("checkout"),
             repo: Some("Clubria/riabuild".into()),
-            accounts: Accounts::from(vec![Account::new(Kind::Claude, 1, None)]),
             prompt: None,
             theme: riabuild_theme::Theme::plain(),
             unicode: true,
@@ -500,7 +498,7 @@ mod tests {
         let store = Store::rooted_at(temp.path());
         let request = request(temp.path());
         let runner = Arc::new(FakeRunner::new());
-        let mut app = App::new(request.accounts.clone());
+        let mut app = App::offering(first_of_each());
         let mut readers = restore(&store, &request, &mut app).await.unwrap();
         assert!(app.panes.is_empty());
         assert_eq!(store.sessions(&request.cwd).await.unwrap().len(), 0);
@@ -528,6 +526,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_on_the_command_line_goes_to_the_first_signed_in_sign_in_of_each_harness() {
+        // Two Claude sign-ins and a Codex one, Grok Build signed out: one
+        // session under `claude-1`, one under `codex-1`, and none under
+        // anything that is not signed in.
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::rooted_at(temp.path());
+        let request = request(temp.path());
+        let runner = Arc::new(FakeRunner::new());
+        let mut app = App::offering(vec![
+            SignedIn::new(Account::new(Kind::Claude, 1, None), None),
+            SignedIn::new(Account::new(Kind::Claude, 2, None), None),
+            SignedIn::new(Account::new(Kind::Codex, 1, None), None),
+        ]);
+        let mut readers = restore(&store, &request, &mut app).await.unwrap();
+        first_prompt(
+            &store,
+            runner.as_ref(),
+            &request,
+            &mut app,
+            &mut readers,
+            "why is the nightly job slow",
+        )
+        .await;
+        let mut names: Vec<String> = app.panes.iter().map(Pane::account_name).collect();
+        names.sort();
+        assert_eq!(names, ["claude-1", "codex-1"]);
+    }
+
+    #[tokio::test]
     async fn an_untouched_session_from_an_older_riabuild_is_cleaned_up() {
         // Every existing install has three of these per checkout, made by a
         // window that opened a pane per harness. Nothing was ever said in one,
@@ -544,7 +571,7 @@ mod tests {
         }
         assert_eq!(store.sessions(&request.cwd).await.unwrap().len(), 3);
 
-        let mut app = App::new(request.accounts.clone());
+        let mut app = App::offering(first_of_each());
         restore(&store, &request, &mut app).await.unwrap();
         assert!(app.panes.is_empty());
         assert_eq!(store.sessions(&request.cwd).await.unwrap().len(), 0);
@@ -562,7 +589,7 @@ mod tests {
         record.title = "a real conversation".into();
         store.write(&record).await.unwrap();
 
-        let mut app = App::new(request.accounts.clone());
+        let mut app = App::offering(first_of_each());
         restore(&store, &request, &mut app).await.unwrap();
         assert_eq!(app.panes.len(), 1);
         assert_eq!(app.panes[0].label(), "a real conversation");
@@ -595,7 +622,7 @@ mod tests {
     async fn pasting_an_image_puts_a_readable_path_in_the_box() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::rooted_at(temp.path());
-        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let mut app = App::new();
         let runner: Arc<dyn riabuild_runner::CommandRunner> = with_an_image();
         let clipboard = riabuild_channel::clipboard::CliClipboard::x11(runner);
 
@@ -622,7 +649,7 @@ mod tests {
     async fn an_empty_clipboard_is_said_out_loud_and_nothing_else() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::rooted_at(temp.path());
-        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let mut app = App::new();
         let runner: Arc<dyn riabuild_runner::CommandRunner> =
             Arc::new(FakeRunner::new().with("xclip -selection clipboard -t TARGETS -o", 1, "", ""));
         let clipboard = riabuild_channel::clipboard::CliClipboard::x11(runner);
@@ -639,7 +666,7 @@ mod tests {
     async fn a_laptop_with_no_clipboard_tool_is_told_what_to_install() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::rooted_at(temp.path());
-        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let mut app = App::new();
 
         paste_into_compose(&store, &mut app, None).await;
         let notice = app.notice.unwrap_or_default();
@@ -659,7 +686,10 @@ mod tests {
             .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
             .await
             .unwrap();
-        let mut app = App::new(Accounts::from(vec![Account::new(Kind::Claude, 1, None)]));
+        let mut app = App::offering(vec![SignedIn::new(
+            Account::new(Kind::Claude, 1, None),
+            None,
+        )]);
         app.add(Pane::new(
             record.id.clone(),
             Kind::Claude,

@@ -1635,42 +1635,38 @@ prove it. `drive::send` is the one place a session is created, and the first pro
 calls it. `restore` forgets an untouched session an older riabuild left behind, so a
 machine that upgrades is cleaned up rather than carrying the old count forward.
 
-**Three offers, up to twenty-seven sign-ins.** The rail offers each harness's first
-account and `n` opens a chooser over every profile riabuild keeps — as many `claude-N` as
-the developer has accounts, and `codex-1` … `codex-9` and `grok-1` … `grok-9`, named
-exactly as their launchers are. Choosing one *offers*
-it rather than opening it, for the reason above. One row per account instead would be a
-list of twenty-seven nobody can read, built for a developer using two of them. Every row is
-labelled with its sign-in rather than its harness, because that is the only thing that
-tells two sessions on one harness apart before either has been asked anything — with the
-account's email beside it where riabuild has learnt one, and nothing where it has not.
+**NEW SESSION is what is signed in, and nothing else.** On launch
+`dispatch::find_what_is_signed_in` looks at every profile riabuild keeps — each Claude
+account, `codex-1` … `codex-9`, `grok-1` … `grok-9` — and the rail offers exactly the ones
+it found signed in, one row each, named as their launchers are. There is no chooser and
+no key to add a sign-in: a list of twenty-seven that mostly could not start anything was
+the thing this replaced, along with a refusal a keypress later for the ones that were
+signed out. A sign-in that is not signed in is not shown anywhere.
 
-**Who a sign-in belongs to arrives after the window does.** `claude auth status --json` is
-a subprocess costing about 450 ms, so `dispatch::ask_who_is_signed_in` starts them all and
-streams the answers in over a channel the draw loop selects on. Blocking on nine of them
-would be four seconds of blank terminal before the first frame. An account nobody has
-answered for renders as **nothing** — never as "signed out", which would be a claim
-riabuild has not established. The emails live in a side table on `App` rather than on
-`Account`, because an `Account` is compared by identity all over that crate and an email
-arriving late must not make the same sign-in unequal to itself.
+**Signing in is outside the window.** The developer runs `claude-N auth login`,
+`codex-N login` or `grok-N login` in a terminal, and the window names those commands when
+nothing is signed in. It never signs anything in, and does not re-check while open — a
+sign-in made meanwhile appears the next time it is opened. Keep it that way: a window
+that ran a harness's login flow would be a second place that owns a browser handoff and a
+device code, for a credential riabuild does not broker in the first place.
 
-**Three states, and the third is what keeps the window usable.** `app::Signin` is `In` or
-`Out`, and *absent* is "nobody has answered yet" — `Identity::Unknown` is deliberately sent
-as no message at all. That distinction is load-bearing in both directions: a signed-out
-sign-in is said out loud on the rail, in the chooser and on the splash, and a prompt typed
-at one is **refused** rather than creating a directory and a turn that fails; but silence
-must never become either, or every account is accused of being logged out for the second
-the probes take to come back and the window refuses the prompt that would have said why.
+**How "signed in" is decided, per harness, and locally.** Claude Code is asked —
+`claude auth status --json` under each account's `CLAUDE_CONFIG_DIR`, the same probe
+`riabuild claude` uses — because where its credential lives is Claude Code's business: a
+file on Linux, the keychain on macOS. Codex and Grok Build keep theirs in
+`$CODEX_HOME/auth.json` and `$GROK_HOME/auth.json` and nowhere else (see the two sections
+above), so the file existing is the answer and no process is started. A probe that could
+not answer counts as **not** signed in: the window only offers what it can vouch for.
 
-The refusal lives in the **keymap**, not in `drive::send`, and that placement is the whole
-of why it is not annoying: `Action::Send` is handed the text only after `Compose::take` has
-emptied the box, so refusing there would throw away the paragraph the developer had just
-typed. `App::blocked_offer` is asked before the take, the text stays, and pressing Enter
-again once they have signed in sends it. `drive::send` refuses too, for the one caller with
-no keymap in front of it — `riabuild agents "do the thing"`, which asks every offer at once.
-
-Only an **offer** is refused. A session that already exists has a conversation in it, and
-the harness's own answer to the next prompt is a better report than a guess made here.
+**The answer arrives after the window does, once.** Nine `claude auth status` calls at
+about 450 ms each in front of the first frame would be a blank terminal, so the window
+draws with `checking sign-ins…` under NEW SESSION and the probes send one list over a
+oneshot when the last has answered. One list rather than a row at a time, because the
+files answer long before the subprocesses and rows arriving one by one would reorder under
+a cursor that had already settled. `--prompt` is the one caller that waits for it, since a
+prompt given on the command line has to know where it can go. Emails live in a side table
+on `App` rather than on `Account`, because an `Account` is compared by identity all over
+that crate.
 
 **A harness that says it is signed out is answered in riabuild's own words, under its
 own.** `Failed to authenticate: OAuth session expired and could not be refreshed` reaches a

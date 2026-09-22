@@ -10,11 +10,11 @@ code is right and this file is out of date.
 
 `riabuild agents` is a full-screen terminal window for talking to Claude Code, Codex and
 Grok Build side by side, in the current Clubria checkout. The left column (the **rail**)
-lists sessions and the sign-ins a new session can be started under. The right column (the
-**pane**) shows the selected row's conversation and a box to type into. Every row keeps
-its own half-written prompt. Pressing Enter sends it. The agent works in the background
-and never asks for approval. Closing the window stops nothing: agents keep working, and
-reopening the window shows everything that happened in the meantime.
+lists sessions and the signed-in sign-ins a new session can be started under. The right
+column (the **pane**) shows the selected row's conversation and a box to type into. Every
+row keeps its own half-written prompt. Pressing Enter sends it. The agent works in the
+background and never asks for approval. Closing the window stops nothing: agents keep
+working, and reopening the window shows everything that happened in the meantime.
 
 ## Words
 
@@ -22,13 +22,21 @@ reopening the window shows everything that happened in the meantime.
 |---|---|
 | **sign-in** | One of a harness's profiles, named as its launcher is: `claude-1` … `claude-N`, `codex-1` … `codex-9`, `grok-1` … `grok-9`. |
 | **session** | One conversation with one harness under one sign-in, in one checkout. It exists on disk, has a title, and is listed under SESSIONS. |
-| **offer** | A sign-in on the rail that a new session *could* be started under. Not a session: nothing exists on disk and nothing is counted. Listed under NEW SESSION. |
+| **offer** | A signed-in sign-in on the rail that a new session *could* be started under. Not a session: nothing exists on disk and nothing is counted. Listed under NEW SESSION. |
 | **turn** | One prompt and the harness's answer to it. It runs detached from the window. |
 | **subagent** | A session that another session started (a Claude Code session handing work to Codex). Drawn under its parent. |
 | **draft** | The text in a row's box that has not been sent yet. Each row has its own. |
 
-A session exists only once it has been sent a prompt. Browsing the rail or the chooser
-never creates anything.
+A session exists only once it has been sent a prompt. Browsing the rail never creates
+anything.
+
+## Signing in happens outside the window
+
+Signing into a provider is done by the developer, **outside** `riabuild agents`, with
+that harness's own command in an ordinary terminal: `claude-N auth login`,
+`codex-N login`, `grok-N login` (or `riabuild claude new` for another Claude account).
+The window never signs anything in, never opens a browser, and never offers a sign-in
+that is not signed in. It only looks.
 
 ## Starting it
 
@@ -44,11 +52,23 @@ agents [--prompt TEXT]            # ~/.riabuild/bin/agents runs the same thing
 - Before the window draws, it drops the least recently used sessions past **50 per
   checkout** and the oldest pasted images past **20**. It also deletes sessions an older
   riabuild created that were never sent anything.
-- With `--prompt TEXT`, the same prompt goes to each offer on the rail (the first sign-in
-  of each harness) before the first frame. That creates one session per offer, except
-  under a sign-in known to be signed out.
+- On launch it finds out which sign-ins are signed in: every profile of every harness,
+  `claude-1` … `claude-N`, `codex-1` … `codex-9`, `grok-1` … `grok-9`. This is local and
+  starts no session:
+  - **Claude Code**: `claude auth status --json` under that account's config directory,
+    all accounts at once. Signed in means it answered `loggedIn` true. It also gives the
+    email.
+  - **Codex** and **Grok Build**: the profile's `auth.json` exists
+    (`~/.riabuild/codex/<n>/auth.json`, `~/.riabuild/grok/<n>/auth.json`). No email.
+  - A probe that cannot answer (a `claude` that will not start) counts as not signed in.
+
+  The window draws without waiting for this. The answer arrives once, for all sign-ins
+  together, usually within half a second, and fills in NEW SESSION.
+- With `--prompt TEXT`, the window waits for that answer first. The prompt then goes to
+  the first signed-in sign-in of each harness that has one, before the first frame. That
+  creates one session per such harness, at most three.
 - The window opens with the **rail** focused and the cursor on the first row: the newest
-  session, or the Claude offer if there are no sessions.
+  session, or the first offer if there are no sessions.
 - The terminal's title becomes `riabuild agents — owner/repo` while the window is open,
   and goes back to what it was on exit.
 
@@ -120,18 +140,22 @@ in the window appears at the top, where it will also be when the window is reope
 subagent comes directly after its parent. An idle subagent's mark is muted so it stays in
 the background. A subagent that is working or in trouble uses the normal colours.
 
-**NEW SESSION.** One row per offer: cursor, `+`, the sign-in, then a tail after ` · `:
+**NEW SESSION.** Exactly the sign-ins found signed in on launch, one row each, in the
+order Claude Code, Codex, Grok Build and by number within each. A sign-in that is not
+signed in is not shown anywhere. Each row: cursor, `+`, the sign-in, and ` · email` when
+riabuild knows the sign-in's address and it fits. It is left out rather than cut. Emails
+are only ever known for Claude sign-ins.
 
-- `signed out`, in the warning colour, when riabuild has been told the sign-in is signed
-  out. This is never left out, however narrow the rail.
-- otherwise the sign-in's email, when riabuild knows it and it fits. Left out rather
-  than cut.
+Before the answer arrives, NEW SESSION reads `checking sign-ins…`. If nothing is signed
+in, it reads, wrapped to the rail:
 
-The rail starts with three offers, the first sign-in of Claude Code, Codex and Grok Build.
-The chooser adds more.
+```
+Nothing is signed in. Sign in outside riabuild agents with `claude-1 auth login`,
+`codex-1 login`, `grok-1 login`, then open it again.
+```
 
-Sign-in state is only ever learned for Claude sign-ins. It arrives a moment after the
-window opens. A sign-in nobody has answered for yet shows nothing, never `signed out`.
+Commands are never broken across rows. The list is not refreshed while the window is
+open: a sign-in made meanwhile shows up the next time the window is opened.
 
 ### The pane
 
@@ -169,9 +193,7 @@ create a Claude session
 login: claude-1 · ada@clubria.com
 ```
 
-Only the harness name uses the accent colour. For a sign-in known to be signed out, a
-blank line and ``claude-1 is not signed in — run `claude-1 auth login` in a terminal.``
-follow, in the warning colour.
+Only the harness name uses the accent colour.
 
 **A session that could not be started** (see "Hit a failure") replaces the splash of the
 offer it was started from: the error, every line of it, in red, centred both ways. It
@@ -190,41 +212,27 @@ stays until a session is started under that sign-in.
 out the draft of the row arrived at. Enter only ever sends the draft of the row it was
 written in. Drafts last as long as the window is open.
 
-### The chooser
-
-Pressing `n` on the rail opens a bordered box titled ` new session ` over the body. It lists
-every sign-in riabuild keeps: `claude-1` … `claude-N` (as many as exist), `codex-1` …
-`codex-9`, `grok-1` … `grok-9`, in that order. Each row shows the sign-in and then
-`signed out` (warning colour) if riabuild has been told so, or its email if known, or the
-harness name (`Claude Code`, `Codex`, `Grok Build`). The list scrolls to keep the cursor
-visible.
-
-- It opens on the sign-in of the row you were on, so "another session like this one" is
-  `n`, Enter.
-- Enter **offers** the chosen sign-in: it is added to NEW SESSION (or found there if
-  already present) and the cursor moves to it on the rail. No session is created. Offers
-  added this way last as long as the window is open.
-- Esc closes it and changes nothing.
-
 ## Focus and keys
 
-The keyboard talks to one of three places. `Ctrl-C` quits from any of them. Key releases
-are ignored.
+The keyboard talks to one of two places. `Ctrl-C` quits from either. Key releases are
+ignored.
 
-**Rail** (footer: `↑↓ move · → open · n sign-in · q quit`)
+**Rail** (footer: `↑↓ move · → open · q quit`)
 
 | Key | Does |
 |---|---|
 | `↓` `j` `Tab` / `↑` `k` `Shift-Tab` | next / previous row. Runs through sessions and then offers, and wraps around |
-| `→` `Enter` | focus the pane, with the caret at the **end** of that row's draft. Typing works immediately |
-| `n` | open the chooser |
+| `→` `Enter` | focus the pane, with the caret at the **end** of that row's draft. Typing works immediately. Does nothing when the rail has no rows (no sessions and nothing signed in) |
 | `q` | quit |
+
+There is no key to add a sign-in or pick one from a list: every signed-in sign-in is
+already a row.
 
 **Pane** (footer: `enter send · ^v paste · alt+enter newline · ↑↓ scroll · ← sessions`)
 
 | Key | Does |
 |---|---|
-| any character | typed into the box at the caret. `q`, `n`, `j` and digits are just letters here |
+| any character | typed into the box at the caret. `q`, `j` and digits are just letters here |
 | `Enter` | send the trimmed draft and clear it. An empty draft sends nothing. Focus **stays** in the pane |
 | `Alt-Enter` `Shift-Enter` `Cmd-Enter` `Ctrl-J` | a line break (`Shift-Enter` only where the terminal reports Shift) |
 | `←` | move the caret left. At the very start of the draft it goes back to the rail instead, keeping the draft |
@@ -243,14 +251,6 @@ are ignored.
 
 A footer hint that does not fit is dropped whole, from the right, rather than cut.
 
-**Chooser** (footer: `↑↓ account · enter choose · esc back`)
-
-| Key | Does |
-|---|---|
-| `↓` `j` / `↑` `k` | next / previous sign-in, wrapping |
-| `Enter` | offer it and return to the rail |
-| `Esc` | return to the rail |
-
 The mouse is not captured, so the terminal's own text selection and copy work as usual.
 
 ## What happens when you…
@@ -258,10 +258,6 @@ The mouse is not captured, so the terminal's own text selection and copy work as
 **Send to an offer.** A session is created under that sign-in and added to the **top** of
 SESSIONS with the cursor on it. Its title is the prompt, flattened to one line and cut at
 60 characters. Then the turn starts. The offer stays on the rail for next time.
-
-**Send to an offer that is signed out.** Refused: a notice says
-``claude-1 is not signed in — run `claude-1 auth login` in a terminal.`` and the draft
-stays in the box, so Enter sends it once you have signed in.
 
 **Send to a session.** `› text` appears at once and the session shows as working at once,
 before the process has started. Any trouble mark is cleared. The turn continues the same
@@ -316,7 +312,6 @@ One line in the warning colour, in place of the footer:
 - `Nothing on the clipboard to paste.`
 - the command to install a clipboard tool, on a Linux machine that has none
 - the error, if reading the clipboard failed
-- the signed-out sentence, when Enter is refused on a signed-out offer
 
 A notice goes away on the **next keypress**, not after a set time. The window never
 closes because of one.
@@ -329,17 +324,16 @@ same one every `claude` launcher uses.
 
 ## Look
 
-- **No borders or dividers.** The pane is separated from the rail by its raised
+- **No borders, dividers or popups.** The pane is separated from the rail by its raised
   background alone. On terminals with fewer than 256 colours there is no raised
-  background, so a muted vertical line in the gap takes its place. The chooser's box is
-  the only bordered thing on screen.
+  background, so a muted vertical line in the gap takes its place. Nothing is ever drawn
+  over the body.
 - **Colours by role**, from `riabuild-theme`: brand (cursor bar, `+`, header name, your
-  prompts, `›`, caret, chooser border), ok/green (idle, tool succeeded), busy/orange
-  (working, tool running, the "working" count), danger/red (trouble, failed tool, failure
-  text, a session that could not be started), warn (notices, `signed out`), muted
-  (headings, sign-ins, unselected titles, secondary text), strong (selected title,
-  repository, tool names, key names). Nothing uses a hard-coded colour, and `NO_COLOR`
-  turns colour off.
+  prompts, `›`, caret), ok/green (idle, tool succeeded), busy/orange (working, tool
+  running, the "working" count), danger/red (trouble, failed tool, failure text, a session
+  that could not be started), warn (notices), muted (headings, sign-ins, unselected
+  titles, secondary text), strong (selected title, repository, tool names, key names).
+  Nothing uses a hard-coded colour, and `NO_COLOR` turns colour off.
 - **ASCII fallback** where the terminal is not trusted with Unicode:
 
   | Unicode | ASCII |
