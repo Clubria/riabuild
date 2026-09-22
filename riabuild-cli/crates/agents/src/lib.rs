@@ -68,6 +68,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{event, execute};
+use ratatui::layout::Position;
 use riabuild_harness::Kind;
 use riabuild_runner::CommandRunner;
 use riabuild_theme::Theme;
@@ -600,11 +601,19 @@ fn claim(title: &str) -> Result<Screen> {
 /// prompt printed on top of it. Clearing first costs nothing where the switch
 /// works and is the whole of the fix where it does not.
 ///
+/// The clear alone left those terminals blank with the shell's prompt on the
+/// very last row: ratatui's `clear` puts the cursor back where it found it, and
+/// where it found it was the compose line at the bottom of the window. So the
+/// cursor goes home after it. Where the switch works this is invisible — leaving
+/// the alternate screen restores the cursor saved on the way in — and where it
+/// does not, the prompt starts at the top of a clean screen, as after `clear`.
+///
 /// Every step is attempted even if an earlier one failed: giving the terminal
 /// back matters more than reporting why raw mode would not come off, and there
 /// is nobody to report to until it has.
 fn release(terminal: &mut Screen) {
     let _ = terminal.clear();
+    let _ = terminal.set_cursor_position(Position::ORIGIN);
     let _ = terminal.flush();
     let _ = disable_raw_mode();
     let _ = write!(terminal.backend_mut(), "{POP_TITLE}");
