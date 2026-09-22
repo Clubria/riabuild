@@ -103,8 +103,13 @@ async fn hydrate(store: &Store, record: &store::Record) -> Option<(Pane, Reader)
     for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
         pane.observe(&riabuild_harness::Event::Trouble(line.to_string()));
     }
+    if !trouble.trim().is_empty() {
+        pane.turn.stopped();
+    }
     pane.trouble_offset = trouble_at;
-    pane.running = running;
+    // Through the setter, so a turn that is running as the window opens is
+    // seen launching or mid-stream according to what the spool already holds.
+    pane.set_running(running);
     Some((pane, reader))
 }
 
@@ -362,6 +367,9 @@ async fn follow(store: &Store, app: &mut App, readers: &mut HashMap<String, Read
             for line in trouble.lines().filter(|line| !line.trim().is_empty()) {
                 app.observe(&id, &riabuild_harness::Event::Trouble(line.to_string()));
             }
+            // Written as a turn ends and never during one, so whatever was on
+            // the indicator is over.
+            app.stopped(&id);
             if let Some(pane) = app.pane_mut(&id) {
                 pane.trouble_offset = at;
             }
@@ -370,6 +378,47 @@ async fn follow(store: &Store, app: &mut App, readers: &mut HashMap<String, Read
         // end by being killed, and nothing is written then.
         let running = store.running(&id).await;
         app.set_running(&id, running);
+        look_up_codex_turn(store, app, &id).await;
+    }
+}
+
+/// Fills in a Codex turn's model and effort from its rollout.
+///
+/// The one harness whose stream carries neither — see `crate::rollout`. Looked
+/// up a few times per turn at most, and only once the thread id is known,
+/// because the file is named after it.
+async fn look_up_codex_turn(store: &Store, app: &mut App, id: &str) {
+    let Some(pane) = app.pane_mut(id) else {
+        return;
+    };
+    if pane.kind != riabuild_harness::Kind::Codex || !pane.turn.wants_lookup() {
+        return;
+    }
+    let Some(thread) = pane.thread.clone() else {
+        return;
+    };
+    pane.turn.lookups -= 1;
+    let known = pane.turn.rollout.clone();
+
+    let path = match known {
+        Some(path) => Some(path),
+        None => match store.read(id).await.ok().and_then(|record| record.home) {
+            Some(home) => crate::rollout::find(&home, &thread).await,
+            None => None,
+        },
+    };
+    let Some(path) = path else {
+        return;
+    };
+    let context = crate::rollout::read(&path).await;
+    let Some(pane) = app.pane_mut(id) else {
+        return;
+    };
+    pane.turn.rollout = Some(path);
+    if let Some(context) = context {
+        pane.turn.lookups = 0;
+        pane.model = context.model;
+        pane.effort = context.effort;
     }
 }
 
@@ -437,6 +486,7 @@ pub async fn send(
         }
         Err(error) => {
             app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
+            app.stopped(&id);
             app.set_running(&id, false);
             return;
         }
@@ -463,6 +513,7 @@ pub async fn send(
             }
             None => {
                 app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
+                app.stopped(&id);
                 app.set_running(&id, false);
             }
         }

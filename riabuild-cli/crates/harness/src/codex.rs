@@ -75,8 +75,11 @@ impl Decode for Reader {
                         .map(str::to_string),
                     // Codex names no model in this frame. Left `None` rather
                     // than guessed: a pane showing the wrong model is worse than
-                    // one showing none.
+                    // one showing none. The window reads both this and the
+                    // reasoning effort out of the thread's own rollout instead
+                    // — see `riabuild_agents::rollout`.
                     model: None,
+                    effort: None,
                 }]
             }
             // VERIFIED. Carries nothing; the fleet already knows a turn began,
@@ -259,6 +262,7 @@ mod tests {
             Some(&Event::Ready {
                 thread: Some("01a03328-0c86-7f93-8c73-817d64e595c6".into()),
                 model: None,
+                effort: None,
             })
         );
         assert_eq!(events.last(), Some(&Event::Idle));

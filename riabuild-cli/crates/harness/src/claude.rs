@@ -140,6 +140,18 @@ impl Reader {
                         .get("model")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    // Declared on `init` by Claude Code 2.1.280's own source,
+                    // and set only when the session was given one — a `-p` run
+                    // with `--effort high` was observed *not* to carry it. Read
+                    // when present, and never inferred from settings: the level
+                    // Claude Code settles on runs through a flag, an
+                    // environment variable, a settings key and a per-model
+                    // default, and restating that precedence here would be a
+                    // guess that looks like a fact.
+                    effort: frame
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 }]
             }
             // A hook that failed is worth surfacing; one that ran is not. This
@@ -344,6 +356,21 @@ mod tests {
     }
 
     #[test]
+    fn an_init_that_carries_an_effort_hands_it_on() {
+        // 2.1.280 declares `effort` on `init` and sets it only when the session
+        // was given one; the transcript above predates it and has none.
+        let init = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5","effort":"high"}"#;
+        assert_eq!(
+            decode(init),
+            vec![Event::Ready {
+                thread: Some("s".into()),
+                model: Some("claude-opus-5".into()),
+                effort: Some("high".into()),
+            }]
+        );
+    }
+
+    #[test]
     fn a_real_transcript_decodes_to_the_session_the_developer_had() {
         let events = decode(TRANSCRIPT);
         assert_eq!(
@@ -352,6 +379,7 @@ mod tests {
                 Event::Ready {
                     thread: Some("28eac785-edf9-4ac2-8920-81bd1870b094".into()),
                     model: Some("claude-opus-5[1m]".into()),
+                    effort: None,
                 },
                 Event::Said("ok".into()),
                 Event::Usage {

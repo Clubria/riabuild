@@ -100,6 +100,9 @@ impl Decode for Reader {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                // Grok Build takes `--reasoning-effort` and reports it nowhere
+                // in `streaming-json`, which is documented rather than observed.
+                effort: None,
             });
         }
         events.extend(self.update(update));
@@ -238,6 +241,7 @@ mod tests {
             Event::Ready {
                 thread: Some("s1".into()),
                 model: None,
+                effort: None,
             },
             Event::Said("hi".into()),
         ];
