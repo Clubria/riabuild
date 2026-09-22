@@ -220,26 +220,14 @@ fn list_key(app: &mut App, code: KeyCode) -> Action {
         // One keypress into the pane, and typing works immediately once there.
         // It used to take two — one to reach the session, one to reach its box —
         // which is a confirmation of a decision the cursor had already made.
+        // The caret goes to the end of whatever is already written there, which
+        // is where somebody coming back to a draft carries on typing.
         KeyCode::Right | KeyCode::Enter => {
-            app.focus = Focus::Session;
+            app.enter();
             Action::Nothing
         }
         KeyCode::Char('n') => {
             app.open_picker();
-            Action::Nothing
-        }
-        // The quick way to a harness's own offer, for a developer who has one
-        // account each and does not want a chooser.
-        KeyCode::Char('1') => {
-            app.jump_to_offer(Kind::Claude);
-            Action::Nothing
-        }
-        KeyCode::Char('2') => {
-            app.jump_to_offer(Kind::Codex);
-            Action::Nothing
-        }
-        KeyCode::Char('3') => {
-            app.jump_to_offer(Kind::Grok);
             Action::Nothing
         }
         _ => Action::Nothing,
@@ -966,12 +954,59 @@ mod tests {
     }
 
     #[test]
-    fn a_digit_jumps_to_a_harnesss_own_sign_in() {
-        for (digit, kind) in [('1', Kind::Claude), ('2', Kind::Codex), ('3', Kind::Grok)] {
-            let mut app = with_one_session();
+    fn a_digit_on_the_rail_does_nothing() {
+        // `1`/`2`/`3` once jumped to each harness's first offer. Nobody asked
+        // for them, and they only ever reached the first sign-in of each.
+        let mut app = with_one_session();
+        for digit in ['1', '2', '3'] {
             key(&mut app, press(KeyCode::Char(digit)));
-            assert_eq!(app.offered().map(|account| account.kind), Some(kind));
+            assert_eq!(app.cursor, 0);
         }
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            key(app, press(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn each_row_keeps_its_own_draft() {
+        // The bug: one box for the whole window, so `Tab` from inside a pane
+        // carried a half-written prompt to the next session, and Enter sent it
+        // there — or to an offer, which started a session nobody meant.
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Right));
+        typed(&mut app, "for the session");
+
+        key(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.row(), Some(app::Row::Offer(0)));
+        assert!(app.compose.text().is_empty(), "{}", app.compose.text());
+        typed(&mut app, "for claude");
+
+        key(&mut app, press(KeyCode::BackTab));
+        assert_eq!(app.compose.text(), "for the session");
+        key(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.compose.text(), "for claude");
+    }
+
+    #[test]
+    fn leaving_by_the_left_edge_keeps_the_draft_and_coming_back_puts_the_caret_at_its_end() {
+        let mut app = with_one_session();
+        key(&mut app, press(KeyCode::Right));
+        typed(&mut app, "half a thought");
+        key(&mut app, press(KeyCode::Home));
+        // Caret at 0, so this `←` leaves rather than moving inside the text.
+        key(&mut app, press(KeyCode::Left));
+        assert_eq!(app.focus, Focus::List);
+
+        // Browse elsewhere and come back: the draft is where it was left.
+        key(&mut app, press(KeyCode::Down));
+        key(&mut app, press(KeyCode::Up));
+        key(&mut app, press(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Session);
+        assert_eq!(app.compose.text(), "half a thought");
+        assert_eq!(app.compose.caret(), "half a thought".chars().count());
     }
 
     #[test]

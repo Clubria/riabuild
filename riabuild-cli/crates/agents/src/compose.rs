@@ -57,6 +57,17 @@ pub struct Compose {
 }
 
 impl Compose {
+    /// A box already holding `text`, with the caret after the last character —
+    /// where a developer coming back to a half-written prompt carries on.
+    pub fn holding(text: &str) -> Self {
+        let mut compose = Self {
+            text: text.to_string(),
+            caret: 0,
+        };
+        compose.end();
+        compose
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }

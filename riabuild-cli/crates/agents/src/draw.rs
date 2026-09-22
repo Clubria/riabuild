@@ -463,6 +463,18 @@ pub fn splash_lines(
     lines
 }
 
+/// What an offer's pane says when the last attempt to start a session under it
+/// failed, in place of the splash.
+///
+/// Every line of the error kept, and all of it in the danger colour: this is
+/// the only report of the failure there is, because no session exists for it
+/// to go in. `frame.rs` centres it both ways, the way it centres the splash.
+pub fn failure_lines(why: &str, theme: Theme) -> Vec<Line<'static>> {
+    why.lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), theme.style(Role::Danger))))
+        .collect()
+}
+
 /// The sign-ins a new session can be started under.
 pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
     if app.accounts.is_empty() {
@@ -553,12 +565,11 @@ pub fn status_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
         left.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
         used += 3 + email.chars().count();
     }
-    let spent = match app.selected() {
-        Some(pane) if pane.input_tokens > 0 || pane.output_tokens > 0 => format!(
-            "{} in / {} out",
-            thousands(pane.input_tokens),
-            thousands(pane.output_tokens)
-        ),
+    // The session's total over every turn, not the last turn's count.
+    let spent = match app.selected().map(Pane::tokens) {
+        Some((input, output)) if input > 0 || output > 0 => {
+            format!("{} in / {} out", thousands(input), thousands(output))
+        }
         _ => String::new(),
     };
     if !spent.is_empty() {

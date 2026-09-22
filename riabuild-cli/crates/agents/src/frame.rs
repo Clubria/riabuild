@@ -244,7 +244,12 @@ fn render_splash(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     };
     let email = app.login_of(account.kind, account.number);
     let signed_out = app.is_signed_out(account.kind, account.number);
-    let lines: Vec<Line<'static>> = draw::splash_lines(account, email, signed_out, theme);
+    // A session that could not be started says why here, where the session
+    // would have been, until one is started under this sign-in.
+    let lines: Vec<Line<'static>> = match app.failure_of(account.kind, account.number) {
+        Some(why) => draw::failure_lines(why, theme),
+        None => draw::splash_lines(account, email, signed_out, theme),
+    };
     // Wrapped, and measured *after* wrapping. The sentence a signed-out sign-in
     // shows is a whole one — it names the account and the command that fixes it
     // — and it is longer than a pane beside a rail on a laptop. Unwrapped it was
