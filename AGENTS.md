@@ -40,6 +40,13 @@ anything structural.
 
 Each subproject has its own `AGENTS.md` with conventions specific to it.
 
+Any module — a crate, a directory, a subsystem — may also have a `DESIGN.md` beside its
+code, holding what is worth knowing about *that* module and nothing wider: how it looks
+and behaves, the terms it uses, the shape it has to keep. Read it before changing the
+module, and update it in the same pull request when the change makes it untrue. The code
+wins where the two disagree. `riabuild-cli/crates/agents/DESIGN.md`, the UI and UX of
+`riabuild agents`, is the first.
+
 ## Workflow — not optional
 
 **All work goes through a pull request. Work is not finished until PR CI has completed.**
