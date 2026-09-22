@@ -23,12 +23,42 @@
 //! directories were created on disk before a developer had typed anything.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use riabuild_harness::{Event, Kind};
 
 use crate::account::{Account, SignedIn};
 use crate::activity::Turn;
 use crate::compose::Compose;
+
+/// How long a first quit key waits for the second one.
+pub const QUIT_WINDOW: Duration = Duration::from_secs(5);
+
+/// Which key asked to quit, so the footer can name the one to press again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitKey {
+    /// `q`, on the rail.
+    Q,
+    /// `Ctrl-C`, anywhere.
+    CtrlC,
+}
+
+impl QuitKey {
+    /// What the footer calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            QuitKey::Q => "q",
+            QuitKey::CtrlC => "ctrl-c",
+        }
+    }
+}
+
+/// A quit asked for once and waiting to be confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Armed {
+    pub key: QuitKey,
+    pub at: Instant,
+}
 
 /// Whether a harness said, in its own words, that it is not signed in.
 ///
@@ -582,6 +612,13 @@ pub struct App {
     /// are worse as silence — a key that does nothing and says nothing is
     /// indistinguishable from one that is not bound.
     pub notice: Option<String>,
+    /// A first `q` or `Ctrl-C`, and when it was pressed.
+    ///
+    /// Quitting takes two presses within [`QUIT_WINDOW`], because one stray
+    /// key on the rail was enough to close a window a developer was in the
+    /// middle of using. Shown after the key hints, and gone when it expires or
+    /// any other key is pressed.
+    pub armed: Option<Armed>,
 }
 
 impl App {
@@ -604,6 +641,21 @@ impl App {
             scrollback: 0,
             tick: 0,
             notice: None,
+            armed: None,
+        }
+    }
+
+    /// Forgets a first quit key once [`QUIT_WINDOW`] has passed since it.
+    ///
+    /// Called on every redraw tick, so the footer's message goes away on time
+    /// rather than on the next keypress, and by the keymap before it decides
+    /// whether a quit key is the first press or the second.
+    pub fn expire_quit(&mut self, now: Instant) {
+        if self
+            .armed
+            .is_some_and(|armed| now.saturating_duration_since(armed.at) >= QUIT_WINDOW)
+        {
+            self.armed = None;
         }
     }
 

@@ -57,6 +57,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use ratatui::Terminal;
@@ -87,7 +88,7 @@ pub mod store;
 pub mod turn;
 
 pub use account::{Account, SignedIn};
-use app::{App, Focus};
+use app::{App, Armed, Focus, QuitKey};
 use store::Store;
 
 /// The environment variable a turn tells its harness which session it is.
@@ -154,22 +155,51 @@ pub enum Action {
 
 /// The keymap.
 pub fn key(app: &mut App, event: KeyEvent) -> Action {
+    key_at(app, event, Instant::now())
+}
+
+/// The keymap, at a given moment — which only the quit confirmation reads, and
+/// which is a parameter so its five seconds are testable without waiting them.
+pub fn key_at(app: &mut App, event: KeyEvent, now: Instant) -> Action {
     // Windows sends both press and release; without this every key acts twice.
     // Harmless on the two platforms riabuild supports and wrong to leave out.
     if event.kind == KeyEventKind::Release {
         return Action::Nothing;
-    }
-    // Ctrl-C leaves, from anywhere. A developer who has just typed half a prompt
-    // still expects it to work — and leaving now interrupts nothing, because the
-    // turn is not this process's child.
-    if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
-        return Action::Quit;
     }
     // A notice is the answer to the last key, so the next key is what it stops
     // being true for. Cleared here rather than on a timer: a message that
     // vanishes on its own is one a developer can miss entirely, and one that
     // stays is still on screen after the thing it described was undone.
     app.notice = None;
+
+    // Ctrl-C from anywhere, and `q` on the rail — in the pane `q` is a letter.
+    // Either one asks, and a second press of either within `QUIT_WINDOW`
+    // leaves: one stray key used to close a window a developer was in the
+    // middle of using. A developer who has just typed half a prompt still
+    // expects Ctrl-C to work, and leaving interrupts nothing, because the turn
+    // is not this process's child.
+    let quit =
+        if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
+            Some(QuitKey::CtrlC)
+        } else if app.focus == Focus::List && event.code == KeyCode::Char('q') {
+            Some(QuitKey::Q)
+        } else {
+            None
+        };
+    app.expire_quit(now);
+    if let Some(which) = quit {
+        if app.armed.is_some() {
+            return Action::Quit;
+        }
+        app.armed = Some(Armed {
+            key: which,
+            at: now,
+        });
+        return Action::Nothing;
+    }
+    // Any other key is the developer getting on with something, so the next
+    // quit key starts over rather than confirming a question they moved past.
+    app.armed = None;
 
     match app.focus {
         Focus::List => list_key(app, event.code),
@@ -180,7 +210,6 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
 /// The rail. Up and down move between sessions and offers, and only here.
 fn list_key(app: &mut App, code: KeyCode) -> Action {
     match code {
-        KeyCode::Char('q') => Action::Quit,
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
             app.select_next();
             Action::Nothing
@@ -796,6 +825,7 @@ mod tests {
         // The bug this stops: `q` typed into a prompt quitting the program, and
         // taking the half-written message with it.
         let mut app = with_one_session();
+        assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Nothing);
         assert_eq!(key(&mut app, press(KeyCode::Char('q'))), Action::Quit);
 
         let mut app = with_one_session();
@@ -911,6 +941,7 @@ mod tests {
             let mut app = with_one_session();
             app.focus = focus;
             let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert_eq!(key(&mut app, event), Action::Nothing, "{focus:?}");
             assert_eq!(key(&mut app, event), Action::Quit, "{focus:?}");
         }
     }
@@ -1029,7 +1060,96 @@ mod tests {
     fn ctrl_c_still_leaves_from_the_compose_line() {
         let mut app = with_one_session();
         key(&mut app, press(KeyCode::Enter));
+        type_into(&mut app, "half");
+        assert_eq!(key(&mut app, hold(KeyCode::Char('c'))), Action::Nothing);
         assert_eq!(key(&mut app, hold(KeyCode::Char('c'))), Action::Quit);
+        // Asking did not type a `c`.
+        assert_eq!(app.compose.text(), "half");
+    }
+
+    /// One `q` or Ctrl-C asks; a second within five seconds leaves. Time is
+    /// passed in, so the window is tested without waiting it out.
+    #[test]
+    fn quitting_takes_a_second_press_within_five_seconds() {
+        let start = Instant::now();
+        let later = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+
+        // Confirmed in time.
+        let mut app = with_one_session();
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), start),
+            Action::Nothing
+        );
+        assert_eq!(app.armed.map(|armed| armed.key), Some(QuitKey::Q));
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), later(4)),
+            Action::Quit
+        );
+
+        // Too late: the second press asks again rather than leaving.
+        let mut app = with_one_session();
+        key_at(&mut app, press(KeyCode::Char('q')), start);
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), later(5)),
+            Action::Nothing
+        );
+        assert_eq!(app.armed.map(|armed| armed.at), Some(later(5)));
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), later(6)),
+            Action::Quit
+        );
+
+        // The redraw tick takes the message away on time, with no key pressed.
+        let mut app = with_one_session();
+        key_at(&mut app, hold(KeyCode::Char('c')), start);
+        app.expire_quit(later(4));
+        assert!(app.armed.is_some());
+        app.expire_quit(later(5));
+        assert_eq!(app.armed, None);
+    }
+
+    /// Either quit key confirms the other, and any other key starts over.
+    #[test]
+    fn either_quit_key_confirms_and_anything_else_disarms() {
+        let now = Instant::now();
+        let mut app = with_one_session();
+        key_at(&mut app, press(KeyCode::Char('q')), now);
+        assert_eq!(
+            key_at(&mut app, hold(KeyCode::Char('c')), now),
+            Action::Quit
+        );
+
+        let mut app = with_one_session();
+        key_at(&mut app, press(KeyCode::Char('q')), now);
+        key_at(&mut app, press(KeyCode::Down), now);
+        assert_eq!(app.armed, None);
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), now),
+            Action::Nothing
+        );
+
+        // In the pane `q` is a letter, so it disarms a Ctrl-C rather than
+        // confirming it — and is typed.
+        let mut app = with_one_session();
+        key_at(&mut app, press(KeyCode::Enter), now);
+        key_at(&mut app, hold(KeyCode::Char('c')), now);
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), now),
+            Action::Nothing
+        );
+        assert_eq!(app.armed, None);
+        assert_eq!(app.compose.text(), "q");
+
+        // A release is not a keypress and changes nothing.
+        let mut app = with_one_session();
+        key_at(&mut app, press(KeyCode::Char('q')), now);
+        let mut release = press(KeyCode::Down);
+        release.kind = KeyEventKind::Release;
+        key_at(&mut app, release, now);
+        assert_eq!(
+            key_at(&mut app, press(KeyCode::Char('q')), now),
+            Action::Quit
+        );
     }
 
     /// A notice is the answer to one key, so the next key is what it stops

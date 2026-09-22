@@ -108,7 +108,8 @@ Top to bottom:
 3. A blank row.
 4. **Body**: the rail, a two-column gap, and the pane.
 5. A blank row.
-6. **Footer**: key hints for the focused area, or a notice (see "Notices").
+6. **Footer**: key hints for the focused area, or a notice (see "Notices"), followed by
+   the quit confirmation while one is pending (see "Quit").
 
 The whole frame has two columns of margin on each side. The rail is a third of the width,
 held between 22 and 40 columns. The pane gets the rest. Everything is redrawn every frame,
@@ -248,8 +249,8 @@ written in. Drafts last as long as the window is open.
 
 ## Focus and keys
 
-The keyboard talks to one of two places. `Ctrl-C` quits from either. Key releases are
-ignored.
+The keyboard talks to one of two places. `Ctrl-C` asks to quit from either, and a second
+press quits (see "Quit"). Key releases are ignored.
 
 **Rail** (footer: `↑↓ move · → open · q quit`)
 
@@ -257,7 +258,7 @@ ignored.
 |---|---|
 | `↓` `j` `Tab` / `↑` `k` `Shift-Tab` | next / previous row. Runs through sessions and then offers, and wraps around |
 | `→` `Enter` | focus the pane, with the caret at the **end** of that row's draft. Typing works immediately. Does nothing when the rail has no rows (no sessions and nothing signed in) |
-| `q` | quit |
+| `q` | ask to quit; a second `q` or `Ctrl-C` within 5 seconds quits |
 
 There is no key to add a sign-in or pick one from a list: every signed-in sign-in is
 already a row.
@@ -332,9 +333,18 @@ up within about three seconds, under their parent. The cursor stays on the row i
 - On a server reached with `riabuild remote`, the clipboard read is the laptop's.
 - `Cmd-V` / `Ctrl-Shift-V` are the terminal's own paste and never reach this handler.
 
-**Quit** (`Ctrl-C` anywhere, or `q` on the rail). The screen is cleared, the terminal
-title is restored, and the shell comes back as it was. Running turns are **not** stopped.
-Drafts are not kept.
+**Quit** (`Ctrl-C` anywhere, or `q` on the rail) takes **two presses within 5 seconds**.
+
+- The first press quits nothing. It shows `press q again to quit` or
+  `press ctrl-c again to quit`, naming the key that was pressed, in the warning colour
+  at the end of the footer, after the key hints. It does not type anything.
+- Either quit key confirms the other: `q` then `Ctrl-C` quits too.
+- Any other key cancels it, and the next quit key asks again. In the pane that includes
+  `q`, which is a letter there and is typed.
+- After 5 seconds with no second press it expires and the message disappears on its
+  own, without a keypress.
+- On quitting, the screen is cleared, the terminal title is restored, and the shell comes
+  back as it was. Running turns are **not** stopped. Drafts are not kept.
 
 **Reopen.** Every session in this checkout comes back, in the same order, with its full
 conversation replayed. Running turns show as working, and failures from earlier are still
@@ -349,7 +359,9 @@ One line in the warning colour, in place of the footer:
 - the error, if reading the clipboard failed
 
 A notice goes away on the **next keypress**, not after a set time. The window never
-closes because of one.
+closes because of one. A quit key is a keypress too, so it clears a notice before asking
+to quit; if the two were ever on screen together, the quit message would follow the
+notice rather than replace it.
 
 ## Agents never ask
 
@@ -367,9 +379,9 @@ same one every `claude` launcher uses.
   prompts, `›`, caret), ok/green (idle, tool succeeded), busy/orange (working, tool
   running, the "working" count, the activity line's spinner and `running`), danger/red
   (trouble, failed tool, failure text, a session that could not be started), warn
-  (notices), muted (headings, sign-ins, unselected titles, secondary text), strong
-  (selected title, repository, tool names, key names). Nothing uses a hard-coded colour,
-  and `NO_COLOR` turns colour off.
+  (notices, the quit confirmation), muted (headings, sign-ins, unselected titles,
+  secondary text), strong (selected title, repository, tool names, key names). Nothing
+  uses a hard-coded colour, and `NO_COLOR` turns colour off.
 - **ASCII fallback** where the terminal is not trusted with Unicode:
 
   | Unicode | ASCII |
@@ -382,5 +394,7 @@ same one every `claude` launcher uses.
   | `↳` child | `>` |
   | `◌` `✓` `✗` tool | `.` `+` `!` |
 
-- **Cutting**: titles end in `…` when cut. An email that does not fit is left out
+- **Cutting**: titles end in `…` when cut. Footer hints are dropped whole from the
+  right, and room for the quit confirmation is set aside before them; if even the
+  message alone does not fit, it is cut with `…`. An email that does not fit is left out
   entirely. `(subagent)` is left out before the title is cut to nothing.

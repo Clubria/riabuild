@@ -697,13 +697,47 @@ fn whose(app: &App) -> Option<(String, riabuild_harness::Kind, usize)> {
 /// as `← se`, a key hint that is not a key and not a word. Dropping from the
 /// right keeps the ones a developer needs most, which is why the order they are
 /// written in is the order they matter in.
+///
+/// A first `q` or `Ctrl-C` adds one more thing *after* the hints, in the warning
+/// colour: `press q again to quit`. It is the answer to the key just pressed, so
+/// its room is set aside first and the hints fit into what is left, dropped
+/// whole as ever; on a terminal too narrow even for the message alone, it is
+/// cut with `…` like a title.
 pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
-    // A notice takes the whole line while it lasts. It is the answer to the key
-    // just pressed, and the hints it stands in front of are still true — showing
-    // both would make the one thing worth reading the shorter half of the line.
-    if let Some(notice) = &app.notice {
-        return Line::from(Span::styled(notice.clone(), theme.style(Role::Warn)));
+    let width = width as usize;
+    let quit = app
+        .armed
+        .map(|armed| format!("press {} again to quit", armed.key.name()));
+    let reserved = quit
+        .as_ref()
+        .map_or(0, |message| QUIT_GAP.len() + message.chars().count());
+    // A notice takes the hints' place while it lasts. It is the answer to the
+    // key just pressed, and the hints it stands in front of are still true —
+    // showing both would make the one thing worth reading the shorter half of
+    // the line.
+    let mut spans = match &app.notice {
+        Some(notice) => vec![Span::styled(notice.clone(), theme.style(Role::Warn))],
+        None => hint_spans(app, theme, width.saturating_sub(reserved)),
+    };
+    if let Some(message) = quit {
+        let used: usize = spans.iter().map(|span| span.width()).sum();
+        let gap = if used > 0 { QUIT_GAP.len() } else { 0 };
+        let room = width.saturating_sub(used + gap);
+        if room > 0 {
+            if gap > 0 {
+                spans.push(Span::raw(QUIT_GAP));
+            }
+            spans.push(Span::styled(clip(&message, room), theme.style(Role::Warn)));
+        }
     }
+    Line::from(spans)
+}
+
+/// What stands between the last hint and the quit message.
+const QUIT_GAP: &str = "   ";
+
+/// The hints for what the keyboard is talking to, as many as fit in `width`.
+fn hint_spans(app: &App, theme: Theme, width: usize) -> Vec<Span<'static>> {
     let keys: &[(&str, &str)] = match app.focus {
         Focus::List => &[("↑↓", "move"), ("→", "open"), ("q", "quit")],
         // No letters advertised: every one of them is a character in the box.
@@ -727,7 +761,7 @@ pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
     for (index, (key, what)) in keys.iter().enumerate() {
         let separator = if index > 0 { 3 } else { 0 };
         let wants = separator + key.chars().count() + 1 + what.chars().count();
-        if used + wants > width as usize {
+        if used + wants > width {
             break;
         }
         used += wants;
@@ -737,7 +771,7 @@ pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
         spans.push(Span::styled((*key).to_string(), theme.style(Role::Strong)));
         spans.push(Span::styled(format!(" {what}"), theme.style(Role::Muted)));
     }
-    Line::from(spans)
+    spans
 }
 
 /// The mark the box opens with, and the width it costs every row.
@@ -859,7 +893,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::account::tests::first_of_each;
     use crate::account::{Account, SignedIn};
-    use crate::app::Pane as TestPane;
+    use crate::app::{Armed, Pane as TestPane, QuitKey};
     use riabuild_harness::{Kind, testing};
     use riabuild_theme::Depth;
 
@@ -961,6 +995,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// A first quit key is answered after the hints, in the warning colour,
+    /// naming the key that was pressed. The hints make room for it, never the
+    /// other way round.
+    #[test]
+    fn a_first_quit_key_is_answered_after_the_hints() {
+        let theme = Theme::with_depth(Depth::Ansi16);
+        let mut app = App::new();
+        app.focus = Focus::List;
+        app.armed = Some(Armed {
+            key: QuitKey::Q,
+            at: std::time::Instant::now(),
+        });
+        let line = footer_line(&app, theme, 120);
+        let text = text_of(&line);
+        assert!(text.starts_with("↑↓ move"), "{text}");
+        assert!(text.ends_with("q quit   press q again to quit"), "{text}");
+        let last = line.spans.last().expect("a message");
+        assert_eq!(last.style, theme.style(Role::Warn));
+
+        app.armed = Some(Armed {
+            key: QuitKey::CtrlC,
+            at: std::time::Instant::now(),
+        });
+        // Narrow: hints are dropped whole to keep the message.
+        let narrow = text_of(&footer_line(&app, theme, 40));
+        assert!(narrow.chars().count() <= 40, "{narrow:?}");
+        assert!(narrow.ends_with("press ctrl-c again to quit"), "{narrow:?}");
+        assert!(narrow.starts_with("↑↓ move"), "{narrow:?}");
+        // Too narrow for the message alone: cut like a title.
+        let tiny = text_of(&footer_line(&app, theme, 12));
+        assert_eq!(tiny, "press ctrl-…");
+
+        // Beside a notice, it follows the notice.
+        app.notice = Some("Nothing on the clipboard to paste.".into());
+        let noticed = text_of(&footer_line(&app, theme, 120));
+        assert_eq!(
+            noticed,
+            "Nothing on the clipboard to paste.   press ctrl-c again to quit"
+        );
+    }
+
     #[test]
     fn every_colour_on_screen_comes_from_the_palette() {
         // The rule the rest of riabuild follows, and the one ratatui makes easy
@@ -1004,6 +1079,11 @@ pub(crate) mod tests {
         // over one frame never reaches.
         let mut noticed = App::new();
         noticed.notice = Some("Nothing on the clipboard to paste.".into());
+        lines.push(footer_line(&noticed, sixteen, 120));
+        noticed.armed = Some(Armed {
+            key: QuitKey::Q,
+            at: std::time::Instant::now(),
+        });
         lines.push(footer_line(&noticed, sixteen, 120));
         lines.extend(compose_lines(&app, sixteen, true, 40));
         lines.extend(splash_lines(
