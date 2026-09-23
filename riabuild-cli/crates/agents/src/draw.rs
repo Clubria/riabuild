@@ -650,6 +650,26 @@ pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
 const COMPOSE_MARK: &str = "› ";
 pub const COMPOSE_INDENT: usize = 2;
 
+/// How many columns of a box `width` wide the text may wrap into, once the
+/// caret's own cell is set aside.
+///
+/// The caret is drawn as an extra cell beside the character it sits before or
+/// after, never by styling a cell already spoken for — see [`compose_lines`].
+/// A row wrapped all the way to the edge of the box would then need one column
+/// more than the box has the moment the caret landed on it, which is exactly
+/// the column with nowhere to go: ratatui does not wrap a `Line` that runs past
+/// its `Rect`, it stops drawing at the edge, so that one cell — the caret,
+/// mid-prompt, on whatever keystroke first filled the row — silently never
+/// appeared. Reserving it here, in the same width both [`compose_lines`] and
+/// `frame::render_compose` wrap by, is what keeps every row inside the box
+/// regardless of where the caret is on it.
+pub fn compose_wrap_width(width: u16) -> usize {
+    (width as usize)
+        .saturating_sub(COMPOSE_INDENT)
+        .saturating_sub(1)
+        .max(1)
+}
+
 /// The prompt box, which lives inside the pane and never across the window.
 ///
 /// Many lines rather than one. A prompt is prose and prose is longer than a
@@ -658,7 +678,7 @@ pub const COMPOSE_INDENT: usize = 2;
 /// could not see. `Compose::wrap` decides where the breaks fall, because the
 /// caret has to land on the same row its character does and only the editor
 /// knows both.
-pub fn compose_lines(app: &App, theme: Theme, width: u16) -> Vec<Line<'static>> {
+pub fn compose_lines(app: &App, theme: Theme, unicode: bool, width: u16) -> Vec<Line<'static>> {
     let room = (width as usize).saturating_sub(COMPOSE_INDENT);
     if app.focus != Focus::Session {
         let (text, role) = if app.compose.is_empty() {
@@ -674,8 +694,14 @@ pub fn compose_lines(app: &App, theme: Theme, width: u16) -> Vec<Line<'static>> 
         ])];
     }
 
-    let wrapped = app.compose.wrap(room);
+    let wrapped = app.compose.wrap(compose_wrap_width(width));
     let (caret_row, caret_column) = wrapped.caret;
+    // ASCII where the terminal cannot be trusted with the block glyph, the
+    // same fallback every other mark in this file offers — see `cursor_mark`.
+    // A caret with no fallback is the one glyph in the box that is always on
+    // screen while a developer is typing, so a terminal that renders it as
+    // nothing at all reads as a blank cell beside every character they type.
+    let caret_glyph = if unicode { "▏" } else { "|" };
     wrapped
         .rows
         .iter()
@@ -706,7 +732,7 @@ pub fn compose_lines(app: &App, theme: Theme, width: u16) -> Vec<Line<'static>> 
                 // A block rather than the terminal's own cursor, which would
                 // have to be positioned and would blink wherever the last cell
                 // was written.
-                Span::styled("▏", theme.style(Role::Brand)),
+                Span::styled(caret_glyph, theme.style(Role::Brand)),
                 Span::raw(after.to_string()),
             ])
         })
@@ -881,7 +907,7 @@ pub(crate) mod tests {
         let mut noticed = App::new(Accounts::default());
         noticed.notice = Some("Nothing on the clipboard to paste.".into());
         lines.push(footer_line(&noticed, sixteen, 120));
-        lines.extend(compose_lines(&app, sixteen, 40));
+        lines.extend(compose_lines(&app, sixteen, true, 40));
         lines.extend(picker_lines(&app, sixteen, true));
         lines.extend(splash_lines(
             &Account::new(Kind::Claude, 1, None),
@@ -1297,13 +1323,44 @@ pub(crate) mod tests {
         for ch in "hello".chars() {
             app.compose.insert(ch);
         }
-        assert!(text_of(&compose_lines(&app, Theme::plain(), 40)[0]).contains("hello"));
+        assert!(text_of(&compose_lines(&app, Theme::plain(), true, 40)[0]).contains("hello"));
         app.focus = Focus::List;
-        let from_rail = text_of(&compose_lines(&app, Theme::plain(), 40)[0]);
+        let from_rail = text_of(&compose_lines(&app, Theme::plain(), true, 40)[0]);
         assert!(from_rail.contains("hello"), "{from_rail}");
         // and an empty box says how to reach it rather than nothing at all
         app.compose.take();
-        assert!(text_of(&compose_lines(&app, Theme::plain(), 40)[0]).contains("press →"));
+        assert!(text_of(&compose_lines(&app, Theme::plain(), true, 40)[0]).contains("press →"));
+    }
+
+    #[test]
+    fn the_caret_never_pushes_a_row_past_the_box_it_is_drawn_in() {
+        // The caret is an extra cell rather than a styled one, so a row
+        // wrapped right up to the box's own edge used to need one column more
+        // than the box had the instant the caret landed on it — and ratatui
+        // does not wrap a `Line` that runs past its `Rect`, it stops drawing,
+        // so that column silently never appeared. That read as a cursor that
+        // vanished on some keystrokes and a phantom blank cell on others.
+        let mut app = App::new(every_account());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
+        app.focus = Focus::Session;
+        let width = 12u16;
+        // Filled to exactly the width the box wraps at, with the caret at the
+        // very end of it — the one position that used to overflow.
+        for _ in 0..compose_wrap_width(width) {
+            app.compose.insert('a');
+        }
+        for line in compose_lines(&app, Theme::plain(), true, width) {
+            let total: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            assert!(
+                total <= width as usize,
+                "{total} > {width}: {:?}",
+                text_of(&line)
+            );
+        }
     }
 
     #[test]

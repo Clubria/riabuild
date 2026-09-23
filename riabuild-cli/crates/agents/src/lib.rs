@@ -171,6 +171,12 @@ pub enum Action {
     /// keypress to an intention — the same reason sending a prompt is
     /// [`Action::Send`] rather than a turn started from inside the keymap.
     Paste,
+    /// Esc, on a session that is still working: ask its turn to stop rather
+    /// than leave the pane for the rail. Asked for here and performed in
+    /// [`drive`], because a turn is a process this window has no handle to —
+    /// the only way to reach it is a file, and writing one is IO the keymap
+    /// does not do.
+    Interrupt,
 }
 
 /// The keymap.
@@ -262,6 +268,13 @@ fn session_key(app: &mut App, event: KeyEvent) -> Action {
         };
     }
     match event.code {
+        // Stop, not leave, while a turn is running — asked by the lock
+        // (`Pane::running`) rather than by `Pane::state`, because
+        // `usage_limited` overrides the *displayed* state to `Trouble` while
+        // Codex is still retrying through an exhausted subscription, and the
+        // turn is exactly as reachable then as it is on an ordinary busy
+        // session. Once nothing is running, Esc goes back to leaving the box.
+        KeyCode::Esc if app.selected().is_some_and(|pane| pane.running) => Action::Interrupt,
         KeyCode::Esc => {
             app.focus = Focus::List;
             Action::Nothing
@@ -1047,6 +1060,22 @@ mod tests {
             key(&mut app, press(KeyCode::Enter)),
             Action::Send("and another thing".into())
         );
+    }
+
+    #[test]
+    fn escape_interrupts_a_running_session_instead_of_leaving_it() {
+        let mut app = with_one_session();
+        app.set_running("s1", true);
+        key(&mut app, press(KeyCode::Enter));
+        assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Interrupt);
+        // And the developer is still looking at the box — an interrupt is
+        // not a navigation, and there is nothing here to leave for.
+        assert_eq!(app.focus, Focus::Session);
+
+        // Once nothing is running any more, Esc goes back to its other job.
+        app.set_running("s1", false);
+        assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
+        assert_eq!(app.focus, Focus::List);
     }
 
     #[test]

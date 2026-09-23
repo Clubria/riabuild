@@ -9,6 +9,7 @@
 //! | `events.ndjson` | every turn's stdout, appended in order, exactly as the harness wrote it |
 //! | `turn.lock` | held by the running turn, and by nothing else |
 //! | `pending/*.txt` | prompts waiting for a turn to pick them up |
+//! | `cancel` | present while a developer's Esc is waiting for the running turn to notice it |
 //! | `errors.log` | what riabuild itself could not do, which the spool cannot hold |
 //!
 //! # Why the spool is the harness's own bytes
@@ -259,6 +260,21 @@ impl Store {
         self.session_dir(id).join("pending")
     }
 
+    /// Where a developer's request to stop this session's running turn is
+    /// left.
+    ///
+    /// A marker file rather than a signal, because the turn is `riabuild
+    /// internal agent-turn`, started detached specifically so that this
+    /// window never holds a handle to kill by any other means — see the
+    /// crate's own doc comment on why a turn outlives the window that started
+    /// it. `turn::one_turn`'s read loop is the side that notices this: it
+    /// already has something else to poll for whenever a harness has nothing
+    /// new to say, which is exactly the state a hung or an endlessly-retrying
+    /// harness leaves it in.
+    pub fn cancel_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("cancel")
+    }
+
     /// Every session for one checkout, newest first.
     ///
     /// Scoped by `cwd` because a developer opening the window in a repository
@@ -421,6 +437,40 @@ impl Store {
             Ok(None) => true,
             Err(_) => true,
         }
+    }
+
+    /// Leaves a marker asking this session's running turn to stop.
+    ///
+    /// Fire-and-forget from the window's side: there is nothing to wait for,
+    /// because the only process that could answer is the one being asked to
+    /// stop. [`Store::running`] — the lock — is what tells the window the
+    /// turn is actually gone.
+    pub async fn request_cancel(&self, id: &str) -> Result<()> {
+        tokio::fs::write(self.cancel_path(id), b"").await?;
+        Ok(())
+    }
+
+    /// Whether a cancellation is waiting, without clearing it.
+    ///
+    /// Left in place rather than consumed here, because a turn's read loop
+    /// asks this on every poll until it acts on it — consuming it on the
+    /// first ask would mean only the very next poll after the marker landed
+    /// could ever see it.
+    pub async fn cancel_requested(&self, id: &str) -> bool {
+        tokio::fs::try_exists(self.cancel_path(id))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Clears a pending cancellation.
+    ///
+    /// Called once a turn has acted on one, and unconditionally again when
+    /// the turn ends however it ends: a marker means "stop *this* turn", and
+    /// one left behind by an Esc that lost the race with a turn already
+    /// finishing on its own would otherwise outlive it and reach into the
+    /// next turn this session runs.
+    pub async fn clear_cancel(&self, id: &str) {
+        let _ = tokio::fs::remove_file(self.cancel_path(id)).await;
     }
 
     /// Starts a turn, detached, and returns once it has been started.
@@ -839,6 +889,27 @@ mod tests {
         // Released by the kernel, which is what makes a reboot answer correctly
         // without anything having to clean up after it.
         assert!(!store.running(&record.id).await);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_marker_is_written_seen_and_cleared() {
+        let (_dir, store) = store();
+        let record = store
+            .create(&Account::new(Kind::Claude, 1, None), Path::new("/work"))
+            .await
+            .unwrap();
+        assert!(!store.cancel_requested(&record.id).await);
+
+        store.request_cancel(&record.id).await.unwrap();
+        assert!(store.cancel_requested(&record.id).await);
+        // Left in place by asking alone, which is what lets a turn poll
+        // repeatedly until it is ready to act on it.
+        assert!(store.cancel_requested(&record.id).await);
+
+        store.clear_cancel(&record.id).await;
+        assert!(!store.cancel_requested(&record.id).await);
+        // Idempotent: nothing to clear is not an error.
+        store.clear_cancel(&record.id).await;
     }
 
     #[tokio::test]

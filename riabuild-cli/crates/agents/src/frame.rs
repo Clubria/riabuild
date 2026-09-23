@@ -181,7 +181,7 @@ fn render_pane(frame: &mut Frame, app: &App, chrome: Chrome<'_>, gutter: Rect, a
         None => render_splash(frame, app, theme, middle),
     }
 
-    render_compose(frame, app, theme, inset(rows[5]));
+    render_compose(frame, app, theme, chrome.unicode, inset(rows[5]));
 }
 
 /// The tallest the prompt box may grow before it starts scrolling itself.
@@ -195,11 +195,11 @@ const BOX_LINES: u16 = 8;
 /// Scrolled from the bottom rather than the top: the caret is where the typing
 /// is happening, so a prompt taller than the box shows its end, and moving the
 /// caret back up brings the earlier rows with it.
-fn render_compose(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let lines = draw::compose_lines(app, theme, area.width);
+fn render_compose(frame: &mut Frame, app: &App, theme: Theme, unicode: bool, area: Rect) {
+    let lines = draw::compose_lines(app, theme, unicode, area.width);
     let caret = app
         .compose
-        .wrap((area.width as usize).saturating_sub(draw::COMPOSE_INDENT))
+        .wrap(draw::compose_wrap_width(area.width))
         .caret
         .0 as u16;
     let offset = (caret + 1).saturating_sub(area.height);
