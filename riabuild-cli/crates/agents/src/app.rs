@@ -22,6 +22,8 @@
 //! "3 sessions" on its first frame, and it cost more than a wrong number: three
 //! directories were created on disk before a developer had typed anything.
 
+use std::collections::HashMap;
+
 use riabuild_harness::{Event, Kind};
 
 use crate::account::{Account, Accounts};
@@ -261,8 +263,12 @@ pub struct Pane {
     /// that is thinking, not one nobody can hear from until a person notices
     /// the plan is empty.
     pub usage_limited: bool,
+    /// Every token the finished turns read and wrote — see [`Pane::tokens`].
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// What the turn in progress has reported so far.
+    turn_input: u64,
+    turn_output: u64,
     pub entries: Vec<Entry>,
     /// Entries produced by a subagent rather than by this session, by index.
     /// Kept beside `entries` rather than inside `Entry` so that every variant
@@ -297,11 +303,37 @@ impl Pane {
             usage_limited: false,
             input_tokens: 0,
             output_tokens: 0,
+            turn_input: 0,
+            turn_output: 0,
             entries: Vec::new(),
             delegated: Vec::new(),
             offset: 0,
             trouble_offset: 0,
         }
+    }
+
+    /// Tokens in and out over the whole session, the turn in progress
+    /// included.
+    ///
+    /// A total, and it has to be assembled: every harness reports usage
+    /// *cumulative for the turn*, so within a turn the larger figure wins and
+    /// across turns they add. Each turn re-reads the conversation, and that
+    /// re-read is tokens the session really did spend.
+    pub fn tokens(&self) -> (u64, u64) {
+        (
+            self.input_tokens + self.turn_input,
+            self.output_tokens + self.turn_output,
+        )
+    }
+
+    /// Folds the turn just finished into the session's total.
+    ///
+    /// Called on both edges of a turn — its `Ready` and its `Idle` — because a
+    /// turn that was killed says nothing at its end, and folding twice is
+    /// harmless: the second fold adds zero.
+    fn close_turn(&mut self) {
+        self.input_tokens += std::mem::take(&mut self.turn_input);
+        self.output_tokens += std::mem::take(&mut self.turn_output);
     }
 
     pub fn state(&self) -> State {
@@ -358,6 +390,9 @@ impl Pane {
     fn apply(&mut self, event: &Event, delegated: bool) {
         match event {
             Event::Ready { thread, model } => {
+                if !delegated {
+                    self.close_turn();
+                }
                 if thread.is_some() {
                     self.thread = thread.clone();
                 }
@@ -398,16 +433,15 @@ impl Pane {
                     ),
                 }
             }
+            // A subagent's count belongs to the subagent's own session.
+            Event::Usage { .. } if delegated => {}
             Event::Usage { input, output } => {
                 // Cumulative for the turn, so the larger figure wins rather than
                 // being added: two `Usage` events in one turn are two reports of
-                // the same tokens, and summing them doubles the count.
-                //
-                // Across turns it is a floor rather than a total, which is the
-                // honest thing a per-turn harness can report: each turn starts
-                // its own count, and adding them would double every cached read.
-                self.input_tokens = self.input_tokens.max(*input);
-                self.output_tokens = self.output_tokens.max(*output);
+                // the same tokens, and summing them doubles the count. Across
+                // turns they add — see `close_turn`.
+                self.turn_input = self.turn_input.max(*input);
+                self.turn_output = self.turn_output.max(*output);
             }
             Event::Trouble(text) => {
                 // Said on purpose, not gone wrong — see `reads_as_interrupted`.
@@ -447,7 +481,12 @@ impl Pane {
             // The turn saying it is done. Not what decides whether this pane is
             // busy — the lock does, because a turn can also end by being killed,
             // and nothing is emitted then.
-            Event::Idle => {}
+            // It does close the turn's token count.
+            Event::Idle => {
+                if !delegated {
+                    self.close_turn();
+                }
+            }
             // Unwrapped by `App::observe` before it gets here.
             Event::Delegated { .. } => {}
         }
@@ -466,6 +505,17 @@ pub enum Row {
     /// A sign-in a new session could be started under, by index into
     /// [`App::offers`].
     Offer(usize),
+}
+
+/// Which rail row a half-written prompt belongs to.
+///
+/// By identity rather than by [`Row`], because a row's index moves whenever a
+/// session is created or a subagent arrives, and a draft keyed on an index
+/// would turn up under whichever row slid into that position.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Draft {
+    Session(String),
+    Offer(Kind, usize),
 }
 
 /// Which part of the screen the keyboard is talking to.
@@ -515,7 +565,17 @@ pub struct App {
     /// Which row the chooser is on, while it is open.
     pub picking: usize,
     pub focus: Focus,
+    /// The box of the row under the cursor.
+    ///
+    /// Every other row's box is in [`App::drafts`], and moving the cursor swaps
+    /// the two — so a prompt half-written to one session stays with it, and is
+    /// never sent to whatever the cursor moved on to.
     pub compose: Compose,
+    /// The half-written prompts of every row the cursor is *not* on.
+    drafts: HashMap<Draft, Compose>,
+    /// Why a new session could not be started under a sign-in, shown in the
+    /// middle of that offer's pane until a session there starts.
+    failures: Vec<(Kind, usize, String)>,
     pub quit: bool,
     /// How far the transcript is scrolled from the bottom, in lines. Zero
     /// follows the newest output.
@@ -565,6 +625,8 @@ impl App {
             // resting state.
             focus: Focus::List,
             compose: Compose::default(),
+            drafts: HashMap::new(),
+            failures: Vec::new(),
             quit: false,
             scrollback: 0,
             tick: 0,
@@ -610,12 +672,116 @@ impl App {
     ///
     /// Called once the store has made the directory, which is what the first
     /// prompt does — nothing here writes anything.
+    ///
+    /// The new session goes at the **top**, which is where it will be every
+    /// time the window is opened after this: the rail is newest-created first,
+    /// and a session that sat at the bottom until the next reopen and then
+    /// jumped to the top was a list whose order depended on something nobody
+    /// could see.
     pub fn begin(&mut self, id: String, account: &Account) {
+        self.stash();
         let mut pane = Pane::new(id, account.kind, String::new());
         pane.account = account.number;
-        self.panes.push(pane);
-        self.cursor = self.panes.len() - 1;
+        self.panes.insert(0, pane);
+        self.failures
+            .retain(|(kind, number, _)| (*kind, *number) != (account.kind, account.number));
+        self.cursor = 0;
+        self.load();
+    }
+
+    /// Takes back a session whose first turn could not be started, and says
+    /// why in the middle of the offer it came from.
+    ///
+    /// A session nothing ran in is not a conversation — leaving it on the rail
+    /// would be an empty row saying a session exists — so it goes, the cursor
+    /// goes back to the offer, and the prompt goes back in that offer's box so
+    /// Enter tries again with nothing retyped.
+    pub fn abandon(&mut self, id: &str, account: &Account, why: String, text: &str) {
+        self.drafts.remove(&Draft::Session(id.to_string()));
+        if let Some(at) = self.panes.iter().position(|pane| pane.id == id) {
+            self.panes.remove(at);
+        }
+        self.failed(account, why, text);
+    }
+
+    /// Records that a new session could not be started under `account`, and
+    /// puts the cursor back on its offer with the prompt still in the box.
+    pub fn failed(&mut self, account: &Account, why: String, text: &str) {
+        self.failures
+            .retain(|(kind, number, _)| (*kind, *number) != (account.kind, account.number));
+        self.failures.push((account.kind, account.number, why));
+        if let Some(at) = self
+            .offers
+            .iter()
+            .position(|held| held.kind == account.kind && held.number == account.number)
+        {
+            // Not `move_to`: the box the cursor is leaving is the one that was
+            // just emptied by sending, and it is being given the text back.
+            self.cursor = self.panes.len() + at;
+            self.compose = Compose::holding(text);
+            self.scrollback = 0;
+        }
+    }
+
+    /// Why the last attempt to start a session under this sign-in failed, if
+    /// it did.
+    pub fn failure_of(&self, kind: Kind, number: usize) -> Option<&str> {
+        self.failures
+            .iter()
+            .find(|(held, at, _)| *held == kind && *at == number)
+            .map(|(_, _, why)| why.as_str())
+    }
+
+    /// Which draft the row under the cursor owns.
+    fn draft_key(&self) -> Option<Draft> {
+        match self.row()? {
+            Row::Session(index) => self
+                .panes
+                .get(index)
+                .map(|pane| Draft::Session(pane.id.clone())),
+            Row::Offer(index) => self
+                .offers
+                .get(index)
+                .map(|account| Draft::Offer(account.kind, account.number)),
+        }
+    }
+
+    /// Puts the box away under the row the cursor is on.
+    fn stash(&mut self) {
+        let compose = std::mem::take(&mut self.compose);
+        if let Some(key) = self.draft_key()
+            && !compose.text().is_empty()
+        {
+            self.drafts.insert(key, compose);
+        }
+    }
+
+    /// Takes out the box of the row the cursor is now on, caret at the end.
+    fn load(&mut self) {
+        self.compose = self
+            .draft_key()
+            .and_then(|key| self.drafts.remove(&key))
+            .unwrap_or_default();
+        self.compose.end();
         self.scrollback = 0;
+    }
+
+    /// Moves the cursor to a rail row, taking each row's draft with it.
+    ///
+    /// The one way the cursor changes rows. It used to be a bare assignment, and
+    /// the box stayed where it was while the row changed under it — so `Tab`
+    /// from inside a pane quietly retargeted a half-written prompt at another
+    /// session, or at an offer that would start a new one.
+    pub fn move_to(&mut self, cursor: usize) {
+        self.stash();
+        self.cursor = cursor;
+        self.load();
+    }
+
+    /// Goes into the pane under the cursor, caret at the end of its draft.
+    pub fn enter(&mut self) {
+        self.focus = Focus::Session;
+        self.compose.end();
     }
 
     /// Puts a sign-in on the rail and moves the cursor to it.
@@ -631,8 +797,7 @@ impl App {
                 self.offers.push(account);
                 self.offers.len() - 1
             });
-        self.cursor = self.panes.len() + at;
-        self.scrollback = 0;
+        self.move_to(self.panes.len() + at);
     }
 
     /// Records what riabuild has learned about a sign-in.
@@ -770,23 +935,13 @@ impl App {
 
     pub fn select_next(&mut self) {
         if self.rows() > 0 {
-            self.cursor = (self.cursor + 1) % self.rows();
-            self.scrollback = 0;
+            self.move_to((self.cursor + 1) % self.rows());
         }
     }
 
     pub fn select_previous(&mut self) {
         if self.rows() > 0 {
-            self.cursor = self.cursor.checked_sub(1).unwrap_or(self.rows() - 1);
-            self.scrollback = 0;
-        }
-    }
-
-    /// Moves the cursor to the offer for a harness, for the digit keys.
-    pub fn jump_to_offer(&mut self, kind: Kind) {
-        if let Some(at) = self.offers.iter().position(|offer| offer.kind == kind) {
-            self.cursor = self.panes.len() + at;
-            self.scrollback = 0;
+            self.move_to(self.cursor.checked_sub(1).unwrap_or(self.rows() - 1));
         }
     }
 
@@ -1179,8 +1334,46 @@ mod tests {
                 output: 9,
             },
         );
-        let pane = app.selected().unwrap();
-        assert_eq!((pane.input_tokens, pane.output_tokens), (180, 9));
+        assert_eq!(app.selected().unwrap().tokens(), (180, 9));
+    }
+
+    #[test]
+    fn two_turns_are_added_together() {
+        // The figure on the status line is the session's total. It used to be
+        // the largest single turn, which is a floor shown as though it were a
+        // sum.
+        let mut app = App::new(Accounts::default());
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        for (input, output) in [(100, 5), (250, 20)] {
+            app.observe(
+                "s1",
+                &Event::Ready {
+                    thread: None,
+                    model: None,
+                },
+            );
+            app.observe("s1", &Event::Usage { input, output });
+            app.observe("s1", &Event::Idle);
+        }
+        assert_eq!(app.selected().unwrap().tokens(), (350, 25));
+
+        // A turn killed before it said it was done is still counted, once:
+        // the next turn's `Ready` closes it.
+        app.observe(
+            "s1",
+            &Event::Usage {
+                input: 7,
+                output: 1,
+            },
+        );
+        app.observe(
+            "s1",
+            &Event::Ready {
+                thread: None,
+                model: None,
+            },
+        );
+        assert_eq!(app.selected().unwrap().tokens(), (357, 26));
     }
 
     #[test]
@@ -1224,6 +1417,47 @@ mod tests {
         assert_eq!(app.rows(), 4);
         app.sent("do the thing");
         assert_eq!(app.selected().unwrap().state(), State::Busy);
+    }
+
+    #[test]
+    fn a_new_session_goes_at_the_top_where_it_will_stay() {
+        // Newest created first, which is the order a reopened window lists them
+        // in — so a session does not sit at the bottom until the next reopen
+        // and then jump.
+        let mut app = App::new(Accounts::default());
+        app.add(Pane::new("older".into(), Kind::Claude, "older".into()));
+        let account = Account::new(Kind::Codex, 1, None);
+        app.begin("newer".into(), &account);
+        assert_eq!(app.panes[0].id, "newer");
+        assert_eq!(app.row(), Some(Row::Session(0)));
+    }
+
+    #[test]
+    fn a_session_that_could_not_start_gives_back_the_prompt_and_says_why() {
+        let mut app = App::new(Accounts::default());
+        let account = app.offered().cloned().unwrap();
+        app.begin("s1".into(), &account);
+        app.sent("do the thing");
+        app.abandon(
+            "s1",
+            &account,
+            "could not start the session:\nno such file".into(),
+            "do the thing",
+        );
+        // No empty session left behind, the cursor back on the offer, and the
+        // prompt in its box with the caret at the end, ready to send again.
+        assert!(app.panes.is_empty());
+        assert_eq!(app.row(), Some(Row::Offer(0)));
+        assert_eq!(app.compose.text(), "do the thing");
+        assert_eq!(app.compose.caret(), "do the thing".len());
+        assert_eq!(
+            app.failure_of(account.kind, account.number),
+            Some("could not start the session:\nno such file")
+        );
+
+        // and a session that does start there is what clears it
+        app.begin("s2".into(), &account);
+        assert_eq!(app.failure_of(account.kind, account.number), None);
     }
 
     #[test]

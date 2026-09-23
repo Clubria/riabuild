@@ -1635,9 +1635,10 @@ prove it. `drive::send` is the one place a session is created, and the first pro
 calls it. `restore` forgets an untouched session an older riabuild left behind, so a
 machine that upgrades is cleaned up rather than carrying the old count forward.
 
-**Three offers, twenty-seven sign-ins.** The rail offers each harness's first account and
-`n` opens a chooser over every profile riabuild keeps — `claude-1` … `claude-9`, and the
-same for Codex and Grok Build, named exactly as their launchers are. Choosing one *offers*
+**Three offers, up to twenty-seven sign-ins.** The rail offers each harness's first
+account and `n` opens a chooser over every profile riabuild keeps — as many `claude-N` as
+the developer has accounts, and `codex-1` … `codex-9` and `grok-1` … `grok-9`, named
+exactly as their launchers are. Choosing one *offers*
 it rather than opening it, for the reason above. One row per account instead would be a
 list of twenty-seven nobody can read, built for a developer using two of them. Every row is
 labelled with its sign-in rather than its harness, because that is the only thing that
@@ -1701,6 +1702,34 @@ it leave for the rail (`compose.at_start()` is what that branches on). Enter sen
 *stays*, since a conversation is a sequence of prompts. `PageUp`/`PageDown` still work and
 nothing depends on them — they are `Fn` and an arrow on every laptop keyboard in the room,
 which is why the plain arrows scroll.
+
+**Every rail row has its own draft.** `App::compose` is the box of the row under the
+cursor and every other row's is in `App::drafts`, keyed by session id or by sign-in —
+never by row index, which moves whenever a session is created or a subagent arrives.
+`App::move_to` is the one way the cursor changes rows, and it swaps the two. There used to
+be one box for the whole window, and `Tab` from inside a pane changed the row under a
+half-written prompt, so Enter sent it to a session it was not written for, or to an offer
+that started a session nobody meant. Coming back into a pane puts the caret at the end of
+its draft, which is where somebody carries on typing.
+
+**The rail's order is creation, newest first, and nothing a session does moves it.**
+`Store::sessions` sorts on `created`; it sorted on `updated`, so every finished turn
+reshuffled the rail between one opening of the window and the next, and a session created
+in the window sat at the bottom until then. `App::begin` puts a new session at the top,
+which is where a reopened window will list it. `Store::prune` still drops by `updated` —
+what goes is what nobody has used longest.
+
+**A session that could not be started is said in the middle of its offer, and takes
+nothing with it.** `drive::send` used to return in silence when the directory could not be
+created, with the prompt already out of the box. Now a failure to create the session or to
+launch its first turn removes whatever was made, puts the cursor back on the offer and the
+prompt back in its draft, and `App::failure_of` replaces that offer's splash with the error
+in `Danger`, centred, every line of it, until a session starts under that sign-in.
+
+**The status line's token count is a total.** Every harness reports usage cumulative for
+the *turn*, so within a turn the largest report wins and at each turn's edge — its `Ready`
+or its `Idle`, since a killed turn says nothing at the end — it is added to the session's
+total. It used to be the largest single turn, a floor printed as though it were a sum.
 
 **And the box has the gestures every other text field has**, because a prompt is prose and
 nobody edits prose one character at a time: Ctrl-arrow jumps a word, Cmd-arrow goes to the

@@ -166,15 +166,12 @@ fn regroup(app: &mut App, records: &[store::Record]) {
         .map(|record| record.id)
         .collect();
     // A pane with no record — one created a moment ago by this window's own
-    // `begin` and not yet on disk when the listing was taken — sorts to the
-    // end rather than being dropped. `sort_by_key` is stable, so several of
-    // them keep the order they were added in.
-    app.panes.sort_by_key(|pane| {
-        order
-            .iter()
-            .position(|id| id == &pane.id)
-            .unwrap_or(usize::MAX)
-    });
+    // `begin` and not yet on disk when the listing was taken — is the newest
+    // there is, so it stays at the top where `begin` put it rather than being
+    // dropped. `None` sorts before `Some`, and `sort_by_key` is stable, so
+    // several of them keep the order they were added in.
+    app.panes
+        .sort_by_key(|pane| order.iter().position(|id| id == &pane.id));
 
     if let Some(id) = held {
         if let Some(at) = app.panes.iter().position(|pane| pane.id == id) {
@@ -202,12 +199,14 @@ pub async fn first_prompt(
     readers: &mut HashMap<String, Reader>,
     prompt: &str,
 ) {
-    let sessions = app.panes.len();
     for offer in 0..app.offers.len() {
-        app.cursor = sessions + offer;
+        // Counted afresh each time: every session this creates is another
+        // row above the offers, and a count taken once before the loop put the
+        // cursor back on the first offer from the second pass on.
+        app.move_to(app.panes.len() + offer);
         send(store, runner, request, app, readers, prompt).await;
     }
-    app.cursor = 0;
+    app.move_to(0);
 }
 
 /// Everything outside the window it can reach while it is open.
@@ -380,6 +379,9 @@ pub async fn send(
     readers: &mut HashMap<String, Reader>,
     text: &str,
 ) {
+    // Set where this prompt is what created the session, so a first turn that
+    // will not start can take the session back rather than leave an empty one.
+    let mut created = None;
     let id = match app.row() {
         Some(Row::Session(index)) => match app.panes.get(index) {
             Some(pane) => pane.id.clone(),
@@ -402,12 +404,22 @@ pub async fn send(
                 Ok(record) => {
                     readers.insert(record.id.clone(), Reader::new(account.kind));
                     app.begin(record.id.clone(), &account);
+                    created = Some(account);
                     record.id
                 }
                 // Nowhere to write this: there is no session yet, so there is no
-                // `errors.log` for it either. The offer stays on the rail and
-                // the next prompt tries again.
-                Err(_) => return,
+                // `errors.log` for it either. It used to be dropped here, with
+                // the prompt already out of the box — so Enter did nothing,
+                // said nothing, and lost what was typed. The offer's pane says
+                // why instead, and the prompt goes back in its box.
+                Err(error) => {
+                    app.failed(
+                        &account,
+                        format!("could not create the session: {error:#}"),
+                        text,
+                    );
+                    return;
+                }
             }
         }
         None => return,
@@ -438,8 +450,24 @@ pub async fn send(
         .start_turn(runner, &request.riabuild, &record, text)
         .await
     {
-        app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
-        app.set_running(&id, false);
+        match created {
+            // The session's very first turn: nothing ever ran in it, so it is
+            // not a conversation. It goes, and the offer it came from says why.
+            Some(account) => {
+                readers.remove(&id);
+                let _ = store.forget(&id).await;
+                app.abandon(
+                    &id,
+                    &account,
+                    format!("could not start the session: {error:#}"),
+                    text,
+                );
+            }
+            None => {
+                app.observe(&id, &riabuild_harness::Event::Trouble(format!("{error:#}")));
+                app.set_running(&id, false);
+            }
+        }
     }
 }
 

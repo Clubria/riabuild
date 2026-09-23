@@ -275,7 +275,7 @@ impl Store {
         self.session_dir(id).join("cancel")
     }
 
-    /// Every session for one checkout, newest first.
+    /// Every session for one checkout, newest created first.
     ///
     /// Scoped by `cwd` because a developer opening the window in a repository
     /// is asking about that repository. A record naming a directory that no
@@ -305,9 +305,13 @@ impl Store {
                 found.push(record);
             }
         }
-        // Newest first, so the session a developer was last in is the one the
-        // window opens on.
-        found.sort_by_key(|record| std::cmp::Reverse(record.updated));
+        // Newest *created* first, and never by last use. Sorting on `updated`
+        // moved a session to the top every time a turn finished in it, so the
+        // rail reshuffled itself between one opening of the window and the
+        // next, and a session created in the window sat at the bottom until
+        // then. Creation never changes, so neither does a session's place. The
+        // id breaks ties within a second, so two windows agree.
+        found.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
         Ok(found)
     }
 
@@ -519,7 +523,10 @@ impl Store {
     /// A running session is never removed however old it is: the directory it
     /// is writing into would go with it.
     pub async fn prune(&self, cwd: &Path) -> Result<()> {
-        let sessions = self.sessions(cwd).await?;
+        let mut sessions = self.sessions(cwd).await?;
+        // By last use, not by the rail's order: what goes is what nobody has
+        // asked anything for longest, however long ago it was created.
+        sessions.sort_by_key(|record| std::cmp::Reverse(record.updated));
         for record in sessions.into_iter().skip(KEEP) {
             if self.running(&record.id).await {
                 continue;
@@ -645,8 +652,9 @@ mod tests {
 
     #[test]
     fn a_subagent_is_listed_under_the_session_that_asked_for_it() {
-        // Newest first, which is the order `sessions` hands over: the child ran
-        // most recently, then an unrelated session, then its parent.
+        // Newest created first, which is the order `sessions` hands over: the
+        // child was made most recently, then an unrelated session, then its
+        // parent.
         let listing = vec![
             listed("child", Some("parent")),
             listed("other", None),
@@ -1027,6 +1035,37 @@ mod tests {
         assert_eq!(left.len(), KEEP + 1);
         assert!(left.iter().any(|record| record.id == ids[0]));
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn using_a_session_does_not_move_it_on_the_rail() {
+        // The order is creation, newest first, and nothing a session does
+        // afterwards changes it: a rail that reshuffled whenever a turn finished
+        // was a list nobody could find anything in twice.
+        let (_dir, store) = store();
+        let cwd = Path::new("/work");
+        let mut ids = Vec::new();
+        for index in 0..3u64 {
+            let mut record = store
+                .create(&Account::new(Kind::Claude, 1, None), cwd)
+                .await
+                .unwrap();
+            record.created = 1_000 + index;
+            record.updated = record.created;
+            store.write(&record).await.unwrap();
+            ids.push(record.id);
+        }
+        let order = |sessions: Vec<Record>| -> Vec<String> {
+            sessions.into_iter().map(|record| record.id).collect()
+        };
+        let before = order(store.sessions(cwd).await.unwrap());
+        assert_eq!(before, vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+
+        // The oldest session finishes a turn.
+        let mut oldest = store.read(&ids[0]).await.unwrap();
+        oldest.updated = 9_999;
+        store.write(&oldest).await.unwrap();
+        assert_eq!(order(store.sessions(cwd).await.unwrap()), before);
     }
 
     #[test]
