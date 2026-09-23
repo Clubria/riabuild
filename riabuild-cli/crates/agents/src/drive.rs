@@ -278,6 +278,7 @@ pub async fn drive(
             }
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
+                app.expire_quit(std::time::Instant::now());
                 follow(store, app, readers).await;
                 if app.tick.is_multiple_of(RESCAN_TICKS) {
                     adopt(store, request, app, readers).await;
