@@ -303,7 +303,7 @@ fn rate_limit(frame: &Value) -> Vec<Event> {
 /// something structural. The keys are Claude Code's own tool schema, and an
 /// unknown tool simply gets no detail, which is correct: a wrong summary is
 /// worse than none.
-fn summarise(input: Option<&Value>) -> Option<String> {
+pub(super) fn summarise(input: Option<&Value>) -> Option<String> {
     let input = input?;
     for key in ["command", "file_path", "pattern", "path", "url", "query"] {
         if let Some(value) = input.get(key).and_then(Value::as_str) {

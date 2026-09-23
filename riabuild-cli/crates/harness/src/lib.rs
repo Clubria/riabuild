@@ -53,9 +53,10 @@
 //! binary, in `claude::tests`. Codex's *envelope* — `thread.started`,
 //! `turn.started`, `item.completed`, `turn.failed` — is captured from the real
 //! binary too, but only its failure path: the machine this was written on had no
-//! OpenAI or xAI sign-in, so the success-path item bodies and every Grok update
-//! shape are written from documentation and are **inferred**. Each is marked at
-//! its match arm. That is why every decoder here degrades rather than fails: an
+//! OpenAI or xAI sign-in, so the success-path item bodies are written from
+//! documentation and are **inferred**, each marked at its match arm. Grok's
+//! stream is read from the user guide its 1.0.5 release installs beside itself,
+//! whose example stream is pinned in `grok::tests`. That is why every decoder here degrades rather than fails: an
 //! unknown `type` becomes nothing at all, never an error, so a schema that moves
 //! under us loses detail instead of killing a session.
 
