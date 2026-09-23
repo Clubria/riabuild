@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_line_no_decoder_understood_still_ends_launching() {
-        // Grok's documented frames and Claude's hook notices decode to nothing,
+        // Claude's hook notices, and any line a newer harness adds, decode to nothing,
         // and a turn that is writing them is not still starting.
         let mut app = crate::app::App::new();
         app.begin(
