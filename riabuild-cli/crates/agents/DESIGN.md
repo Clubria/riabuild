@@ -286,7 +286,31 @@ already a row.
 
 A footer hint that does not fit is dropped whole, from the right, rather than cut.
 
-The mouse is not captured, so the terminal's own text selection and copy work as usual.
+The mouse is **not** captured. The window reads no mouse event, so a click does nothing
+here and a drag is the terminal's own selection.
+
+## Copying
+
+Select with the mouse and copy the way the terminal always does: `Cmd-C` in iTerm2 and
+Terminal.app, `Ctrl-Shift-C` in GNOME Terminal, copy-on-select and middle-click where the
+terminal has them. Over `riabuild remote` the selection is made by the laptop's terminal,
+so it lands on the laptop's clipboard with nothing else involved. riabuild has no copy key
+and no selection of its own.
+
+The trade-off is that the terminal sees cells, not panes:
+
+- A drag across lines also picks up the **rail** beside them, since nothing in between
+  stops it. To take the pane alone, use a block selection: `Option`-drag in Terminal.app,
+  `Cmd-Option`-drag in iTerm2, `Ctrl`-drag in GNOME Terminal.
+- A line the pane **wrapped** copies as two lines, and a line may carry trailing spaces
+  from the raised background.
+- Only what is on screen can be selected. Scroll the pane with `↑` `↓` `PageUp`
+  `PageDown` to bring the rest into view.
+- Inside tmux with `mouse on`, tmux takes the drag; hold `Shift` to reach the terminal's.
+
+Capturing the mouse would fix the first two and cost the rest: every terminal's own
+selection, copy-on-select and middle-click paste would stop working, and riabuild would
+have to reimplement all of it.
 
 ## What happens when you…
 
