@@ -222,7 +222,6 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         // scoped to this checkout by the store; what was missing was the line
         // that tells a developer so.
         repo: ctx.repo().ok().map(|repo| repo.slug().to_string()),
-        accounts: every_account(ctx),
         prompt,
         theme: ctx.ui.theme(),
         // The same question `riabuild-ui` already answered for the banner, asked
@@ -230,7 +229,7 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         unicode: riabuild_ui::glyphs_render(),
     };
 
-    let logins = ask_who_is_signed_in(ctx);
+    let signed_in = find_what_is_signed_in(ctx);
     // What Ctrl-V reads. Resolved here rather than in the window, because which
     // backend this machine needs is the one platform question and
     // `riabuild-channel` is where it is answered. On a server the `xclip` it
@@ -241,107 +240,109 @@ pub async fn agents(ctx: &mut Ctx, prompt: Option<String>) -> Result<i32> {
         ctx.runner.clone(),
         ctx.paths.as_ref(),
         request,
-        logins,
+        signed_in,
         clipboard,
     )
     .await?;
     Ok(0)
 }
 
-/// Asks each Claude account who it belongs to, without holding the window up.
+/// Finds out which sign-ins are signed in, without holding the window up.
 ///
-/// `claude auth status --json` is a subprocess and costs about 450 ms, almost
-/// all of it the child's own startup — so nine of them in front of the first
-/// frame is a blank terminal for four seconds. They are started here and the
-/// answers arrive over the channel as they come; a sign-in nobody has answered
-/// for yet renders as nothing, never as "signed out".
+/// Every profile of every harness riabuild keeps — each Claude Code account,
+/// `codex-1` … `codex-9` and `grok-1` … `grok-9` — and the window offers a new
+/// session under exactly the ones found signed in. Signing one in is the
+/// developer's to do outside the window; this only looks.
 ///
-/// Claude only. Codex and Grok Build keep their credentials in their own homes
-/// with no command that reports an address, so there is nothing to ask and
-/// inventing a probe for them would be guessing on a developer's behalf.
+/// Looked at locally, starting no session and making no call of riabuild's own:
 ///
-/// `LoggedOut` is sent as well as `LoggedIn`, and [`Identity::Unknown`] is sent
-/// as neither. That is the whole of the three-state distinction the window
-/// depends on: a probe that could not answer must not become "signed out", or
-/// every account is accused of it on a machine whose `claude` will not start —
-/// and the window would then refuse to create the session that would have said
-/// why.
-fn ask_who_is_signed_in(ctx: &Ctx) -> tokio::sync::mpsc::UnboundedReceiver<agents::Login> {
-    let (into, out) = tokio::sync::mpsc::unbounded_channel();
+/// - **Claude Code** by `claude auth status --json`, which is what `riabuild
+///   claude` already asks and reports `loggedIn` and an address for whatever
+///   `CLAUDE_CONFIG_DIR` points at. It is a subprocess and costs about 450 ms,
+///   almost all of it the child's own startup, so they are all started at once.
+///   Where the credential is is Claude Code's business — a file on Linux, the
+///   keychain on macOS — which is why this asks it rather than reading a file.
+/// - **Codex** and **Grok Build** by whether `auth.json` exists in the profile's
+///   home. Both keep their credentials there and nowhere else, no keychain —
+///   see `shims::codex` and `shims::grok` — and a sign-out removes it. Neither
+///   has a status command worth starting a process for, nor an address to read.
+///
+/// A probe that could not answer — a `claude` that would not start — is not
+/// signed in. The window only ever offers what it found signed in, and a
+/// session started under a sign-in it could not vouch for would fail anyway.
+///
+/// Sent once, in the order `riabuild claude` lists accounts and the launchers
+/// are numbered, when the last one has answered. A row at a time would land
+/// out of order, since the files answer long before the subprocesses do.
+fn find_what_is_signed_in(ctx: &Ctx) -> tokio::sync::oneshot::Receiver<Vec<agents::SignedIn>> {
+    let (into, out) = tokio::sync::oneshot::channel();
     let claude = ctx.claude();
-    for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
-        let runner = ctx.runner.clone();
-        let claude = claude.clone();
-        let dir = ctx.paths.claude_profile_dir(id);
-        let into = into.clone();
-        let number = index + 1;
-        tokio::spawn(async move {
-            let signin = match accounts::status::read_at(runner, claude, dir).await {
-                accounts::status::Identity::LoggedIn(email) => agents::Signin::In(email),
-                accounts::status::Identity::LoggedOut => agents::Signin::Out,
-                accounts::status::Identity::Unknown(_) => return,
-            };
-            let _ = into.send(agents::Login {
-                kind: Kind::Claude,
-                number,
-                signin,
-            });
-        });
-    }
-    out
-}
-
-/// Every sign-in a session in the agents window may run under.
-///
-/// All of them, not the first of each. riabuild keeps nine profiles per harness
-/// and writes a launcher for every one — `claude-3`, `codex-2`, `grok-9` — so a
-/// window that could only ever reach account 1 left a developer who signed in to
-/// three of them with no way to use two. The chooser lists what is here, and
-/// what a session was opened under is recorded on it.
-///
-/// Resume is scoped to the profile that created a session — each tool keeps its
-/// transcripts inside its own home — so a session started under one and resumed
-/// under another finds nothing and quietly begins a new conversation, with
-/// nothing on screen saying so. That is why the home travels with the number
-/// rather than being looked up again later.
-///
-/// Claude's are keyed by each *account's id* rather than by position, because
-/// accounts can be deleted and renumbered and a session outlives that. Codex and
-/// Grok Build have a fixed set of nine, so the number is the directory name.
-///
-/// The order is `Kind::ALL` and then the number within it, which is the order
-/// `riabuild claude` lists them in and the order the launchers are numbered.
-fn every_account(ctx: &Ctx) -> agents::Accounts {
-    let mut all = Vec::new();
-    for (index, id) in ctx.config.claude_accounts.iter().enumerate() {
-        all.push(agents::Account::new(
-            Kind::Claude,
-            index + 1,
-            Some(ctx.paths.claude_profile_dir(id)),
-        ));
-    }
-    // A machine where riabuild has not made a Claude account yet still gets a
-    // Claude pane, under whatever home Claude Code picks for itself — which is
-    // what every session did before this window could offer a choice. Leaving
-    // the harness out instead would answer a setup problem by hiding a tool.
-    if all.is_empty() {
-        all.push(agents::Account::new(Kind::Claude, 1, None));
-    }
+    let claudes: Vec<agents::Account> = ctx
+        .config
+        .claude_accounts
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            agents::Account::new(
+                Kind::Claude,
+                index + 1,
+                Some(ctx.paths.claude_profile_dir(id)),
+            )
+        })
+        .collect();
+    let mut others = Vec::new();
     for number in 1..=shims::codex::PROFILES {
-        all.push(agents::Account::new(
+        others.push(agents::Account::new(
             Kind::Codex,
             number,
             Some(ctx.paths.codex_profile_dir(number)),
         ));
     }
     for number in 1..=shims::grok::PROFILES {
-        all.push(agents::Account::new(
+        others.push(agents::Account::new(
             Kind::Grok,
             number,
             Some(ctx.paths.grok_profile_dir(number)),
         ));
     }
-    agents::Accounts::from(all)
+    let runner = ctx.runner.clone();
+    tokio::spawn(async move {
+        // Each started on its own task, so the Claude Code children run side
+        // by side, and then collected in the order they were started.
+        let mut probes = Vec::new();
+        for account in claudes {
+            let runner = runner.clone();
+            let claude = claude.clone();
+            probes.push(tokio::spawn(async move {
+                let dir = account.home.clone()?;
+                match accounts::status::read_at(runner, claude, dir).await {
+                    accounts::status::Identity::LoggedIn(email) => {
+                        Some(agents::SignedIn::new(account, Some(email)))
+                    }
+                    _ => None,
+                }
+            }));
+        }
+        for account in others {
+            probes.push(tokio::spawn(async move {
+                let home = account.home.clone()?;
+                let signed_in = tokio::fs::try_exists(home.join("auth.json"))
+                    .await
+                    .unwrap_or(false);
+                signed_in.then(|| agents::SignedIn::new(account, None))
+            }));
+        }
+        let mut found = Vec::new();
+        for probe in probes {
+            // A probe that panicked found nothing, which is what not signed
+            // in means here.
+            if let Ok(Some(signed_in)) = probe.await {
+                found.push(signed_in);
+            }
+        }
+        let _ = into.send(found);
+    });
+    out
 }
 
 /// `riabuild remote …`

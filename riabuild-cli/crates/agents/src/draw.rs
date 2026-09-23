@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use riabuild_theme::{Role, Style, Theme};
 
 use crate::account::Account;
-use crate::app::{App, Entry, Focus, Pane, Row, State, signed_out_hint};
+use crate::app::{App, Entry, Focus, Pane, Row, State};
 
 /// What every line-builder needs and none of them should look up twice.
 ///
@@ -289,30 +289,88 @@ pub fn rail_lines(app: &App, chrome: Chrome<'_>, width: u16) -> Vec<Line<'static
         // Dropped rather than truncated where it does not fit. Half an email
         // address identifies nobody, and a rail that is narrow today is wide
         // again the moment the developer resizes the window.
-        //
-        // "signed out" is the one tail that is *not* dropped when it is tight:
-        // it is the reason typing here would do nothing, and a row that hid it
-        // to save four columns would be hiding the only thing worth reading.
-        let signed_out = app.is_signed_out(account.kind, account.number);
-        let tail = match signed_out {
-            true => Some("signed out".to_string()),
-            false => app
-                .login_of(account.kind, account.number)
-                .map(str::to_string),
-        };
-        if let Some(tail) = tail {
+        if let Some(email) = app.login_of(account.kind, account.number) {
             let room = inner.saturating_sub(2 + name.chars().count());
-            if signed_out || tail.chars().count() + 3 <= room {
+            if email.chars().count() + 3 <= room {
                 spans.push(Span::styled(" · ", theme.style(Role::Muted)));
-                spans.push(Span::styled(
-                    tail,
-                    theme.style(if signed_out { Role::Warn } else { Role::Muted }),
-                ));
+                spans.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
             }
         }
         lines.push(Line::from(spans));
     }
+    if app.offers.is_empty() {
+        if app.checking {
+            lines.push(Line::from(Span::styled(
+                "  checking sign-ins…",
+                theme.style(Role::Muted),
+            )));
+        } else {
+            // One sentence, wrapped to the rail rather than cut: it is the only
+            // thing on the rail that says why there is nothing to start, and the
+            // commands at the end of it are the part worth reading.
+            for row in wrap_words(&nothing_signed_in(), inner.saturating_sub(2).max(1)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {row}"),
+                    theme.style(Role::Muted),
+                )));
+            }
+        }
+    }
     lines
+}
+
+/// What NEW SESSION says when nothing is signed in.
+///
+/// Signing in is the developer's to do, outside this window, with each
+/// harness's own command — so the window names the commands and does nothing
+/// else. It is asked once, when the window opens, which is why the sentence
+/// ends by saying to open it again.
+pub fn nothing_signed_in() -> String {
+    let commands: Vec<String> = riabuild_harness::Kind::ALL
+        .into_iter()
+        .map(|kind| format!("`{}`", crate::account::sign_in_command(kind)))
+        .collect();
+    format!(
+        "Nothing is signed in. Sign in outside riabuild agents with {}, then open it again.",
+        commands.join(", ")
+    )
+}
+
+/// Breaks `text` into rows of at most `width` characters, at spaces.
+///
+/// A command in backticks is one word, never broken inside: split across two
+/// rows it is one nobody can copy. A word longer than the row is left whole on
+/// a row of its own, where the frame cuts it.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut quoted = false;
+    for word in text.split(' ') {
+        match words.last_mut() {
+            Some(last) if quoted => {
+                last.push(' ');
+                last.push_str(word);
+            }
+            _ => words.push(word.to_string()),
+        }
+        if word.matches('`').count() % 2 == 1 {
+            quoted = !quoted;
+        }
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in words.iter().filter(|word| !word.is_empty()) {
+        if !row.is_empty() && row.chars().count() + 1 + word.chars().count() > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(word);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 /// Which line of [`rail_lines`] the cursor is on.
@@ -426,17 +484,7 @@ pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec
 /// A sentence rather than a status, because nothing is happening yet: the only
 /// thing worth saying is what typing would start, and under whose sign-in. Only
 /// the vendor's name is accented — the rest is prose.
-///
-/// A sign-in riabuild has been *told* is signed out says so here instead, with
-/// the command that fixes it: this is the screen a developer is looking at while
-/// they type the prompt that would be refused, so it is the one place the
-/// sentence arrives before the refusal rather than after it.
-pub fn splash_lines(
-    account: &Account,
-    email: Option<&str>,
-    signed_out: bool,
-    theme: Theme,
-) -> Vec<Line<'static>> {
+pub fn splash_lines(account: &Account, email: Option<&str>, theme: Theme) -> Vec<Line<'static>> {
     let mut login = vec![
         Span::styled("login: ", theme.style(Role::Muted)),
         Span::styled(account.name(), theme.style(Role::Strong)),
@@ -445,22 +493,14 @@ pub fn splash_lines(
         login.push(Span::styled(" · ", theme.style(Role::Muted)));
         login.push(Span::styled(email.to_string(), theme.style(Role::Muted)));
     }
-    let mut lines = vec![
+    vec![
         Line::from(vec![
             Span::styled("create a ", Style::default()),
             Span::styled(account.kind.short(), theme.style(Role::Brand)),
             Span::styled(" session", Style::default()),
         ]),
         Line::from(login),
-    ];
-    if signed_out {
-        lines.push(Line::from(String::new()));
-        lines.push(Line::from(Span::styled(
-            signed_out_hint(&account.name()),
-            theme.style(Role::Warn),
-        )));
-    }
-    lines
+    ]
 }
 
 /// What an offer's pane says when the last attempt to start a session under it
@@ -472,45 +512,6 @@ pub fn splash_lines(
 pub fn failure_lines(why: &str, theme: Theme) -> Vec<Line<'static>> {
     why.lines()
         .map(|line| Line::from(Span::styled(line.to_string(), theme.style(Role::Danger))))
-        .collect()
-}
-
-/// The sign-ins a new session can be started under.
-pub fn picker_lines(app: &App, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
-    if app.accounts.is_empty() {
-        return vec![Line::from(Span::styled(
-            "no accounts yet — run riabuild",
-            theme.style(Role::Muted),
-        ))];
-    }
-    app.accounts
-        .all()
-        .iter()
-        .enumerate()
-        .map(|(index, account)| {
-            let selected = index == app.picking;
-            // Said here as well as on the rail, because this is the list a
-            // developer picks *from*: a chooser that lets somebody select a
-            // sign-in and refuses it a keypress later is asking a question it
-            // already knows the answer to.
-            let signed_out = app.is_signed_out(account.kind, account.number);
-            let tail = match (signed_out, app.login_of(account.kind, account.number)) {
-                (true, _) => "signed out".to_string(),
-                (false, Some(email)) => email.to_string(),
-                (false, None) => account.kind.label().to_string(),
-            };
-            Line::from(vec![
-                Span::styled(cursor_mark(selected, unicode), theme.style(Role::Brand)),
-                Span::styled(
-                    format!("{:<10}", account.name()),
-                    theme.style(if selected { Role::Strong } else { Role::Muted }),
-                ),
-                Span::styled(
-                    tail,
-                    theme.style(if signed_out { Role::Warn } else { Role::Muted }),
-                ),
-            ])
-        })
         .collect()
 }
 
@@ -612,12 +613,7 @@ pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
         return Line::from(Span::styled(notice.clone(), theme.style(Role::Warn)));
     }
     let keys: &[(&str, &str)] = match app.focus {
-        Focus::List => &[
-            ("↑↓", "move"),
-            ("→", "open"),
-            ("n", "sign-in"),
-            ("q", "quit"),
-        ],
+        Focus::List => &[("↑↓", "move"), ("→", "open"), ("q", "quit")],
         // No letters advertised: every one of them is a character in the box.
         Focus::Session => &[
             ("enter", "send"),
@@ -633,7 +629,6 @@ pub fn footer_line(app: &App, theme: Theme, width: u16) -> Line<'static> {
             ("↑↓", "scroll"),
             ("←", "sessions"),
         ],
-        Focus::Picker => &[("↑↓", "account"), ("enter", "choose"), ("esc", "back")],
     };
     let mut spans = Vec::new();
     let mut used = 0usize;
@@ -770,21 +765,11 @@ pub fn thousands(value: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::account::{Account, Accounts};
-    use crate::app::{Pane as TestPane, Signin};
+    use crate::account::tests::first_of_each;
+    use crate::account::{Account, SignedIn};
+    use crate::app::Pane as TestPane;
     use riabuild_harness::{Kind, testing};
     use riabuild_theme::Depth;
-
-    /// Every sign-in riabuild keeps, which is what the window is handed.
-    pub(crate) fn every_account() -> Accounts {
-        let mut all = Vec::new();
-        for kind in Kind::ALL {
-            for number in 1..=9 {
-                all.push(Account::new(kind, number, None));
-            }
-        }
-        Accounts::from(all)
-    }
 
     pub(crate) fn text_of(line: &Line<'_>) -> String {
         line.spans
@@ -802,7 +787,11 @@ pub(crate) mod tests {
     }
 
     fn played(kind: Kind, transcript: &str) -> App {
-        let mut app = App::new(every_account());
+        played_with(kind, transcript, first_of_each())
+    }
+
+    fn played_with(kind: Kind, transcript: &str, signed_in: Vec<SignedIn>) -> App {
+        let mut app = App::offering(signed_in);
         app.add(TestPane::new("s1".into(), kind, "the first prompt".into()));
         app.cursor = 0;
         for event in testing::decode(kind, transcript) {
@@ -835,7 +824,7 @@ pub(crate) mod tests {
     #[test]
     fn the_footer_offers_paste_and_gives_the_line_up_for_a_notice() {
         let theme = Theme::with_depth(Depth::Ansi16);
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.focus = Focus::Session;
         let hints: String = footer_line(&app, theme, 120)
             .spans
@@ -859,7 +848,7 @@ pub(crate) mod tests {
         // through it, which renders the last hint as `← se` — not a key and not
         // a word. The ones that matter most are written first, so what goes is
         // what is worth least.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.focus = Focus::Session;
         let theme = Theme::plain();
         let whole = text_of(&footer_line(&app, theme, 120));
@@ -885,8 +874,14 @@ pub(crate) mod tests {
         // The rule the rest of riabuild follows, and the one ratatui makes easy
         // to break: a literal `Color::Rgb` here would reach a sixteen-colour
         // terminal as an escape it cannot read.
-        let mut app = played(Kind::Claude, testing::CLAUDE);
-        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
+        let app = played_with(
+            Kind::Claude,
+            testing::CLAUDE,
+            vec![SignedIn::new(
+                Account::new(Kind::Claude, 1, None),
+                Some("ada@clubria.com".into()),
+            )],
+        );
         let sixteen = Theme::with_depth(Depth::Ansi16);
         let chrome = Chrome {
             theme: sixteen,
@@ -915,26 +910,19 @@ pub(crate) mod tests {
         // The footer has two shapes and the notice is the one that only appears
         // after a key was pressed — exactly the sort of line a palette check
         // over one frame never reaches.
-        let mut noticed = App::new(Accounts::default());
+        let mut noticed = App::new();
         noticed.notice = Some("Nothing on the clipboard to paste.".into());
         lines.push(footer_line(&noticed, sixteen, 120));
         lines.extend(compose_lines(&app, sixteen, true, 40));
-        lines.extend(picker_lines(&app, sixteen, true));
         lines.extend(splash_lines(
             &Account::new(Kind::Claude, 1, None),
             Some("ada@clubria.com"),
-            false,
             sixteen,
         ));
-        // The signed-out shape too, which only appears once a probe has come
-        // back and is exactly the sort of line a palette check over one frame
-        // never reaches.
-        lines.extend(splash_lines(
-            &Account::new(Kind::Claude, 2, None),
-            None,
-            true,
-            sixteen,
-        ));
+        // The two shapes NEW SESSION takes when it has no rows: still asking,
+        // and nothing signed in.
+        lines.extend(rail_lines(&App::new(), chrome, 30));
+        lines.extend(rail_lines(&App::offering(Vec::new()), chrome, 30));
 
         for line in &lines {
             for span in &line.spans {
@@ -978,7 +966,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_delegated_line_is_indented_under_the_session_that_asked_for_it() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(TestPane::new("s1".into(), Kind::Claude, String::new()));
         app.observe("s1", &riabuild_harness::Event::Said("mine".into()));
         app.observe(
@@ -1000,7 +988,7 @@ pub(crate) mod tests {
         // The complaint this redesign started from: a window that had been
         // asked nothing said "3 sessions", because opening a pane per harness
         // was how the three sign-ins were offered.
-        let app = App::new(every_account());
+        let app = App::offering(first_of_each());
         let counts = text_of(&counts_line(&app, Theme::plain()));
         assert!(counts.contains("0 sessions"), "{counts}");
         assert!(!counts.contains("working"), "{counts}");
@@ -1019,7 +1007,7 @@ pub(crate) mod tests {
     /// A Claude session with a Codex subagent under it, which is the shape
     /// `store::arrange` hands the window.
     fn with_a_subagent() -> App {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(TestPane::new(
             "parent".into(),
             Kind::Claude,
@@ -1070,7 +1058,7 @@ pub(crate) mod tests {
         // The whole of why a session is two lines. The rail is the only place a
         // developer tells two conversations apart, and one line of a forty-
         // column rail is eighteen characters of prompt.
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(TestPane::new(
             "s1".into(),
             Kind::Claude,
@@ -1111,7 +1099,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_title_that_fits_on_one_line_leaves_the_second_blank() {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(TestPane::new("s1".into(), Kind::Claude, "why".into()));
         app.cursor = 0;
         let rows = rows_of(&app, 40);
@@ -1127,7 +1115,7 @@ pub(crate) mod tests {
         // `rail_cursor_line` is arithmetic over the shape `rail_lines` builds,
         // and the two would drift apart in silence — a rail that scrolled to the
         // wrong line looks like a cursor that vanished. This is what pins them.
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         for index in 0..4 {
             app.add(TestPane::new(
                 format!("s{index}"),
@@ -1192,7 +1180,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_rail_separates_what_is_running_from_what_could_be_started() {
-        let app = App::new(every_account());
+        let app = App::offering(first_of_each());
         let rows: Vec<String> = rail_lines(&app, plain_chrome(), 30)
             .iter()
             .map(text_of)
@@ -1213,8 +1201,10 @@ pub(crate) mod tests {
     fn a_sign_in_carries_the_email_it_belongs_to() {
         // What a developer with nine Claude accounts actually needs: `claude-1`
         // says which login it is only to riabuild.
-        let mut app = App::new(every_account());
-        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
+        let app = App::offering(vec![SignedIn::new(
+            Account::new(Kind::Claude, 1, None),
+            Some("ada@clubria.com".into()),
+        )]);
         let wide: String = rail_lines(&app, plain_chrome(), 40)
             .iter()
             .map(text_of)
@@ -1232,19 +1222,21 @@ pub(crate) mod tests {
 
     #[test]
     fn a_session_says_which_sign_in_and_which_login_it_is_running_under() {
-        let mut app = App::new(every_account());
-        app.set_login(Kind::Claude, 2, Signin::In("ada@clubria.com".into()));
+        let mut app = App::offering(vec![SignedIn::new(
+            Account::new(Kind::Claude, 2, None),
+            Some("ada@clubria.com".into()),
+        )]);
         app.begin("s1".into(), &Account::new(Kind::Claude, 2, None));
         let status = text_of(&status_line(&app, Theme::plain(), 60));
         assert!(status.starts_with("claude-2 · ada@clubria.com"), "{status}");
     }
 
     #[test]
-    fn a_sign_in_nobody_has_asked_about_yet_claims_nothing() {
-        // The probe is a subprocess per account and answers late. An unknown
-        // login renders as nothing rather than as "signed out", which would be
-        // a claim riabuild has not established.
-        let mut app = App::new(every_account());
+    fn a_sign_in_with_no_known_address_claims_none() {
+        // Codex and Grok Build keep no address riabuild can read, and a Claude
+        // session can outlive the sign-in it was made under. Either way the
+        // status line names the sign-in and invents nothing beside it.
+        let mut app = App::offering(first_of_each());
         app.begin("s1".into(), &Account::new(Kind::Claude, 2, None));
         let status = text_of(&status_line(&app, Theme::plain(), 60));
         assert_eq!(status.trim(), "claude-2");
@@ -1255,11 +1247,10 @@ pub(crate) mod tests {
         // "waiting for the first reply…" was said over a pane that had no
         // session behind it at all, so there was nothing to wait for.
         let account = Account::new(Kind::Claude, 1, None);
-        let lines: Vec<String> =
-            splash_lines(&account, Some("ada@clubria.com"), false, Theme::plain())
-                .iter()
-                .map(text_of)
-                .collect();
+        let lines: Vec<String> = splash_lines(&account, Some("ada@clubria.com"), Theme::plain())
+            .iter()
+            .map(text_of)
+            .collect();
         assert_eq!(
             lines,
             vec![
@@ -1269,7 +1260,7 @@ pub(crate) mod tests {
         );
         // and only the vendor's name is accented — the rest is prose
         let brand = Theme::with_depth(Depth::TrueColor);
-        let first = splash_lines(&account, None, false, brand).remove(0);
+        let first = splash_lines(&account, None, brand).remove(0);
         assert_eq!(first.spans[1].content.as_ref(), "Claude");
         assert_eq!(first.spans[1].style, brand.style(Role::Brand));
         assert_eq!(first.spans[0].style, Style::default());
@@ -1310,7 +1301,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_footer_says_what_the_keyboard_is_talking_to() {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
         app.cursor = 0;
         app.focus = Focus::List;
@@ -1328,7 +1319,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_half_written_prompt_survives_a_trip_to_the_rail() {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
         app.focus = Focus::Session;
         for ch in "hello".chars() {
@@ -1351,7 +1342,7 @@ pub(crate) mod tests {
         // does not wrap a `Line` that runs past its `Rect`, it stops drawing,
         // so that column silently never appeared. That read as a cursor that
         // vanished on some keystrokes and a phantom blank cell on others.
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
         app.focus = Focus::Session;
         let width = 12u16;
@@ -1375,31 +1366,52 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_sign_in_riabuild_keeps_is_in_the_chooser() {
-        // The bug: a window that opened three panes on account 1 and gave the
-        // other twenty-four no way in at all, on a machine where a developer had
-        // deliberately signed in to each of them.
-        let app = App::new(every_account());
-        let rows: Vec<String> = picker_lines(&app, Theme::plain(), true)
+    fn new_session_lists_exactly_what_is_signed_in() {
+        // Two Claude sign-ins and one Grok, and nothing else: no Codex row,
+        // because no Codex sign-in is signed in.
+        let app = App::offering(vec![
+            SignedIn::new(Account::new(Kind::Claude, 1, None), None),
+            SignedIn::new(Account::new(Kind::Claude, 3, None), None),
+            SignedIn::new(Account::new(Kind::Grok, 2, None), None),
+        ]);
+        let offers: Vec<String> = rail_lines(&app, plain_chrome(), 30)
             .iter()
             .map(text_of)
+            .filter(|row| row.contains("+ "))
             .collect();
-        assert_eq!(rows.len(), 27);
-        for name in ["claude-1", "claude-9", "codex-1", "grok-3", "grok-9"] {
-            assert!(
-                rows.iter().any(|row| row.contains(name)),
-                "{name} {rows:#?}"
-            );
+        assert_eq!(offers.len(), 3, "{offers:#?}");
+        for (row, name) in offers.iter().zip(["claude-1", "claude-3", "grok-2"]) {
+            assert!(row.contains(name), "{row}");
         }
     }
 
     #[test]
-    fn a_machine_with_no_accounts_says_so_rather_than_offering_nothing() {
-        let app = App::new(Accounts::default());
-        let rows: String = picker_lines(&app, Theme::plain(), true)
+    fn new_session_says_it_is_still_asking_rather_than_that_nothing_is_there() {
+        let rows: Vec<String> = rail_lines(&App::new(), plain_chrome(), 30)
             .iter()
             .map(text_of)
             .collect();
-        assert!(rows.contains("no accounts"), "{rows}");
+        assert!(rows.iter().any(|row| row.contains("checking")), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("Nothing")), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_machine_with_nothing_signed_in_says_how_to_sign_in_outside_the_window() {
+        let app = App::offering(Vec::new());
+        let rows: Vec<String> = rail_lines(&app, plain_chrome(), 30)
+            .iter()
+            .map(text_of)
+            .collect();
+        assert!(!rows.iter().any(|row| row.contains("+ ")), "{rows:#?}");
+        let said = rows.join(" ");
+        assert!(said.contains("Nothing is signed in."), "{said}");
+        assert!(said.contains("outside riabuild agents"), "{said}");
+        for command in ["`claude-1 auth login`", "`codex-1 login`", "`grok-1 login`"] {
+            assert!(said.contains(command), "{command} {rows:#?}");
+        }
+        // and every row fits the rail, a command left whole rather than split
+        for row in &rows {
+            assert!(row.chars().count() <= 30, "{row:?}");
+        }
     }
 }

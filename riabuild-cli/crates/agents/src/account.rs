@@ -3,7 +3,8 @@
 //! riabuild keeps nine sign-ins for each of the three harnesses, and a developer
 //! already knows them by the launchers on their `PATH`: `claude-2`, `codex-1`,
 //! `grok-9`. This is that same set, handed to the window so a session can be
-//! started under any of them rather than under the first one only.
+//! started under any of them rather than under the first one only — those of
+//! them that are signed in.
 //!
 //! An account is resolved by the caller — from riabuild's own account list and
 //! its path layout — and never here. This crate has no opinion about where a
@@ -47,71 +48,53 @@ impl Account {
     }
 }
 
-/// Every sign-in this window can start a session under, in the order shown.
+/// A sign-in riabuild found signed in when the window opened.
 ///
-/// Grouped by harness in [`Kind::ALL`] order and numbered within it, because
-/// that is the order `riabuild claude` lists them in and the order the
-/// launchers are numbered — one list, sorted one way, everywhere.
-#[derive(Debug, Clone, Default)]
-pub struct Accounts(Vec<Account>);
+/// The rail's NEW SESSION group is exactly these, one row each, and nothing
+/// else: a sign-in that is not signed in has nowhere for a session to go, so
+/// it is not offered at all. Signing in is done by the developer, outside this
+/// window, with the harness's own command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedIn {
+    pub account: Account,
+    /// The address it is signed in as, where the harness says. Claude Code
+    /// does; Codex and Grok Build keep no address riabuild can read, and
+    /// nothing is invented for them.
+    pub email: Option<String>,
+}
 
-impl Accounts {
-    pub fn all(&self) -> &[Account] {
-        &self.0
-    }
-
-    pub fn get(&self, index: usize) -> Option<&Account> {
-        self.0.get(index)
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// The account a harness opens on, which is its first.
-    ///
-    /// `None` only where a harness has no accounts at all, which the caller
-    /// decides the meaning of: `riabuild agents` still opens a pane per harness,
-    /// so it passes an account with no home rather than leaving one out.
-    pub fn first(&self, kind: Kind) -> Option<&Account> {
-        self.0.iter().find(|account| account.kind == kind)
-    }
-
-    /// Where `account` sits in this list, for opening the chooser on it.
-    pub fn position(&self, kind: Kind, number: usize) -> Option<usize> {
-        self.0
-            .iter()
-            .position(|account| account.kind == kind && account.number == number)
+impl SignedIn {
+    pub fn new(account: Account, email: Option<String>) -> Self {
+        Self { account, email }
     }
 }
 
-impl From<Vec<Account>> for Accounts {
-    fn from(all: Vec<Account>) -> Self {
-        Self(all)
+/// How a developer signs a harness in, for the window to say so when nothing
+/// is — spelled the way they would type it for that harness's first sign-in.
+pub fn sign_in_command(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Claude => "claude-1 auth login",
+        Kind::Codex => "codex-1 login",
+        Kind::Grok => "grok-1 login",
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn nine_of_everything() -> Accounts {
-        let mut all = Vec::new();
-        for kind in Kind::ALL {
-            for number in 1..=9 {
-                all.push(Account::new(kind, number, Some(PathBuf::from("/r"))));
-            }
-        }
-        Accounts::from(all)
+    /// The first sign-in of each harness, all signed in and none with a known
+    /// address — the rail most tests want.
+    pub(crate) fn first_of_each() -> Vec<SignedIn> {
+        Kind::ALL
+            .into_iter()
+            .map(|kind| SignedIn::new(Account::new(kind, 1, Some(PathBuf::from("/r"))), None))
+            .collect()
     }
 
     #[test]
     fn an_account_is_named_the_way_its_launcher_is() {
-        // The developer signed in by running `grok-3 auth login`. Anything else
+        // The developer signed in by running `grok-3 login`. Anything else
         // here would make them work out which row that was.
         assert_eq!(Account::new(Kind::Grok, 3, None).name(), "grok-3");
         assert_eq!(Account::new(Kind::Claude, 1, None).name(), "claude-1");
@@ -119,20 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn a_harness_opens_on_its_first_account() {
-        let accounts = nine_of_everything();
+    fn every_harness_is_told_how_to_sign_in() {
         for kind in Kind::ALL {
-            assert_eq!(accounts.first(kind).map(|a| a.number), Some(1), "{kind:?}");
+            assert!(sign_in_command(kind).starts_with(kind.tag()), "{kind:?}");
         }
-    }
-
-    #[test]
-    fn every_sign_in_riabuild_keeps_is_offered() {
-        // The whole point: a window that could only ever reach account 1 left
-        // the other eight of each harness with no way in at all.
-        let accounts = nine_of_everything();
-        assert_eq!(accounts.len(), 27);
-        assert_eq!(accounts.position(Kind::Grok, 9), Some(26));
-        assert!(accounts.position(Kind::Codex, 10).is_none());
     }
 }

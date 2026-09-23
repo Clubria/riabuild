@@ -26,24 +26,8 @@ use std::collections::HashMap;
 
 use riabuild_harness::{Event, Kind};
 
-use crate::account::{Account, Accounts};
+use crate::account::{Account, SignedIn};
 use crate::compose::Compose;
-
-/// What riabuild knows about one sign-in.
-///
-/// Three states and not two, and the third is the one that matters: **absent**
-/// is "nobody has answered yet", which is rendered as nothing. Asking a harness
-/// who is signed in costs a subprocess each, so the window opens before any of
-/// them have replied — and a missing answer drawn as "signed out" would accuse
-/// every account of being logged out for the first second of every run, and
-/// would refuse to start a session under one that was fine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Signin {
-    /// Signed in, as this address.
-    In(String),
-    /// Signed out. A session started here has nowhere to go.
-    Out,
-}
 
 /// Whether a harness said, in its own words, that it is not signed in.
 ///
@@ -75,15 +59,6 @@ pub fn reads_as_signed_out(text: &str) -> bool {
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
-}
-
-/// What to tell a developer whose sign-in has nowhere to go.
-///
-/// One sentence, in one place, because it is said in three: on the rail's
-/// splash, in the notice when Enter is refused, and in the transcript when a
-/// turn came back saying it. Three wordings of one fact read as three problems.
-pub fn signed_out_hint(name: &str) -> String {
-    format!("{name} is not signed in \u{2014} run `{name} auth login` in a terminal.")
 }
 
 /// Whether a harness said, in its own words, that an account is out of usage.
@@ -128,7 +103,7 @@ pub fn reads_as_usage_limit(text: &str) -> bool {
 
 /// What to tell a developer whose account has run out of usage.
 ///
-/// One sentence, said once per trouble the same way [`signed_out_hint`] is,
+/// One sentence, said once per trouble the same way the signed-out sentence is,
 /// under the harness's own wording rather than instead of it.
 pub fn usage_limit_hint(name: &str, plan: &str) -> String {
     format!("{name} looks to have hit a usage limit \u{2014} check your {plan} plan.")
@@ -286,7 +261,7 @@ pub struct Pane {
 
 impl Pane {
     /// A pane on a harness's first account, which is what a window opens
-    /// with. A restored session and one started from the chooser say otherwise
+    /// with. A restored session and one started from an offer say otherwise
     /// by setting [`Pane::account`], the way they already set the thread id.
     pub fn new(id: String, kind: Kind, title: String) -> Self {
         Self {
@@ -533,37 +508,33 @@ pub enum Focus {
     /// A session. Typed characters go into its box, `↑↓` scroll the transcript,
     /// and `←` at the start of the line — or escape — comes back to the rail.
     Session,
-    /// Choosing which of the twenty-seven sign-ins a new session runs under.
-    Picker,
 }
 
 /// The whole interface.
 pub struct App {
     pub panes: Vec<Pane>,
-    /// The sign-ins the rail offers a new session under.
+    /// The sign-ins the rail offers a new session under: every one riabuild
+    /// found signed in when the window opened, and no other.
     ///
-    /// One per harness to begin with, and whatever the chooser has added since.
-    /// Deliberately not one per account: twenty-seven rows is a list nobody
-    /// reads, for a developer using two of them.
+    /// Empty until [`App::signed_in`] is called, which is once, when every
+    /// harness has answered. A sign-in that is not signed in is not here at
+    /// all — offering one would be offering a session with nowhere to go, and
+    /// signing it in is the developer's to do outside this window.
     pub offers: Vec<Account>,
     /// Which rail row the cursor is on — sessions first, then offers.
     pub cursor: usize,
-    /// Every sign-in a new session can be started under. Resolved once by the
-    /// caller and carried here so the chooser is drawable and testable without
-    /// a filesystem.
-    pub accounts: Accounts,
-    /// What riabuild knows about each sign-in, as it learns it.
+    /// Whether riabuild is still finding out which sign-ins are signed in.
     ///
-    /// Beside [`Account`] rather than inside it: an account is compared by
-    /// identity all over this crate, and an email that arrives half a second
-    /// after the window opened would make two of the same account unequal.
+    /// The window opens before the answer does: asking Claude Code costs a
+    /// subprocess per account, and a blank terminal while they run reads as a
+    /// window that did not start.
+    pub checking: bool,
+    /// The address each signed-in sign-in belongs to, where one is known.
     ///
-    /// A sign-in nobody has answered for is **absent** rather than [`Signin::Out`]
-    /// — see the type. That distinction is what keeps the window from refusing
-    /// to start anything during the second it takes the probes to come back.
-    logins: Vec<(Kind, usize, Signin)>,
-    /// Which row the chooser is on, while it is open.
-    pub picking: usize,
+    /// Beside [`Account`] rather than inside it, because an account is compared
+    /// by identity all over this crate. Kept for sessions as well as offers: a
+    /// session's status line names the address of the sign-in it runs under.
+    emails: Vec<(Kind, usize, String)>,
     pub focus: Focus,
     /// The box of the row under the cursor.
     ///
@@ -594,32 +565,14 @@ pub struct App {
 }
 
 impl App {
-    /// A window offering these sign-ins.
-    ///
-    /// Takes them rather than defaulting to one per harness: an empty list is a
-    /// machine with no accounts, which the chooser says out loud, and inventing
-    /// a plausible one here would start sessions under a home nobody has.
-    pub fn new(accounts: Accounts) -> Self {
-        // A harness with no accounts at all still gets an offer, under no home
-        // — which is what every session ran under before accounts were offered.
-        // Leaving the harness out instead would answer a setup problem by
-        // hiding a tool riabuild installed.
-        let offers = Kind::ALL
-            .into_iter()
-            .map(|kind| {
-                accounts
-                    .first(kind)
-                    .cloned()
-                    .unwrap_or_else(|| Account::new(kind, 1, None))
-            })
-            .collect();
+    /// A window that has not yet found out which sign-ins are signed in.
+    pub fn new() -> Self {
         Self {
             panes: Vec::new(),
-            offers,
+            offers: Vec::new(),
             cursor: 0,
-            accounts,
-            logins: Vec::new(),
-            picking: 0,
+            checking: true,
+            emails: Vec::new(),
             // The rail, because that is where a window with nothing running
             // has something to say. Reading an empty transcript is not a
             // resting state.
@@ -631,6 +584,34 @@ impl App {
             scrollback: 0,
             tick: 0,
             notice: None,
+        }
+    }
+
+    /// A window offering exactly these sign-ins, for tests.
+    #[cfg(test)]
+    pub(crate) fn offering(signed_in: Vec<SignedIn>) -> Self {
+        let mut app = Self::new();
+        app.signed_in(signed_in);
+        app
+    }
+
+    /// What riabuild found signed in, which becomes NEW SESSION.
+    ///
+    /// Called once, with every answer at the same time and in the caller's
+    /// order, rather than a row at a time as each harness replies — Codex and
+    /// Grok Build answer from a file and Claude Code from a subprocess, so rows
+    /// arriving one by one would land out of order under a cursor that had
+    /// already settled on one of them.
+    ///
+    /// A cursor on a session stays there, because offers come after sessions. A
+    /// cursor on nothing — a window with no sessions — lands on the first offer.
+    pub fn signed_in(&mut self, signed_in: Vec<SignedIn>) {
+        self.checking = false;
+        for SignedIn { account, email } in signed_in {
+            if let Some(email) = email {
+                self.emails.push((account.kind, account.number, email));
+            }
+            self.offers.push(account);
         }
     }
 
@@ -784,111 +765,12 @@ impl App {
         self.compose.end();
     }
 
-    /// Puts a sign-in on the rail and moves the cursor to it.
-    ///
-    /// What the chooser does. It offers rather than opens: a directory made
-    /// before anybody typed anything is the "3 sessions" bug written down.
-    pub fn offer(&mut self, account: Account) {
-        let at = self
-            .offers
-            .iter()
-            .position(|held| held.kind == account.kind && held.number == account.number)
-            .unwrap_or_else(|| {
-                self.offers.push(account);
-                self.offers.len() - 1
-            });
-        self.move_to(self.panes.len() + at);
-    }
-
-    /// Records what riabuild has learned about a sign-in.
-    pub fn set_login(&mut self, kind: Kind, number: usize, signin: Signin) {
-        match self
-            .logins
-            .iter_mut()
-            .find(|(held, at, _)| *held == kind && *at == number)
-        {
-            Some(entry) => entry.2 = signin,
-            None => self.logins.push((kind, number, signin)),
-        }
-    }
-
-    /// What riabuild knows about a sign-in, or `None` where nobody has said
-    /// yet — which is rendered as nothing rather than as a claim either way.
-    pub fn signin_of(&self, kind: Kind, number: usize) -> Option<&Signin> {
-        self.logins
-            .iter()
-            .find(|(held, at, _)| *held == kind && *at == number)
-            .map(|(_, _, signin)| signin)
-    }
-
     /// The address a sign-in belongs to, where riabuild knows one.
     pub fn login_of(&self, kind: Kind, number: usize) -> Option<&str> {
-        match self.signin_of(kind, number) {
-            Some(Signin::In(email)) => Some(email.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Whether riabuild has been *told* this sign-in is signed out.
-    ///
-    /// False for an account nobody has answered for, which is the whole reason
-    /// [`Signin`] has no `Unknown`: silence is not an accusation.
-    pub fn is_signed_out(&self, kind: Kind, number: usize) -> bool {
-        matches!(self.signin_of(kind, number), Some(Signin::Out))
-    }
-
-    /// The sentence to show instead of starting a session under a sign-in that
-    /// has nowhere to go, or `None` where there is nothing in the way.
-    ///
-    /// Asked by the keymap *before* the box is emptied, so a developer who has
-    /// just typed a paragraph into a signed-out account still has it. Only an
-    /// offer is refused: a session that already exists has a conversation in it,
-    /// and the harness's own answer is a better report than a guess made here.
-    pub fn blocked_offer(&self) -> Option<String> {
-        let account = self.offered()?;
-        self.is_signed_out(account.kind, account.number)
-            .then(|| signed_out_hint(&account.name()))
-    }
-
-    /// Opens the chooser, on the sign-in the cursor is already on.
-    ///
-    /// Starting there rather than at the top is what makes "another one of
-    /// these" a single keypress, which is the thing a developer asks for most:
-    /// a second Claude on the same sign-in, beside the one that is busy.
-    pub fn open_picker(&mut self) {
-        let at = match self.row() {
-            Some(Row::Session(index)) => self
-                .panes
-                .get(index)
-                .and_then(|pane| self.accounts.position(pane.kind, pane.account)),
-            Some(Row::Offer(index)) => self
-                .offers
-                .get(index)
-                .and_then(|account| self.accounts.position(account.kind, account.number)),
-            None => None,
-        };
-        self.picking = at.unwrap_or(0);
-        self.focus = Focus::Picker;
-    }
-
-    /// The account the chooser is on.
-    pub fn picked(&self) -> Option<&Account> {
-        self.accounts.get(self.picking)
-    }
-
-    pub fn pick_next(&mut self) {
-        if !self.accounts.is_empty() {
-            self.picking = (self.picking + 1) % self.accounts.len();
-        }
-    }
-
-    pub fn pick_previous(&mut self) {
-        if !self.accounts.is_empty() {
-            self.picking = self
-                .picking
-                .checked_sub(1)
-                .unwrap_or(self.accounts.len() - 1);
-        }
+        self.emails
+            .iter()
+            .find(|(held, at, _)| *held == kind && *at == number)
+            .map(|(_, _, email)| email.as_str())
     }
 
     pub fn pane_mut(&mut self, id: &str) -> Option<&mut Pane> {
@@ -951,13 +833,20 @@ impl App {
     }
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::tests::first_of_each;
     use riabuild_harness::testing;
 
     fn play(kind: Kind, transcript: &str) -> App {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), kind, "the first prompt".into()));
         for event in testing::decode(kind, transcript) {
             app.observe("s1", &event);
@@ -1157,24 +1046,50 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_nobody_has_answered_for_is_neither_in_nor_out() {
-        // Three states, and the third is the one the window depends on: the
-        // probes take a second and a half to come back, and silence read as
-        // "signed out" would accuse every account on the way in.
-        let mut app = App::new(Accounts::default());
-        assert!(app.signin_of(Kind::Claude, 1).is_none());
-        assert!(!app.is_signed_out(Kind::Claude, 1));
-        assert_eq!(app.login_of(Kind::Claude, 1), None);
+    fn nothing_is_offered_until_riabuild_knows_what_is_signed_in() {
+        // The window opens before the answer does. Until then NEW SESSION is
+        // empty rather than a guess, and the guess it would have been — every
+        // sign-in riabuild keeps — is the list this replaced.
+        let mut app = App::new();
+        assert!(app.checking);
+        assert!(app.offers.is_empty());
+        assert_eq!(app.row(), None);
 
-        app.set_login(Kind::Claude, 1, Signin::Out);
-        assert!(app.is_signed_out(Kind::Claude, 1));
-        // and a signed-out account has no address to show, rather than a stale
-        // one from before it expired
-        assert_eq!(app.login_of(Kind::Claude, 1), None);
+        app.signed_in(vec![
+            SignedIn::new(
+                Account::new(Kind::Claude, 2, None),
+                Some("ada@clubria.com".into()),
+            ),
+            SignedIn::new(Account::new(Kind::Grok, 1, None), None),
+        ]);
+        assert!(!app.checking);
+        // Exactly what was signed in, one row each, in the order given.
+        let names: Vec<String> = app.offers.iter().map(Account::name).collect();
+        assert_eq!(names, ["claude-2", "grok-1"]);
+        assert_eq!(app.login_of(Kind::Claude, 2), Some("ada@clubria.com"));
+        assert_eq!(app.login_of(Kind::Grok, 1), None);
+        // and a window with no sessions lands on the first of them
+        assert_eq!(app.row(), Some(Row::Offer(0)));
+    }
 
-        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
-        assert!(!app.is_signed_out(Kind::Claude, 1));
-        assert_eq!(app.login_of(Kind::Claude, 1), Some("ada@clubria.com"));
+    #[test]
+    fn a_machine_with_nothing_signed_in_offers_nothing() {
+        let mut app = App::new();
+        app.signed_in(Vec::new());
+        assert!(!app.checking);
+        assert_eq!(app.rows(), 0);
+        assert_eq!(app.row(), None);
+        assert!(app.offered().is_none());
+    }
+
+    #[test]
+    fn a_session_keeps_the_cursor_when_the_sign_ins_arrive() {
+        // Offers come after sessions, so the answer arriving under a developer
+        // who is already reading a session moves nothing.
+        let mut app = App::new();
+        app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
+        app.signed_in(first_of_each());
+        assert_eq!(app.row(), Some(Row::Session(0)));
     }
 
     #[test]
@@ -1251,7 +1166,7 @@ mod tests {
     fn a_tool_result_resolves_the_newest_matching_call() {
         // A long session reuses tool names constantly; only the id is unique,
         // and an older open call with the same id must not steal the result.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         for event in [
             Event::ToolStarted {
@@ -1284,7 +1199,7 @@ mod tests {
 
     #[test]
     fn a_result_for_a_call_nobody_saw_is_recorded_rather_than_dropped() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
             "s1",
@@ -1298,7 +1213,7 @@ mod tests {
 
     #[test]
     fn a_subagents_work_is_marked_as_its_own() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe("s1", &Event::Said("mine".into()));
         app.observe(
@@ -1318,7 +1233,7 @@ mod tests {
     fn two_usage_reports_in_one_turn_are_not_added_together() {
         // Both Claude and Codex report cumulative counts. Summing them makes a
         // session appear to have spent twice what it did.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.observe(
             "s1",
@@ -1342,7 +1257,7 @@ mod tests {
         // The figure on the status line is the session's total. It used to be
         // the largest single turn, which is a floor shown as though it were a
         // sum.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         for (input, output) in [(100, 5), (250, 20)] {
             app.observe(
@@ -1380,7 +1295,7 @@ mod tests {
     fn a_session_is_named_by_what_it_was_asked() {
         // Every session in the list is in the same checkout, so the directory
         // cannot tell two apart. The first prompt can.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         app.sent("fix the flaky test");
         assert_eq!(app.selected().unwrap().label(), "fix the flaky test");
@@ -1394,7 +1309,7 @@ mod tests {
         // The bug in one assertion: three offers and a count of zero. It used
         // to be three panes, three directories on disk, and a header saying
         // "3 sessions" before anybody had typed a word.
-        let app = App::new(Accounts::default());
+        let app = App::offering(first_of_each());
         assert!(app.panes.is_empty());
         assert_eq!(app.offers.len(), 3);
         assert_eq!(app.rows(), 3);
@@ -1407,7 +1322,7 @@ mod tests {
 
     #[test]
     fn a_prompt_is_what_turns_an_offer_into_a_session() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::offering(first_of_each());
         let account = app.offered().cloned().unwrap();
         assert_eq!(account.kind, Kind::Claude);
         app.begin("s1".into(), &account);
@@ -1424,7 +1339,7 @@ mod tests {
         // Newest created first, which is the order a reopened window lists them
         // in — so a session does not sit at the bottom until the next reopen
         // and then jump.
-        let mut app = App::new(Accounts::default());
+        let mut app = App::new();
         app.add(Pane::new("older".into(), Kind::Claude, "older".into()));
         let account = Account::new(Kind::Codex, 1, None);
         app.begin("newer".into(), &account);
@@ -1434,7 +1349,7 @@ mod tests {
 
     #[test]
     fn a_session_that_could_not_start_gives_back_the_prompt_and_says_why() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::offering(first_of_each());
         let account = app.offered().cloned().unwrap();
         app.begin("s1".into(), &account);
         app.sent("do the thing");
@@ -1462,7 +1377,7 @@ mod tests {
 
     #[test]
     fn the_cursor_runs_over_sessions_and_then_offers() {
-        let mut app = App::new(Accounts::default());
+        let mut app = App::offering(first_of_each());
         app.add(Pane::new("s1".into(), Kind::Claude, String::new()));
         assert_eq!(app.rows(), 4);
         assert_eq!(app.row(), Some(Row::Session(0)));
@@ -1478,37 +1393,19 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_sign_in_offers_it_rather_than_opening_it() {
-        // Nothing is written until a prompt is typed, so a developer who opens
-        // the chooser, picks `claude-4` and changes their mind has left no
-        // directory behind.
-        let mut app = App::new(Accounts::default());
-        app.offer(Account::new(Kind::Claude, 4, None));
-        assert!(app.panes.is_empty());
-        assert_eq!(app.offers.len(), 4);
-        assert_eq!(
-            app.offered().map(Account::name).as_deref(),
-            Some("claude-4")
-        );
-        // and choosing it twice does not put it on the rail twice
-        app.offer(Account::new(Kind::Claude, 4, None));
-        assert_eq!(app.offers.len(), 4);
-    }
-
-    #[test]
-    fn an_email_arriving_late_does_not_change_what_an_account_is() {
-        // `Account` is compared by identity all over this crate. An email
-        // stored inside one would make the same sign-in unequal to itself for
-        // the half second before `claude auth status` answers.
-        let mut app = App::new(Accounts::default());
-        assert_eq!(app.login_of(Kind::Claude, 1), None);
-        app.set_login(Kind::Claude, 1, Signin::In("ada@clubria.com".into()));
+    fn an_email_does_not_change_what_an_account_is() {
+        // `Account` is compared by identity all over this crate, so the address
+        // lives beside it rather than inside it.
+        let mut app = App::offering(vec![SignedIn::new(
+            Account::new(Kind::Claude, 1, None),
+            Some("ada@clubria.com".into()),
+        )]);
+        assert_eq!(app.offers[0], Account::new(Kind::Claude, 1, None));
         assert_eq!(app.login_of(Kind::Claude, 1), Some("ada@clubria.com"));
-        // Re-signing in replaces rather than appends.
-        app.set_login(Kind::Claude, 1, Signin::In("grace@clubria.com".into()));
-        assert_eq!(app.login_of(Kind::Claude, 1), Some("grace@clubria.com"));
         assert_eq!(app.login_of(Kind::Claude, 2), None);
         assert_eq!(app.login_of(Kind::Codex, 1), None);
+        app.cursor = 0;
+        assert!(app.offered().is_some());
     }
 
     #[test]

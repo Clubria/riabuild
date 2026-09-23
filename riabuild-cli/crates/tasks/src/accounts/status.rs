@@ -98,9 +98,8 @@ pub async fn read(ctx: &Ctx, id: &str) -> Identity {
 ///
 /// Everything [`ask`] needs and nothing borrowed from a [`Ctx`], so a caller can
 /// spawn it and pick the answer up later. That is what the agents window does:
-/// twenty-seven of these at 450 ms each is a blank terminal for a second and a
-/// half before the first frame, so it opens without them and fills the sign-ins
-/// in as the children answer.
+/// nine of these at 450 ms each in front of the first frame would be a blank
+/// terminal, so it opens without them and fills NEW SESSION in once they answer.
 pub async fn read_at(
     runner: std::sync::Arc<dyn CommandRunner>,
     claude: String,

@@ -31,7 +31,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use riabuild_theme::{Role, Theme};
 
-use crate::app::{App, Focus};
+use crate::app::App;
 use crate::draw::{self, Chrome};
 
 /// The margin down each edge of the window, and inside the pane.
@@ -98,12 +98,6 @@ pub fn render(frame: &mut Frame, app: &App, chrome: Chrome<'_>) {
         Paragraph::new(draw::footer_line(app, chrome.theme, inset(rows[5]).width)),
         inset(rows[5]),
     );
-
-    // Last, and over the body: it is a question, so it covers what it was asked
-    // from rather than taking a column away from it.
-    if app.focus == Focus::Picker {
-        render_picker(frame, app, chrome, rows[3]);
-    }
 }
 
 /// The rail, scrolled so the row under the cursor is on screen.
@@ -111,7 +105,7 @@ pub fn render(frame: &mut Frame, app: &App, chrome: Chrome<'_>) {
 /// It needed no scrolling while a session was one line: ten of them fitted in
 /// the body of a laptop terminal. Two lines each halves that, and a cursor the
 /// developer cannot see is worse than a rail that does not show everything — so
-/// the list follows the cursor, the way the chooser already does.
+/// the list follows the cursor.
 ///
 /// Both of a row's lines are kept in view rather than just its first, because
 /// the second is where a long title finishes and where `(subagent)` is said.
@@ -243,18 +237,15 @@ fn render_splash(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         return;
     };
     let email = app.login_of(account.kind, account.number);
-    let signed_out = app.is_signed_out(account.kind, account.number);
     // A session that could not be started says why here, where the session
     // would have been, until one is started under this sign-in.
     let lines: Vec<Line<'static>> = match app.failure_of(account.kind, account.number) {
         Some(why) => draw::failure_lines(why, theme),
-        None => draw::splash_lines(account, email, signed_out, theme),
+        None => draw::splash_lines(account, email, theme),
     };
-    // Wrapped, and measured *after* wrapping. The sentence a signed-out sign-in
-    // shows is a whole one — it names the account and the command that fixes it
-    // — and it is longer than a pane beside a rail on a laptop. Unwrapped it was
-    // simply cut at the edge, which took the command off the end of the only
-    // line that was any use.
+    // Wrapped, and measured *after* wrapping: a sign-in and an address together
+    // are longer than a pane beside a rail on a narrow terminal, and unwrapped
+    // they were simply cut at the edge.
     let height: u16 = lines
         .iter()
         .map(|line| wrapped_height(line, area.width))
@@ -290,39 +281,12 @@ fn wrapped_height(line: &Line<'_>, width: u16) -> u16 {
     (columns.div_ceil(width)).max(1) as u16
 }
 
-/// The chooser, centred over the body.
-fn render_picker(frame: &mut Frame, app: &App, chrome: Chrome<'_>, area: Rect) {
-    let lines = draw::picker_lines(app, chrome.theme, chrome.unicode);
-    let width = 44.min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-    // Without this the pane underneath shows through the gaps in the box, for
-    // the reason the terminal's own history did before `claim` cleared it:
-    // ratatui writes differences, and a cell a widget does not set is a cell
-    // nobody wrote.
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .title(" new session ")
-        .border_style(chrome.theme.style(Role::Brand));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    // Twenty-seven sign-ins do not fit in a box this size, so the list follows
-    // the cursor rather than the cursor being limited to the box.
-    let offset = (app.picking as u16 + 1).saturating_sub(inner.height.max(1));
-    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::Account;
-    use crate::app::Pane;
-    use crate::draw::tests::every_account;
+    use crate::account::tests::first_of_each;
+    use crate::app::{Focus, Pane};
     use riabuild_harness::{Kind, testing};
     use riabuild_theme::{Depth, Tone};
 
@@ -362,7 +326,7 @@ mod tests {
     }
 
     fn with_a_session() -> App {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
         for event in testing::decode(Kind::Claude, testing::CLAUDE) {
             app.observe("s1", &event);
@@ -374,7 +338,7 @@ mod tests {
     fn the_window_opens_on_the_rail_and_says_what_a_new_session_would_be() {
         // Both halves of the first frame a developer sees: the cursor is in the
         // rail, and the pane beside it is not pretending to be a conversation.
-        let app = App::new(every_account());
+        let app = App::offering(first_of_each());
         assert_eq!(app.focus, Focus::List);
         let screen = frame_of(&app, Theme::plain(), 100, 24);
         assert!(
@@ -442,7 +406,7 @@ mod tests {
         // Three read as a seam rather than a join. The gap is the rail's own
         // spare column plus `GUTTER`, so this asserts what a developer counts
         // rather than either constant on its own.
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(Pane::new(
             "s1".into(),
             Kind::Claude,
@@ -521,24 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn the_chooser_covers_the_pane_rather_than_showing_through_it() {
-        let mut app = with_a_session();
-        app.open_picker();
-        let screen = frame_of(&app, Theme::plain(), 100, 24);
-        assert!(
-            screen.iter().any(|row| row.contains("new session")),
-            "{screen:#?}"
-        );
-        let boxed: Vec<&String> = screen.iter().filter(|row| row.contains('│')).collect();
-        assert!(boxed.len() > 5, "{screen:#?}");
-        for row in &boxed {
-            let inside = row.split('│').nth(1).unwrap_or_default();
-            assert!(
-                ["claude-", "codex-", "grok-"]
-                    .iter()
-                    .any(|name| inside.contains(name)),
-                "{inside:?} showed through the box\n{screen:#?}"
-            );
+    fn a_window_with_nothing_signed_in_says_how_to_sign_in() {
+        let app = App::offering(Vec::new());
+        let screen = frame_of(&app, Theme::plain(), 120, 24).join("\n");
+        assert!(screen.contains("Nothing is signed in."), "{screen}");
+        for command in ["claude-1 auth login", "codex-1 login", "grok-1 login"] {
+            assert!(screen.contains(command), "{command}\n{screen}");
         }
     }
 
@@ -546,12 +498,12 @@ mod tests {
     fn a_window_too_small_for_any_of_it_still_draws() {
         // A split terminal on a laptop. Every dimension here is arithmetic on
         // an area that can be smaller than the thing it is centring.
-        let mut app = with_a_session();
+        let app = with_a_session();
         for (width, height) in [(100, 24), (40, 10), (20, 6), (8, 4), (4, 2), (1, 1)] {
             let _ = frame_of(&app, Theme::plain(), width, height);
         }
-        app.open_picker();
-        for (width, height) in [(100, 24), (30, 8), (12, 6), (4, 4)] {
+        let app = App::offering(Vec::new());
+        for (width, height) in [(100, 24), (30, 8), (12, 6), (4, 4), (1, 1)] {
             let _ = frame_of(&app, Theme::plain(), width, height);
         }
     }

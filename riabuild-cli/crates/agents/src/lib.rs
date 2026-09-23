@@ -69,10 +69,10 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{event, execute};
 use ratatui::layout::Position;
-use riabuild_harness::Kind;
 use riabuild_runner::CommandRunner;
 use riabuild_theme::Theme;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::oneshot;
 
 pub mod account;
 pub mod app;
@@ -84,8 +84,7 @@ pub mod paste;
 pub mod store;
 pub mod turn;
 
-pub use account::{Account, Accounts};
-pub use app::Signin;
+pub use account::{Account, SignedIn};
 use app::{App, Focus};
 use store::Store;
 
@@ -120,16 +119,6 @@ pub struct Request {
     /// only its own. What was missing was saying it out loud, which is what made
     /// the window look as though it held every agent on the machine.
     pub repo: Option<String>,
-    /// Every sign-in a session in this window may be started under —
-    /// `claude-1` … `claude-9`, and the same for Codex and Grok Build.
-    ///
-    /// Resolved by the caller from riabuild's own account list, and the one that
-    /// was chosen is recorded on the session when it is created — never
-    /// recomputed. A session is only resumable under the profile that made it,
-    /// so if the primary Claude account changes between turns, a recomputed home
-    /// would point at a different store and the conversation would silently
-    /// start over as a new one.
-    pub accounts: Accounts,
     /// The first thing to say, asked of every harness at once.
     pub prompt: Option<String>,
     pub theme: Theme,
@@ -138,29 +127,11 @@ pub struct Request {
     pub unicode: bool,
 }
 
-/// What riabuild found out about a sign-in.
-///
-/// Streamed rather than resolved before the window opens: asking a harness who
-/// is signed in is a subprocess per account, and twenty-seven of them is a
-/// second and a half of a blank terminal before the first frame. An answer that
-/// has not arrived is rendered as nothing, never as "signed out".
-///
-/// Which is why an account that is *actually* signed out has to be sent as a
-/// message rather than left as silence — the two used to be the same thing here,
-/// so a developer whose OAuth session had expired found out by watching a turn
-/// fail rather than by looking at the rail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Login {
-    pub kind: Kind,
-    pub number: usize,
-    pub signin: Signin,
-}
-
 /// What a keypress asks for.
 ///
 /// Returned rather than performed, so the whole keymap is testable without a
 /// terminal, a process or a filesystem. Opening a session is not among them:
-/// the chooser *offers* a sign-in, and the prompt is what creates anything.
+/// the prompt is what creates anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Nothing,
@@ -201,7 +172,6 @@ pub fn key(app: &mut App, event: KeyEvent) -> Action {
     match app.focus {
         Focus::List => list_key(app, event.code),
         Focus::Session => session_key(app, event),
-        Focus::Picker => picker_key(app, event.code),
     }
 }
 
@@ -222,12 +192,12 @@ fn list_key(app: &mut App, code: KeyCode) -> Action {
         // which is a confirmation of a decision the cursor had already made.
         // The caret goes to the end of whatever is already written there, which
         // is where somebody coming back to a draft carries on typing.
-        KeyCode::Right | KeyCode::Enter => {
+        //
+        // Only where the cursor is on something. A window with no sessions and
+        // nothing signed in has no row, and a box that took a prompt there would
+        // be taking one it has nowhere to send.
+        KeyCode::Right | KeyCode::Enter if app.row().is_some() => {
             app.enter();
-            Action::Nothing
-        }
-        KeyCode::Char('n') => {
-            app.open_picker();
             Action::Nothing
         }
         _ => Action::Nothing,
@@ -335,14 +305,6 @@ fn session_key(app: &mut App, event: KeyEvent) -> Action {
                 app.compose.insert('\n');
                 return Action::Nothing;
             }
-            // Refused *before* the box is emptied, which is the whole reason
-            // this is asked here rather than in `drive::send`: a developer who
-            // has just typed a paragraph at a signed-out account keeps it, and
-            // gets it sent by pressing Enter again once they have signed in.
-            if let Some(hint) = app.blocked_offer() {
-                app.notice = Some(hint);
-                return Action::Nothing;
-            }
             let text = app.compose.take().trim().to_string();
             if text.is_empty() {
                 Action::Nothing
@@ -421,38 +383,6 @@ fn editing_key(app: &mut App, event: KeyEvent) -> Option<Action> {
     Some(Action::Nothing)
 }
 
-/// Choosing which sign-in to put on the rail.
-///
-/// Escape is the way out, and choosing nothing is always possible: this is the
-/// one screen that appears because a developer asked a question, so it must be
-/// answerable with "never mind".
-fn picker_key(app: &mut App, code: KeyCode) -> Action {
-    match code {
-        KeyCode::Esc => {
-            app.focus = Focus::List;
-            Action::Nothing
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.pick_next();
-            Action::Nothing
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.pick_previous();
-            Action::Nothing
-        }
-        KeyCode::Enter => {
-            // Offered, never opened. A directory created because somebody
-            // browsed a list is the "3 sessions" bug written down.
-            if let Some(account) = app.picked().cloned() {
-                app.offer(account);
-            }
-            app.focus = Focus::List;
-            Action::Nothing
-        }
-        _ => Action::Nothing,
-    }
-}
-
 /// Reads keys on a thread of their own.
 ///
 /// A dedicated OS thread rather than a task: `event::read` blocks, and blocking
@@ -479,11 +409,16 @@ fn keys() -> UnboundedReceiver<TermEvent> {
 /// backend this machine needs is `riabuild-channel`'s question, already
 /// answered by `clipboard::for_this_machine`. `None` is a Linux laptop with
 /// neither `xclip` nor `wl-clipboard`, and Ctrl-V says so rather than failing.
+///
+/// `signed_in` is every sign-in the caller found signed in, sent once when the
+/// last harness has answered. The window opens without waiting for it — asking
+/// Claude Code is a subprocess per account — and NEW SESSION fills in when it
+/// arrives. A sender dropped without answering is read as nothing signed in.
 pub async fn run(
     runner: Arc<dyn CommandRunner>,
     paths: &dyn riabuild_paths::Paths,
     request: Request,
-    logins: UnboundedReceiver<Login>,
+    mut signed_in: oneshot::Receiver<Vec<SignedIn>>,
     clipboard: Option<Box<dyn riabuild_channel::clipboard::Clipboard>>,
 ) -> Result<()> {
     let store = Store::new(paths);
@@ -492,10 +427,14 @@ pub async fn run(
     let _ = store.prune(&request.cwd).await;
     let _ = store.prune_images().await;
 
-    let mut app = App::new(request.accounts.clone());
+    let mut app = App::new();
     let mut readers = drive::restore(&store, &request, &mut app).await?;
 
     if let Some(prompt) = request.prompt.clone() {
+        // The one place the window waits for the answer: a prompt given on the
+        // command line goes to what is signed in, so what is signed in has to be
+        // known before it can go anywhere.
+        app.signed_in((&mut signed_in).await.unwrap_or_default());
         drive::first_prompt(
             &store,
             runner.as_ref(),
@@ -523,7 +462,7 @@ pub async fn run(
         &request,
         &mut app,
         &mut readers,
-        logins,
+        signed_in,
     )
     .await;
     release(&mut terminal);
@@ -643,7 +582,9 @@ fn restore_terminal_on_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::tests::first_of_each;
     use crate::app::Pane;
+    use riabuild_harness::Kind;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -656,7 +597,7 @@ mod tests {
 
     /// A window with one session, focused on its box, holding `text`.
     fn writing(text: &str) -> App {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(Pane::new("s1".into(), Kind::Claude, "a session".into()));
         app.cursor = 0;
         app.focus = Focus::Session;
@@ -759,52 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_typed_at_a_signed_out_sign_in_is_refused_and_kept() {
-        // Both halves matter. Refusing is the point — a session created under a
-        // sign-in with nowhere to go is a directory on disk and a turn that
-        // fails — and *keeping the text* is why the refusal is here rather than
-        // in `drive::send`, which is handed the prompt only after the box has
-        // been emptied.
-        let mut app = App::new(every_account());
-        app.focus = Focus::Session;
-        let offered = app.offered().cloned().expect("the rail opens on an offer");
-        app.set_login(offered.kind, offered.number, Signin::Out);
-        for ch in "why is the nightly job slow".chars() {
-            app.compose.insert(ch);
-        }
-
-        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert_eq!(app.compose.text(), "why is the nightly job slow");
-        let notice = app.notice.clone().unwrap_or_default();
-        assert!(notice.contains("claude-1 auth login"), "{notice}");
-
-        // and the same key sends the moment the account answers for itself
-        app.set_login(offered.kind, offered.number, Signin::In("ada@c.com".into()));
-        assert!(matches!(
-            key(&mut app, press(KeyCode::Enter)),
-            Action::Send(_)
-        ));
-    }
-
-    #[test]
-    fn a_sign_in_nobody_has_answered_for_is_not_refused() {
-        // The three-state distinction, from the side that would break things.
-        // Twenty-seven probes take a second and a half to come back; a window
-        // that read silence as "signed out" would refuse every prompt typed
-        // into it before they did.
-        let mut app = App::new(every_account());
-        app.focus = Focus::Session;
-        for ch in "hello".chars() {
-            app.compose.insert(ch);
-        }
-        assert!(app.blocked_offer().is_none());
-        assert!(matches!(
-            key(&mut app, press(KeyCode::Enter)),
-            Action::Send(_)
-        ));
-    }
-
-    #[test]
     fn the_terminal_is_told_what_this_window_is_and_which_repository() {
         assert_eq!(
             title_for(Some("Clubria/riabuild"), true),
@@ -818,19 +713,8 @@ mod tests {
         assert_eq!(title_for(None, true), "riabuild agents");
     }
 
-    /// Every sign-in riabuild keeps, which is what the window is handed.
-    fn every_account() -> Accounts {
-        let mut all = Vec::new();
-        for kind in Kind::ALL {
-            for number in 1..=9 {
-                all.push(Account::new(kind, number, Some(PathBuf::from("/r"))));
-            }
-        }
-        Accounts::from(all)
-    }
-
     fn with_one_session() -> App {
-        let mut app = App::new(every_account());
+        let mut app = App::offering(first_of_each());
         app.add(Pane::new("s1".into(), Kind::Claude, "a title".into()));
         app.cursor = 0;
         app
@@ -846,7 +730,7 @@ mod tests {
     fn the_window_opens_on_the_rail() {
         // Where a window with nothing running has something to say. Reading an
         // empty transcript is not a resting state.
-        let app = App::new(every_account());
+        let app = App::new();
         assert_eq!(app.focus, Focus::List);
     }
 
@@ -954,13 +838,23 @@ mod tests {
     }
 
     #[test]
-    fn a_digit_on_the_rail_does_nothing() {
-        // `1`/`2`/`3` once jumped to each harness's first offer. Nobody asked
-        // for them, and they only ever reached the first sign-in of each.
-        let mut app = with_one_session();
-        for digit in ['1', '2', '3'] {
-            key(&mut app, press(KeyCode::Char(digit)));
-            assert_eq!(app.cursor, 0);
+    fn a_window_with_nothing_to_select_has_no_box_to_type_into() {
+        let mut app = App::offering(Vec::new());
+        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(key(&mut app, press(KeyCode::Right)), Action::Nothing);
+        assert_eq!(app.focus, Focus::List);
+    }
+
+    #[test]
+    fn neither_n_nor_a_digit_does_anything_on_the_rail() {
+        // There is no chooser and no jumping to a harness: NEW SESSION already
+        // lists every signed-in sign-in, one row each.
+        for ch in ['n', '1', '2', '3'] {
+            let mut app = with_one_session();
+            assert_eq!(key(&mut app, press(KeyCode::Char(ch))), Action::Nothing);
+            assert_eq!(app.focus, Focus::List, "{ch}");
+            assert_eq!(app.cursor, 0, "{ch}");
+            assert_eq!(app.offers.len(), 3, "{ch}");
         }
     }
 
@@ -1010,54 +904,8 @@ mod tests {
     }
 
     #[test]
-    fn the_chooser_offers_a_sign_in_rather_than_opening_a_session() {
-        // The whole of the fix for "3 sessions": browsing twenty-seven sign-ins
-        // must not create anything on disk.
-        let mut app = with_one_session();
-        key(&mut app, press(KeyCode::Char('n')));
-        assert_eq!(app.focus, Focus::Picker);
-        // On the sign-in the selected session already runs under, so "another
-        // one of these" is one keypress.
-        assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-1"));
-        for _ in 0..3 {
-            key(&mut app, press(KeyCode::Down));
-        }
-        assert_eq!(app.picked().map(Account::name).as_deref(), Some("claude-4"));
-        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert_eq!(app.focus, Focus::List);
-        assert_eq!(app.panes.len(), 1, "nothing was created");
-        assert_eq!(
-            app.offered().map(Account::name).as_deref(),
-            Some("claude-4")
-        );
-    }
-
-    #[test]
-    fn the_chooser_can_be_left_without_offering_anything() {
-        let mut app = with_one_session();
-        let offers = app.offers.len();
-        key(&mut app, press(KeyCode::Char('n')));
-        key(&mut app, press(KeyCode::Down));
-        assert_eq!(key(&mut app, press(KeyCode::Esc)), Action::Nothing);
-        assert_eq!(app.focus, Focus::List);
-        assert_eq!(app.offers.len(), offers);
-    }
-
-    #[test]
-    fn a_window_with_no_accounts_offers_a_harness_under_no_home_rather_than_nothing() {
-        // Reachable on a machine riabuild has not finished setting up. Leaving
-        // the harness off the rail would answer a setup problem by hiding a tool
-        // riabuild installs.
-        let mut app = App::new(Accounts::default());
-        assert_eq!(app.offers.len(), 3);
-        key(&mut app, press(KeyCode::Char('n')));
-        assert_eq!(key(&mut app, press(KeyCode::Enter)), Action::Nothing);
-        assert!(app.panes.is_empty());
-    }
-
-    #[test]
     fn ctrl_c_leaves_from_anywhere() {
-        for focus in [Focus::List, Focus::Session, Focus::Picker] {
+        for focus in [Focus::List, Focus::Session] {
             let mut app = with_one_session();
             app.focus = focus;
             let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1133,28 +981,6 @@ mod tests {
         assert_eq!(app.scrollback, 0);
         key(&mut app, press(KeyCode::PageUp));
         assert_eq!(app.scrollback, 10);
-    }
-
-    #[test]
-    fn a_home_is_recorded_per_account_and_never_shared() {
-        // Resume is scoped to the profile that created the session. One home
-        // used for two accounts would put both conversations in one store, and
-        // the second would resume the first's.
-        let accounts = Accounts::from(vec![
-            Account::new(Kind::Claude, 1, Some("/r/claude/abc".into())),
-            Account::new(Kind::Claude, 2, Some("/r/claude/def".into())),
-            Account::new(Kind::Codex, 1, Some("/r/codex/1".into())),
-            Account::new(Kind::Grok, 1, Some("/r/grok/1".into())),
-        ]);
-        // A harness opens on its first account, never on whichever came first
-        // in the list.
-        assert_eq!(
-            accounts.first(Kind::Claude).and_then(|a| a.home.clone()),
-            Some(PathBuf::from("/r/claude/abc"))
-        );
-        let homes: Vec<_> = accounts.all().iter().map(|a| a.home.clone()).collect();
-        assert_eq!(homes[0], Some(PathBuf::from("/r/claude/abc")));
-        assert_ne!(homes[0], homes[1]);
     }
 
     fn hold(code: KeyCode) -> KeyEvent {
