@@ -1835,8 +1835,22 @@ is the row it is on.
 
 **A pane with no session behind it says what typing would start.** Centred in the middle of
 the pane: *create a **Claude** session* over *login: claude-1 · ada@clubria.com*, with only
-the vendor's name accented. "waiting for the first reply…" was said there before, over
-something that had not been asked anything and never would be until it existed.
+the vendor's name accented. It used to say it was waiting for a first reply, over something
+that had not been asked anything and never would be until it existed. A session no longer
+says that either: what its turn is doing is the activity line's to say, below.
+
+**A turn is in one of four states, and "stopped" is drawn as nothing.** Launching (started,
+and the harness has said nothing), thinking (writing, no tool call open), running a tool (a
+call is out and its result is not back), or stopped. `activity.rs` works this out from the
+events the stream decoded to and the turn lock, and `crates/agents/DESIGN.md` has what each
+looks like. There is no "waiting for a reply" state. Said before the process started, it
+claimed an agent had a prompt that had not reached one. Left on a turn that failed, it
+promised a reply that was never coming. The model and effort on the thinking line are only
+what a harness reported. Codex's `exec --json` reports neither, so they are read from the
+`turn_context` line in its own rollout file (`rollout.rs`). That read is read-only, reads
+at most the last megabyte, happens a few times per turn at most, and may find nothing. When
+it finds nothing, the line names Codex and stops. It never shows a default riabuild thinks
+Codex has.
 
 **A window that takes the terminal by hand has to clear it — twice.** `claim()` does what
 `ratatui::init` would: ratatui writes only the cells that differ from the previous frame,

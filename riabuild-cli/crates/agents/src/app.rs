@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use riabuild_harness::{Event, Kind};
 
 use crate::account::{Account, SignedIn};
+use crate::activity::Turn;
 use crate::compose::Compose;
 
 /// Whether a harness said, in its own words, that it is not signed in.
@@ -214,8 +215,12 @@ pub struct Pane {
     /// above it is the right pane.
     pub parent: Option<String>,
     pub model: Option<String>,
+    /// The reasoning effort the model is running at, where the harness says.
+    pub effort: Option<String>,
     /// Whether a turn holds the session's lock right now.
     pub running: bool,
+    /// Where the turn in flight has got to — see [`crate::activity`].
+    pub turn: Turn,
     /// Sticky until the next prompt. A session that goes quietly green the
     /// instant after it failed is the one bug this screen exists to prevent, so
     /// the turn ending is not what clears this — asking it something else is.
@@ -272,7 +277,9 @@ impl Pane {
             thread: None,
             parent: None,
             model: None,
+            effort: None,
             running: false,
+            turn: Turn::default(),
             troubled: false,
             signed_out: false,
             usage_limited: false,
@@ -354,6 +361,12 @@ impl Pane {
     /// Public because rehydration replays a spool straight into a pane before
     /// the window exists, which is the same operation the live tail performs.
     pub fn observe(&mut self, event: &Event) {
+        // Before the entry is pushed, so a turn that begins with this event
+        // counts it as its own.
+        match event {
+            Event::Idle => self.turn.idle(self.entries.len()),
+            _ => self.turn.heard(self.entries.len()),
+        }
         match event {
             Event::Delegated { inner, .. } => self.apply(inner, true),
             other => self.apply(other, false),
@@ -364,7 +377,11 @@ impl Pane {
     /// [`Event::Delegated`].
     fn apply(&mut self, event: &Event, delegated: bool) {
         match event {
-            Event::Ready { thread, model } => {
+            Event::Ready {
+                thread,
+                model,
+                effort,
+            } => {
                 if !delegated {
                     self.close_turn();
                 }
@@ -373,6 +390,9 @@ impl Pane {
                 }
                 if model.is_some() {
                     self.model = model.clone();
+                }
+                if effort.is_some() {
+                    self.effort = effort.clone();
                 }
             }
             Event::Said(text) => self.push(Entry::Said(text.clone()), delegated),
@@ -787,7 +807,21 @@ impl App {
     /// Whether a turn holds this session's lock.
     pub fn set_running(&mut self, id: &str, running: bool) {
         if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
-            pane.running = running;
+            pane.set_running(running);
+        }
+    }
+
+    /// This session's harness wrote a line that decoded to no event.
+    pub fn heard(&mut self, id: &str) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            pane.turn.heard(pane.entries.len());
+        }
+    }
+
+    /// riabuild's wrapper wrote that this session's turn could not go on.
+    pub fn stopped(&mut self, id: &str) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            pane.turn.stopped();
         }
     }
 
@@ -800,6 +834,7 @@ impl App {
         if let Some(Row::Session(index)) = self.row()
             && let Some(pane) = self.panes.get_mut(index)
         {
+            pane.turn.asked(pane.entries.len());
             pane.push(Entry::Note(format!("› {text}")), false);
             pane.running = true;
             // A new question is the developer acting on whatever went wrong,
@@ -1265,6 +1300,7 @@ mod tests {
                 &Event::Ready {
                     thread: None,
                     model: None,
+                    effort: None,
                 },
             );
             app.observe("s1", &Event::Usage { input, output });
@@ -1286,6 +1322,7 @@ mod tests {
             &Event::Ready {
                 thread: None,
                 model: None,
+                effort: None,
             },
         );
         assert_eq!(app.selected().unwrap().tokens(), (357, 26));

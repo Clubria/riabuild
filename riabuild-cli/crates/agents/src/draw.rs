@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use riabuild_theme::{Role, Style, Theme};
 
 use crate::account::Account;
+use crate::activity::Activity;
 use crate::app::{App, Entry, Focus, Pane, Row, State};
 
 /// What every line-builder needs and none of them should look up twice.
@@ -400,8 +401,9 @@ pub fn rail_cursor_line(app: &App) -> usize {
 /// The selected session's transcript.
 ///
 /// Empty for an offer: there is no conversation, and `frame.rs` puts the splash
-/// there instead. Saying "waiting for the first reply" about a session that has
-/// not been created would be describing something that is not happening.
+/// there instead. Empty for a session with nothing in it too — what a turn is
+/// doing is [`activity_line`]'s to say, and a placeholder here would be a second
+/// voice saying it, wrongly as soon as the turn had failed.
 pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec<Line<'static>> {
     let Some(pane) = pane else {
         return Vec::new();
@@ -470,13 +472,103 @@ pub fn transcript_lines(pane: Option<&Pane>, theme: Theme, unicode: bool) -> Vec
             ))),
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "waiting for the first reply…",
-            theme.style(Role::Muted),
-        )));
-    }
     lines
+}
+
+/// The one line saying what the selected session's turn is doing, or `None`
+/// when no turn is running — which is how "stopped" is shown: by not being
+/// shown at all.
+///
+/// Three shapes, one spinner:
+///
+/// - `⠹ launching claude session…` — started, and the harness has said nothing.
+/// - `⠹ thinking… · claude opus-5 at high` — writing, no tool call open. The
+///   model and the effort are whatever the harness reported, and each is left
+///   out where it reported nothing rather than filled in with a guess.
+/// - `⠹ running Bash  pnpm test login` — a tool call is out, in the working
+///   colour so it reads as the agent waiting on something rather than thinking.
+///
+/// Cut to `width` rather than wrapped: it is a status, and a status that grew a
+/// second row would push the conversation up and down as tools came and went.
+pub fn activity_line(
+    pane: Option<&Pane>,
+    chrome: Chrome<'_>,
+    tick: usize,
+    width: u16,
+) -> Option<Line<'static>> {
+    let pane = pane?;
+    let activity = pane.activity()?;
+    let theme = chrome.theme;
+    let ellipsis = if chrome.unicode { "…" } else { "..." };
+    let spinner = if chrome.unicode {
+        SPINNER[tick % SPINNER.len()]
+    } else {
+        "~"
+    };
+    let tag = pane.kind.tag();
+    let mut parts: Vec<(String, Style)> = vec![(format!("{spinner} "), theme.style(Role::Busy))];
+    match activity {
+        Activity::Launching => parts.push((
+            format!("launching {tag} session{ellipsis}"),
+            theme.style(Role::Muted),
+        )),
+        Activity::Thinking => {
+            parts.push((format!("thinking{ellipsis}"), Style::default()));
+            let mut about = format!(" · {tag}");
+            if let Some(model) = pane
+                .model
+                .as_deref()
+                .map(|model| model_name(pane.kind, model))
+                && !model.is_empty()
+            {
+                about.push(' ');
+                about.push_str(&model);
+            }
+            if let Some(effort) = pane.effort.as_deref().filter(|effort| !effort.is_empty()) {
+                about.push_str(" at ");
+                about.push_str(effort);
+            }
+            parts.push((about, theme.style(Role::Muted)));
+        }
+        Activity::Tool { name, detail } => {
+            parts.push(("running ".to_string(), theme.style(Role::Busy)));
+            parts.push((name.to_string(), theme.style(Role::Strong)));
+            if let Some(detail) = detail {
+                parts.push((format!("  {detail}"), theme.style(Role::Muted)));
+            }
+        }
+    }
+
+    // Cut from the right, a span at a time, so the spinner and the verb are
+    // always there and only the detail loses its end.
+    let mut room = width as usize;
+    let mut spans = Vec::new();
+    for (text, style) in parts {
+        if room == 0 {
+            break;
+        }
+        let fitted = clip(&text, room);
+        room = room.saturating_sub(fitted.chars().count());
+        spans.push(Span::styled(fitted, style));
+    }
+    Some(Line::from(spans))
+}
+
+/// A model id as the indicator shows it.
+///
+/// Claude Code reports `claude-opus-5[1m]`: the harness is already named beside
+/// it, so the vendor prefix is a stutter, and the bracket is a context-window
+/// variant rather than a different model. Everything else is shown as reported.
+fn model_name(kind: riabuild_harness::Kind, model: &str) -> String {
+    let bare = match model.find('[') {
+        Some(at) => &model[..at],
+        None => model,
+    };
+    let bare = match kind {
+        riabuild_harness::Kind::Claude => bare.strip_prefix("claude-").unwrap_or(bare),
+        _ => bare,
+    };
+    bare.to_string()
 }
 
 /// What a pane says when the cursor is on an offer rather than on a session.
@@ -1244,8 +1336,8 @@ pub(crate) mod tests {
 
     #[test]
     fn an_offer_says_what_typing_would_start_rather_than_waiting_for_a_reply() {
-        // "waiting for the first reply…" was said over a pane that had no
-        // session behind it at all, so there was nothing to wait for.
+        // A pane with no session behind it once said it was waiting for a
+        // reply, when there was nothing to wait for.
         let account = Account::new(Kind::Claude, 1, None);
         let lines: Vec<String> = splash_lines(&account, Some("ada@clubria.com"), Theme::plain())
             .iter()
@@ -1413,5 +1505,140 @@ pub(crate) mod tests {
         for row in &rows {
             assert!(row.chars().count() <= 30, "{row:?}");
         }
+    }
+
+    /// The indicator for the selected session, as plain text.
+    fn indicator(app: &App, unicode: bool, width: u16) -> Option<String> {
+        let chrome = Chrome {
+            unicode,
+            ..plain_chrome()
+        };
+        activity_line(app.selected(), chrome, 0, width).map(|line| text_of(&line))
+    }
+
+    fn asked(kind: Kind) -> App {
+        let mut app = App::offering(first_of_each());
+        app.begin("s1".into(), &Account::new(kind, 1, None));
+        app.sent("fix the flaky login test");
+        app
+    }
+
+    #[test]
+    fn nothing_says_it_is_waiting_for_a_first_reply() {
+        // A session with nothing in it yet has an empty transcript; what its
+        // turn is doing is the indicator's to say, and only while it is true.
+        let mut app = App::offering(first_of_each());
+        app.begin("s1".into(), &Account::new(Kind::Claude, 1, None));
+        assert!(transcript_lines(app.selected(), Theme::plain(), true).is_empty());
+        assert_eq!(indicator(&app, true, 80), None);
+    }
+
+    #[test]
+    fn a_turn_that_has_said_nothing_is_launching_its_harness() {
+        for (kind, word) in [
+            (Kind::Claude, "claude"),
+            (Kind::Codex, "codex"),
+            (Kind::Grok, "grok"),
+        ] {
+            let app = asked(kind);
+            assert_eq!(
+                indicator(&app, true, 80).as_deref(),
+                Some(format!("⠋ launching {word} session…").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_names_the_harness_the_model_and_the_effort_it_reported() {
+        let mut app = asked(Kind::Claude);
+        app.set_running("s1", true);
+        app.observe(
+            "s1",
+            &riabuild_harness::Event::Ready {
+                thread: Some("t".into()),
+                model: Some("claude-opus-5[1m]".into()),
+                effort: Some("xhigh".into()),
+            },
+        );
+        assert_eq!(
+            indicator(&app, true, 80).as_deref(),
+            Some("⠋ thinking… · claude opus-5 at xhigh")
+        );
+    }
+
+    #[test]
+    fn what_the_harness_did_not_report_is_left_out() {
+        // Codex's stream names no model: the line says so by saying less,
+        // never by naming a default riabuild believes Codex has.
+        let mut app = asked(Kind::Codex);
+        app.set_running("s1", true);
+        for event in testing::decode(Kind::Codex, r#"{"type":"thread.started","thread_id":"t1"}"#) {
+            app.observe("s1", &event);
+        }
+        assert_eq!(
+            indicator(&app, true, 80).as_deref(),
+            Some("⠋ thinking… · codex")
+        );
+        // and a model with no effort drops only the effort
+        app.panes[0].model = Some("gpt-5.6-sol".into());
+        assert_eq!(
+            indicator(&app, true, 80).as_deref(),
+            Some("⠋ thinking… · codex gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn a_tool_in_flight_is_named_with_what_it_is_running() {
+        let mut app = asked(Kind::Claude);
+        app.set_running("s1", true);
+        // The canned turn up to its tool call: the call is still out.
+        let first_two: Vec<&str> = testing::CLAUDE.lines().take(2).collect();
+        for event in testing::decode(Kind::Claude, &first_two.join("\n")) {
+            app.observe("s1", &event);
+        }
+        let theme = Theme::with_depth(Depth::TrueColor);
+        let chrome = Chrome {
+            theme,
+            ..plain_chrome()
+        };
+        let line = activity_line(app.selected(), chrome, 0, 80).unwrap();
+        assert_eq!(text_of(&line), "⠋ running Bash  cargo test --workspace");
+        // in the working colour, so it does not read as the agent thinking
+        assert_eq!(line.spans[1].style, theme.style(Role::Busy));
+        assert_eq!(line.spans[2].style, theme.style(Role::Strong));
+
+        // and once the result is in, it is back to thinking
+        let rest: Vec<&str> = testing::CLAUDE.lines().skip(2).take(2).collect();
+        for event in testing::decode(Kind::Claude, &rest.join("\n")) {
+            app.observe("s1", &event);
+        }
+        assert!(
+            indicator(&app, true, 80)
+                .unwrap()
+                .starts_with("⠋ thinking… · claude opus-5")
+        );
+    }
+
+    #[test]
+    fn a_session_whose_turn_is_over_draws_no_indicator_at_all() {
+        let mut app = asked(Kind::Claude);
+        app.set_running("s1", true);
+        for event in testing::decode(Kind::Claude, testing::CLAUDE) {
+            app.observe("s1", &event);
+        }
+        app.set_running("s1", false);
+        assert_eq!(indicator(&app, true, 80), None);
+    }
+
+    #[test]
+    fn the_indicator_has_an_ascii_spelling_and_fits_its_row() {
+        let app = asked(Kind::Grok);
+        assert_eq!(
+            indicator(&app, false, 80).as_deref(),
+            Some("~ launching grok session...")
+        );
+        let cut = indicator(&app, true, 12).unwrap();
+        assert!(cut.chars().count() <= 12, "{cut}");
+        assert!(cut.starts_with("⠋ "), "{cut}");
     }
 }

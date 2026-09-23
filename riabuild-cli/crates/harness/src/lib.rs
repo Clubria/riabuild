@@ -218,6 +218,10 @@ pub enum Event {
     Ready {
         thread: Option<String>,
         model: Option<String>,
+        /// How hard the model was told to think, in the harness's own words
+        /// (`high`, `xhigh`), where its stream says. `None` is "not reported",
+        /// never "none": a pane shows nothing rather than a level it guessed.
+        effort: Option<String>,
     },
     /// Prose for the developer.
     Said(String),

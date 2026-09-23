@@ -75,12 +75,14 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::oneshot;
 
 pub mod account;
+pub mod activity;
 pub mod app;
 pub mod compose;
 pub mod draw;
 mod drive;
 pub mod frame;
 pub mod paste;
+mod rollout;
 pub mod store;
 pub mod turn;
 

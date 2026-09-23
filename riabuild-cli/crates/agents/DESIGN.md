@@ -86,12 +86,12 @@ this is visible.
   ▌            flaky login  ┊
    ● codex-1   add a test   ┊  › fix the flaky login test
                for retries  ┊  ✓ Read  src/login.test.ts
-   ● ↳ codex-1 write a      ┊  ◌ Bash  pnpm test login
-               test (subagent)  I found the race: the mock resolves first.
+   ● ↳ codex-1 write a      ┊  I found the race: the mock resolves first.
+               test         ┊  ◌ Bash  pnpm test login
                             ┊
-  NEW SESSION               ┊  › ▏
+  NEW SESSION               ┊  ⠹ running Bash  pnpm test login
    + claude-1 · ada@club…   ┊
-   + codex-1                ┊
+   + codex-1                ┊  › ▏
    + grok-1                 ┊
                                                                     ← blank row
   enter send · ^v paste · alt+enter newline · ↑↓ scroll · ← sessions
@@ -167,9 +167,11 @@ Drawn on a slightly raised background, with a two-column margin inside. Top to b
    The total is every turn added together, cache reads included.
 3. A blank row.
 4. **Conversation** for a session, or the **splash** for an offer.
-5. A blank row.
-6. **Compose box**.
-7. A blank row.
+5. While a turn is running: a blank row, then the **activity line** (see "What a turn
+   is doing"). When no turn is running, neither row is there.
+6. A blank row.
+7. **Compose box**.
+8. A blank row.
 
 **Conversation.** One entry per event, oldest at the top:
 
@@ -182,9 +184,41 @@ Drawn on a slightly raised background, with a two-column margin inside. Top to b
 | a failure | red text |
 | a subagent's work inside its parent | the same, indented with `  ↳ ` |
 
-Long lines wrap. A session with no entries yet reads `waiting for the first reply…`. The
-view stays pinned to the newest line unless you scroll up. Changing rows, editing the
-draft or sending a prompt pins it to the bottom again.
+Long lines wrap. A session with no entries yet shows an empty conversation, with no
+placeholder text. The view stays pinned to the newest line unless you scroll up. Changing
+rows, editing the draft or sending a prompt pins it to the bottom again.
+
+**What a turn is doing.** One line between the conversation and the compose box. It
+says which of four states the selected session is in, worked out from the turn's event
+stream and from whether a turn holds the session's lock:
+
+| State | When | Line |
+|---|---|---|
+| **launching** | a turn was started and its harness has said nothing yet | `⠹ launching claude session…` (`codex` / `grok` for those) |
+| **thinking** | the harness is writing and no tool call is open | `⠹ thinking… · claude opus-5 at high` |
+| **running a tool** | a tool call was made and its result has not arrived | `⠹ running Bash  pnpm test login` |
+| **stopped** | no turn is running | no line at all |
+
+- The spinner is the rail's, in the working colour. `running` is in the working colour
+  too, with the tool name in bold and its detail muted, so a tool call does not look
+  like thinking. `thinking…` is plain text and what follows it is muted.
+- **Model and effort** are shown only as the harness reports them. A part it did not
+  report is left out, never guessed: `thinking… · codex` alone is correct.
+  - Claude Code: the model comes from the `init` event (`claude-opus-5[1m]` is shown as
+    `opus-5`). The effort is shown when `init` includes one; a `-p` turn on 2.1.280
+    does not.
+  - Codex: its stream has neither. Both come from the `turn_context` line Codex writes
+    into the thread's own rollout under `$CODEX_HOME/sessions/`, when one is there.
+  - Grok Build: neither is reported.
+- When several tool calls are open, the newest is shown: for a subagent, that is the
+  subagent's own tool rather than the call that started it. A call an earlier turn left
+  open does not count.
+- The line stays put while you scroll the conversation. It is cut with `…` to one row,
+  never wrapped.
+- **Stopped has no text.** When a turn ends, fails, or is killed, the line and the blank
+  row above it go away, and the rail's mark is what remains.
+- A prompt sent while a turn is running waits behind it. It shows as launching once the
+  turn in front of it ends.
 
 **Splash** (an offer), centred both ways in the pane:
 
@@ -260,7 +294,7 @@ SESSIONS with the cursor on it. Its title is the prompt, flattened to one line a
 60 characters. Then the turn starts. The offer stays on the rail for next time.
 
 **Send to a session.** `› text` appears at once and the session shows as working at once,
-before the process has started. Any trouble mark is cleared. The turn continues the same
+with `launching … session…` under the conversation, before the process has started. Any trouble mark is cleared. The turn continues the same
 conversation under the sign-in the session was created with.
 
 **Send while a turn is running.** Allowed. The prompt is queued and runs after the current
@@ -271,7 +305,8 @@ output, or within moments if the harness has gone quiet, and the conversation sa
 stopped in the accent colour — not as trouble, because nothing went wrong.
 
 **Wait.** The window redraws about eight times a second. New output shows up as it is
-written, and the spinner turns. Sessions the window did not start, meaning subagents, show
+written, the spinners turn, and the activity line moves between thinking and running a
+tool as the agent works. Sessions the window did not start, meaning subagents, show
 up within about three seconds, under their parent. The cursor stays on the row it was on.
 
 **Hit a failure.**
@@ -330,10 +365,11 @@ same one every `claude` launcher uses.
   over the body.
 - **Colours by role**, from `riabuild-theme`: brand (cursor bar, `+`, header name, your
   prompts, `›`, caret), ok/green (idle, tool succeeded), busy/orange (working, tool
-  running, the "working" count), danger/red (trouble, failed tool, failure text, a session
-  that could not be started), warn (notices), muted (headings, sign-ins, unselected
-  titles, secondary text), strong (selected title, repository, tool names, key names).
-  Nothing uses a hard-coded colour, and `NO_COLOR` turns colour off.
+  running, the "working" count, the activity line's spinner and `running`), danger/red
+  (trouble, failed tool, failure text, a session that could not be started), warn
+  (notices), muted (headings, sign-ins, unselected titles, secondary text), strong
+  (selected title, repository, tool names, key names). Nothing uses a hard-coded colour,
+  and `NO_COLOR` turns colour off.
 - **ASCII fallback** where the terminal is not trusted with Unicode:
 
   | Unicode | ASCII |
@@ -341,6 +377,7 @@ same one every `claude` launcher uses.
   | `▌` cursor | `>` |
   | `●` idle | `*` |
   | spinner / `◐` working | `~` (no spinner) |
+  | `…` on the activity line | `...` |
   | `▲` trouble | `!` |
   | `↳` child | `>` |
   | `◌` `✓` `✗` tool | `.` `+` `!` |

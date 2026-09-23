@@ -148,11 +148,20 @@ fn render_pane(frame: &mut Frame, app: &App, chrome: Chrome<'_>, gutter: Rect, a
     let room = area.height.saturating_sub(6).max(1);
     let box_height = wanted.clamp(1, room.min(BOX_LINES));
 
+    // What the turn is doing, on a row of its own under the conversation and
+    // clear of it by one — so it stays in view while the developer scrolls
+    // back, and so it is not mistaken for something the agent said. No turn,
+    // no rows: an idle session is drawn exactly as it was before it was asked
+    // anything, and that absence is the whole of how "stopped" reads.
+    let activity = draw::activity_line(app.selected(), chrome, app.tick, inset(area).width);
+    let status_rows = if activity.is_some() { 2 } else { 0 };
+
     let rows = Layout::vertical([
         Constraint::Length(1), // a blank row inside the pane's own edge
         Constraint::Length(1), // whose sign-in this is
         Constraint::Length(1),
-        Constraint::Min(1),    // the conversation, or what would start one
+        Constraint::Min(1), // the conversation, or what would start one
+        Constraint::Length(status_rows), // a blank row, then what the turn is doing
         Constraint::Length(1), // the newline above the box
         Constraint::Length(box_height), // the box
         Constraint::Length(1),
@@ -175,7 +184,17 @@ fn render_pane(frame: &mut Frame, app: &App, chrome: Chrome<'_>, gutter: Rect, a
         None => render_splash(frame, app, theme, middle),
     }
 
-    render_compose(frame, app, theme, chrome.unicode, inset(rows[5]));
+    if let Some(line) = activity {
+        let row = inset(rows[4]);
+        let row = Rect {
+            y: row.y + row.height.saturating_sub(1),
+            height: row.height.min(1),
+            ..row
+        };
+        paint(frame, theme, Paragraph::new(line), row);
+    }
+
+    render_compose(frame, app, theme, chrome.unicode, inset(rows[6]));
 }
 
 /// The tallest the prompt box may grow before it starts scrolling itself.
@@ -332,6 +351,38 @@ mod tests {
             app.observe("s1", &event);
         }
         app
+    }
+
+    #[test]
+    fn a_running_turn_says_so_above_the_box_and_an_idle_one_does_not() {
+        let mut app = App::offering(first_of_each());
+        app.begin("s1".into(), &Account::new(Kind::Codex, 1, None));
+        app.sent("add a test");
+        app.focus = Focus::Session;
+        let busy = frame_of(&app, Theme::plain(), 100, 24);
+        let at = busy
+            .iter()
+            .position(|row| row.contains("launching codex session"))
+            .expect("the indicator is drawn");
+        // clear of the conversation above it and the box below it by a row
+        let pane = |row: &str| row.split('│').nth(1).unwrap_or_default().trim().to_string();
+        assert!(pane(&busy[at - 1]).is_empty(), "{busy:#?}");
+        assert!(pane(&busy[at + 1]).is_empty(), "{busy:#?}");
+        assert!(pane(&busy[at + 2]).starts_with('›'), "{busy:#?}");
+
+        // A turn that has ended is drawn as nothing at all.
+        app.set_running("s1", true);
+        for event in testing::decode(Kind::Codex, r#"{"type":"turn.completed"}"#) {
+            app.observe("s1", &event);
+        }
+        app.set_running("s1", false);
+        let idle = frame_of(&app, Theme::plain(), 100, 24);
+        assert!(
+            !idle
+                .iter()
+                .any(|row| row.contains("launching") || row.contains("thinking")),
+            "{idle:#?}"
+        );
     }
 
     #[test]
