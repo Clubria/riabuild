@@ -47,7 +47,7 @@ pub(super) async fn install_codex(ctx: &mut Ctx) -> Result<()> {
     let prefix = node_dir.to_string_lossy().into_owned();
     let spec = package_spec();
     // `--ignore-scripts` because `@openai/codex` declares none — checked
-    // against 0.149.0, whose `package.json` has no `scripts` block at all — and
+    // against 0.159.2, whose `package.json` has no `scripts` block at all — and
     // its per-platform binaries arrive as `optionalDependencies` npm resolves
     // rather than as a `postinstall` that downloads one. So the flag costs
     // nothing here and closes the gap that makes an npm install different from

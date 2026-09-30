@@ -6,7 +6,7 @@
 //! when the binary it recorded has moved.
 //!
 //! ```sh
-//! CODEX_HOME=~/.riabuild/codex codex --yolo --dangerously-bypass-hook-trust
+//! CODEX_HOME=~/.riabuild/codex codex --yolo agents
 //! ```
 //!
 //! What decides all of that is [`handoff`], in Rust; the file in `bin/` is one
@@ -48,12 +48,6 @@ const YOLO_LONG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
 /// The flag riabuild adds where the developer named no policy of their own.
 const YOLO: &str = "--yolo";
-
-/// Runs the checkout's hooks without Codex stopping to ask whether it may trust
-/// them. The checkout is the one riabuild selected and provisioned, and its
-/// `.codex/hooks.json` is versioned code from that repository rather than a
-/// program supplied by riabuild-web.
-const TRUST_HOOKS: &str = "--dangerously-bypass-hook-trust";
 
 /// How many Codex profiles riabuild makes.
 ///
@@ -130,18 +124,19 @@ pub(super) fn handoff(
     if !stands_aside {
         args.push(YOLO.to_string());
     }
-    if !plan.args.iter().any(|arg| arg == TRUST_HOOKS) {
-        args.push(TRUST_HOOKS.to_string());
+    // A bare `codex` in a terminal opens `codex agents`. Only a bare one: a
+    // subcommand or prompt the developer typed is theirs, and `codex agents`
+    // refuses an initial prompt outright. Only in a terminal: a pipe or a
+    // script has nobody to show a full-screen view to.
+    //
+    // 0.149.0 refused this — "`codex agents` cannot attach to shared sessions
+    // with invocation-specific configuration overrides", which `--yolo` is —
+    // and 0.159.2 dropped that refusal and installs its daemon from the npm
+    // package riabuild verified rather than wanting a standalone install.
+    let bare_and_interactive = plan.args.is_empty() && world.stdin_is_tty && world.stdout_is_tty;
+    if bare_and_interactive {
+        args.push("agents".to_string());
     }
-    // A bare `codex` opens the ordinary interactive session, not `codex
-    // agents`. The agents view refuses any launch that carries its own
-    // configuration — "`codex agents` cannot attach to shared sessions with
-    // invocation-specific configuration overrides", and `--yolo` and
-    // `--dangerously-bypass-hook-trust` are both that — and without them it
-    // wants the standalone install Codex's own installer lays down under
-    // `$CODEX_HOME/packages/standalone`, which is a second provisioner and not
-    // the npm package riabuild verifies. Verified against 0.149.0. A developer
-    // who wants it can still type `codex agents` and get Codex's own answer.
     args.extend(plan.args.iter().cloned());
     handoff.with_args(args)
 }
@@ -285,17 +280,11 @@ mod tests {
 
     #[test]
     fn the_launcher_adds_yolo_by_default() {
-        assert_eq!(
-            launch_handoff(&fixture(), &laptop()).args,
-            vec![YOLO, TRUST_HOOKS]
-        );
+        assert_eq!(launch_handoff(&fixture(), &laptop()).args, vec![YOLO]);
     }
 
-    /// `codex agents` rejects `--yolo` and `--dangerously-bypass-hook-trust`
-    /// as invocation-specific overrides, so a bare launch that opened it
-    /// failed every time instead of starting a session.
     #[test]
-    fn a_bare_interactive_launch_opens_an_ordinary_session() {
+    fn a_bare_interactive_launch_opens_the_agents_view() {
         let interactive = World {
             stdin_is_tty: true,
             stdout_is_tty: true,
@@ -303,7 +292,7 @@ mod tests {
         };
         assert_eq!(
             launch_handoff(&fixture(), &interactive).args,
-            vec![YOLO, TRUST_HOOKS]
+            vec![YOLO, "agents"]
         );
     }
 
@@ -316,16 +305,33 @@ mod tests {
         };
         assert_eq!(
             launch_handoff(&carrying(&["resume"]), &interactive).args,
-            vec![YOLO, TRUST_HOOKS, "resume"]
+            vec![YOLO, "resume"]
         );
     }
 
+    /// Hook trust is Codex's own question again: the launcher no longer
+    /// answers it on the developer's behalf, on any launch.
     #[test]
-    fn the_launcher_autotrusts_checkout_hooks_without_duplicating_the_flag() {
-        assert_eq!(
-            launch_handoff(&carrying(&[TRUST_HOOKS, "--version"]), &laptop()).args,
-            vec![YOLO, TRUST_HOOKS, "--version"]
-        );
+    fn the_launcher_does_not_bypass_hook_trust() {
+        let interactive = World {
+            stdin_is_tty: true,
+            stdout_is_tty: true,
+            ..laptop()
+        };
+        for handoff in [
+            launch_handoff(&fixture(), &laptop()),
+            launch_handoff(&fixture(), &interactive),
+            launch_handoff(&carrying(&["exec", "hi"]), &laptop()),
+        ] {
+            assert!(
+                !handoff
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-hook-trust"),
+                "{:?}",
+                handoff.args
+            );
+        }
     }
 
     #[test]
@@ -346,9 +352,7 @@ mod tests {
             let args = launch_handoff(&carrying(&chosen), &laptop()).args;
             assert_eq!(
                 args,
-                std::iter::once(TRUST_HOOKS.to_string())
-                    .chain(chosen.iter().map(|a| a.to_string()))
-                    .collect::<Vec<_>>(),
+                chosen.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "riabuild added a flag beside the developer's own policy"
             );
         }
@@ -359,7 +363,7 @@ mod tests {
     #[test]
     fn a_launch_that_names_no_policy_still_gets_the_default() {
         let args = launch_handoff(&carrying(&["exec", "--full-auto"]), &laptop()).args;
-        assert_eq!(args, vec![YOLO, TRUST_HOOKS, "exec", "--full-auto"]);
+        assert_eq!(args, vec![YOLO, "exec", "--full-auto"]);
     }
 
     #[test]
@@ -608,6 +612,13 @@ mod tests {
         // only thing that differs between the nine, and the whole claim under
         // test.
         let codex = codex.to_string_lossy().into_owned();
+        // `launch::run` creates each home before exec'ing, and Codex refuses
+        // one that is not there; this drives `handoff` alone, so it does both.
+        for profile in [1, 2] {
+            tokio::fs::create_dir_all(home.path().join("codex").join(profile.to_string()))
+                .await
+                .unwrap();
+        }
         let env_of = |profile: usize| {
             let codex_home = home.path().join("codex").join(profile.to_string());
             launch_handoff(&plan(&codex_home, &codex, &bin), &world).env
