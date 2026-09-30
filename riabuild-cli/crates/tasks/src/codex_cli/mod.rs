@@ -51,7 +51,7 @@ const PACKAGE: &str = "@openai/codex";
 ///
 /// Bumping this is a code change, and `version()` goes up beside it so every
 /// existing install converges.
-const PACKAGE_VERSION: &str = "0.149.0";
+const PACKAGE_VERSION: &str = "0.159.2";
 
 /// The version every behaviour this task and its launcher depend on was
 /// verified against.
@@ -89,8 +89,11 @@ impl Task for CodexCli {
     /// 2 for `PACKAGE_VERSION`. A machine provisioned before the pin has
     /// whatever npm called `latest` that day, and `check()` now disagrees with
     /// it — but only once the engine asks, which is what the bump is for.
+    ///
+    /// 3 for 0.159.2, the first pin whose `codex agents` accepts `--yolo`,
+    /// which is what lets a bare launch open the agents view.
     fn version(&self) -> u32 {
-        2
+        3
     }
 
     fn depends_on(&self) -> &[TaskId] {

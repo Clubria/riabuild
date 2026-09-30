@@ -32,7 +32,10 @@ use riabuild_version as version;
 /// 2.0.x may not have `auth status --json` at all, which this task now treats as
 /// a hard failure rather than a misread. Raising the floor costs nothing —
 /// `install_claude` installs whatever npm calls latest.
-const MIN_VERSION: &str = "2.1.223";
+///
+/// Raised to 2.1.285, the current release, so every existing install is
+/// upgraded rather than left on whatever it last cleared the floor with.
+const MIN_VERSION: &str = "2.1.285";
 
 pub struct ClaudeAccounts;
 
@@ -118,8 +121,9 @@ impl Task for ClaudeAccounts {
         "Claude Code accounts"
     }
 
+    /// 2 for raising `MIN_VERSION` to 2.1.285.
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn depends_on(&self) -> &[TaskId] {
@@ -338,7 +342,7 @@ mod tests {
     const NODE: &str = "22.23.1";
 
     fn installed() -> FakeRunner {
-        FakeRunner::new().with(VERSION, 0, "2.1.223 (Claude Code)", "")
+        FakeRunner::new().with(VERSION, 0, &format!("{MIN_VERSION} (Claude Code)"), "")
     }
 
     fn signed_in() -> FakeRunner {
