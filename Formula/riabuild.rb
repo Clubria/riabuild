@@ -14,7 +14,7 @@
 class Riabuild < Formula
   desc "Sets up a Clubria developer's machine and opens the Clubria environment"
   homepage "https://riabuild.clubria.com"
-  version "2026.09.23"
+  version "2026.09.30"
   license "MIT"
 
   # Homebrew runs on Linux and this formula would install there. It should not:
@@ -28,13 +28,13 @@ class Riabuild < Formula
   depends_on :macos
 
   on_arm do
-    url "https://github.com/Clubria/riabuild/releases/download/v2026.09.23/riabuild-2026.09.23-aarch64-apple-darwin.tar.gz"
-    sha256 "a27392dd2f534bba3e785bed54698010fd372f4be44f7594ef0eedad4f824062"
+    url "https://github.com/Clubria/riabuild/releases/download/v2026.09.30/riabuild-2026.09.30-aarch64-apple-darwin.tar.gz"
+    sha256 "b56d772db53757aa8b9df5cf902bbb3382c427858d510b4080e284b7360af9ae"
   end
 
   on_intel do
-    url "https://github.com/Clubria/riabuild/releases/download/v2026.09.23/riabuild-2026.09.23-x86_64-apple-darwin.tar.gz"
-    sha256 "64f689d37ceca973870a2a84ea3290b20e179a55223b2cbe804d879c5e50306f"
+    url "https://github.com/Clubria/riabuild/releases/download/v2026.09.30/riabuild-2026.09.30-x86_64-apple-darwin.tar.gz"
+    sha256 "aa5bd33a21f60bd3afad4e0b416e65a04c368033b182a8983ef63f77c73400c5"
   end
 
   def install
@@ -75,6 +75,6 @@ class Riabuild < Formula
     # Compared against the literal rather than #{version}: riabuild's versions
     # are zero-padded release dates, and this asserts what the binary prints
     # without depending on how Homebrew's own Version renders "2026.08.04".
-    assert_match "riabuild 2026.09.23", shell_output("#{bin}/riabuild --version")
+    assert_match "riabuild 2026.09.30", shell_output("#{bin}/riabuild --version")
   end
 end
